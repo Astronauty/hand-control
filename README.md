@@ -1,7 +1,7 @@
 ## Installation instructions
 ```
-conda create -n hand-control
-pip install -r requirements.txt
+conda create -f environment.yml
+conda activate hand-control
 ```
 
 ## User Interfaces
