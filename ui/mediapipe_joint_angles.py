@@ -84,6 +84,11 @@ def get_finger_angles(hand_landmarks):
     landmarks = [[lm.x, lm.y] for lm in hand_landmarks]
     
     angles = {}
+
+    # Thumb angles
+    angles['thumb_cmc'] = calculate_angle(landmarks[0], landmarks[1], landmarks[2])
+    angles['thumb_mcp'] = calculate_angle(landmarks[1], landmarks[2], landmarks[3])
+    angles['thumb_ip'] = calculate_angle(landmarks[2], landmarks[3], landmarks[4])
     
     # Index finger angles
     angles['index_mcp'] = calculate_angle(landmarks[0], landmarks[5], landmarks[6])
@@ -129,6 +134,9 @@ options = HandLandmarkerOptions(
 
 # Use OpenCV’s VideoCapture to start capturing from the webcam.
 cap = cv2.VideoCapture(0)
+#get fps of the webcam
+fps = cap.get(cv2.CAP_PROP_FPS)
+frame_counter = 0
 
 with HandLandmarker.create_from_options(options) as landmarker:
     while True:
@@ -141,7 +149,9 @@ with HandLandmarker.create_from_options(options) as landmarker:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=numpy_frame_from_opencv)
         
         # Track timestamps in ms
-        frame_timestamp_ms = time.monotonic_ns() // 1_000_000
+        # frame_timestamp_ms = time.monotonic_ns() // 1_000_000
+        frame_timestamp_ms = int(frame_counter * 1000 // fps)  # assuming 30 FPS
+        frame_counter += 1
         
         # Run inference
         landmarker.detect_async(mp_image, frame_timestamp_ms)
