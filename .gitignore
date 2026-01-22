@@ -1,3 +1,7 @@
+hand_snapshots/*
+
+
+
 # VSCode
 .vscode/*
 !.vscode/settings.json
