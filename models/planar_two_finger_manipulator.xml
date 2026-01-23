@@ -27,7 +27,7 @@
         <body name="base" pos="0 0 0">
             <geom type="box" size="0.1 0.05 0.01" rgba="0.5 0.3 0.3 0.5"/>
             <joint name="Th_base_x" type="slide" axis="1 0 0" limited="true" range="-5.0 5.0" damping="1"/>
-            <joint name="Th_base_y" type="slide" axis="0 1 0" limited="true" range="-0.3 0.3" damping="1"/>
+            <joint name="Th_base_y" type="slide" axis="0 1 0" limited="true" range="-1.0 1.0" damping="1"/>
 
 
             <body name="right_index_proximal_link" pos="0.1 0 0">
@@ -89,15 +89,15 @@
     </worldbody>
 
     <actuator>
-        <position name="Th_base_x_act" joint="Th_base_x" kp="50" dampratio="1"/>
-        <position name="Th_base_y_act" joint="Th_base_y" kp="50" dampratio="1"/>
+        <position name="Th_base_x_act" joint="Th_base_x" kp="100" dampratio="1" ctrllimited="false"/>
+        <position name="Th_base_y_act" joint="Th_base_y" kp="100" dampratio="1" ctrllimited="false"/>
 
-        <position name="right_index_MCP_joint" joint="right_index_MCP_joint" kp="1" dampratio="1" ctrllimited="false"/> 
-        <position name="right_index_PIP_joint" joint="right_index_PIP_joint" kp="1" dampratio="1"/>
-        <position name="right_index_DIP_joint"joint="right_index_DIP_joint" kp="1" dampratio="1"/>
+        <position name="right_index_MCP_joint" joint="right_index_MCP_joint" kp="2" dampratio="1" ctrllimited="false"/> 
+        <position name="right_index_PIP_joint" joint="right_index_PIP_joint" kp="2" dampratio="1" ctrllimited="false"/>
+        <position name="right_index_DIP_joint"joint="right_index_DIP_joint" kp="2" dampratio="1" ctrllimited="false"/>
 
         <position joint="right_thumb_MCP_joint" kp="1" dampratio="1" ctrllimited="false"/> 
-        <position joint="right_thumb_PIP_joint" kp="1" dampratio="1"/>
-        <position joint="right_thumb_DIP_joint" kp="1" dampratio="1"/>
+        <position joint="right_thumb_PIP_joint" kp="1" dampratio="1" ctrllimited="false"/>
+        <position joint="right_thumb_DIP_joint" kp="1" dampratio="1" ctrllimited="false"/>
     </actuator>
 </mujoco>
