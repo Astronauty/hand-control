@@ -18,7 +18,7 @@
     <worldbody>
         <!-- Scene Visualization -->
         <camera name="cam0" pos="0.0 0.0 2.0" xyaxes="1 0 0 0 1 0"/>
-        <light pos="-1 1 0"/>
+        <light pos="0 10 0" dir="0 -1 0"/>
 
         <geom type="plane" material="groundplane" pos="0 -0.8 0" quat="0.7071068 -0.7071068 0 0" size="1 1 1" rgba="1 1 1 1" contype="1" conaffinity="1"/>
         
@@ -40,7 +40,7 @@
 
                     <body name="right_index_distal_link" pos="0.1 0 0">
                         <joint name="right_index_DIP_joint" type="hinge" axis="0 0 1"/>
-                        <geom type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
+                        <geom name="right_index_distal_geom" type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" conaffinity="1"/>
                             
                     </body>
                 </body>
@@ -59,7 +59,7 @@
 
                     <body name="right_thumb_distal_link" pos="-0.1 0 0">
                         <joint name="right_thumb_DIP_joint" type="hinge" axis="0 0 1"/>
-                        <geom type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
+                        <geom name="right_thumb_distal_geom" type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1" conaffinity="1"/>
                             
                     </body>
                 </body>
@@ -74,13 +74,13 @@
         <!-- <body name="Th_base" pos="0 0 0">
             <geom type="box" size="0.1 0.05 0.01" rgba="0.5 0.3 0.3 0.5"/>
 
-            
+                
         </body> -->
 
 
         <body name="obj1" pos="0.0 -0.4 0.0">
             <joint name="free_obj1_joint" type="free"/>
-            <geom type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 1.0" mass="0.2" friction="1 0.1 0.1" contype="1" conaffinity="1"/>
+            <geom name="obj1_geom" type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 1.0" mass="0.2" friction="1 0.1 0.1" contype="1" conaffinity="1"/>
         </body>
         <!-- <body name="mocap" mocap="true" pos="0 -0.1 0">
             <geom type="sphere" size="0.005" rgba="0 1 0 1.0"/>
