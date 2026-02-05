@@ -204,12 +204,14 @@ def save_hand_data_to_csv(path, timestamp, hand_index, handedness, hand_landmark
 
 def init_ros():
     """Initialize ROS 2 node and publisher."""
-    global ros_node, joint_angles_pub
+    # FIX: Add calibration_pub to global list
+    global ros_node, joint_angles_pub, calibration_pub 
+    
     rclpy.init()
     ros_node = rclpy.create_node('hand_joint_publisher')
     
     joint_angles_pub = ros_node.create_publisher(Float32MultiArray, '/hand/joint_angles', 10)
-    calibration_pub = ros_node.create_publisher(Empty, '/teleop/trigger_calibration', 10) # <--- TRIGGER
+    calibration_pub = ros_node.create_publisher(Empty, '/teleop/trigger_calibration', 10)
 
     ros_node.get_logger().info("ROS 2 Node Started. Publishing to /hand/joint_angles")
     ros_node.get_logger().info(" - Press 'C' to calibrate home position")
@@ -347,6 +349,8 @@ def main():
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
+                elif key == ord("c"): 
+                    trigger_calibration()
                 elif key == 32:  # SPACE
                     if DEBUG_FLAG and last_frame is not None and last_hand_data:
                         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")

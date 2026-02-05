@@ -32,9 +32,10 @@ class TeleopCalibrationNode(Node):
         print(">> Node Ready. Move robot to start pos, then press 'C' in MediaPipe.")
 
     def hand_callback(self, msg):
-        """Store the latest human wrist position (Camera Frame)."""
+        """Store the latest human wrist position AND raw data."""
+        self.current_raw_msg = msg  # <--- SAVE THIS for the angle extraction
+        
         if len(msg.data) >= 3:
-            # XYZ from MediaPipe
             self.current_human_wrist = np.array(msg.data[0:3])
 
     def get_robot_wrist_position(self):
@@ -82,24 +83,23 @@ class TeleopCalibrationNode(Node):
 
     def update_control(self):
         """Main control loop."""
-        # Update Physics (Keep simulation running)
+        # Update Physics
         mujoco.mj_step(self.model, self.data)
         
         if self.state == "TRACKING" and self.current_human_wrist is not None:
-            # 1. Get current human pos in robot frame
+            # 1. Calculate Virtual Wrist (Base) Target
             human_curr = self.map_camera_to_robot_frame(self.current_human_wrist)
+            target_base = human_curr + self.virtual_offset
             
-            # 2. Apply the calibrated offset
-            # Target = Current_Human + (Robot_Start - Human_Start)
-            target = human_curr + self.virtual_offset
+            # 2. Apply FULL CONTROLS (Base + Fingers) <<--- CHANGED
+            self.apply_teleop_controls(target_base)
             
-            # 3. Publish & Visualize
-            self.publish_target(target)
-            
-            # Move 'mocap' marker in MuJoCo for visualization
+            # 3. Visualize Target
             mocap_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, 'mocap')
             if mocap_id != -1:
-                self.data.mocap_pos[0] = target
+                # Still useful to see where the "Goal" is vs where physics is
+                self.data.mocap_pos[0][0] = target_base[0]
+                self.data.mocap_pos[0][1] = target_base[1]
 
     def publish_target(self, target):
         msg = PoseStamped()
@@ -109,6 +109,60 @@ class TeleopCalibrationNode(Node):
         msg.pose.position.y = float(target[1])
         msg.pose.position.z = 0.0
         self.target_pub.publish(msg)
+
+    def apply_teleop_controls(self, target_base_pos):
+        """
+        Directly maps MediaPipe joint angles to MuJoCo actuators.
+        Call this inside update_control() when state is TRACKING.
+        """
+        # 0. Safety Check
+        if self.current_raw_msg is None:
+            return
+
+        # 1. Parse The Raw Message
+        # Format: [Wrist(6) | Thumb_CMC(3), Thumb_MCP(3)... | Index_MCP(3)...]
+        # Each joint has 3 angles: [Yaw(Z), Pitch(Y), Roll(X)]
+        # We generally use 'Z' (Yaw) for flexion in this specific coordinate setup
+        data = self.current_raw_msg.data
+        
+        # Helper to get angle in RADIANS for a specific joint
+        # joint_index corresponding to JOINT_ORDER list
+        def get_flexion(joint_idx):
+            start_idx = 6 + (joint_idx * 3) # Skip wrist(6) + prev joints
+            deg = data[start_idx] # Index 0 is Z-rotation (Flexion)
+            return np.radians(deg)
+
+        # 2. Extract Finger Angles (Indices from your JOINT_ORDER)
+        # Thumb: MCP=1, IP=2 (XML has MCP, PIP, DIP? Mapping 3 joints)
+        # Your MP script has: thumb_cmc(0), thumb_mcp(1), thumb_ip(2)
+        th_mcp = get_flexion(1) 
+        th_pip = get_flexion(2)
+        th_dip = get_flexion(2) * 0.5 # Mimic DIP based on IP since MP only has 3 thumb pts
+        
+        # Index: MCP=3, PIP=4, DIP=5
+        in_mcp = get_flexion(3)
+        in_pip = get_flexion(4)
+        in_dip = get_flexion(5)
+
+        # 3. Apply to MuJoCo Actuators
+        # XML Order: [Th_base_x, Th_base_y, Index_MCP, Index_PIP, Index_DIP, Thumb_MCP, Thumb_PIP, Thumb_DIP]
+        
+        ctrl = self.data.ctrl
+        
+        # A. Base Movement (Virtual Wrist)
+        ctrl[0] = target_base_pos[0]
+        ctrl[1] = target_base_pos[1]
+        
+        # B. Index Finger (Gain -1.0 often needed depending on axis definition)
+        # Adjust signs here if fingers curl backwards!
+        ctrl[2] = -in_mcp 
+        ctrl[3] = -in_pip 
+        ctrl[4] = -in_dip 
+
+        # C. Thumb 
+        ctrl[5] = th_mcp
+        ctrl[6] = th_pip
+        ctrl[7] = th_dip
 
 def main():
     rclpy.init()
