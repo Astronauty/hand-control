@@ -514,8 +514,10 @@ def solve(model, data, object_state, q_ref, cfg: Config):
         opti.subject_to(d_index == 0)
 
     if cfg.penetration_constraint:
-        opti.subject_to(gap_thumb == -1e-4)
-        opti.subject_to(gap_index == -1e-4)
+        # opti.subject_to(gap_thumb == -1e-4)
+        # opti.subject_to(gap_index == -1e-4)
+        opti.subject_to(gap_thumb == 0)
+        opti.subject_to(gap_index == 0)
 
     # ---- Initial values ----
     p1_init = obj_center + np.array([-obj_half_x, 0.0])
@@ -760,8 +762,8 @@ def solve_global(model, data, object_state, cfg: Config):
     thumb_gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, cfg.thumb_geom)
     index_gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, cfg.index_geom)
 
-    base_y_vals = np.linspace(-0.3, 0.0, 3)
-    curl_vals   = np.linspace(-0.5, -1.5, 3)
+    base_y_vals = np.linspace(-0.3, 0.1, 5)
+    curl_vals   = np.linspace(-0.5, -1.5, 5)
     q_base      = np.array([data.qpos[i] for i in act_idx])
 
     q_inits = []

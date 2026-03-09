@@ -1,5 +1,6 @@
 hand_snapshots/*
 simulation/logs/*
+simulation/results/*
 simulation/wip_debug_scripts/*
 
 
