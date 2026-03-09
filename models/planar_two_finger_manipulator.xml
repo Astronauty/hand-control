@@ -15,6 +15,12 @@
     </asset>
 
 
+    <keyframe>
+        <key name="grasp_init"
+             qpos="0.0 0.0 -0.50 -0.50 -0.50 0.50 0.50 0.50 0.0 -0.4 0.0 1.0 0.0 0.0 0.0"
+             ctrl="0.0 0.0 -0.50 -0.50 -0.50 0.50 0.50 0.50"/>
+    </keyframe>
+
     <worldbody>
         <!-- Scene Visualization -->
         <camera name="cam0" pos="0.0 0.0 2.0" xyaxes="1 0 0 0 1 0"/>
@@ -26,9 +32,8 @@
         <!-- Right Hand Index Finger -->
         <body name="base" pos="0 0 0">
             <geom type="box" size="0.1 0.05 0.01" rgba="0.5 0.3 0.3 0.5"/>
-            <joint name="Th_base_x" type="slide" axis="1 0 0" limited="true" range="-5.0 5.0" damping="1"/>
-            <joint name="Th_base_y" type="slide" axis="0 1 0" limited="true" range="-1.0 1.0" damping="1"/>
-
+            <joint name="Th_base_x" type="slide" axis="1 0 0" damping="1"/>
+            <joint name="Th_base_y" type="slide" axis="0 1 0" damping="1"/>
 
             <body name="right_index_proximal_link" pos="0.1 0 0">
                 <geom type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
@@ -44,11 +49,9 @@
                             
                     </body>
                 </body>
-
             </body>
 
             <!-- Right Hand Thumb Finger -->
-
             <body name="right_thumb_proximal_link" pos="-0.1 0 0">
                 <geom type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
                 <joint name="right_thumb_MCP_joint" type="hinge" axis="0 0 1"/>
@@ -63,28 +66,31 @@
                             
                     </body>
                 </body>
-
             </body>
-
-
         </body>
-
-
-
-        <!-- <body name="Th_base" pos="0 0 0">
-            <geom type="box" size="0.1 0.05 0.01" rgba="0.5 0.3 0.3 0.5"/>
-
-                
-        </body> -->
-
 
         <body name="obj1" pos="0.0 -0.4 0.0">
             <joint name="free_obj1_joint" type="free"/>
             <geom name="obj1_geom" type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 1.0" mass="0.2" friction="1 0.1 0.1" contype="1" conaffinity="1"/>
         </body>
-        <!-- <body name="mocap" mocap="true" pos="0 -0.1 0">
-            <geom type="sphere" size="0.005" rgba="0 1 0 1.0"/>
-        </body> -->
+
+        <!-- Contact point markers (initially hidden at origin) -->
+        <site name="contact_p1" type="sphere" size="0.01" 
+            rgba="1 0 0 0.8" pos="0 0 -10"/>  <!-- Red sphere for thumb -->
+        
+        <site name="contact_p2" type="sphere" size="0.01" 
+            rgba="0 1 0 0.8" pos="0 0 -10"/>  <!-- Green sphere for index -->
+
+        <!-- Contact point geoms (for mj_geomDistance queries) -->
+        <body name="cp1_body" mocap="true" pos="0 0 -10">
+            <geom name="cp1" type="sphere" size="0.0001" 
+                contype="0" conaffinity="0" rgba="1 0 0 0.8"/>
+        </body>
+
+        <body name="cp2_body" mocap="true" pos="0 0 -10">
+            <geom name="cp2" type="sphere" size="0.0001" 
+                contype="0" conaffinity="0" rgba="0 1 0 0.8"/>
+        </body>
 
     </worldbody>
 
@@ -94,7 +100,7 @@
 
         <position name="right_index_MCP_joint" joint="right_index_MCP_joint" kp="2" dampratio="1" ctrllimited="false"/> 
         <position name="right_index_PIP_joint" joint="right_index_PIP_joint" kp="2" dampratio="1" ctrllimited="false"/>
-        <position name="right_index_DIP_joint"joint="right_index_DIP_joint" kp="2" dampratio="1" ctrllimited="false"/>
+        <position name="right_index_DIP_joint" joint="right_index_DIP_joint" kp="2" dampratio="1" ctrllimited="false"/>
 
         <position joint="right_thumb_MCP_joint" kp="1" dampratio="1" ctrllimited="false"/> 
         <position joint="right_thumb_PIP_joint" kp="1" dampratio="1" ctrllimited="false"/>

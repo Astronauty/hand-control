@@ -1,5 +1,6 @@
 hand_snapshots/*
-
+simulation/logs/*
+simulation/wip_debug_scripts/*
 
 
 # VSCode
@@ -222,3 +223,5 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
