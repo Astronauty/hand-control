@@ -3,6 +3,7 @@ hand_snapshots/*
 
 
 # VSCode
+**/.DS_Store
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json

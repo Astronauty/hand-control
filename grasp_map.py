@@ -6,6 +6,11 @@ import matplotlib.patches as patches
 import scipy.linalg
 import math
 
+import mujoco as mj
+from mujoco import viewer
+
+
+
 
 def planar_hat_map(a):
     a_hat = np.array([
@@ -14,7 +19,8 @@ def planar_hat_map(a):
     ])
     return a_hat
 
-def planar_grasp_map_PCWF(ax, p1_o, p2_o, theta1, theta2):
+
+def planar_grasp_map_PCWF(ax, p1_o, p2_o, theta1, theta2, plot_grasp_map_nullspace=True):
     """Returns the planar grasp G map assuming 2 point contacts with friction.
     F_o = G f_c
         where Fo_o is the object wrench in the object frame,
@@ -67,17 +73,18 @@ def planar_grasp_map_PCWF(ax, p1_o, p2_o, theta1, theta2):
     G = np.block([G1, G2])
     
     # Visualize Grasp Map Nullspace
-    G_null = scipy.linalg.null_space(G).flatten()
-    print(f"Nullspace of G:\n{G_null}")
+    if plot_grasp_map_nullspace:
+        G_null = scipy.linalg.null_space(G).flatten()
+        print(f"Nullspace of G:\n{G_null}")
 
-    f1null_c1 = G_null[0:2].reshape(2,1)
-    f2null_c2 = G_null[2:4].reshape(2,1)
-    
-    f1null_o = R1 @ f1null_c1
-    f2null_o = R2 @ f2null_c2
-    
-    draw_null_force_arrow(ax, f1null_o, p1_o)
-    draw_null_force_arrow(ax, f2null_o, p2_o)
+        f1null_c1 = G_null[0:2].reshape(2,1)
+        f2null_c2 = G_null[2:4].reshape(2,1)
+        
+        f1null_o = R1 @ f1null_c1
+        f2null_o = R2 @ f2null_c2
+        
+        draw_null_force_arrow(ax, f1null_o, p1_o)
+        draw_null_force_arrow(ax, f2null_o, p2_o)
 
     return G
 
@@ -188,21 +195,66 @@ if __name__ == "__main__":
     draw_box_object(ax, (-1, 0), 2, 2)
     
     # Define contact frames
-    p1_o = np.array([-1, 1.0])
+    p1_o = np.array([-1, 1.5])
     p2_o = np.array([1, 1.0])
     
     theta1 = np.pi
     theta2 = 0
     
+    
+    # Draw grasp map contact frames
     draw_frame(ax, p1_o[0], p1_o[1], 0, label='c1')
     draw_frame(ax, p2_o[0], p2_o[1], np.pi, label='c2')
     
-    G = planar_grasp_map_PCWF(ax, p1_o, p2_o, theta1, theta2)
+    G = planar_grasp_map_PCWF(ax, p1_o, p2_o, theta1, theta2, plot_grasp_map_nullspace=True)
     print(f"Grasp Map G: \n {G}")
 
     
     plt.show()
     
+
+    # Solve for desired contact forces based on nullspace of grasp map
+    # and scaling parameter gamma
+    gamma = 5.0
+    G_null = scipy.linalg.null_space(G).flatten()
+    
+    f_c1 = G_null[:2] * gamma
+    f_c2 = G_null[2:] * gamma
+    
+    print("f_c1: ", f_c1)
+    print("f_c2: ", f_c2)
+    
+    # Load in mujoco model
+    model = mj.MjModel.from_xml_path('models/planar_two_finger_manipulator.xml') 
+    data = mj.MjData(model)
+    
+    index_site_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'index_touch')
+    thumb_site_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'thumb_id')
+    
+    jacp_index = np.zeros((3, model.nv)) # translational jacobian of the index finger
+    jacr_index = np.zeros((3, model.nv)) # rotational jacobian of the index finger
+
+    jacp_thumb = np.zeros((3, model.nv))
+    jacr_thumb = np.zeros((3, model.nv))   
+ 
+    
+    # Form the jacobians
+    mj.mj_jacSite(model, data, jacp_index, jacr_index, index_site_id)
+    mj.mj_jacSite(model, data, jacp_thumb, jacr_thumb, thumb_site_id)
+    
+    print(jacp_index.shape)
+    print(jacp_thumb.shape)
+    print(f_c1.shape)
+    print(f_c2.shape)
+    
+    tau_index = jacp_index[:2, :].T @ f_c1
+    tau_thumb = jacp_thumb[:2, :].T @ f_c2
+    
+    print(tau_index.shape)
+    
+    # print("tau_index: ", tau_index)
+    # print("tau_thumb: ", tau_thumb)
+              
     
     
     

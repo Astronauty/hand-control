@@ -18,7 +18,10 @@
     <worldbody>
         <!-- Scene Visualization -->
         <camera name="cam0" pos="0.0 0.0 2.0" xyaxes="1 0 0 0 1 0"/>
-        <light pos="-1 1 0"/>
+        <!-- <light pos="0 -1 2"/> -->
+
+        <light pos="0 0 3" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8" specular="0.2 0.2 0.2"/>
+
 
         <geom type="plane" material="groundplane" pos="0 -0.8 0" quat="0.7071068 -0.7071068 0 0" size="1 1 1" rgba="1 1 1 1" contype="1" conaffinity="1"/>
         
@@ -90,6 +93,7 @@
 
     </worldbody>
 
+    <!-- Position control -->
     <actuator>
         <position name="Th_base_x_act" joint="Th_base_x" kp="100" dampratio="1" ctrllimited="false"/>
         <position name="Th_base_y_act" joint="Th_base_y" kp="100" dampratio="1" ctrllimited="false"/>
@@ -102,6 +106,22 @@
         <position name="right_thumb_PIP_joint" joint="right_thumb_PIP_joint" kp="1" dampratio="1" ctrllimited="false"/>
         <position name="right_thumb_DIP_joint" joint="right_thumb_DIP_joint" kp="1" dampratio="1" ctrllimited="false"/>
     </actuator>
+
+    <!-- Torque Control -->
+    <!-- <actuator>
+        <motor name="Th_base_x_act" joint="Th_base_x" ctrllimited="true" ctrlrange="-1 1"/>
+        <motor name="Th_base_y_act" joint="Th_base_y" ctrllimited="true" ctrlrange="-1 1"/>
+
+        <motor name="right_index_MCP_joint" joint="right_index_MCP_joint" ctrllimited="true" ctrlrange="-1 1"/> 
+        <motor name="right_index_PIP_joint" joint="right_index_PIP_joint" ctrllimited="true" ctrlrange="-1 1"/>
+        <motor name="right_index_DIP_joint" joint="right_index_DIP_joint" ctrllimited="true" ctrlrange="-1 1"/>
+
+        <motor name="right_thumb_MCP_joint" joint="right_thumb_MCP_joint" ctrllimited="true" ctrlrange="-1 1"/> 
+        <motor name="right_thumb_PIP_joint" joint="right_thumb_PIP_joint" ctrllimited="true" ctrlrange="-1 1"/>
+        <motor name="right_thumb_DIP_joint" joint="right_thumb_DIP_joint" ctrllimited="true" ctrlrange="-1 1"/>
+    </actuator>
+
+     -->
 
     <sensor>
         <contact name="thumb_contact" body1="right_thumb_distal_link" body2="obj1" num="1" data="found force pos normal tangent" reduce="maxforce"/>
