@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import scipy.linalg
 import math
+import time
 
 import mujoco as mj
 from mujoco import viewer
@@ -20,7 +21,7 @@ def planar_hat_map(a):
     return a_hat
 
 
-def planar_grasp_map_PCWF(ax, p1_o, p2_o, theta1, theta2, plot_grasp_map_nullspace=True):
+def planar_grasp_map_PCWF(p1_o, p2_o, theta1, theta2, plot_grasp_map_nullspace=True):
     """Returns the planar grasp G map assuming 2 point contacts with friction.
     F_o = G f_c
         where Fo_o is the object wrench in the object frame,
@@ -72,19 +73,19 @@ def planar_grasp_map_PCWF(ax, p1_o, p2_o, theta1, theta2, plot_grasp_map_nullspa
     
     G = np.block([G1, G2])
     
-    # Visualize Grasp Map Nullspace
-    if plot_grasp_map_nullspace:
-        G_null = scipy.linalg.null_space(G).flatten()
-        print(f"Nullspace of G:\n{G_null}")
+    # # Visualize Grasp Map Nullspace
+    # if plot_grasp_map_nullspace:
+    #     G_null = scipy.linalg.null_space(G).flatten()
+    #     print(f"Nullspace of G:\n{G_null}")
 
-        f1null_c1 = G_null[0:2].reshape(2,1)
-        f2null_c2 = G_null[2:4].reshape(2,1)
+    #     f1null_c1 = G_null[0:2].reshape(2,1)
+    #     f2null_c2 = G_null[2:4].reshape(2,1)
         
-        f1null_o = R1 @ f1null_c1
-        f2null_o = R2 @ f2null_c2
+    #     f1null_o = R1 @ f1null_c1
+    #     f2null_o = R2 @ f2null_c2
         
-        draw_null_force_arrow(ax, f1null_o, p1_o)
-        draw_null_force_arrow(ax, f2null_o, p2_o)
+    #     draw_null_force_arrow(ax, f1null_o, p1_o)
+    #     draw_null_force_arrow(ax, f2null_o, p2_o)
 
     return G
 
@@ -187,12 +188,13 @@ def draw_null_force_arrow(ax, gnull, end_o, length=0.6, color="blue", lw=2.5, no
 if __name__ == "__main__":
     sns.set_theme(style="ticks")
     
-    fig, ax = plt.subplots()
-    ax.set_xlim(-2, 2)
-    ax.set_ylim(0, 3)
+    # fig, ax = plt.subplots()
+    # ax.set_xlim(-2, 2)
+    # ax.set_ylim(0, 3)
 
+    ### Object visualization
     # Draw object
-    draw_box_object(ax, (-1, 0), 2, 2)
+    # draw_box_object(ax, (-1, 0), 2, 2)
     
     # Define contact frames
     p1_o = np.array([-1, 1.5])
@@ -201,16 +203,14 @@ if __name__ == "__main__":
     theta1 = np.pi
     theta2 = 0
     
+    # # Draw grasp map contact frames
+    # draw_frame(ax, p1_o[0], p1_o[1], 0, label='c1')
+    # draw_frame(ax, p2_o[0], p2_o[1], np.pi, label='c2')
     
-    # Draw grasp map contact frames
-    draw_frame(ax, p1_o[0], p1_o[1], 0, label='c1')
-    draw_frame(ax, p2_o[0], p2_o[1], np.pi, label='c2')
-    
-    G = planar_grasp_map_PCWF(ax, p1_o, p2_o, theta1, theta2, plot_grasp_map_nullspace=True)
+    G = planar_grasp_map_PCWF(p1_o, p2_o, theta1, theta2, plot_grasp_map_nullspace=True)
     print(f"Grasp Map G: \n {G}")
-
     
-    plt.show()
+    # plt.show()
     
 
     # Solve for desired contact forces based on nullspace of grasp map
@@ -228,6 +228,8 @@ if __name__ == "__main__":
     model = mj.MjModel.from_xml_path('models/planar_two_finger_manipulator.xml') 
     data = mj.MjData(model)
     
+    mj.mj_forward(model, data)
+    
     index_site_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'index_touch')
     thumb_site_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'thumb_id')
     
@@ -242,19 +244,43 @@ if __name__ == "__main__":
     mj.mj_jacSite(model, data, jacp_index, jacr_index, index_site_id)
     mj.mj_jacSite(model, data, jacp_thumb, jacr_thumb, thumb_site_id)
     
-    print(jacp_index.shape)
-    print(jacp_thumb.shape)
-    print(f_c1.shape)
-    print(f_c2.shape)
+    # print(jacp_index.shape)
+    # print(jacp_thumb.shape)
+    # print(f_c1.shape)
+    # print(f_c2.shape)
+    
+    print(jacp_index[:2, :])
+    
     
     tau_index = jacp_index[:2, :].T @ f_c1
     tau_thumb = jacp_thumb[:2, :].T @ f_c2
     
     print(tau_index.shape)
     
-    # print("tau_index: ", tau_index)
-    # print("tau_thumb: ", tau_thumb)
-              
+    print("tau_index: ", tau_index)
+    print("tau_thumb: ", tau_thumb)
     
+    tau_total = tau_index + tau_thumb
     
+    ### load keyframe
+    key_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_KEY, "both_contacts")
     
+    mj.mj_resetDataKeyframe(model, data, key_id)
+    
+    data.ctrl[:] = 0.0
+    mj.mj_forward(model, data)
+    
+    with mj.viewer.launch_passive(model, data) as viewer:
+        while viewer.is_running():
+            step_start = time.time()
+            
+            data.qfrc_applied[:] = tau_total + data.qfrc_bias
+            # print(f"Qfrc Bias: ", data.qfrc_bias)
+            # print(f"Tau Total: ", tau_total)
+            mj.mj_step(model, data)
+            
+            viewer.sync()
+                
+            time_until_next_step = model.opt.timestep - (time.time() - step_start)
+            if time_until_next_step > 0:
+                time.sleep(time_until_next_step)

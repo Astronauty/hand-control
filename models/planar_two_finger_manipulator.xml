@@ -35,16 +35,18 @@
 
             <body name="right_index_proximal_link" pos="0.1 0 0">
                 <geom type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
-                <joint name="right_index_MCP_joint" type="hinge" axis="0 0 1"/>
+                <joint name="right_index_MCP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
 
                 <body name="right_index_medial_link" pos="0.1 0 0">
-                    <joint name="right_index_PIP_joint" type="hinge" axis="0 0 1"/>
+                    <joint name="right_index_PIP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
                     <geom type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
 
                     <body name="right_index_distal_link" pos="0.1 0 0">
-                        <joint name="right_index_DIP_joint" type="hinge" axis="0 0 1"/>
+                        <joint name="right_index_DIP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
                         <geom type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1"/>
-                        <site name="index_touch" pos="0.085 -0.015 0" size="0.01" group="1" rgba="255 255 0 0.8"/>
+                        <!-- <site name="index_touch" pos="0.085 -0.015 0" size="0.01" group="1" rgba="255 255 0 0.8"/> -->
+                        <site name="index_touch" pos="0.015 -0.0 0" size="0.01" group="1" rgba="255 255 0 0.8"/>
+
                             
                     </body>
                 </body>
@@ -55,16 +57,18 @@
 
             <body name="right_thumb_proximal_link" pos="-0.1 0 0">
                 <geom type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
-                <joint name="right_thumb_MCP_joint" type="hinge" axis="0 0 1"/>
+                <joint name="right_thumb_MCP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
 
                 <body name="right_thumb_medial_link" pos="-0.1 0 0">
-                    <joint name="right_thumb_PIP_joint" type="hinge" axis="0 0 1"/>
+                    <joint name="right_thumb_PIP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
                     <geom type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
 
                     <body name="right_thumb_distal_link" pos="-0.1 0 0">
-                        <joint name="right_thumb_DIP_joint" type="hinge" axis="0 0 1"/>
+                        <joint name="right_thumb_DIP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
                         <geom type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1"/>
-                        <site name="thumb_touch" pos="-0.085 -0.015 0" size="0.01" group="1" rgba="255 255 0 0.8"/>
+                        <!-- <site name="thumb_touch" pos="-0.085 -0.015 0" size="0.01" group="1" rgba="255 255 0 0.8"/> -->
+                        <site name="thumb_touch" pos="-0.12 -0.0 0" size="0.01" group="1" rgba="255 255 0 0.8"/>
+
                             
                     </body>
                 </body>
@@ -79,13 +83,15 @@
         <!-- <body name="Th_base" pos="0 0 0">
             <geom type="box" size="0.1 0.05 0.01" rgba="0.5 0.3 0.3 0.5"/>
 
-            
         </body> -->
 
 
         <body name="obj1" pos="0.0 -0.75 0.0">
-            <joint name="free_obj1_joint" type="free"/>
-            <geom type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 1.0" mass="0.2" friction="1 0.1 0.1" contype="1" conaffinity="1"/>
+            <!-- <joint name="free_obj1_joint" type="free"/> -->
+            <geom type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 1.0" mass="0.2" friction="1 0.1 0.1" contype="0" conaffinity="0"/>
+            <site name="index_box_touch" pos="0.05 0.0 0.0" size="0.01" group="1" rgba="0 255 0 0.8"/>
+            <site name="thumb_box_touch" pos="-0.05 0.0 0.0" size="0.01" group="1" rgba="0 255 0 0.8"/>
+
         </body>
         <!-- <body name="mocap" mocap="true" pos="0 -0.1 0">
             <geom type="sphere" size="0.005" rgba="0 1 0 1.0"/>
@@ -94,7 +100,7 @@
     </worldbody>
 
     <!-- Position control -->
-    <actuator>
+    <!-- <actuator>
         <position name="Th_base_x_act" joint="Th_base_x" kp="100" dampratio="1" ctrllimited="false"/>
         <position name="Th_base_y_act" joint="Th_base_y" kp="100" dampratio="1" ctrllimited="false"/>
 
@@ -105,12 +111,12 @@
         <position name="right_thumb_MCP_joint" joint="right_thumb_MCP_joint" kp="1" dampratio="1" ctrllimited="false"/> 
         <position name="right_thumb_PIP_joint" joint="right_thumb_PIP_joint" kp="1" dampratio="1" ctrllimited="false"/>
         <position name="right_thumb_DIP_joint" joint="right_thumb_DIP_joint" kp="1" dampratio="1" ctrllimited="false"/>
-    </actuator>
+    </actuator> -->
 
     <!-- Torque Control -->
-    <!-- <actuator>
-        <motor name="Th_base_x_act" joint="Th_base_x" ctrllimited="true" ctrlrange="-1 1"/>
-        <motor name="Th_base_y_act" joint="Th_base_y" ctrllimited="true" ctrlrange="-1 1"/>
+    <actuator>
+        <motor name="Th_base_x_act" joint="Th_base_x" ctrllimited="true" ctrlrange="-20 20"/>
+        <motor name="Th_base_y_act" joint="Th_base_y" ctrllimited="true" ctrlrange="-20 20"/>
 
         <motor name="right_index_MCP_joint" joint="right_index_MCP_joint" ctrllimited="true" ctrlrange="-1 1"/> 
         <motor name="right_index_PIP_joint" joint="right_index_PIP_joint" ctrllimited="true" ctrlrange="-1 1"/>
@@ -121,7 +127,7 @@
         <motor name="right_thumb_DIP_joint" joint="right_thumb_DIP_joint" ctrllimited="true" ctrlrange="-1 1"/>
     </actuator>
 
-     -->
+    
 
     <sensor>
         <contact name="thumb_contact" body1="right_thumb_distal_link" body2="obj1" num="1" data="found force pos normal tangent" reduce="maxforce"/>
@@ -129,11 +135,11 @@
     </sensor>
 
     <keyframe>
-        <key 
+        <!-- <key 
         name = "both_contacts"
         qpos="3.22496e-15 -0.4881 -1.02225 -0.95832 -0.117645 0.94468 0.930984 0.225179 -0.00802626 -0.750108 -5.1446e-15 1 3.44405e-17 -2.68886e-16 -2.14886e-09"
         ctrl="0 -0.39 -1 -1 -0.13 0.87 1 0.25"
-        />
+        /> -->
 
     </keyframe>
 </mujoco>
