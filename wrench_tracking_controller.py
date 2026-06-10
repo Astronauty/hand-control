@@ -17,7 +17,6 @@ def contact_force_solve(W_des, G, internal_force_mag):
     
     f_c = np.linalg.pinv(G)*W_des + np.linalg.null_space(G).flatten()
     
-
     # Create a dense numpy array for the Jacobian (3 rows, nv columns)
     jac_index = np.zeros((3, model.nv))
     mj.mj_jacSite(model, data, jac_index, None, site_id)

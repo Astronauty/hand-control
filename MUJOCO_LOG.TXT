@@ -25,3 +25,15 @@ ERROR: mj_setKeyframe: keyframe index cannot be negative
 Wed Apr 29 18:06:02 2026
 WARNING: Nan, Inf or huge value in QACC at DOF 1. The simulation is unstable. Time = 0.0040.
 
+Mon Jun  8 15:39:17 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 2. The simulation is unstable. Time = 0.0100.
+
+Mon Jun  8 15:40:02 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 2. The simulation is unstable. Time = 0.0110.
+
+Mon Jun  8 15:40:46 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 1. The simulation is unstable. Time = 0.0160.
+
+Mon Jun  8 15:40:54 2026
+WARNING: Nan, Inf or huge value in QACC at DOF 2. The simulation is unstable. Time = 0.0260.
+

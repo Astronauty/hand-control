@@ -43,9 +43,9 @@
 
                     <body name="right_index_distal_link" pos="0.1 0 0">
                         <joint name="right_index_DIP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
-                        <geom type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1"/>
+                        <geom type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" rgba="0.5 0.5 0.5 0.3"/>
                         <!-- <site name="index_touch" pos="0.085 -0.015 0" size="0.01" group="1" rgba="255 255 0 0.8"/> -->
-                        <site name="index_touch" pos="0.015 -0.0 0" size="0.01" group="1" rgba="255 255 0 0.8"/>
+                        <site name="index_touch" pos="0.12 -0.0 0" size="0.01" group="1" rgba="255 255 0 0.8"/>
 
                             
                     </body>
@@ -89,9 +89,14 @@
         <body name="obj1" pos="0.0 -0.75 0.0">
             <!-- <joint name="free_obj1_joint" type="free"/> -->
             <geom type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 1.0" mass="0.2" friction="1 0.1 0.1" contype="0" conaffinity="0"/>
-            <site name="index_box_touch" pos="0.05 0.0 0.0" size="0.01" group="1" rgba="0 255 0 0.8"/>
-            <site name="thumb_box_touch" pos="-0.05 0.0 0.0" size="0.01" group="1" rgba="0 255 0 0.8"/>
+            <site name="index_box_touch" pos="0.05 0.0 0.0" size="0.01" group="1" rgba="0 1 0 0.8"/>
+            <site name="thumb_box_touch" pos="-0.05 0.0 0.0" size="0.01" group="1" rgba="0 1 0 0.8"/>
+        </body>
 
+        <body name="obj2" pos="0.3 -0.75 0.0">
+            <geom type="box" size="0.05 0.05 0.05" rgba="0.5 0.3 0.1 1.0" mass="0.2" friction="1 0.1 0.1" contype="0" conaffinity="0"/>
+            <site name="index_box_touch_2" pos="0.05 0.0 0.0" size="0.01" group="1" rgba="0 1 0 0.8"/>
+            <site name="thumb_box_touch_2" pos="-0.05 0.0 0.0" size="0.01" group="1" rgba="0 1 0 0.8"/>
         </body>
         <!-- <body name="mocap" mocap="true" pos="0 -0.1 0">
             <geom type="sphere" size="0.005" rgba="0 1 0 1.0"/>
