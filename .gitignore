@@ -5,6 +5,7 @@ simulation/wip_debug_scripts/*
 
 
 # VSCode
+**/.DS_Store
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json

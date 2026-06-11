@@ -6,7 +6,7 @@ from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial import ConvexHull
 
 # Load model 
-model = mujoco.MjModel.from_xml_path('planar_two_finger_manipulator.xml') 
+model = mujoco.MjModel.from_xml_path('models/planar_two_finger_manipulator.xml') 
 data = mujoco.MjData(model)
 
 # Set to contact keyframe 
@@ -159,10 +159,11 @@ ax.set_ylim([min(all_wrenches[:,1]), max(all_wrenches[:,1])])
 ax.set_zlim([min(all_wrenches[:,2]), max(all_wrenches[:,2])])
 ax.plot_trisurf(vert_sums[:,0], vert_sums[:,1], vert_sums[:,2],
                 triangles=hull.simplices, alpha=0.3)
-ax.set_xlabel('F_x in body frame\n(right +ve)')
-ax.set_ylabel('F_y in body frame\n(up +ve)')
-ax.set_zlabel('M_z in body frame\n(CCW +ve)')
+ax.set_xlabel('F_x in body frame\n(right +ve)', labelpad=20)
+ax.set_ylabel('F_y in body frame\n(up +ve)', labelpad=20)
+ax.set_zlabel('M_z in body frame\n(CCW +ve)', labelpad=20)
 plt.legend()
+plt.tight_layout()
 plt.show()
 
 # with viewer.launch_passive(model, data) as v:

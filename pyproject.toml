@@ -1,0 +1,13 @@
+[project]
+name = "hand-control"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "casadi>=3.7.2",
+    "mujoco>=3.6.0",
+    "numpy>=2.2.6",
+    "scipy>=1.15.3",
+    "seaborn>=0.13.2",
+]
