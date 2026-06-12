@@ -17,7 +17,7 @@
 
     <keyframe>
         <key name="grasp_init"
-             qpos="0.0 0.0 -0.50 -0.50 -0.50 0.50 0.50 0.50 0.0 -0.4 0.0 1.0 0.0 0.0 0.0"
+             qpos="0.0 0.0 -0.50 -0.50 -0.50 0.50 0.50 0.50"
              ctrl="0.0 0.0 -0.50 -0.50 -0.50 0.50 0.50 0.50"/>
     </keyframe>
 
@@ -34,21 +34,21 @@
 
         <!-- Right Hand Index Finger -->
         <body name="base" pos="0 0 0">
-            <geom type="box" size="0.1 0.05 0.01" rgba="0.5 0.3 0.3 0.5"/>
-            <joint name="Th_base_x" type="slide" axis="1 0 0" damping="1"/>
-            <joint name="Th_base_y" type="slide" axis="0 1 0" damping="1"/>
+            <geom type="box" size="0.1 0.05 0.01" rgba="0.5 0.3 0.3 0.5" mass="0.5"/>
+            <joint name="Th_base_x" type="slide" axis="1 0 0" damping="1" range="-0.65 0.65" limited="true"/>
+            <joint name="Th_base_y" type="slide" axis="0 1 0" damping="1" range="-1.2 0.2" limited="true"/>
 
             <body name="right_index_proximal_link" pos="0.1 0 0">
-                <geom type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
-                <joint name="right_index_MCP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
+                <geom name="index_proximal" type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
+                <joint name="right_index_MCP_joint" type="hinge" axis="0 0 1" damping="0.01" range="-2.09 0.52" limited="true"/>
 
                 <body name="right_index_medial_link" pos="0.1 0 0">
-                    <joint name="right_index_PIP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
-                    <geom type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
+                    <joint name="right_index_PIP_joint" type="hinge" axis="0 0 1" damping="0.01" range="-2.09 0.0" limited="true"/>
+                    <geom name="index_medial" type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
 
                     <body name="right_index_distal_link" pos="0.1 0 0">
-                        <joint name="right_index_DIP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
-                        <geom type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" rgba="0.5 0.5 0.5 0.3"/>
+                        <joint name="right_index_DIP_joint" type="hinge" axis="0 0 1" damping="0.01" range="-1.57 0.0" limited="true"/>
+                        <geom name="index_distal" type="capsule" size="0.02" fromto="0 0 0 0.1 0 0" mass="0.1" group="1" rgba="0.5 0.5 0.5 0.3"/>
                         <!-- <site name="index_touch" pos="0.085 -0.015 0" size="0.01" group="1" rgba="255 255 0 0.8"/> -->
                         <site name="index_touch" pos="0.12 -0.0 0" size="0.01" group="1" rgba="255 255 0 0.8"/>
 
@@ -59,16 +59,16 @@
 
             <!-- Right Hand Thumb Finger -->
             <body name="right_thumb_proximal_link" pos="-0.1 0 0">
-                <geom type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
-                <joint name="right_thumb_MCP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
+                <geom name="thumb_proximal" type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
+                <joint name="right_thumb_MCP_joint" type="hinge" axis="0 0 1" damping="0.01" range="-0.52 2.09" limited="true"/>
 
                 <body name="right_thumb_medial_link" pos="-0.1 0 0">
-                    <joint name="right_thumb_PIP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
-                    <geom type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
+                    <joint name="right_thumb_PIP_joint" type="hinge" axis="0 0 1" damping="0.01" range="0.0 2.09" limited="true"/>
+                    <geom name="thumb_medial" type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1" conaffinity="0"/>
 
                     <body name="right_thumb_distal_link" pos="-0.1 0 0">
-                        <joint name="right_thumb_DIP_joint" type="hinge" axis="0 0 1" damping="0.01"/>
-                        <geom type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1"/>
+                        <joint name="right_thumb_DIP_joint" type="hinge" axis="0 0 1" damping="0.01" range="0.0 1.57" limited="true"/>
+                        <geom name="thumb_distal" type="capsule" size="0.02" fromto="0 0 0 -0.1 0 0" mass="0.1" group="1"/>
                         <!-- <site name="thumb_touch" pos="-0.085 -0.015 0" size="0.01" group="1" rgba="255 255 0 0.8"/> -->
                         <site name="thumb_touch" pos="-0.12 -0.0 0" size="0.01" group="1" rgba="255 255 0 0.8"/>
 
@@ -76,11 +76,6 @@
                     </body>
                 </body>
             </body>
-        </body>
-
-        <body name="obj1" pos="0.0 -0.4 0.0">
-            <joint name="free_obj1_joint" type="free"/>
-            <geom name="obj1_geom" type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 1.0" mass="0.2" friction="1 0.1 0.1" contype="1" conaffinity="1"/>
         </body>
 
         <!-- Contact point markers (initially hidden at origin) -->
@@ -97,8 +92,9 @@
         </body>
 
         <body name="cp2_body" mocap="true" pos="0 0 -10">
-            <geom name="cp2" type="sphere" size="0.0001" 
+            <geom name="cp2" type="sphere" size="0.0001"
                 contype="0" conaffinity="0" rgba="0 1 0 0.8"/>
+        </body>
 
 
         <!-- <body name="Th_base" pos="0 0 0">
@@ -107,17 +103,32 @@
         </body> -->
 
 
-        <body name="obj1" pos="0.0 -0.75 0.0">
-            <!-- <joint name="free_obj1_joint" type="free"/> -->
-            <geom type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 1.0" mass="0.2" friction="1 0.1 0.1" contype="0" conaffinity="0"/>
-            <site name="index_box_touch" pos="0.05 0.0 0.0" size="0.01" group="1" rgba="0 1 0 0.8"/>
-            <site name="thumb_box_touch" pos="-0.05 0.0 0.0" size="0.01" group="1" rgba="0 1 0 0.8"/>
+        <body name="obj1" pos="-0.45 -0.75 0.0">
+            <joint name="obj1_tx" type="slide" axis="1 0 0" damping="2"/>
+            <joint name="obj1_ty" type="slide" axis="0 1 0" damping="2"/>
+            <joint name="obj1_rz" type="hinge" axis="0 0 1" damping="2"/>
+            <geom type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 0.4" mass="0.2" friction="1 0.1 0.1"/>
+            <site name="index_box_touch" pos="0.055 0.05 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
+            <site name="thumb_box_touch" pos="-0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
         </body>
 
-        <body name="obj2" pos="0.3 -0.75 0.0">
-            <geom type="box" size="0.05 0.05 0.05" rgba="0.5 0.3 0.1 1.0" mass="0.2" friction="1 0.1 0.1" contype="0" conaffinity="0"/>
-            <site name="index_box_touch_2" pos="0.05 0.0 0.0" size="0.01" group="1" rgba="0 1 0 0.8"/>
-            <site name="thumb_box_touch_2" pos="-0.05 0.0 0.0" size="0.01" group="1" rgba="0 1 0 0.8"/>
+        <body name="obj2" pos="0.45 -0.75 0.0">
+            <joint name="obj2_tx" type="slide" axis="1 0 0" damping="2"/>
+            <joint name="obj2_ty" type="slide" axis="0 1 0" damping="2"/>
+            <joint name="obj2_rz" type="hinge" axis="0 0 1" damping="2"/>
+            <geom type="box" size="0.05 0.05 0.05" rgba="0.5 0.3 0.1 0.4" mass="0.2" friction="1 0.1 0.1"/>
+            <site name="index_box_touch_2" pos="0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
+            <site name="thumb_box_touch_2" pos="-0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
+        </body>
+
+        <!-- Cylinder object (key 3) — visually distinct round shape centred in the scene -->
+        <body name="obj3" pos="0.0 -0.75 0.0">
+            <joint name="obj3_tx" type="slide" axis="1 0 0" damping="2"/>
+            <joint name="obj3_ty" type="slide" axis="0 1 0" damping="2"/>
+            <joint name="obj3_rz" type="hinge" axis="0 0 1" damping="2"/>
+            <geom type="cylinder" size="0.05 0.05" rgba="0.2 0.5 0.4 0.4" mass="0.2" friction="1 0.1 0.1"/>
+            <site name="index_cyl_touch" pos="0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
+            <site name="thumb_cyl_touch" pos="-0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
         </body>
 
     </worldbody>
