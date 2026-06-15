@@ -27,6 +27,7 @@ FINGER_GEOMS  = ['index_proximal', 'index_medial', 'index_distal',
                  'thumb_proximal', 'thumb_medial', 'thumb_distal']
 OBJ_BODIES    = ['obj1', 'obj2']
 PREGRASP_OFFSET = 0.05  # must match internal_force_control.py
+RRT_CLEARANCE   = PREGRASP_OFFSET - 0.005  # 0.045 m — must match internal_force_control.py
 SAFE_LIFT       = 0.12
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -116,7 +117,7 @@ def main():
     q_safe  = q_start.copy()
     q_safe[1] = min(q_safe[1] + SAFE_LIFT, model.jnt_range[1, 1])
 
-    planner = RRTPlanner(model, FINGER_GEOMS, OBJ_BODIES)
+    planner = RRTPlanner(model, FINGER_GEOMS, OBJ_BODIES, clearance=RRT_CLEARANCE)
     print(f"\nPlanning obj{src_idx+1} → obj{dst_idx+1}  (clearance={planner.clearance}m) ...")
     path = planner.plan(q_safe, q_pre)
 

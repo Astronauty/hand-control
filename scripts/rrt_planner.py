@@ -134,13 +134,15 @@ class RRTPlanner:
 
     def _gauss_smooth(self, path):
         """Smooth the densified path with a Gaussian kernel applied per joint.
-        Rounds sharp corners left by the shortcut smoother without re-checking
-        collision — safe because max corner displacement (~0.4 × sigma × spacing)
-        stays well inside the clearance band."""
+        Any waypoint the kernel pushes into clearance violation is reverted to its
+        original (pre-smooth) value so the clearance guarantee is preserved."""
         if self.smooth_sigma is None or self.smooth_sigma <= 0 or len(path) < 3:
             return path
-        arr = np.array(path)                                         # (N, nq)
-        arr = gaussian_filter1d(arr, sigma=self.smooth_sigma, axis=0, mode='nearest')
+        original = np.array(path)                                    # (N, nq)
+        arr = gaussian_filter1d(original, sigma=self.smooth_sigma, axis=0, mode='nearest')
+        for i in range(len(arr)):
+            if not self._is_free(arr[i]):
+                arr[i] = original[i]
         return list(arr)
 
     def _densify(self, path):

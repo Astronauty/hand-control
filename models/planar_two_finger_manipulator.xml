@@ -17,7 +17,7 @@
 
     <keyframe>
         <key name="grasp_init"
-             qpos="0.0 0.0 -0.50 -0.50 -0.50 0.50 0.50 0.50"
+             qpos="0.0 0.0 -0.50 -0.50 -0.50 0.50 0.50 0.50  0 0 0  0 0 0  0 0 0"
              ctrl="0.0 0.0 -0.50 -0.50 -0.50 0.50 0.50 0.50"/>
     </keyframe>
 
@@ -26,7 +26,8 @@
         <camera name="cam0" pos="0.0 0.0 2.0" xyaxes="1 0 0 0 1 0"/>
         <!-- <light pos="0 -1 2"/> -->
 
-        <light pos="0 0 3" dir="0 0 -1" directional="true" diffuse="0.8 0.8 0.8" specular="0.2 0.2 0.2"/>
+        <light pos="0 0 3" dir="0 0 -1" directional="true" ambient="0.3 0.3 0.3" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1"/>
+        <light pos="0 3 1"  dir="0 -1 -0.3" directional="true" ambient="0.0 0.0 0.0" diffuse="0.4 0.4 0.4" specular="0.0 0.0 0.0"/>
 
 
         <geom type="plane" material="groundplane" pos="0 -0.8 0" quat="0.7071068 -0.7071068 0 0" size="1 1 1" rgba="1 1 1 1" contype="1" conaffinity="1"/>
@@ -72,13 +73,12 @@
                         <!-- <site name="thumb_touch" pos="-0.085 -0.015 0" size="0.01" group="1" rgba="255 255 0 0.8"/> -->
                         <site name="thumb_touch" pos="-0.12 -0.0 0" size="0.01" group="1" rgba="255 255 0 0.8"/>
 
-                            
                     </body>
                 </body>
             </body>
         </body>
 
-        <!-- Contact point markers (initially hidden at origin) -->
+        <!-- Contact point markers (initially hidden at origin)
         <site name="contact_p1" type="sphere" size="0.01" 
             rgba="1 0 0 0.8" pos="0 0 -10"/>  <!-- Red sphere for thumb -->
         
@@ -89,12 +89,12 @@
         <body name="cp1_body" mocap="true" pos="0 0 -10">
             <geom name="cp1" type="sphere" size="0.0001" 
                 contype="0" conaffinity="0" rgba="1 0 0 0.8"/>
-        </body>
+        </body> -->
 
-        <body name="cp2_body" mocap="true" pos="0 0 -10">
+        <!-- <body name="cp2_body" mocap="true" pos="0 0 -10">
             <geom name="cp2" type="sphere" size="0.0001"
                 contype="0" conaffinity="0" rgba="0 1 0 0.8"/>
-        </body>
+        </body> -->
 
 
         <!-- <body name="Th_base" pos="0 0 0">
@@ -108,7 +108,7 @@
             <joint name="obj1_ty" type="slide" axis="0 1 0" damping="2"/>
             <joint name="obj1_rz" type="hinge" axis="0 0 1" damping="2"/>
             <geom type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 0.4" mass="0.2" friction="1 0.1 0.1"/>
-            <site name="index_box_touch" pos="0.055 0.05 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
+            <site name="index_box_touch" pos="0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
             <site name="thumb_box_touch" pos="-0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
         </body>
 
@@ -172,12 +172,4 @@
         <contact name="index_contact" body1="right_index_distal_link" body2="obj1" num="1" data="found force pos normal tangent" reduce="maxforce"/> 
     </sensor>
 
-    <keyframe>
-        <!-- <key 
-        name = "both_contacts"
-        qpos="3.22496e-15 -0.4881 -1.02225 -0.95832 -0.117645 0.94468 0.930984 0.225179 -0.00802626 -0.750108 -5.1446e-15 1 3.44405e-17 -2.68886e-16 -2.14886e-09"
-        ctrl="0 -0.39 -1 -1 -0.13 0.87 1 0.25"
-        /> -->
-
-    </keyframe>
 </mujoco>

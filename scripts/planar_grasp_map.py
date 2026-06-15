@@ -224,63 +224,63 @@ if __name__ == "__main__":
     print("f_c1: ", f_c1)
     print("f_c2: ", f_c2)
     
-    # Load in mujoco model
-    model = mj.MjModel.from_xml_path('models/planar_two_finger_manipulator.xml') 
-    data = mj.MjData(model)
+    # # Load in mujoco model
+    # model = mj.MjModel.from_xml_path('models/planar_two_finger_manipulator.xml') 
+    # data = mj.MjData(model)
     
-    mj.mj_forward(model, data)
+    # mj.mj_forward(model, data)
     
-    index_site_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'index_touch')
-    thumb_site_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'thumb_id')
+    # index_site_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'index_touch')
+    # thumb_site_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'thumb_id')
     
-    jacp_index = np.zeros((3, model.nv)) # translational jacobian of the index finger
-    jacr_index = np.zeros((3, model.nv)) # rotational jacobian of the index finger
+    # jacp_index = np.zeros((3, model.nv)) # translational jacobian of the index finger
+    # jacr_index = np.zeros((3, model.nv)) # rotational jacobian of the index finger
 
-    jacp_thumb = np.zeros((3, model.nv))
-    jacr_thumb = np.zeros((3, model.nv))   
+    # jacp_thumb = np.zeros((3, model.nv))
+    # jacr_thumb = np.zeros((3, model.nv))   
  
     
-    # Form the jacobians
-    mj.mj_jacSite(model, data, jacp_index, jacr_index, index_site_id)
-    mj.mj_jacSite(model, data, jacp_thumb, jacr_thumb, thumb_site_id)
+    # # Form the jacobians
+    # mj.mj_jacSite(model, data, jacp_index, jacr_index, index_site_id)
+    # mj.mj_jacSite(model, data, jacp_thumb, jacr_thumb, thumb_site_id)
     
-    # print(jacp_index.shape)
-    # print(jacp_thumb.shape)
-    # print(f_c1.shape)
-    # print(f_c2.shape)
+    # # print(jacp_index.shape)
+    # # print(jacp_thumb.shape)
+    # # print(f_c1.shape)
+    # # print(f_c2.shape)
     
-    print(jacp_index[:2, :])
+    # print(jacp_index[:2, :])
     
     
-    tau_index = jacp_index[:2, :].T @ f_c1
-    tau_thumb = jacp_thumb[:2, :].T @ f_c2
+    # tau_index = jacp_index[:2, :].T @ f_c1
+    # tau_thumb = jacp_thumb[:2, :].T @ f_c2
     
-    print(tau_index.shape)
+    # print(tau_index.shape)
     
-    print("tau_index: ", tau_index)
-    print("tau_thumb: ", tau_thumb)
+    # print("tau_index: ", tau_index)
+    # print("tau_thumb: ", tau_thumb)
     
-    tau_total = tau_index + tau_thumb
+    # tau_total = tau_index + tau_thumb
     
-    ### load keyframe
-    key_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_KEY, "both_contacts")
+    # ### load keyframe
+    # key_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_KEY, "both_contacts")
     
-    mj.mj_resetDataKeyframe(model, data, key_id)
+    # mj.mj_resetDataKeyframe(model, data, key_id)
     
-    data.ctrl[:] = 0.0
-    mj.mj_forward(model, data)
+    # data.ctrl[:] = 0.0
+    # mj.mj_forward(model, data)
     
-    with mj.viewer.launch_passive(model, data) as viewer:
-        while viewer.is_running():
-            step_start = time.time()
+    # with mj.viewer.launch_passive(model, data) as viewer:
+    #     while viewer.is_running():
+    #         step_start = time.time()
             
-            data.qfrc_applied[:] = tau_total + data.qfrc_bias
-            # print(f"Qfrc Bias: ", data.qfrc_bias)
-            # print(f"Tau Total: ", tau_total)
-            mj.mj_step(model, data)
+    #         data.qfrc_applied[:] = tau_total + data.qfrc_bias
+    #         # print(f"Qfrc Bias: ", data.qfrc_bias)
+    #         # print(f"Tau Total: ", tau_total)
+    #         mj.mj_step(model, data)
             
-            viewer.sync()
+    #         viewer.sync()
                 
-            time_until_next_step = model.opt.timestep - (time.time() - step_start)
-            if time_until_next_step > 0:
-                time.sleep(time_until_next_step)
+    #         time_until_next_step = model.opt.timestep - (time.time() - step_start)
+    #         if time_until_next_step > 0:
+    #             time.sleep(time_until_next_step)
