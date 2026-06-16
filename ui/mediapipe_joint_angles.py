@@ -3,6 +3,7 @@ import sys
 import os
 import time
 import math
+import argparse
 from datetime import datetime
 from collections import deque
 
@@ -62,6 +63,87 @@ GRASP_CLOSURE_THRESHOLD = 0.05
 VELOCITY_IDLE = 0.005
 VELOCITY_APPROACH = 0.01
 OPEN_HAND_THRESHOLD = 0.1
+
+
+# --- One Euro Filter ---
+# Adaptive low-pass filter for noisy tracking signals (Casiez et al., 2012).
+# At low velocity the cutoff is min_cutoff (heavy smoothing).
+# At high velocity the cutoff rises as min_cutoff + beta*speed (less lag).
+# Key parameters:
+#   min_cutoff  (Hz) : smoothing at rest. Lower = smoother but laggier. ~1–2 Hz.
+#   beta             : speed coefficient. Higher = less lag on fast moves. ~0.1–0.5.
+#   d_cutoff    (Hz) : cutoff for the derivative estimate. Usually left at 1.0.
+
+class OneEuroFilter:
+    """One Euro Filter for a single scalar channel."""
+
+    def __init__(self, freq: float = 30.0,
+                 min_cutoff: float = 1.0,
+                 beta: float = 0.2,
+                 d_cutoff: float = 1.0):
+        self.freq = freq
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self._x_prev: float | None = None
+        self._dx_prev: float = 0.0
+        self._t_prev: float | None = None
+
+    def _alpha(self, cutoff: float) -> float:
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        te  = 1.0 / self.freq
+        return 1.0 / (1.0 + tau / te)
+
+    def __call__(self, x: float, t: float | None = None) -> float:
+        # Update frequency from wall-clock timestamps if provided
+        if t is not None and self._t_prev is not None:
+            dt = t - self._t_prev
+            if dt > 0:
+                self.freq = 1.0 / dt
+        if t is not None:
+            self._t_prev = t
+
+        if self._x_prev is None:
+            self._x_prev = x
+            return x
+
+        # Derivative estimate → filter it → adaptive cutoff
+        dx     = (x - self._x_prev) * self.freq
+        a_d    = self._alpha(self.d_cutoff)
+        dx_hat = a_d * dx + (1.0 - a_d) * self._dx_prev
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+
+        # Filter the signal
+        a     = self._alpha(cutoff)
+        x_hat = a * x + (1.0 - a) * self._x_prev
+
+        self._x_prev  = x_hat
+        self._dx_prev = dx_hat
+        return x_hat
+
+    def reset(self) -> None:
+        self._x_prev  = None
+        self._dx_prev = 0.0
+        self._t_prev  = None
+
+
+class OneEuroFilterArray:
+    """One Euro Filter applied independently to each element of a fixed-length array."""
+
+    def __init__(self, n: int, freq: float = 30.0,
+                 min_cutoff: float = 1.0,
+                 beta: float = 0.2,
+                 d_cutoff: float = 1.0):
+        self._filters = [
+            OneEuroFilter(freq, min_cutoff, beta, d_cutoff) for _ in range(n)
+        ]
+
+    def __call__(self, x: np.ndarray, t: float | None = None) -> np.ndarray:
+        return np.array([f(float(v), t) for f, v in zip(self._filters, x)])
+
+    def reset(self) -> None:
+        for f in self._filters:
+            f.reset()
 
 
 # --- Math & Geometry Helpers ---
@@ -125,6 +207,51 @@ def get_euler_angles(hand_landmarks):
     
     return euler_angles
 
+def get_flexion_angles(world_landmarks):
+    """Compute finger closure angles (degrees) for the index and thumb.
+
+    Uses world landmarks (metric, wrist at origin).  All values increase as
+    the hand closes from spread-open toward pinch.  No Euler-angle discontinuities.
+
+    Returns 6 values:
+        [index_mcp, index_pip, index_dip, thumb_spread, thumb_ip, thumb_ip*0.5]
+
+    Index joints: inter-segment bend at MCP / PIP / DIP.
+        0° = straight segment, ~70-90° = fully flexed.
+
+    Thumb: the primary pinch motion is CMC adduction (the whole thumb sweeps
+    across the palm), NOT MCP/IP flexion.  We capture this as the angle at the
+    wrist between the direction to the index-MCP and the direction to the
+    thumb-tip.  Large angle (60-100°) = spread open;  small angle (5-25°) = pinch.
+    The ROM calibration handles the inverted direction automatically.
+
+    Message layout (appended after the 51-value Euler block): indices 51-56.
+    """
+    pts = np.array([[lm.x, lm.y, lm.z] for lm in world_landmarks])
+
+    def angle_between(va, vb):
+        na, nb = np.linalg.norm(va), np.linalg.norm(vb)
+        if na < 1e-6 or nb < 1e-6:
+            return 0.0
+        return float(np.degrees(np.arccos(np.clip(np.dot(va, vb) / (na * nb), -1.0, 1.0))))
+
+    def bend(p, j, c):
+        return angle_between(pts[j] - pts[p], pts[c] - pts[j])
+
+    idx_mcp = bend(0, 5, 6)    # wrist  → index-MCP  → index-PIP
+    idx_pip = bend(5, 6, 7)    # index-MCP → PIP → DIP
+    idx_dip = bend(6, 7, 8)    # index-PIP → DIP → tip
+
+    # Thumb spread angle: angle at wrist between (wrist→index-MCP) and
+    # (wrist→thumb-tip).  Large when spread apart, small when pinching.
+    # This captures CMC adduction — the primary thumb closure mechanism.
+    thumb_spread = angle_between(pts[5] - pts[0], pts[4] - pts[0])
+
+    th_ip = bend(2, 3, 4)      # thumb-MCP → IP → tip  (secondary flexion)
+
+    return [idx_mcp, idx_pip, idx_dip, thumb_spread, th_ip, th_ip * 0.5]
+
+
 def get_wrist_pose(hand_landmarks):
     """
     Computes the 6DOF Pose (Position + Orientation) of the wrist in Camera Frame.
@@ -148,6 +275,19 @@ def get_wrist_pose(hand_landmarks):
     
     return wrist_pos, r.as_euler('ZYX', degrees=True)
 
+
+
+# --- Hand Selection ---
+
+def _hand_bbox_area(hand_landmarks) -> float:
+    """Return the bounding-box area of a hand in normalised image coordinates.
+
+    Larger area == hand is closer to the camera (appears bigger in frame).
+    Used to pick the dominant hand when multiple hands are detected.
+    """
+    xs = [lm.x for lm in hand_landmarks]
+    ys = [lm.y for lm in hand_landmarks]
+    return (max(xs) - min(xs)) * (max(ys) - min(ys))
 
 
 # --- Visualization ---
@@ -225,21 +365,26 @@ def trigger_calibration():
         print("[USER] Calibration Trigger Sent!")
 
 
-def publish_hand_config(angles, wrist_pose):
+def publish_hand_config(angles, wrist_pose, flexion_angles=None):
     global joint_angles_pub, ros_node
     if not joint_angles_pub:
         return
-        
+
     msg = Float32MultiArray()
     joint_config = []
-    
-    joint_config.extend(wrist_pose[0])  # Wrist Position
-    joint_config.extend(wrist_pose[1])  # Wrist Orientation (Euler)
+
+    joint_config.extend(wrist_pose[0])  # Wrist Position          [0:3]
+    joint_config.extend(wrist_pose[1])  # Wrist Orientation (Euler)[3:6]
 
     for joint in JOINT_ORDER:
         yaw, pitch, roll = angles[joint]
-        joint_config.extend([yaw, pitch, roll])
-    
+        joint_config.extend([yaw, pitch, roll])               # [6:51]
+
+    # Append inter-segment flexion angles (robust, no discontinuities) [51:57]
+    # [idx_mcp, idx_pip, idx_dip, th_mcp, th_ip, th_ip*0.5]
+    if flexion_angles is not None:
+        joint_config.extend(flexion_angles)
+
     msg.data = joint_config
     joint_angles_pub.publish(msg)
     
@@ -249,20 +394,98 @@ def publish_hand_config(angles, wrist_pose):
 
 # --- Main Application ---
 
+_VIRTUAL_CAM_KEYWORDS = ("obs", "virtual", "dshow2", "ndi", "manycam", "xsplit", "camtwist")
+
+
+def _get_camera_names_windows(max_index: int) -> list[str]:
+    """Query DirectShow camera friendly names via PowerShell (Windows only). Order matches OpenCV indices."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-PnpDevice -Class Camera -Status OK | Select-Object -ExpandProperty FriendlyName"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            names = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+            # Pad to max_index+1 entries so list index matches camera index
+            while len(names) <= max_index:
+                names.append("")
+            return names
+    except Exception:
+        pass
+    return [""] * (max_index + 1)
+
+
+def _probe_cameras(max_index: int = 4) -> list[int]:
+    """Return indices of real cameras first, virtual cameras (OBS etc.) last."""
+    import sys
+    names = _get_camera_names_windows(max_index) if sys.platform == "win32" else [""] * (max_index + 1)
+    real, virtual = [], []
+    for i in range(max_index + 1):
+        cap = cv2.VideoCapture(i)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        cap.release()
+        name = names[i].lower() if i < len(names) else ""
+        is_virtual = any(kw in name for kw in _VIRTUAL_CAM_KEYWORDS)
+        if is_virtual:
+            print(f"[INFO] Camera {i} ({names[i]}): virtual cam — deprioritised.")
+            virtual.append(i)
+        else:
+            label = f" ({names[i]})" if names[i] else ""
+            print(f"[INFO] Camera {i}{label}: real camera.")
+            real.append(i)
+    return real + virtual
+
+
 def main():
     global last_timestamp, last_landmarks
+
+    parser = argparse.ArgumentParser(description="Hand tracking publisher")
+    parser.add_argument(
+        "--camera", type=int, default=None,
+        help="Camera index to use (0=laptop built-in, 1=first USB camera, etc.). "
+             "Omit to auto-select: prefers index 1+ (external webcam) if available.")
+    parser.add_argument(
+        "--list-cameras", action="store_true",
+        help="List available camera indices and exit.")
+    args = parser.parse_args()
+
+    if args.list_cameras:
+        cams = _probe_cameras()
+        print(f"Available cameras: {cams}")
+        print("  0 is usually the laptop built-in camera.")
+        print("  1+ are external/USB cameras (e.g. EMEET).")
+        return
+
+    # Auto-select camera: prefer external (index >= 1) for better index+thumb visibility
+    if args.camera is not None:
+        camera_index = args.camera
+    else:
+        available = _probe_cameras()
+        if not available:
+            print("ERROR: No cameras found.")
+            return
+        # Prefer first external camera; fall back to laptop if only one exists
+        camera_index = next((i for i in available if i >= 1), available[0])
+        print(f"[INFO] Available cameras: {available}  -- using index {camera_index}")
+        if camera_index == 0:
+            print("[INFO] Only built-in camera found. For better index+thumb tracking,")
+            print("       plug in your EMEET webcam and set a side-view angle, then rerun.")
 
     # 1. Setup Filesystem
     script_dir = os.path.dirname(os.path.abspath(__file__))
     model_path = os.path.join(script_dir, MODEL_FILENAME)
-    
+
     if not os.path.exists(model_path):
         print(f"ERROR: Model file not found at: {model_path}")
         print("Please download 'hand_landmarker.task' and place it in the script directory.")
         return
 
     init_csv_if_needed(CSV_PATH)
-    
+
     # 2. Setup ROS
     try:
         init_ros()
@@ -280,16 +503,35 @@ def main():
     options = HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=VisionRunningMode.VIDEO,
-        num_hands=1,
+        num_hands=3,
         min_hand_detection_confidence=0.5,
         min_hand_presence_confidence=0.5,
         min_tracking_confidence=0.5
     )
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        print(f"ERROR: Could not open camera index {camera_index}.")
+        print(f"       Run with --list-cameras to see available indices.")
+        return
+    print(f"[INFO] Camera {camera_index} opened.")
+
+    # One Euro Filters — applied per-channel before publishing.
+    # Wrist: [x, y, z, yaw, pitch, roll]  (image-space position + orientation)
+    # Flexion: [idx_mcp, idx_pip, idx_dip, thumb_spread, thumb_ip, thumb_ip*0.5]
+    #
+    # Tuning guide:
+    #   min_cutoff : smoothing at rest (Hz). Lower = smoother, more lag. ~1-2 Hz.
+    #   beta       : speed adaptation. Higher = less lag on fast moves. ~0.1-0.4.
+    #
+    # Wrist gets slightly higher beta so base motion feels responsive.
+    # Flexion gets a lower min_cutoff for heavier smoothing of finger jitter.
+    filter_wrist   = OneEuroFilterArray(6, freq=30.0, min_cutoff=1.0, beta=0.3)
+    filter_flexion = OneEuroFilterArray(6, freq=30.0, min_cutoff=1.5, beta=0.2)
     last_frame = None
     last_hand_data = None
-    
+    show_debug = False  # toggled with 'D' — overlays flexion angles on video
+
     # Timestamp for MediaPipe (must be monotonically increasing)
     start_time_ms = int(time.time() * 1000)
 
@@ -315,42 +557,88 @@ def main():
                 hand_data = []
 
                 if result.hand_landmarks:
-                    for i, hand_landmarks in enumerate(result.hand_landmarks):
-                        # Safety check for handedness index
-                        handedness = "Unknown"
-                        if i < len(result.handedness):
-                            handedness = result.handedness[i][0].category_name
-                        
-                        angles = get_euler_angles(hand_landmarks)
-                        wrist_pose = get_wrist_pose(hand_landmarks)
+                    # Pick the closest hand: largest bounding box in image space.
+                    # Draw all detected hands so the operator can see what's tracked,
+                    # but only publish and filter the selected one.
+                    best_i = max(
+                        range(len(result.hand_landmarks)),
+                        key=lambda i: _hand_bbox_area(result.hand_landmarks[i]),
+                    )
 
-                        # Publish to ROS
-                        publish_hand_config(angles, wrist_pose)
+                    for i, lm in enumerate(result.hand_landmarks):
+                        label = (result.handedness[i][0].category_name
+                                 if i < len(result.handedness) else "?")
+                        draw_landmarks(annotated, lm,
+                                       label if i == best_i else f"{label} (ignored)")
 
-                        # Draw
-                        draw_landmarks(annotated, hand_landmarks, handedness)
-                        
-                        hand_data.append((hand_landmarks, handedness, angles))
-                    
+                    # --- Process only the closest hand ---
+                    hand_landmarks = result.hand_landmarks[best_i]
+                    handedness = (result.handedness[best_i][0].category_name
+                                  if best_i < len(result.handedness) else "Unknown")
+
+                    world_lm = (result.hand_world_landmarks[best_i]
+                                if result.hand_world_landmarks
+                                and best_i < len(result.hand_world_landmarks)
+                                else hand_landmarks)
+
+                    angles = get_euler_angles(world_lm)
+                    wrist_pos, wrist_euler = get_wrist_pose(hand_landmarks)
+                    flexion = get_flexion_angles(world_lm)
+
+                    # Apply One Euro Filter before publishing.
+                    # t is wall-clock seconds — used to adapt the filter's
+                    # internal frequency estimate to the actual frame rate.
+                    t = curr_time_ms / 1000.0
+                    wrist_state = filter_wrist(
+                        np.concatenate([wrist_pos, wrist_euler]), t)
+                    flexion_f = filter_flexion(np.array(flexion), t)
+
+                    wrist_pose_f = (wrist_state[:3], wrist_state[3:])
+
+                    # Publish to ROS (Euler block + filtered flexion angles)
+                    publish_hand_config(angles, wrist_pose_f, flexion_f.tolist())
+
+                    if show_debug:
+                        labels = ["idx_mcp", "idx_pip", "idx_dip",
+                                  "th_spr ", "th_ip  ", "th_ip*.5"]
+                        x0 = annotated.shape[1] - 190
+                        for j, (lbl, val) in enumerate(zip(labels, flexion_f)):
+                            cv2.putText(annotated,
+                                        f"{lbl}:{val:5.1f}",
+                                        (x0, 30 + j * 22),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                        (0, 255, 0), 1)
+
+                    hand_data.append((hand_landmarks, handedness, angles))
+
                     last_timestamp = time.time()
                     last_frame = annotated.copy()
                     last_hand_data = list(hand_data)
+                else:
+                    # Hand lost — reset filters so stale state doesn't corrupt
+                    # the first frame when the hand reappears.
+                    filter_wrist.reset()
+                    filter_flexion.reset()
 
                 # UI Overlay
-                ui_text = "SPACE: Save Snapshot | Q: Quit" if DEBUG_FLAG else "Q: Quit"
-                cv2.putText(annotated, "Press 'C' to Calibrate Home Position", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                cv2.putText(annotated, ui_text, (10, 55),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                dbg_label = "[D:ON]" if show_debug else "D:Debug"
+                ui_text = (f"{dbg_label} | SPACE:Snap | Q:Quit"
+                           if DEBUG_FLAG else f"{dbg_label} | Q:Quit")
+                cv2.putText(annotated, "In MuJoCo: C -> spread open, C -> pinch to calibrate",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+                cv2.putText(annotated, ui_text, (10, 52),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
 
-                cv2.imshow("Hand Tracking (ROS 2 Humble)", annotated)
+                cv2.imshow(f"Hand Tracking  [cam {camera_index}]", annotated)
 
                 # Input Handling
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
-                elif key == ord("c"): 
+                elif key == ord("c"):
                     trigger_calibration()
+                elif key == ord("d"):
+                    show_debug = not show_debug
                 elif key == 32:  # SPACE
                     if DEBUG_FLAG and last_frame is not None and last_hand_data:
                         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
