@@ -10,7 +10,7 @@ import mujoco as mj
 import mujoco.viewer  # noqa: F401
 from pynput import keyboard as _pynput_kb
 
-from rrt_planner import RRTPlanner
+from scripts.rrt_planner import RRTPlanner
 
 
 def planar_hat_map(a):
@@ -96,7 +96,7 @@ if __name__ == "__main__":
     SAFE_LIFT       = 0.12  # metres to lift base before handing off to RRT (clears contact zone)
     STEPS_PER_WP    = 50   # max sim steps before forcing waypoint advance (timeout, 1 step = 1ms)
     WP_REACH_TOL    = 0.01  # joint-space radius to consider a waypoint reached (m or rad)
-    JOG_VEL         = 0.30  # base jog speed while arrow key held (m/s)
+    JOG_VEL         = 1.0  # base jog speed while arrow key held (m/s)
 
     # Object definitions
     object_defs = [
@@ -138,11 +138,15 @@ if __name__ == "__main__":
 
     # Per-joint PD gains for REACH phase.
     # Index: [base_x, base_y, idx_MCP, idx_PIP, idx_DIP, th_MCP, th_PIP, th_DIP]
-    Kp = np.array([3.0,  3.0,  0.8,  0.8,  0.8,  0.8,  0.8,  0.8])
+    Kp = np.array([4.0,  4.0,  0.8,  0.8,  0.8,  0.8,  0.8,  0.8])
     Kd = np.array([2.00, 2.00, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05])
-    Kp_cart = 50.0   # Cartesian impedance stiffness N/m (GRASP)
-    Kd_cart = 5.0    # Cartesian impedance damping N·s/m (GRASP)
-    gamma   = 5.0    # internal squeeze force scale; negate if fingers pull apart
+    Kp_obj     = 50.0  # object position stiffness, N/m (GRASP)
+    Kd_obj     = 5.0   # object position damping, N·s/m (GRASP)
+    Kp_theta   = 5.0   # object orientation stiffness, N·m/rad (GRASP)
+    Kd_theta   = 0.5   # object orientation damping, N·m·s/rad (GRASP)
+    Kp_contact = 100.0   # weak per-finger slip-correction stiffness, N/m (GRASP)
+    Kd_contact = 10.0   # weak per-finger slip-correction damping, N·s/m (GRASP)
+    gamma   = 50.0    # internal squeeze force scale; negate if fingers pull apart
 
     FINGER_GEOMS = ['index_proximal', 'index_medial', 'index_distal',
                     'thumb_proximal', 'thumb_medial', 'thumb_distal']
@@ -214,6 +218,11 @@ if __name__ == "__main__":
     _kb_listener.start()
 
     with mj.viewer.launch_passive(model, data, key_callback=make_key_callback(keys)) as viewer:
+        viewer.cam.fixedcamid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_CAMERA, 'cam0')
+        viewer.cam.type = mj.mjtCamera.mjCAMERA_FIXED
+        viewer.opt.frame = mj.mjtFrame.mjFRAME_WORLD
+        viewer.opt.flags[mj.mjtVisFlag.mjVIS_CONTACTFORCE] = True
+        viewer.opt.label = mj.mjtLabel.mjLABEL_CONTACTFORCE
         running = True
         while viewer.is_running() and running:
             step_start = time.time()
@@ -235,6 +244,12 @@ if __name__ == "__main__":
                 if key == 'enter' and control_phase == 'REACH':
                     control_phase = 'GRASP'
                     jog_base[:] = data.qpos[:2].copy()
+                    # Freeze the object's pose relative to the base at grasp time —
+                    # jogging will target this offset, not the object's live pose.
+                    obj_grasp = objects[active_idx]
+                    obj_grasp['p_obj_offset'] = data.xpos[obj_grasp['id_body']][:2].copy() - data.qpos[:2].copy()
+                    R_WO0 = data.xmat[obj_grasp['id_body']].reshape(3, 3)[:2, :2]
+                    obj_grasp['theta_des'] = np.arctan2(R_WO0[1, 0], R_WO0[0, 0])
                     print(f"\r\n[Control] → GRASP  ({targets[active_tgt]['label']})")
 
                 elif key == 'enter' and control_phase == 'GRASP':
@@ -344,22 +359,44 @@ if __name__ == "__main__":
                 J1 = J1_full[:2, :N_ROBOT]
                 J2 = J2_full[:2, :N_ROBOT]
 
-                # Cartesian impedance forces in world frame
+                # Desired object pose: jog defines a target, tracked via the offset
+                # frozen at grasp time. Orientation is held at its grasp-time value.
+                p_obj_des     = jog_base + obj['p_obj_offset']
+                theta_obj_cur = np.arctan2(R_WO_cur[1, 0], R_WO_cur[0, 0])
+                e_p     = p_obj_des - p_WoO_cur
+                e_theta = np.arctan2(np.sin(obj['theta_des'] - theta_obj_cur),
+                                      np.cos(obj['theta_des'] - theta_obj_cur))
+
+                # Object velocity via body Jacobian (no need to track per-object qvel indices)
+                Jp_o, Jr_o = np.zeros((3, model.nv)), np.zeros((3, model.nv))
+                mj.mj_jacBodyCom(model, data, Jp_o, Jr_o, obj['id_body'])
+                v_obj     = Jp_o[:2] @ data.qvel
+                omega_obj = Jr_o[2]  @ data.qvel
+
+                # Desired object wrench (world-frame force, scalar moment), rotated into
+                # the object frame to match planar_grasp_map_PCWF's convention.
+                f_des_W = Kp_obj * e_p + Kd_obj * (-v_obj)
+                m_des   = Kp_theta * e_theta + Kd_theta * (-omega_obj)
+                w_des_O = np.concatenate([R_WO_cur.T @ f_des_W, [m_des]])
+
+                # Allocate desired wrench to contact forces (min-norm) + null-space squeeze
+                f_c = np.linalg.pinv(G_cur) @ w_des_O + gamma * G_null_cur
+
+                # Low-gain hybrid contact correction: resists slip without overpowering
+                # the wrench-allocated motion above (compare Kp_contact to old Kp_cart=50).
                 dp1 = J1 @ data.qvel[:N_ROBOT]
                 dp2 = J2 @ data.qvel[:N_ROBOT]
-                f_imp_1 = Kp_cart * (p_WoS1_cur - data.site_xpos[id_C1][:2]) + Kd_cart * (-dp1)
-                f_imp_2 = Kp_cart * (p_WoS2_cur - data.site_xpos[id_C2][:2]) + Kd_cart * (-dp2)
+                f_corr_1 = Kp_contact * (p_WoS1_cur - data.site_xpos[id_C1][:2]) + Kd_contact * (-dp1)
+                f_corr_2 = Kp_contact * (p_WoS2_cur - data.site_xpos[id_C2][:2]) + Kd_contact * (-dp2)
 
-                # Null-space squeeze: G_null is in contact frames, rotate to world frame
-                f_null_1 = R_WS1_cur @ G_null_cur[:2] * gamma
-                f_null_2 = R_WS2_cur @ G_null_cur[2:] * gamma
+                f_c1_W = R_WS1_cur @ f_c[:2] + f_corr_1
+                f_c2_W = R_WS2_cur @ f_c[2:] + f_corr_2
 
                 tau_ctrl = np.zeros(model.nv)
-                tau_ctrl[:N_ROBOT] = J1.T @ (f_imp_1 + f_null_1) + J2.T @ (f_imp_2 + f_null_2)
-                # Base jog in GRASP: PD on base joints so arrow keys translate the whole hand+object.
-                tau_ctrl[:2] += Kp[:2] * (jog_base - data.qpos[:2]) + Kd[:2] * (-data.qvel[:2])
+                tau_ctrl[:N_ROBOT] = J1.T @ f_c1_W + J2.T @ f_c2_W
 
-            data.qfrc_applied[:] = tau_ctrl + data.qfrc_bias
+            data.qfrc_applied[:] = tau_ctrl
+            data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
             mj.mj_step(model, data)
             viewer.sync()
             time.sleep(max(0, model.opt.timestep - (time.time() - step_start)))

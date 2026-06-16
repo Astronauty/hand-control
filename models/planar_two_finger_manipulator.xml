@@ -10,7 +10,7 @@
     <asset>
         <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0.1 0.1 0.2" width="512" height="3072"/>
         <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
-            markrgb="0.8 0.8 0.8" width="300" height="300"/>
+            markrgb="0.8 0.8 0.8" width="1000" height="1000"/>
         <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.0"/>
     </asset>
 
@@ -23,7 +23,9 @@
 
     <worldbody>
         <!-- Scene Visualization -->
-        <camera name="cam0" pos="0.0 0.0 2.0" xyaxes="1 0 0 0 1 0"/>
+        <!-- <camera name="cam0" pos="0.0 0.8 4.0" xyaxes="1 0 0 0 0.966 -0.258"/> -->
+        <camera name="cam0" pos="0.0 0.0 4.0" xyaxes="1 0 0 0 1 0"/>
+
         <!-- <light pos="0 -1 2"/> -->
 
         <light pos="0 0 3" dir="0 0 -1" directional="true" ambient="0.3 0.3 0.3" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1"/>
@@ -78,23 +80,14 @@
             </body>
         </body>
 
-        <!-- Contact point markers (initially hidden at origin)
+        <!-- Contact point markers (initially hidden at origin) -->
         <site name="contact_p1" type="sphere" size="0.01" 
             rgba="1 0 0 0.8" pos="0 0 -10"/>  <!-- Red sphere for thumb -->
         
         <site name="contact_p2" type="sphere" size="0.01" 
             rgba="0 1 0 0.8" pos="0 0 -10"/>  <!-- Green sphere for index -->
 
-        <!-- Contact point geoms (for mj_geomDistance queries) -->
-        <body name="cp1_body" mocap="true" pos="0 0 -10">
-            <geom name="cp1" type="sphere" size="0.0001" 
-                contype="0" conaffinity="0" rgba="1 0 0 0.8"/>
-        </body> -->
 
-        <!-- <body name="cp2_body" mocap="true" pos="0 0 -10">
-            <geom name="cp2" type="sphere" size="0.0001"
-                contype="0" conaffinity="0" rgba="0 1 0 0.8"/>
-        </body> -->
 
 
         <!-- <body name="Th_base" pos="0 0 0">
@@ -107,7 +100,7 @@
             <joint name="obj1_tx" type="slide" axis="1 0 0" damping="2"/>
             <joint name="obj1_ty" type="slide" axis="0 1 0" damping="2"/>
             <joint name="obj1_rz" type="hinge" axis="0 0 1" damping="2"/>
-            <geom type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 0.4" mass="0.2" friction="1 0.1 0.1"/>
+            <geom type="box" size="0.05 0.05 0.05" rgba="0.3 0.3 0.5 0.4" mass="0.1" friction="1 0.1 0.1"/>
             <site name="index_box_touch" pos="0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
             <site name="thumb_box_touch" pos="-0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
         </body>
@@ -116,7 +109,7 @@
             <joint name="obj2_tx" type="slide" axis="1 0 0" damping="2"/>
             <joint name="obj2_ty" type="slide" axis="0 1 0" damping="2"/>
             <joint name="obj2_rz" type="hinge" axis="0 0 1" damping="2"/>
-            <geom type="box" size="0.05 0.05 0.05" rgba="0.5 0.3 0.1 0.4" mass="0.2" friction="1 0.1 0.1"/>
+            <geom type="box" size="0.05 0.05 0.05" rgba="0.5 0.3 0.1 0.4" mass="0.1" friction="1 0.1 0.1"/>
             <site name="index_box_touch_2" pos="0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
             <site name="thumb_box_touch_2" pos="-0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
         </body>
@@ -126,7 +119,7 @@
             <joint name="obj3_tx" type="slide" axis="1 0 0" damping="2"/>
             <joint name="obj3_ty" type="slide" axis="0 1 0" damping="2"/>
             <joint name="obj3_rz" type="hinge" axis="0 0 1" damping="2"/>
-            <geom type="cylinder" size="0.05 0.05" rgba="0.2 0.5 0.4 0.4" mass="0.2" friction="1 0.1 0.1"/>
+            <geom type="cylinder" size="0.05 0.05" rgba="0.2 0.5 0.4 0.4" mass="0.1" friction="1 0.1 0.1"/>
             <site name="index_cyl_touch" pos="0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
             <site name="thumb_cyl_touch" pos="-0.055 0.0 0.0" size="0.007" group="1" rgba="0 1 0 0.8"/>
         </body>
