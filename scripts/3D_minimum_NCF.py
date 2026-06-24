@@ -265,15 +265,30 @@ if __name__ ==  "__main__":
     mu_list = [1, 1]
     
     # Test 1: ->▢ <- with wrench ->
-    print('Test 1: ')
+    print('Test 1: ->▢ <- with wrench ->')
     print(f'When fx=1 wrench, gamma = {min_gamma_for_accel(1, 0, 0, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
 
-    # Test 2: ->▢ <- with wrench ↑
-    print('Test 2: ')
+    # Test 2: ->▢ <- with wrench ⊗
+    print('Test 2: ->▢ <- with wrench ⊗')
     print(f'When fy=1 wrench, gamma = {min_gamma_for_accel(0, 1, 0, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
 
-    # Test 3: ->▢ <- with wrench torque about x-axis
-    print('Test 3: ')
+    # Test 3: ->▢ <- with wrench ↑
+    print('Test 3: ->▢ <- with wrench  ↑')
+    print(f'When Tx=1 wrench, gamma = {min_gamma_for_accel(0, 0, 1, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+
+    # Test 4: ->▢ <- with wrench torque about x-axis
+    print('Test 4: ->▢ <- with wrench torque about x-axis')
     print(f'When Tx=1 wrench, gamma = {min_gamma_for_accel(0, 0, 0, 1, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+
+    # Test 5: ->▢ <- with wrench torque about x-axis
+    print('Test 5: ->▢ <- with wrench torque about y-axis')
+    print(f'When Tx=1 wrench, gamma = {min_gamma_for_accel(0, 0, 0, 0, 1, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+
+    # Test 6: ->▢ <- with wrench torque about x-axis
+    print('Test 6: ->▢ <- with wrench torque about z-axis')
+    print(f'When Tx=1 wrench, gamma = {min_gamma_for_accel(0, 0, 0, 0, 0, 1, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+
     print()
+
+
                 
