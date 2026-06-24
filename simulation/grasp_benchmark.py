@@ -45,6 +45,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.lines
 import matplotlib.patches as patches
 from matplotlib.colors import Normalize, BoundaryNorm
 from matplotlib.cm import ScalarMappable
@@ -71,9 +72,19 @@ ap.add_argument("--out",   default="grasp_benchmark.png",
 ap.add_argument("--nx", type=int, default=1, help="base_x grid points")
 ap.add_argument("--ny", type=int, default=5, help="base_y grid points")
 ap.add_argument("--nc", type=int, default=5, help="curl grid points")
+ap.add_argument("--no-on-object",    dest="on_object",    action="store_false",
+                default=True,  help="Disable on-surface constraint (SDF==0)")
+ap.add_argument("--no-penetration",  dest="penetration",  action="store_false",
+                default=True,  help="Disable penetration constraint (gap==-1e-4)")
+ap.add_argument("--no-ik",           dest="ik",           action="store_false",
+                default=True,  help="Disable IK constraint (finger touches p)")
+ap.add_argument("--soft-wrench",     dest="wrench_hard",  action="store_false",
+                default=True,  help="Use soft penalty instead of hard wrench constraint")
 args = ap.parse_args()
 
-out_stem   = args.out.replace(".png", "")
+out_folder = r"simulation/results/"
+
+out_stem   = out_folder + args.out.replace(".png", "")
 out_heat   = out_stem + "_heatmaps.png"
 out_aggr   = out_stem + "_aggregate.png"
 
@@ -85,6 +96,7 @@ logging.basicConfig(level=logging.WARNING,
 log = logging.getLogger("bench")
 log.setLevel(logging.INFO)
 log.addHandler(logging.StreamHandler(sys.stdout))
+logging.getLogger("grasp_planner").setLevel(logging.INFO)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Load model
@@ -96,7 +108,16 @@ mj.mj_resetData(model, data)
 mj.mj_resetDataKeyframe(model, data, 0)
 mj.mj_forward(model, data)
 
-cfg     = GraspConfig()
+cfg     = GraspConfig(
+    on_object=args.on_object,
+    penetration_constraint=args.penetration,
+    ik_constraint=args.ik,
+    wrench_hard=args.wrench_hard,
+)
+log.info(f"Constraints: on_object={cfg.on_object}  "
+         f"penetration={cfg.penetration_constraint}  "
+         f"ik={cfg.ik_constraint}  "
+         f"wrench={'hard' if cfg.wrench_hard else 'soft'}")
 planner = GraspPlanner(model, data, cfg=cfg)
 act_idx = _get_actuated_indices(model)
 obj_bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, cfg.obj_body)
@@ -105,27 +126,21 @@ obj_hx  = model.geom_size[planner._obj_gid][0]
 obj_hy  = model.geom_size[planner._obj_gid][1]
 
 log.info(f"Object centre : {np.round(obj_pos, 4)}  "
-         f"(x={obj_pos[0]:.3f}, y={obj_pos[1]:.3f}  ← y<0 means below origin)")
-log.info(f"Object extents: ±{obj_hx:.3f} m (X)  ±{obj_hy:.3f} m (Y)")
+         f"(x={obj_pos[0]:.3f}, y={obj_pos[1]:.3f}  <- y<0 means below origin)")
+log.info(f"Object extents: +/-{obj_hx:.3f} m (X)  +/-{obj_hy:.3f} m (Y)")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Grid definition
-#
-# base_y range: object is at y=-0.4. We approach from above, so the useful
-# range is just above the object top face (-0.4+0.05 = -0.35) up to well
-# above it (-0.1).  -0.38 gives the solver very little room (fingers fully
-# extended barely reach), while -0.1 means the hand is far above and needs
-# full curl to reach.
 # ─────────────────────────────────────────────────────────────────────────────
-BASE_X_VALS = np.linspace(-0.1,  0.1,  args.nx)   # lateral offset (m)
-BASE_Y_VALS = np.linspace(-0.3, 0.1, args.ny)   # vertical: -0.38≈obj level → -0.1=high above
-CURL_VALS   = np.linspace(-0.5, -1.5,  args.nc)   # finger curl (rad)
+BASE_X_VALS = np.linspace(-0.1,  0.1,  args.nx)
+BASE_Y_VALS = np.linspace(-0.3, 0.1, args.ny)
+CURL_VALS   = np.linspace(-0.5, -1.5,  args.nc)
 
 NX, NY, NC = len(BASE_X_VALS), len(BASE_Y_VALS), len(CURL_VALS)
 N = NX * NY * NC
 q_base = np.array([data.qpos[i] for i in act_idx])
 
-log.info(f"\nGrid: base_x({NX}) × base_y({NY}) × curl({NC}) = {N} solves")
+log.info(f"\nGrid: base_x({NX}) x base_y({NY}) x curl({NC}) = {N} solves")
 log.info(f"  base_x : {np.round(BASE_X_VALS,3)}  (lateral, +right/-left)")
 log.info(f"  base_y : {np.round(BASE_Y_VALS,3)}  (vertical, more-neg=closer to obj)")
 log.info(f"  curl   : {np.round(CURL_VALS,3)}  (finger curl, more-neg=more curled)\n")
@@ -158,7 +173,6 @@ for k, (ix, iy, ic) in enumerate(product(range(NX), range(NY), range(NC))):
 
     elapsed = time.perf_counter() - t0
 
-    # post-solve metrics
     ik_t = ik_i = gap_t = gap_i = sdf1 = sdf2 = np.nan
     if result['q'] is not None:
         info = planner.verify(result)
@@ -199,8 +213,13 @@ log.info(f"\nAll {N} solves complete.\n")
 # ─────────────────────────────────────────────────────────────────────────────
 STATUS_COLOR = {'converged': '#2ecc71', 'best-effort': '#f39c12', 'failed': '#e74c3c'}
 
+# Palette of visually distinct colors for per-pair coloring in panel 7a.
+_TAB20_COLORS = plt.cm.tab20(np.linspace(0, 1, 20))
+PAIR_PALETTE  = [matplotlib.colors.to_hex(c) for c in _TAB20_COLORS]
+
+
 def slice_grid(ix_val: int, key: str, fill=np.nan) -> np.ndarray:
-    """(NY × NC) array for one base_x slice."""
+    """(NY x NC) array for one base_x slice."""
     arr = np.full((NY, NC), fill, dtype=float)
     for r in records:
         if r['ix'] != ix_val:
@@ -242,22 +261,86 @@ def style_slice_ax(ax, ylabel=True):
     if ylabel:
         ax.set_yticks(range(NY))
         ax.set_yticklabels([f"{v:.2f}" for v in BASE_Y_VALS], fontsize=7)
-        ax.set_ylabel("base_y (m)\n← more negative = closer to obj", fontsize=7)
+        ax.set_ylabel("base_y (m)\n<- more negative = closer to obj", fontsize=7)
     else:
         ax.set_yticks(range(NY))
         ax.set_yticklabels([])
 
 
+def _stagger_badge_positions(clusters, badge_r: float = 0.018):
+    """
+    Place count badges along each cluster's own grasp axis so they don't overlap.
+
+    Strategy
+    --------
+    - Each badge starts at the parametric midpoint (t=0.5) of the segment
+      p1_mean → p2_mean.
+    - When two badges from *different* clusters are too close, we slide them
+      in opposite directions **along their own axis lines** (not sideways).
+      This keeps the badge visually "on" the line it annotates.
+    - For pairs whose axes are nearly parallel and co-located the sliding is
+      done along a shared direction; for all others each badge moves along its
+      own unit vector.
+    - Up to 30 iterations are run so even 3-4 coincident pairs fully separate.
+
+    Parameters
+    ----------
+    clusters  : list of cluster dicts with p1_mean, p2_mean (world coords, m)
+    badge_r   : minimum half-gap between badge centres (m); default ~18 mm
+
+    Returns
+    -------
+    list of (bx, by) world-coordinate positions, one per cluster
+    """
+    n = len(clusters)
+
+    # axis unit vectors and span for each cluster
+    axes  = np.zeros((n, 2))
+    spans = np.zeros(n)
+    for i, cl in enumerate(clusters):
+        d    = cl['p2_mean'] - cl['p1_mean']
+        span = np.linalg.norm(d)
+        spans[i] = span
+        axes[i]  = d / span if span > 1e-9 else np.array([1., 0.])
+
+    # parametric t along each axis; t=0 → p1, t=1 → p2, t=0.5 → midpoint
+    t = np.full(n, 0.5)
+
+    def badge_world(i):
+        cl = clusters[i]
+        return cl['p1_mean'] + t[i] * (cl['p2_mean'] - cl['p1_mean'])
+
+    for _ in range(30):
+        moved = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                pi   = badge_world(i)
+                pj   = badge_world(j)
+                dist = np.linalg.norm(pi - pj)
+                if dist < 2.0 * badge_r:
+                    push_world = (2.0 * badge_r - dist) / 2.0 + 1e-4
+                    # project the push onto each cluster's own axis
+                    # (so the badge stays on its line)
+                    dt_i = push_world / max(spans[i], 1e-9)
+                    dt_j = push_world / max(spans[j], 1e-9)
+                    t[i] = np.clip(t[i] + dt_i, 0.05, 0.95)
+                    t[j] = np.clip(t[j] - dt_j, 0.05, 0.95)
+                    moved = True
+        if not moved:
+            break
+
+    return [tuple(badge_world(i)) for i in range(n)]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# FIGURE 1 — Heatmaps  (6 metrics × NX base_x slices)
-# Layout: rows = metrics (6), cols = base_x slices (NX)
+# FIGURE 1 — Heatmaps  (6 metrics x NX base_x slices)
 # ─────────────────────────────────────────────────────────────────────────────
 METRICS = [
     ("outcome",    "Outcome",                        None,       None,   None,    "auto"),
     ("cost",       "Cost",                           "plasma",   None,   None,    "auto"),
-    ("ik_err_mm",  "IK Error  avg(|dθ|,|dι|) [mm]", "RdYlGn_r", 0,     None,    "auto"),
+    ("ik_err_mm",  "IK Error  avg(|dth|,|di|) [mm]","RdYlGn_r", 0,     None,    "auto"),
     ("sdf_err_mm", "SDF Error  max(|s1|,|s2|) [mm]","RdYlGn_r", 0,     None,    "auto"),
-    ("gap_min_mm", "Min Gap  (+ clear / − penet) [mm]","RdYlGn", None,  None,    "auto"),
+    ("gap_min_mm", "Min Gap  (+ clear / - penet) [mm]","RdYlGn", None,  None,    "auto"),
     ("iterations", "IPOPT Iterations",               "YlOrRd",   None,  None,    "auto"),
 ]
 
@@ -270,9 +353,9 @@ fig1, axes1 = plt.subplots(
 )
 
 fig1.suptitle(
-    "GraspPlanner — Heatmaps per base_x slice\n"
+    "GraspPlanner -- Heatmaps per base_x slice\n"
     f"Rows of each heatmap = base_y  |  Cols = curl  |  "
-    f"Object @ y={obj_pos[1]:.3f} m  (gravity −Y, so −y = down toward object)",
+    f"Object @ y={obj_pos[1]:.3f} m  (gravity -Y, so -y = down toward object)",
     fontsize=11, fontweight='bold', y=1.01
 )
 
@@ -304,7 +387,6 @@ for row, (metric, title, cmap, vmin, vmax, asp) in enumerate(METRICS):
             fill = 0 if metric == "iterations" else np.nan
             arr  = slice_grid(col, metric, fill=fill)
 
-            # symmetric colormap for gap
             if metric == "gap_min_mm":
                 vabs = np.nanmax(np.abs(arr)) if not np.all(np.isnan(arr)) else 1.0
                 vmin_, vmax_ = -vabs, vabs
@@ -319,7 +401,6 @@ for row, (metric, title, cmap, vmin, vmax, asp) in enumerate(METRICS):
             annotate(ax, arr, fmt=fmt, nan_str="N/A" if mask else "0")
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-        # column header: show base_x value only on top row
         if row == 0:
             direction = "right" if BASE_X_VALS[col] > 0 else ("left" if BASE_X_VALS[col] < 0 else "centre")
             ax.set_title(
@@ -334,30 +415,13 @@ for row, (metric, title, cmap, vmin, vmax, asp) in enumerate(METRICS):
 fig1.tight_layout()
 fig1.savefig(out_heat, dpi=150, bbox_inches='tight')
 plt.close(fig1)
-log.info(f"Heatmaps saved → {out_heat}")
+log.info(f"Heatmaps saved -> {out_heat}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pair clustering helper
-#
-# Two (p1, p2) pairs are considered the "same grasp" if both thumb contact
-# points are within `tol` of each other AND both index contact points are
-# within `tol`.  We do a simple greedy merge rather than sklearn to keep
-# the dependency list minimal.
 # ─────────────────────────────────────────────────────────────────────────────
 def cluster_pairs(valid_records: list[dict], tol: float = 5e-3):
-    """
-    Group valid (p1, p2) pairs by proximity.
-
-    Returns a list of cluster dicts:
-        p1_mean   : (2,) mean thumb contact position
-        p2_mean   : (2,) mean index contact position
-        count     : int  number of solves in this cluster
-        mean_ik   : float  mean IK error across members (mm)
-        members   : list of record dicts
-        angle_deg : float  grasp axis angle (degrees from +X axis)
-        span_m    : float  distance |p1 - p2| (m)
-    """
     clusters: list[dict] = []
     for r in valid_records:
         p1, p2 = np.array(r['p1']), np.array(r['p2'])
@@ -367,7 +431,6 @@ def cluster_pairs(valid_records: list[dict], tol: float = 5e-3):
                     np.linalg.norm(p2 - cl['p2_mean']) < tol):
                 cl['members'].append(r)
                 n = len(cl['members'])
-                # incremental mean update
                 cl['p1_mean'] = cl['p1_mean'] + (p1 - cl['p1_mean']) / n
                 cl['p2_mean'] = cl['p2_mean'] + (p2 - cl['p2_mean']) / n
                 placed = True
@@ -378,7 +441,6 @@ def cluster_pairs(valid_records: list[dict], tol: float = 5e-3):
                 members=[r],
             ))
 
-    # compute derived fields
     for cl in clusters:
         cl['count']   = len(cl['members'])
         cl['mean_ik'] = float(np.mean([r['ik_err_mm'] for r in cl['members']]))
@@ -387,34 +449,32 @@ def cluster_pairs(valid_records: list[dict], tol: float = 5e-3):
         cl['angle_deg'] = float(np.degrees(np.arctan2(dy, dx)))
         cl['span_m']    = float(np.linalg.norm(cl['p2_mean'] - cl['p1_mean']))
 
-    clusters.sort(key=lambda c: -c['count'])   # most frequent first
+    clusters.sort(key=lambda c: -c['count'])
     return clusters
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIGURE 2 — Aggregate diagnostics  (all N runs pooled)
-# Layout: 4 rows × 2 cols
-#   [7a paired grasp scatter]  [7b angle histogram + pair table]
-#   [8  joint box plots — full width]
-#   [9  constraint violations — full width]
-#   [10 solve time — full width]
+# FIGURE 2 — Aggregate diagnostics
+#
+# Figure height reduced from 22 to 18 inches and height_ratios tightened to
+# remove the whitespace that previously appeared between the top row (7a/7b)
+# and the rows below it.
 # ─────────────────────────────────────────────────────────────────────────────
-fig2 = plt.figure(figsize=(22, 22))
+fig2 = plt.figure(figsize=(22, 18))   # was (22, 22)
 fig2.suptitle(
-    f"GraspPlanner — Aggregate Diagnostics  ({N} initial conditions: "
-    f"base_x({NX}) × base_y({NY}) × curl({NC}))\n"
+    f"GraspPlanner -- Aggregate Diagnostics  ({N} initial conditions: "
+    f"base_x({NX}) x base_y({NY}) x curl({NC}))\n"
     f"Object @ (x={obj_pos[0]:.3f}, y={obj_pos[1]:.3f}) m  "
-    f"[Y axis: +up / −down toward ground]",
+    f"[Y axis: +up / -down toward ground]",
     fontsize=12, fontweight='bold', y=1.00
 )
 
-gs2 = gridspec.GridSpec(4, 2, figure=fig2, hspace=0.60, wspace=0.35,
-                         height_ratios=[1.4, 0.9, 1.2, 1.0])
+gs2 = gridspec.GridSpec(4, 2, figure=fig2, hspace=0.55, wspace=0.35,
+                         height_ratios=[1.0, 0.8, 1.1, 0.9])  # was [1.4, 0.9, 1.2, 1.0]
 
 # ── 7a. Paired contact-point visualisation ───────────────────────────────────
 ax7a = fig2.add_subplot(gs2[0, 0])
 
-# object face
 rect7 = patches.Rectangle(
     (obj_pos[0] - obj_hx, obj_pos[1] - obj_hy),
     2*obj_hx, 2*obj_hy,
@@ -423,72 +483,72 @@ rect7 = patches.Rectangle(
 ax7a.add_patch(rect7)
 ax7a.plot(*obj_pos, 'k+', markersize=12, zorder=2)
 
-valid = [r for r in records if r['p1'] is not None]
+valid    = [r for r in records if r['p1'] is not None]
 clusters = cluster_pairs(valid, tol=5e-3)
 
 if clusters:
-    ik_vals  = np.array([c['mean_ik'] for c in clusters])
-    counts   = np.array([c['count']   for c in clusters])
-    norm7    = Normalize(vmin=0, vmax=max(ik_vals.max(), 0.1))
-    cmap7    = plt.cm.RdYlGn_r
-
-    # line-width and marker-size scale with frequency (sqrt for visual balance)
-    max_count = counts.max()
+    max_count       = max(c['count'] for c in clusters)
+    badge_positions = _stagger_badge_positions(clusters, badge_r=0.018)
+    legend_handles  = []
 
     for ci, cl in enumerate(clusters):
-        freq_scale = np.sqrt(cl['count'] / max_count)   # 0..1
-        lw   = 1.0 + 5.0 * freq_scale          # 1 px (rare) → 6 px (most frequent)
-        ms   = 40  + 160 * freq_scale           # small → large marker
-
-        col  = cmap7(norm7(cl['mean_ik']))
+        pair_color = PAIR_PALETTE[ci % len(PAIR_PALETTE)]
+        freq_scale = np.sqrt(cl['count'] / max_count)
+        lw   = 1.0 + 5.0 * freq_scale
+        ms   = 40  + 160 * freq_scale
         p1m, p2m = cl['p1_mean'], cl['p2_mean']
-        mid  = (p1m + p2m) / 2
+        bx_b, by_b = badge_positions[ci]
 
         # grasp axis line
         ax7a.plot([p1m[0], p2m[0]], [p1m[1], p2m[1]],
-                  color=col, linewidth=lw, alpha=0.85, zorder=3,
+                  color=pair_color, linewidth=lw, alpha=0.90, zorder=3,
                   solid_capstyle='round')
 
         # thumb (circle) and index (triangle) markers
-        ax7a.scatter(*p1m, color=col, marker='o', s=ms, zorder=4,
+        ax7a.scatter(*p1m, color=pair_color, marker='o', s=ms, zorder=4,
                      edgecolors='black', linewidths=0.8)
-        ax7a.scatter(*p2m, color=col, marker='^', s=ms, zorder=4,
+        ax7a.scatter(*p2m, color=pair_color, marker='^', s=ms, zorder=4,
                      edgecolors='black', linewidths=0.8)
 
-        # frequency badge at midpoint
-        ax7a.text(mid[0], mid[1], str(cl['count']),
+        # count badge -- sits on the axis line at the staggered position
+        ax7a.text(bx_b, by_b, str(cl['count']),
                   ha='center', va='center', fontsize=7,
                   fontweight='bold', color='white',
-                  bbox=dict(boxstyle='round,pad=0.15', facecolor=col,
-                            edgecolor='black', linewidth=0.5),
-                  zorder=5)
+                  bbox=dict(boxstyle='round,pad=0.22', facecolor=pair_color,
+                            edgecolor='black', linewidth=0.6),
+                  zorder=6)
 
-    # colourbar
-    sm7 = ScalarMappable(cmap=cmap7, norm=norm7)
-    sm7.set_array([])
-    plt.colorbar(sm7, ax=ax7a, fraction=0.046, pad=0.04,
-                 label='Mean IK error (mm)')
+        legend_handles.append(
+            Patch(facecolor=pair_color, edgecolor='black', linewidth=0.8,
+                  label=f"Pair {ci+1}  (n={cl['count']}, IK={cl['mean_ik']:.2f}mm)")
+        )
 
-    # legend for marker shapes
-    ax7a.scatter([], [], color='grey', marker='o', s=60,
-                 label='Thumb (p1)', edgecolors='k')
-    ax7a.scatter([], [], color='grey', marker='^', s=60,
-                 label='Index (p2)', edgecolors='k')
-    ax7a.plot([], [], color='grey', linewidth=3,
-              label='Grasp axis\n(width ∝ frequency)')
-    ax7a.legend(fontsize=7, loc='upper right', framealpha=0.9)
+    shape_handles = [
+        matplotlib.lines.Line2D([0], [0], marker='o', color='w',
+                                 markerfacecolor='grey', markeredgecolor='k',
+                                 markersize=7, label='Thumb (p1)'),
+        matplotlib.lines.Line2D([0], [0], marker='^', color='w',
+                                 markerfacecolor='grey', markeredgecolor='k',
+                                 markersize=7, label='Index (p2)'),
+        matplotlib.lines.Line2D([0], [0], color='grey', linewidth=3,
+                                 label='Grasp axis\n(width proportional to freq)'),
+    ]
+
+    # ax7a.legend(handles=legend_handles + shape_handles,
+    #             fontsize=7, loc='upper right', framealpha=0.9,
+    #             title='Grasp Pairs', title_fontsize=7)
 
 mg = 0.06
 ax7a.set_aspect('equal')
 ax7a.set_xlim(obj_pos[0]-obj_hx-mg, obj_pos[0]+obj_hx+mg)
 ax7a.set_ylim(obj_pos[1]-obj_hy-mg, obj_pos[1]+obj_hy+mg)
-ax7a.set_xlabel("X (m) — lateral", fontsize=8)
-ax7a.set_ylabel("Y (m) — vertical (+up/−down)", fontsize=8)
+ax7a.set_xlabel("X (m) -- lateral", fontsize=8)
+ax7a.set_ylabel("Y (m) -- vertical (+up/-down)", fontsize=8)
 ax7a.set_title(
-    f"7a. Paired Grasp Contact Points  (○=thumb  △=index)\n"
-    f"Line width & marker size ∝ frequency  |  Badge = # solves in cluster\n"
-    f"{len(valid)} valid solves → {len(clusters)} unique pairs  "
-    f"(cluster tol = 5 mm)",
+    f"7a. Paired Grasp Contact Points  (o=thumb  ^=index)\n"
+    f"Each color = distinct grasp pair  |  Width & size proportional to frequency\n"
+    f"{len(valid)} valid solves -> {len(clusters)} unique pairs  "
+    f"(tol=5 mm)  |  Badge = # solves (slid along axis to avoid overlap)",
     fontsize=9, fontweight='bold'
 )
 ax7a.grid(True, alpha=0.3)
@@ -498,25 +558,24 @@ ax7b = fig2.add_subplot(gs2[0, 1])
 
 if clusters:
     angles  = [c['angle_deg'] for c in clusters]
-    weights = [c['count']     for c in clusters]   # weight by frequency
+    weights = [c['count']     for c in clusters]
 
-    # histogram of grasp-axis angles, frequency-weighted
-    bins = np.linspace(-180, 180, 25)
-    n_hist, bin_edges = np.histogram(angles, bins=bins, weights=weights)
-    bin_centres = (bin_edges[:-1] + bin_edges[1:]) / 2
-    bar_colors_h = [cmap7(norm7(clusters[
-                        min(range(len(clusters)),
-                            key=lambda i: abs(clusters[i]['angle_deg'] - bc))
-                    ]['mean_ik']))
-                    for bc in bin_centres]
+    bins        = np.linspace(-180, 180, 25)
+    bin_centres = (bins[:-1] + bins[1:]) / 2
 
-    ax7b.bar(bin_centres, n_hist, width=np.diff(bin_edges),
-             color=bar_colors_h, alpha=0.80, edgecolor='white', linewidth=0.4)
+    def nearest_pair_color(bc):
+        idx = min(range(len(clusters)),
+                  key=lambda i: abs(clusters[i]['angle_deg'] - bc))
+        return PAIR_PALETTE[idx % len(PAIR_PALETTE)]
 
-    # reference lines for cardinal directions
+    n_hist, _ = np.histogram(angles, bins=bins, weights=weights)
+    bar_colors_h = [nearest_pair_color(bc) for bc in bin_centres]
+
+    ax7b.bar(bin_centres, n_hist, width=np.diff(bins),
+             color=bar_colors_h, alpha=0.85, edgecolor='white', linewidth=0.4)
+
     for ang, lbl in [(0, '+X\n(right)'), (90, '+Y\n(up)'),
-                     (-90, '−Y\n(down)'), (180, '−X\n(left)'),
-                     (-180, '')]:
+                     (-90, '-Y\n(down)'), (180, '-X\n(left)'), (-180, '')]:
         ax7b.axvline(ang, color='gray', linewidth=0.8, linestyle=':', alpha=0.6)
         if lbl:
             ax7b.text(ang, ax7b.get_ylim()[1] if ax7b.get_ylim()[1] > 0 else 1,
@@ -527,11 +586,10 @@ if clusters:
     ax7b.set_xlim(-180, 180)
     ax7b.set_xticks(np.arange(-180, 181, 45))
 
-    # ── pair frequency table (inset below histogram) ─────────────────────────
-    # top-8 pairs by frequency
+    # pair frequency table
     top_n = min(8, len(clusters))
     col_labels = ['Rank', 'Count', '%', 'p1 (x,y) m', 'p2 (x,y) m',
-                  'Span mm', 'Angle °', 'IK err mm']
+                  'Span mm', 'Angle', 'IK err mm']
     table_data = []
     total_valid = len(valid)
     for rank, cl in enumerate(clusters[:top_n], start=1):
@@ -550,7 +608,7 @@ if clusters:
         cellText=table_data,
         colLabels=col_labels,
         loc='bottom',
-        bbox=[0.0, -0.90, 1.0, 0.80],   # [left, bottom, width, height] in axes coords
+        bbox=[0.0, -0.90, 1.0, 0.80],
     )
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(7)
@@ -560,13 +618,17 @@ if clusters:
             cell.set_facecolor('#2c3e50')
             cell.set_text_props(color='white', fontweight='bold')
         elif row % 2 == 0:
-            cell.set_facecolor('#f2f2f2')
+            pair_idx = row - 1
+            base_col = matplotlib.colors.to_rgba(
+                PAIR_PALETTE[pair_idx % len(PAIR_PALETTE)])
+            tinted = (*base_col[:3], 0.18)
+            cell.set_facecolor(tinted)
         else:
             cell.set_facecolor('white')
 
     ax7b.set_title(
         "7b. Grasp Axis Angle Distribution\n"
-        "(bar height = frequency-weighted count)\n"
+        "(bar color matches pair color in 7a)\n"
         f"Top-{top_n} pairs by frequency (table below)",
         fontsize=9, fontweight='bold'
     )
@@ -575,7 +637,7 @@ else:
               ha='center', va='center', fontsize=12)
     ax7b.set_title("7b. Grasp Axis Angle Distribution", fontsize=9, fontweight='bold')
 
-# ── 8. Joint angle box plots  (row 1, full width) ────────────────────────────
+# ── 8. Joint angle box plots ─────────────────────────────────────────────────
 ax8 = fig2.add_subplot(gs2[1, :])
 
 all_q = [r['q_final'] for r in records if r['q_final'] is not None]
@@ -607,7 +669,7 @@ else:
              ha='center', va='center', fontsize=12)
     ax8.set_title("8. Final Joint Angles", fontsize=9, fontweight='bold')
 
-# ── 9. Constraint violations  (row 2, full width) ────────────────────────────
+# ── 9. Constraint violations ──────────────────────────────────────────────────
 ax9  = fig2.add_subplot(gs2[2, :])
 
 bw   = 0.16
@@ -635,7 +697,7 @@ ax9b.plot(xpos, safe(gap_t_v), 'v--', color='#8e44ad', alpha=0.8,
 ax9b.plot(xpos, safe(gap_i_v), '^--', color='#9b59b6', alpha=0.8,
           label='gap index (mm)', markersize=4)
 ax9b.axhline(0, color='gray', linewidth=0.8, linestyle=':')
-ax9b.set_ylabel("Gap (mm)  [+ = clear  |  − = penetrating]", fontsize=8)
+ax9b.set_ylabel("Gap (mm)  [+ = clear  |  - = penetrating]", fontsize=8)
 ax9b.tick_params(axis='y', labelsize=7)
 
 for ix in range(NX):
@@ -657,7 +719,7 @@ l1, b1 = ax9.get_legend_handles_labels()
 l2, b2 = ax9b.get_legend_handles_labels()
 ax9.legend(l1+l2, b1+b2, fontsize=7, loc='upper right', ncol=3, frameon=True)
 
-# ── 10. Solve time  (row 3, full width) ──────────────────────────────────────
+# ── 10. Solve time ────────────────────────────────────────────────────────────
 ax10 = fig2.add_subplot(gs2[3, :])
 
 bar_colors = [STATUS_COLOR[r['status']] for r in records]
@@ -684,7 +746,7 @@ ax10.legend(handles=[
     Patch(facecolor='#e74c3c', label='Failed'),
 ], fontsize=8, loc='upper left')
 
-# ── Summary footer ────────────────────────────────────────────────────────────
+# ── Summary footer ─────────────────────────────────────────────────────────────
 n_conv  = sum(1 for r in records if r['status'] == 'converged')
 n_best  = sum(1 for r in records if r['status'] == 'best-effort')
 n_fail  = sum(1 for r in records if r['status'] == 'failed')
@@ -705,4 +767,4 @@ fig2.text(0.5, -0.005,
 fig2.tight_layout()
 fig2.savefig(out_aggr, dpi=150, bbox_inches='tight')
 plt.close(fig2)
-log.info(f"Aggregate saved  → {out_aggr}")
+log.info(f"Aggregate saved  -> {out_aggr}")

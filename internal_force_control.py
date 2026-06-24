@@ -165,6 +165,8 @@ if __name__ == "__main__":
         path = planner.plan(q_safe, q_pregrasp)
         if path is None:
             print("\r\n[RRT] Planning failed — falling back to pregrasp direct reach")
+            for i, o in enumerate(objects):
+                print(f"         obj{i+1} pos: {data.xpos[o['id_body']][:2]}")
             _plan_result['waypoints'] = [q_pregrasp]
         else:
             # Prepend densified departure segment (q_start → q_safe).
