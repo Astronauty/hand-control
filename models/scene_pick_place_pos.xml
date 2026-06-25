@@ -1,0 +1,27 @@
+<mujoco model="kinova_leap pick-place scene (position control)">
+  <!-- Position-servo variant of scene_pick_place.xml for RRT path-following tests.
+       Uses kinova_leap_pos.xml (position actuators) instead of kinova_leap.xml (motors),
+       so data.ctrl drives joint-position targets directly without needing qfrc_applied. -->
+  <include file="scene_kinova_leap_pos.xml"/>
+
+  <worldbody>
+    <geom name="pick_area_marker" type="cylinder" size="0.12 0.0005" pos="0.45 0.25 0.001"
+      rgba="0.6 0.6 0.6 0.35" contype="0" conaffinity="0"/>
+
+    <body name="obj_box" pos="0.40 0.22 0.03">
+      <freejoint/>
+      <geom name="obj_box_geom" type="box" size="0.03 0.03 0.03" rgba="0.8 0.2 0.2 1"
+        mass="0.05" friction="1 0.05 0.001" condim="3"/>
+      <site name="obj_box_c1" pos="-0.03 0 0" quat="1 0 0 0"/>
+      <site name="obj_box_c2" pos="0.03 0 0" quat="0 0 1 0"/>
+    </body>
+
+    <body name="obj_cylinder" pos="0.45 0.25 0.025">
+      <freejoint/>
+      <geom name="obj_cylinder_geom" type="cylinder" size="0.025 0.025" rgba="0.2 0.7 0.2 1"
+        mass="0.05" friction="1 0.05 0.001" condim="3"/>
+      <site name="obj_cylinder_c1" pos="-0.025 0 0" quat="1 0 0 0"/>
+      <site name="obj_cylinder_c2" pos="0.025 0 0" quat="0 0 1 0"/>
+    </body>
+  </worldbody>
+</mujoco>

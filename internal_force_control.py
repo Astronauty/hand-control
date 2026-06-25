@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # All variable naming notation follows https://drake.mit.edu/doxygen_cxx/group__multibody__quantities.html
 import numpy as np
-import scipy.linalg
 import time
 import threading
 import queue
@@ -11,56 +10,7 @@ import mujoco.viewer  # noqa: F401
 from pynput import keyboard as _pynput_kb
 
 from scripts.rrt_planner import RRTPlanner
-
-
-def planar_hat_map(a):
-    return np.array([[0, -a], [a, 0]])
-
-
-def planar_grasp_map_PCWF(p_S1_O, p_S2_O, R_S1, R_S2):
-    """Maps stacked contact forces [f1; f2] in respective contact frames to
-    a wrench [fx, fy, tau_z] on the object in the object frame.
-
-    Args:
-        p_S1_O: Contact site 1 position relative to object center in object frame
-        p_S2_O: Contact site 2 position relative to object center in object frame
-        R_S1: Rotation of contact frame 1 relative to object frame
-        R_S2: Rotation of contact frame 2 relative to object frame
-    """
-    G_1 = np.array([
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [-p_S1_O[1], p_S1_O[0]],
-    ]) @ R_S1
-
-    G_2 = np.array([
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [-p_S2_O[1], p_S2_O[0]],
-    ]) @ R_S2
-
-    return np.block([G_1, G_2])
-
-
-def solve_ik(model, data, id_C1, id_C2, p_S1_target, p_S2_target, n_robot=8):
-    """Damped-least-squares IK over the first n_robot joints only.
-    Object joints beyond n_robot are left unchanged. Returns n_robot-length q."""
-    q = data.qpos[:n_robot].copy()
-    for _ in range(500):
-        mj.mj_kinematics(model, data)
-        mj.mj_comPos(model, data)
-        err = np.concatenate([p_S1_target - data.site_xpos[id_C1][:2],
-                               p_S2_target - data.site_xpos[id_C2][:2]])
-        if np.linalg.norm(err) < 1e-3:
-            break
-        J1, J2 = np.zeros((3, model.nv)), np.zeros((3, model.nv))
-        mj.mj_jacSite(model, data, J1, None, id_C1)
-        mj.mj_jacSite(model, data, J2, None, id_C2)
-        J  = np.vstack([J1[:2, :n_robot], J2[:2, :n_robot]])
-        dq = J.T @ np.linalg.inv(J @ J.T + 0.01 * np.eye(4)) @ err
-        q += 0.5 * dq
-        data.qpos[:n_robot] = q
-    return q
+from grasp_control import PlanarGraspMapComputer, PlanarIKSolver, GraspForceAllocator
 
 
 def make_key_callback(key_queue):
@@ -115,11 +65,15 @@ if __name__ == "__main__":
         obj['p_S2_W'] = data.site_xpos[obj['id_S2']][:2].copy()
         objects.append(obj)
 
+    ik_solver = PlanarIKSolver(n_robot=N_ROBOT)
+    grasp_map_computer = PlanarGraspMapComputer()
+
     # Solve IK for each object — grasp and pregrasp configs
     for i, obj in enumerate(objects):
         mj.mj_resetData(model, data)
         mj.mj_forward(model, data)
-        obj['q_target'] = solve_ik(model, data, id_C1, id_C2, obj['p_S1_W'], obj['p_S2_W'])
+        obj['q_target'] = ik_solver.solve(model, data, [id_C1, id_C2],
+                                           [obj['p_S1_W'], obj['p_S2_W']])
 
         # Contact-face normals: vector from box center to each contact site (normalised).
         p_box = data.xpos[obj['id_body']][:2]
@@ -130,9 +84,9 @@ if __name__ == "__main__":
         # This gives a side approach (along normal) instead of top-down, avoiding corner clips.
         mj.mj_resetData(model, data)
         mj.mj_forward(model, data)
-        obj['q_pregrasp'] = solve_ik(model, data, id_C1, id_C2,
-                                     obj['p_S1_W'] + PREGRASP_OFFSET * n1,
-                                     obj['p_S2_W'] + PREGRASP_OFFSET * n2)
+        obj['q_pregrasp'] = ik_solver.solve(model, data, [id_C1, id_C2],
+                                            [obj['p_S1_W'] + PREGRASP_OFFSET * n1,
+                                             obj['p_S2_W'] + PREGRASP_OFFSET * n2])
         print(f"Object {i+1} q_target:   {obj['q_target']}")
         print(f"Object {i+1} q_pregrasp: {obj['q_pregrasp']}")
 
@@ -147,6 +101,7 @@ if __name__ == "__main__":
     Kp_contact = 100.0   # weak per-finger slip-correction stiffness, N/m (GRASP)
     Kd_contact = 10.0   # weak per-finger slip-correction damping, N·s/m (GRASP)
     gamma   = 50.0    # internal squeeze force scale; negate if fingers pull apart
+    force_allocator = GraspForceAllocator(gamma)
 
     FINGER_GEOMS = ['index_proximal', 'index_medial', 'index_distal',
                     'thumb_proximal', 'thumb_medial', 'thumb_distal']
@@ -345,14 +300,13 @@ if __name__ == "__main__":
                 R_OS1   = R_WO_cur.T @ R_WS1_cur
                 R_OS2   = R_WO_cur.T @ R_WS2_cur
 
-                G_cur      = planar_grasp_map_PCWF(p_OS1_O, p_OS2_O, R_OS1, R_OS2)
-                G_null_cur = scipy.linalg.null_space(G_cur).flatten()
-                # scipy SVD sign is arbitrary. Enforce inward (compressive) squeeze:
-                # the finger-1 null-space component should point toward the box center,
-                # i.e. dot(G_null[:2], inward_direction_in_contact_frame) > 0.
+                G_cur = grasp_map_computer.compute([
+                    {'p': p_OS1_O, 'R': R_OS1},
+                    {'p': p_OS2_O, 'R': R_OS2},
+                ])
+                # Inward (compressive) squeeze direction, anchored at contact 1: the
+                # finger-1 null-space component should point toward the box center.
                 inward_c1 = R_OS1.T @ (-p_OS1_O / np.linalg.norm(p_OS1_O))
-                if np.dot(G_null_cur[:2], inward_c1) < 0:
-                    G_null_cur = -G_null_cur
 
                 # Fingertip Jacobians (world frame, 2D) — restrict to robot DOF columns
                 J1_full, J2_full = np.zeros((3, model.nv)), np.zeros((3, model.nv))
@@ -376,13 +330,14 @@ if __name__ == "__main__":
                 omega_obj = Jr_o[2]  @ data.qvel
 
                 # Desired object wrench (world-frame force, scalar moment), rotated into
-                # the object frame to match planar_grasp_map_PCWF's convention.
+                # the object frame to match PlanarGraspMapComputer's convention.
                 f_des_W = Kp_obj * e_p + Kd_obj * (-v_obj)
                 m_des   = Kp_theta * e_theta + Kd_theta * (-omega_obj)
                 w_des_O = np.concatenate([R_WO_cur.T @ f_des_W, [m_des]])
 
                 # Allocate desired wrench to contact forces (min-norm) + null-space squeeze
-                f_c = np.linalg.pinv(G_cur) @ w_des_O + gamma * G_null_cur
+                f_c = force_allocator.allocate(G_cur, w_des_O, contact_dof=2,
+                                                inward_dirs=[inward_c1, None])
 
                 # Low-gain hybrid contact correction: resists slip without overpowering
                 # the wrench-allocated motion above (compare Kp_contact to old Kp_cart=50).

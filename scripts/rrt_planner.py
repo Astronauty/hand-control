@@ -23,6 +23,7 @@ class RRTPlanner:
         densify_spacing=0.02,
         smooth_sigma=3.0,
         n_robot=None,
+        n_plan=None,
     ):
         self.model = model
         self.step_size = step_size
@@ -35,6 +36,11 @@ class RRTPlanner:
         self.smooth_sigma = smooth_sigma
         # Restrict planning to the first n_robot joints; objects occupy the rest.
         self._n_robot = n_robot if n_robot is not None else model.nv
+        # Only randomise the first n_plan joints during sampling; the remaining joints
+        # (typically hand DOF) are fixed at the goal values in every random sample and
+        # are excluded from nearest-neighbour distance so the high-dimensional finger
+        # space doesn't swamp the lower-dimensional arm space.
+        self._n_plan = n_plan if n_plan is not None else self._n_robot
 
         self._data = mujoco.MjData(model)
         self._q_lo = model.jnt_range[:self._n_robot, 0].copy()
@@ -80,9 +86,8 @@ class RRTPlanner:
     # Tree operations
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _nearest_idx(nodes_arr, q):
-        diffs = nodes_arr - q
+    def _nearest_idx(self, nodes_arr, q):
+        diffs = nodes_arr[:, :self._n_plan] - q[:self._n_plan]
         return int(np.argmin((diffs * diffs).sum(axis=1)))
 
     def _steer(self, q_from, q_to):
@@ -183,7 +188,17 @@ class RRTPlanner:
         b_nodes, b_arr, b_par = g_nodes, g_arr, g_par
 
         for _ in range(self.max_iter):
-            q_rand = np.random.uniform(self._q_lo, self._q_hi)
+            # Goal-biased sampling: with probability goal_bias, pull toward the opposite
+            # tree's root rather than a random config — the main driver of convergence on
+            # high-DOF chains where pure-random sampling rarely lands near the other tree.
+            if np.random.random() < self.goal_bias:
+                q_rand = b_nodes[0].copy()
+            else:
+                # Non-planned joints (e.g. hand DOF) are fixed at goal values in every
+                # random sample so only the arm joints vary during tree expansion.
+                q_rand = q_goal.copy()
+                q_rand[:self._n_plan] = np.random.uniform(
+                    self._q_lo[:self._n_plan], self._q_hi[:self._n_plan])
 
             status, q_new = self._extend(a_nodes, a_arr, a_par, q_rand)
             if status != "trapped":

@@ -13,3 +13,5 @@ source .venv/bin/activate
 run ui/mediapipe_joint_angles.py
 
 
+## Pull MuJoCo Menagerie Models
+git submodule update --init --recursive

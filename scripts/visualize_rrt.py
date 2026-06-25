@@ -18,7 +18,7 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 
-from rrt_planner import RRTPlanner
+from scripts.rrt_planner import RRTPlanner
 
 
 # ── Must match internal_force_control.py ─────────────────────────────────────

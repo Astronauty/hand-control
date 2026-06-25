@@ -1,0 +1,51 @@
+<mujoco model="kinova_leap pick-place scene">
+  <include file="scene_kinova_leap.xml"/>
+
+  <worldbody>
+    <!-- Pick area: reference marker (visual only) -->
+    <geom name="pick_area_marker" type="cylinder" size="0.12 0.0005" pos="0.45 0.25 0.001"
+      rgba="0.6 0.6 0.6 0.35" contype="0" conaffinity="0"/>
+
+    <!-- Objects, clustered in the pick area -->
+    <body name="obj_box" pos="0.40 0.22 0.03">
+      <freejoint/>
+      <geom name="obj_box_geom" type="box" size="0.03 0.03 0.03" rgba="0.8 0.2 0.2 1"
+        mass="0.05" friction="1 0.05 0.001" condim="3"/>
+      <!-- Antipodal contact sites on the +-x faces, for a 2-finger pinch grasp.
+           Site quat encodes the contact frame: column 0 (local x-axis) is the inward
+           (compressive) surface normal, matching scripts/spatial_grasp_map.py's convention. -->
+      <site name="obj_box_c1" pos="-0.03 0 0" quat="1 0 0 0"/>
+      <site name="obj_box_c2" pos="0.03 0 0" quat="0 0 1 0"/>
+    </body>
+
+    <body name="obj_cylinder" pos="0.45 0.25 0.025">
+      <freejoint/>
+      <geom name="obj_cylinder_geom" type="cylinder" size="0.025 0.025" rgba="0.2 0.7 0.2 1"
+        mass="0.05" friction="1 0.05 0.001" condim="3"/>
+      <!-- Antipodal contact sites on the curved surface at mid-height, same inward-normal
+           convention as obj_box's contact sites. -->
+      <site name="obj_cylinder_c1" pos="-0.025 0 0" quat="1 0 0 0"/>
+      <site name="obj_cylinder_c2" pos="0.025 0 0" quat="0 0 1 0"/>
+    </body>
+
+    <!-- Deformable object: soft cube via flexcomp (native MuJoCo, no plugin) -->
+    <flexcomp name="obj_soft" type="grid" count="3 3 3" spacing="0.018 0.018 0.018"
+      pos="0.50 0.28 0.05" dim="3" radius="0.004" mass="0.05" rgba="0.2 0.4 0.9 1">
+      <edge equality="true" solref="0.005 1"/>
+      <contact selfcollide="none" condim="3" solref="0.01 1"/>
+    </flexcomp>
+
+    <!-- Place areas, one per object, color-matched, spread away from the pick area -->
+    <site name="place_box_site" pos="0.45 -0.15 0.001" size="0.001"/>
+    <geom name="place_box_marker" type="box" size="0.035 0.035 0.0005" pos="0.45 -0.15 0.001"
+      rgba="0.8 0.2 0.2 0.35" contype="0" conaffinity="0"/>
+
+    <site name="place_cylinder_site" pos="0.55 -0.15 0.001" size="0.001"/>
+    <geom name="place_cylinder_marker" type="cylinder" size="0.03 0.0005" pos="0.55 -0.15 0.001"
+      rgba="0.2 0.7 0.2 0.35" contype="0" conaffinity="0"/>
+
+    <site name="place_soft_site" pos="0.50 -0.30 0.001" size="0.001"/>
+    <geom name="place_soft_marker" type="box" size="0.04 0.04 0.0005" pos="0.50 -0.30 0.001"
+      rgba="0.2 0.4 0.9 0.35" contype="0" conaffinity="0"/>
+  </worldbody>
+</mujoco>
