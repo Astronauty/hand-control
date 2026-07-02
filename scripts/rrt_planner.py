@@ -14,6 +14,7 @@ class RRTPlanner:
         model,
         finger_geom_names,
         obj_body_names,
+        extra_obj_geom_names=(),
         step_size=0.05,
         goal_bias=0.1,
         goal_tol=0.05,
@@ -45,6 +46,7 @@ class RRTPlanner:
         self._data = mujoco.MjData(model)
         self._q_lo = model.jnt_range[:self._n_robot, 0].copy()
         self._q_hi = model.jnt_range[:self._n_robot, 1].copy()
+        self._ignore_pairs = frozenset()   # (finger_gid, obj_gid) pairs allowed to touch; set per plan()
 
         self._finger_geoms = [
             mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
@@ -57,6 +59,10 @@ class RRTPlanner:
             start = model.body_geomadr[body_id]
             for i in range(model.body_geomnum[body_id]):
                 self._obj_geoms.append(start + i)
+        # Extra individual obstacle geoms by name (e.g. the ground plane, which lives on
+        # the world body alongside unrelated visual markers we don't want to sweep in).
+        for gname in extra_obj_geom_names:
+            self._obj_geoms.append(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, gname))
 
     # ------------------------------------------------------------------
     # Collision checking
@@ -68,6 +74,12 @@ class RRTPlanner:
         fromto = np.zeros(6)
         for fg in self._finger_geoms:
             for og in self._obj_geoms:
+                # Skip (finger_geom, obj_geom) pairs the caller allows to touch — e.g. the
+                # active fingertips vs the object they're deliberately approaching, so a
+                # close pregrasp goal isn't self-disqualified. All other pairs (non-active
+                # fingers, active tips vs *other* objects) are still enforced.
+                if (fg, og) in self._ignore_pairs:
+                    continue
                 if mujoco.mj_geomDistance(self.model, self._data, fg, og, 10.0, fromto) < self.clearance:
                     return False
         return True
@@ -169,7 +181,11 @@ class RRTPlanner:
     # Public API
     # ------------------------------------------------------------------
 
-    def plan(self, q_start, q_goal):
+    def geom_id(self, name):
+        """Look up a geom id by name (helper for building ignore_pairs at the call site)."""
+        return mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+
+    def plan(self, q_start, q_goal, ignore_pairs=frozenset()):
         """
         Plan a collision-free joint-space path from q_start to q_goal.
         Uses RRT-Connect (bidirectional) for reliability.
@@ -177,7 +193,13 @@ class RRTPlanner:
 
         q_start is trusted to be collision-free (not checked).
         q_goal should be clearly in free space (e.g. a pre-grasp config).
+
+        ignore_pairs : set of (finger_geom_id, obj_geom_id) pairs to exclude from
+                       collision checking for this plan — use it to let the active
+                       fingertips approach (touch) the target object so a close pregrasp
+                       goal is admissible, without disabling any other pair.
         """
+        self._ignore_pairs = frozenset(ignore_pairs)
         # Stable references to start/goal trees — names never change even after swap.
         s_nodes, s_arr, s_par = [q_start.copy()], [np.array([q_start])], [-1]
         g_nodes, g_arr, g_par = [q_goal.copy()],  [np.array([q_goal])],  [-1]

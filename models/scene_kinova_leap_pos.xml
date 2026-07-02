@@ -16,6 +16,11 @@
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
   </asset>
 
+  <!-- Exclude the base_link/shoulder_link self-contact (inherent to gen3 mesh geoms at home pose). -->
+  <contact>
+    <exclude body1="base_link" body2="shoulder_link"/>
+  </contact>
+
   <worldbody>
     <light pos="0 0 1.5" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
