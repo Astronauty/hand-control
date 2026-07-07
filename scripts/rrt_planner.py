@@ -46,12 +46,41 @@ class RRTPlanner:
         self._data = mujoco.MjData(model)
         self._q_lo = model.jnt_range[:self._n_robot, 0].copy()
         self._q_hi = model.jnt_range[:self._n_robot, 1].copy()
-        self._ignore_pairs = frozenset()   # (finger_gid, obj_gid) pairs allowed to touch; set per plan()
+        self._pair_clearance = {}   # (finger_gid, obj_gid) -> clearance override; set per plan()
+
+        # Continuous (unlimited) revolute joints within the planned range live on a circle
+        # (S^1): theta and theta+-2pi are the same configuration. Mark them so distance,
+        # steering, and edge interpolation take the SHORT arc across the +-pi seam instead
+        # of unwinding a near-full turn. Keyed off the model (hinge + not limited) rather
+        # than hardcoded indices.
+        self._circular = np.zeros(self._n_robot, dtype=bool)
+        for j in range(model.njnt):
+            adr = model.jnt_qposadr[j]
+            if (adr < self._n_plan
+                    and model.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE
+                    and not model.jnt_limited[j]):
+                self._circular[adr] = True
+        # Unlimited joints compile with jnt_range == [0, 0], so sampling uniform(lo, hi)
+        # would pin every circular joint to exactly 0 in every random sample — the planner
+        # would only ever explore the limited joints (3 of the Gen3's 7) plus goal-bias
+        # pulls. Sample circular joints over a full turn instead; with the wrap-aware
+        # metric/steer any 2pi branch is equivalent, so [-pi, pi) covers the whole circle.
+        self._q_lo[self._circular] = -np.pi
+        self._q_hi[self._circular] = np.pi
 
         self._finger_geoms = [
             mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
             for name in finger_geom_names
         ]
+        # Bounding-sphere radii for the broadphase prefilter in _is_free: the exact
+        # distance can never be below ||c1-c2|| - rb1 - rb2, so pairs whose sphere bound
+        # already clears the threshold skip mj_geomDistance entirely. Besides the speedup,
+        # this guards against a MuJoCo 3.3.x GJK instability where mj_geomDistance
+        # spuriously returns 0.0 for well-SEPARATED box-box pairs at near-face-parallel
+        # poses (flips with a 1-ulp qpos change) — those phantom "contacts" rejected huge
+        # swaths of genuinely free space and starved the planner. Planes have rbound == 0
+        # (no bounding sphere), so plane pairs always take the exact query.
+        self._rbound = model.geom_rbound.copy()
 
         self._obj_geoms = []
         for body_name in obj_body_names:
@@ -72,21 +101,64 @@ class RRTPlanner:
         self._data.qpos[:self._n_robot] = q   # only set robot DOFs; objects stay at snapshot
         mujoco.mj_kinematics(self.model, self._data)
         fromto = np.zeros(6)
+        xpos = self._data.geom_xpos
         for fg in self._finger_geoms:
+            rb_f = self._rbound[fg]
+            p_f  = xpos[fg]
             for og in self._obj_geoms:
-                # Skip (finger_geom, obj_geom) pairs the caller allows to touch — e.g. the
-                # active fingertips vs the object they're deliberately approaching, so a
-                # close pregrasp goal isn't self-disqualified. All other pairs (non-active
-                # fingers, active tips vs *other* objects) are still enforced.
-                if (fg, og) in self._ignore_pairs:
-                    continue
-                if mujoco.mj_geomDistance(self.model, self._data, fg, og, 10.0, fromto) < self.clearance:
+                # Per-pair clearance override — e.g. the active fingertips vs the object
+                # they're deliberately approaching get 0.0 so a close pregrasp goal isn't
+                # self-disqualified. Unlike the old boolean ignore, the distance is still
+                # CHECKED: the pair may come as close as its override but never deeper, so
+                # an exempted finger can touch yet cannot sweep through the object.
+                clr = self._pair_clearance.get((fg, og), self.clearance)
+                # Bounding-sphere prefilter (see __init__): skip the exact query when the
+                # sphere lower bound already clears clr. rbound==0 means "no sphere"
+                # (planes) — always take the exact query then.
+                rb_o = self._rbound[og]
+                if rb_f > 0 and rb_o > 0:
+                    lb = np.linalg.norm(xpos[og] - p_f) - rb_f - rb_o
+                    if lb >= clr:
+                        continue
+                if mujoco.mj_geomDistance(self.model, self._data, fg, og, 10.0, fromto) < clr:
                     return False
         return True
 
+    def _wrap_diff(self, d):
+        """Wrap the circular-joint components of a difference vector into [-pi, pi] (the
+        short arc). Operates on the last axis, so it handles both a single delta (n_robot,)
+        and a stack of diffs (N, n_plan)."""
+        d = np.array(d, dtype=float)
+        m = self._circular[:d.shape[-1]]
+        if m.any():
+            d[..., m] = (d[..., m] + np.pi) % (2 * np.pi) - np.pi
+        return d
+
+    def rebranch(self, q_ref, q):
+        """Return q with its circular joints shifted onto the 2pi branch nearest q_ref
+        (within +-pi). Same physical configuration, but the numeric values no longer force
+        a near-full turn relative to q_ref. Use on the goal before planning."""
+        q = np.asarray(q, dtype=float).copy()
+        m = self._circular[:q.shape[0]]
+        q[m] = np.asarray(q_ref)[m] + self._wrap_diff(q - np.asarray(q_ref))[m]
+        return q
+
+    def _unwrap_path(self, path):
+        """Remove 2pi jumps on circular joints along the path (np.unwrap per joint) so the
+        stored waypoints are continuous — the connection between the two trees can meet at
+        configs equal mod 2pi but 2pi apart numerically, and every downstream consumer
+        (densify, gaussian smooth, the waypoint follower, ghost markers) interpolates
+        LINEARLY, which would otherwise re-introduce the long way around."""
+        if not self._circular.any() or len(path) < 2:
+            return path
+        arr = np.array(path)
+        for i in np.nonzero(self._circular[:arr.shape[1]])[0]:
+            arr[:, i] = np.unwrap(arr[:, i])
+        return [row.copy() for row in arr]
+
     def _edge_free(self, q_a, q_b):
         """Check strictly interior points of edge (endpoints trusted by caller)."""
-        delta = q_b - q_a
+        delta = self._wrap_diff(q_b - q_a)   # short-arc on circular joints
         # Sample at 0.25× step_size intervals for tighter coverage.
         n_steps = max(2, int(np.ceil(np.linalg.norm(delta) / (0.25 * self.step_size))))
         for i in range(1, n_steps):
@@ -99,13 +171,15 @@ class RRTPlanner:
     # ------------------------------------------------------------------
 
     def _nearest_idx(self, nodes_arr, q):
-        diffs = nodes_arr[:, :self._n_plan] - q[:self._n_plan]
+        diffs = self._wrap_diff(nodes_arr[:, :self._n_plan] - q[:self._n_plan])
         return int(np.argmin((diffs * diffs).sum(axis=1)))
 
     def _steer(self, q_from, q_to):
-        delta = q_to - q_from
+        delta = self._wrap_diff(q_to - q_from)   # shortest arc on circular joints
         d = np.linalg.norm(delta)
-        return q_to.copy() if d <= self.step_size else q_from + delta / d * self.step_size
+        # Move along the (wrapped) delta; on circular joints the result may leave [-pi, pi],
+        # which is fine (those joints are unlimited) and is resolved by _unwrap_path at the end.
+        return q_from + delta if d <= self.step_size else q_from + delta / d * self.step_size
 
     def _extend(self, nodes, arr_ref, parents, q_target):
         """One RRT step toward q_target. Returns ('reached'|'advanced'|'trapped', q_new)."""
@@ -115,8 +189,9 @@ class RRTPlanner:
             nodes.append(q_new)
             arr_ref[0] = np.vstack([arr_ref[0], q_new])
             parents.append(idx)
-            status = "reached" if np.linalg.norm(q_new - q_target) < 1e-9 else "advanced"
-            return status, q_new
+            # Wrap-aware reached test: q_new can equal q_target mod 2pi but differ by 2pi.
+            reached = np.linalg.norm(self._wrap_diff(q_new - q_target)[:self._n_plan]) < 1e-9
+            return ("reached" if reached else "advanced"), q_new
         return "trapped", None
 
     def _connect(self, nodes, arr_ref, parents, q_target):
@@ -182,10 +257,37 @@ class RRTPlanner:
     # ------------------------------------------------------------------
 
     def geom_id(self, name):
-        """Look up a geom id by name (helper for building ignore_pairs at the call site)."""
+        """Look up a geom id by name (helper for building pair_clearance at the call site)."""
         return mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
 
-    def plan(self, q_start, q_goal, ignore_pairs=frozenset()):
+    def _endpoint_grace(self, q):
+        """Relax the clearance of any pair that already violates it at endpoint q (which the
+        caller commits to regardless — the arm may still hug the object it just released at
+        q_start, and the IK can leave an active fingertip marginally inside its allowance at
+        q_goal). The pair's clearance drops to just under its distance at q, so the endpoint
+        is admissible and the pair can move AWAY freely, but can never get any deeper than
+        it already is. Pairs satisfying their clearance at q are untouched."""
+        self._data.qpos[:self._n_robot] = q
+        mujoco.mj_kinematics(self.model, self._data)
+        fromto = np.zeros(6)
+        xpos = self._data.geom_xpos
+        for fg in self._finger_geoms:
+            rb_f = self._rbound[fg]
+            p_f  = xpos[fg]
+            for og in self._obj_geoms:
+                req = self._pair_clearance.get((fg, og), self.clearance)
+                # Same bounding-sphere prefilter as _is_free: a pair whose sphere lower
+                # bound clears its requirement can't need grace (and the exact query is
+                # the one vulnerable to phantom 0.0 results — see __init__).
+                rb_o = self._rbound[og]
+                if rb_f > 0 and rb_o > 0 and \
+                        np.linalg.norm(xpos[og] - p_f) - rb_f - rb_o >= req:
+                    continue
+                d = mujoco.mj_geomDistance(self.model, self._data, fg, og, 10.0, fromto)
+                if d < req:
+                    self._pair_clearance[(fg, og)] = d - 1e-4
+
+    def plan(self, q_start, q_goal, pair_clearance=None):
         """
         Plan a collision-free joint-space path from q_start to q_goal.
         Uses RRT-Connect (bidirectional) for reliability.
@@ -194,12 +296,16 @@ class RRTPlanner:
         q_start is trusted to be collision-free (not checked).
         q_goal should be clearly in free space (e.g. a pre-grasp config).
 
-        ignore_pairs : set of (finger_geom_id, obj_geom_id) pairs to exclude from
-                       collision checking for this plan — use it to let the active
-                       fingertips approach (touch) the target object so a close pregrasp
-                       goal is admissible, without disabling any other pair.
+        pair_clearance : dict {(finger_geom_id, obj_geom_id): clearance_m} overriding the
+                         default clearance per pair — use 0.0 to let the active fingertips
+                         approach (touch) the target object so a close pregrasp goal is
+                         admissible while still forbidding penetration. Pairs already closer
+                         than their clearance at q_start/q_goal are further relaxed to their
+                         endpoint distance (see _endpoint_grace), never below it.
         """
-        self._ignore_pairs = frozenset(ignore_pairs)
+        self._pair_clearance = dict(pair_clearance or {})
+        self._endpoint_grace(q_start)
+        self._endpoint_grace(q_goal)
         # Stable references to start/goal trees — names never change even after swap.
         s_nodes, s_arr, s_par = [q_start.copy()], [np.array([q_start])], [-1]
         g_nodes, g_arr, g_par = [q_goal.copy()],  [np.array([q_goal])],  [-1]
@@ -230,7 +336,10 @@ class RRTPlanner:
                     path_s = self._extract_path(s_nodes, s_par)
                     path_g = self._extract_path(g_nodes, g_par)
                     path_g.reverse()
-                    path = self._gauss_smooth(self._densify(self._smooth(path_s + path_g)))
+                    # Unwrap circular joints FIRST (removes the 2pi jump where the two trees
+                    # meet) so the subsequent linear densify/smooth take the short arc.
+                    raw = self._unwrap_path(path_s + path_g)
+                    path = self._gauss_smooth(self._densify(self._smooth(raw)))
                     print(f"[RRT] Found path: {len(path)} waypoints")
                     return path
 

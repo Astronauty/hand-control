@@ -300,12 +300,16 @@ class ConstrainedIKSolver:
         q_init         : (n_robot,) explicit IPOPT warm-start; overrides q_bias.
         skip_arm_geoms : set of arm geom names to exclude entirely from collision
                          constraints.
-        reduced_clearance_geoms : set of arm geom names that use `reduced_clearance`
-                         (instead of the solver's default clearance) against the OBJECT
-                         geoms — for the active grasping fingers, which must get close to
-                         the object surface. The full clearance is always kept against any
-                         plane geom (the floor), so these fingers never drop underground.
-        reduced_clearance : clearance (m) applied to reduced_clearance_geoms vs objects.
+        reduced_clearance_geoms : arm geoms that use a reduced clearance (instead of the
+                         solver's default) against the OBJECT geoms — for the active
+                         grasping fingers, which must get close to the object surface.
+                         Either a set of geom names (all using `reduced_clearance`) or a
+                         dict {geom_name: clearance_m} for per-geom values (e.g. distal
+                         links disabled, proximal links small-but-finite). The full
+                         clearance is always kept against any plane geom (the floor), so
+                         these fingers never drop underground.
+        reduced_clearance : clearance (m) applied to reduced_clearance_geoms vs objects
+                         when it is a set; ignored when it is a dict.
 
         Returns
         -------
@@ -380,7 +384,10 @@ class ConstrainedIKSolver:
             if ag in skip_arm_geoms:
                 continue
             arm_radius = float(self._model.geom_rbound[gid1])
-            obj_clr    = reduced_clearance if ag in reduced_clearance_geoms else self._clearance
+            if isinstance(reduced_clearance_geoms, dict):
+                obj_clr = reduced_clearance_geoms.get(ag, self._clearance)
+            else:
+                obj_clr = reduced_clearance if ag in reduced_clearance_geoms else self._clearance
             pos_cb = _GeomPositionCallback(f"cik_gp_{ctr}_{gid1}", self._model, gid1, n, obj_qpos)
             _cb_keepalive.append(pos_cb)
             p_arm = pos_cb(q)

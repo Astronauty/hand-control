@@ -125,10 +125,18 @@ if __name__ == "__main__":
 
     mj.mj_forward(model, data)
 
+    # Snapshot the compiled contype BEFORE --viz-only may zero the robot geoms' contype
+    # below: the collision-geom lists (_robot_geom_names etc.) distinguish real collision
+    # geoms from visual-only ones by contype==0, and --viz-only zeroes ALL robot contypes —
+    # so building those lists off the live contype would (wrongly) drop every hand geom and
+    # silently disable IK/RRT collision avoidance in viz-only. Use this snapshot instead.
+    _geom_contype0 = model.geom_contype.copy()
+
     if args.viz_only:
         # IK collision-avoidance (ConstrainedIKSolver) and RRT clearance checks use raw
         # mj_geomDistance, which ignores contype/conaffinity, so this only suppresses
-        # mj_step contact forces — those constraints stay active regardless.
+        # mj_step contact forces — those constraints stay active regardless (they read the
+        # _geom_contype0 snapshot above, not the zeroed live contype).
         _robot_body_ids_dbg = {model.jnt_bodyid[j] for j in range(model.njnt)
                                 if model.jnt_qposadr[j] < N_ROBOT}
         for _gi in range(model.ngeom):
@@ -181,20 +189,20 @@ if __name__ == "__main__":
     dls_ik = SpatialIKSolver(n_robot=N_ROBOT)
 
     # Collision geoms to keep clear during IK and RRT: EVERY collision geom on all four
-    # LEAP fingers + bracelet_link (wrist), not one representative per body. A single
-    # representative is not sufficient — the palm alone has 10 collision geoms and each
-    # finger link 3-6, so representative-only checking let the rest of each body clip
+    # LEAP fingers + the palm + bracelet_link (wrist), not one representative per body. A
+    # single representative is not sufficient — the palm alone has 10 collision geoms and
+    # each finger link 3-6, so representative-only checking let the rest of each body clip
     # through objects/floor. The IK affords the full set because its FD cost is now
     # per-arm-geom (one position callback each), not per arm-geom×object pair.
     _active_body_prefixes = tuple(f'leap_{code}_' for code in FINGER_CODE.values())
     _robot_geom_names = []
     for _gi in range(model.ngeom):
         _gname = mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, _gi)
-        if not _gname or model.geom_contype[_gi] == 0:
-            continue   # skip unnamed / visual-only geoms
+        if not _gname or _geom_contype0[_gi] == 0:
+            continue   # skip unnamed / visual-only geoms (compiled contype, pre-viz-only)
         _bname = mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, model.geom_bodyid[_gi]) or ''
         if (any(_bname.startswith(p) for p in _active_body_prefixes)
-                or _bname == 'bracelet_link'):
+                or _bname in ('leap_palm', 'bracelet_link')):
             _robot_geom_names.append(_gname)
     # 'floor' is the ground plane — keep every checked hand geom above it (both IK and RRT).
     _OBJ_GEOM_NAMES = ['obj_box_geom', 'obj_cylinder_geom', 'floor']
@@ -274,18 +282,33 @@ if __name__ == "__main__":
     #
     # Active (FINGER_SET) fingers must reach/wrap the object being grasped. The IK models
     # each geom as a bounding SPHERE (finger links 15-24mm), which is far too coarse to both
-    # constrain a finger AND let it approach a 3cm object — so the active fingers' OBJECT
-    # constraint is disabled entirely (ANOBJ_DISABLE below: a large negative "clearance" that
-    # the constraint can never violate). Crucially they KEEP full clearance vs the floor
-    # plane (the solver never reduces the plane constraint), so no active finger drops
-    # underground and pregrasp goals stay valid. Palm, wrist, and the non-active fingers stay
-    # fully constrained against everything — those are the "hand bodies" that must not clip.
-    # The RRT (exact distances, no bounding sphere) likewise just ignores active geoms vs
-    # objects while checking them vs the floor and everything else.
+    # constrain a finger AND let it approach a 3cm object — but only the DISTAL link and tip
+    # actually need to reach the surface. So instead of disabling the whole finger (which
+    # let proximal links sit inside the object with unbounded penetration), each active-finger
+    # geom gets a clearance tiered by how close its link legitimately comes to the surface:
+    #   contact tier  (ds/tip geoms):        disabled — they must touch/wrap the object
+    #   adjacent tier (if_md / th_px links): -10mm    — tolerates bounding-sphere slack
+    #                                                    (~1-2cm over-approximation) while
+    #                                                    still bounding gross penetration
+    #   proximal tier (everything else):     +2mm     — should never be near the surface
+    # All tiers KEEP full clearance vs the floor plane (the solver never reduces the plane
+    # constraint), so no active finger drops underground and pregrasp goals stay valid.
+    # Palm, wrist, and the non-active fingers stay fully constrained against everything.
+    # The RRT (exact distances, no bounding sphere) analogously gives active geoms a 0mm
+    # clearance vs the TARGET object only — touch allowed, penetration rejected (see _run_rrt).
     ANOBJ_DISABLE = -1.0
     _active_finger_geoms = {g for g in _robot_geom_names
                             if any(g.startswith(f'leap_{FINGER_CODE[f]}_') for f in FINGER_SET)}
-    print(f"[IK] active-finger geoms (object constraint disabled, floor kept): "
+
+    def _active_obj_clearance(g):
+        if '_ds_' in g or g.endswith('_tip'):
+            return ANOBJ_DISABLE                   # contact tier: must reach the surface
+        if g.startswith(('leap_if_md', 'leap_th_px')):
+            return -0.010                          # adjacent tier: bounded sphere slack
+        return 0.002                               # proximal tier: stay off the surface
+
+    _active_clearance_by_geom = {g: _active_obj_clearance(g) for g in _active_finger_geoms}
+    print(f"[IK] active-finger geoms (tiered object clearance, floor kept): "
           f"{len(_active_finger_geoms)}")
 
     for i, obj in enumerate(objects):
@@ -303,8 +326,7 @@ if __name__ == "__main__":
         print(f"[IK] Object {i+1}: IPOPT grasp (collision refinement) …")
         obj['q_target'] = constrained_ik.solve(data, id_C, obj['p_S_W'],
                                                 q_bias=Q_BIAS, q_init=q_dls_grasp,
-                                                reduced_clearance_geoms=_active_finger_geoms,
-                                                reduced_clearance=ANOBJ_DISABLE,
+                                                reduced_clearance_geoms=_active_clearance_by_geom,
                                                 inward_dirs=obj['inward_S_W'])
         _push_ipopt(f'obj{i+1} grasp')
 
@@ -326,8 +348,7 @@ if __name__ == "__main__":
         print(f"[IK] Object {i+1}: IPOPT pregrasp (collision refinement) …")
         q_pg = constrained_ik.solve(data, id_C, pregrasp_targets,
                                      q_bias=Q_BIAS, q_init=q_dls_pre,
-                                     reduced_clearance_geoms=_active_finger_geoms,
-                                     reduced_clearance=ANOBJ_DISABLE,
+                                     reduced_clearance_geoms=_active_clearance_by_geom,
                                      inward_dirs=obj['inward_S_W'])
         _push_ipopt(f'obj{i+1} pregrasp')
         obj['q_pregrasp'] = q_pg
@@ -340,6 +361,24 @@ if __name__ == "__main__":
             errs = [f"{np.linalg.norm(_d_chk.site_xpos[s] - t)*1e3:.1f} mm"
                     for s, t in zip(id_C, tgts)]
             print(f"[IK] Object {i+1} {label}: tip errors = {errs}")
+            # Exact (mj_geomDistance, no bounding sphere) audit of every active-finger geom
+            # vs the target object at the solution — the IK's sphere model can't see true
+            # penetration, so this is the guardrail that makes it visible. Contact-tier
+            # geoms (ds/tip) legitimately read ~0 at grasp; anything below -2mm is flagged.
+            # Each query is clamped from below by the bounding-sphere bound: MuJoCo 3.3.x
+            # GJK can spuriously return 0.0 for well-separated box-box pairs, and the true
+            # distance can never be under ||c1-c2|| - rb1 - rb2.
+            _ft = np.zeros(6)
+            _pen = {}
+            for g in _active_finger_geoms:
+                _gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g)
+                _lb  = (np.linalg.norm(_d_chk.geom_xpos[obj['id_geom']] - _d_chk.geom_xpos[_gid])
+                        - model.geom_rbound[_gid] - model.geom_rbound[obj['id_geom']])
+                _pen[g] = max(mj.mj_geomDistance(model, _d_chk, _gid, obj['id_geom'], 1.0, _ft), _lb)
+            _worst_g, _worst_d = min(_pen.items(), key=lambda kv: kv[1])
+            _flag = '  ** PENETRATION **' if _worst_d < -0.002 else ''
+            print(f"[IK] Object {i+1} {label}: active-finger min exact dist = "
+                  f"{_worst_d*1e3:.1f} mm ({_worst_g}){_flag}")
 
     # Per-joint PD gains for REACH phase: 7 arm joints + 16 LEAP finger joints.
     # Arm gains sized for Gen3's forcerange (±105/±52 Nm); finger gains mirror the small
@@ -359,17 +398,18 @@ if __name__ == "__main__":
     # the floor, instead of only the fingertips — checking just the tips let the palm /
     # proximal links / wrist sweep straight through objects unnoticed. The historical reason
     # for tips-only (the active fingers legitimately pass near the target at the goal) is now
-    # handled by the per-plan target-aware ignore_pairs below.
+    # handled by the per-plan target-aware pair-clearance overrides below.
     OBJ_BODIES   = ['obj_box', 'obj_cylinder']
     planner = RRTPlanner(model, _robot_geom_names, OBJ_BODIES,
                          extra_obj_geom_names=['floor'], n_robot=N_ROBOT,
                          n_plan=7,            # plan only the 7 arm joints; finger DOF fixed at goal
                          clearance=0.005)     # 5mm clearance, matching the IPOPT solves
 
-    # Geom ids of all ACTIVE-finger geoms — used to build per-plan ignore_pairs so they may
-    # approach (touch) the object being grasped without the RRT disqualifying the goal,
-    # matching the IK's reduced-clearance treatment. Every other hand geom (palm, proximal
-    # links, wrist, non-active fingers) and every geom-vs-floor pair stays checked.
+    # Geom ids of all ACTIVE-finger geoms — used to build per-plan pair-clearance overrides
+    # (0mm vs the TARGET object) so they may approach (touch) the object being grasped
+    # without the RRT disqualifying the goal, matching the IK's reduced-clearance treatment.
+    # Every other hand geom (palm, proximal links, wrist, non-active fingers) and every
+    # geom-vs-floor pair stays checked at the full clearance.
     _ACTIVE_SKIP_GIDS = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g) for g in _active_finger_geoms]
 
     # Background RRT: result dict shared between thread and main loop
@@ -432,17 +472,24 @@ if __name__ == "__main__":
             _ghost_markers.clear()
             _ghost_markers.extend(segments)
 
-    def _run_rrt(q_start, q_pregrasp):
+    def _run_rrt(q_start, q_pregrasp, obj_target):
         # Snapshot current object positions so collision checks reflect the live scene.
         planner._data.qpos[N_ROBOT:] = data.qpos[N_ROBOT:].copy()
-        # Let the active fingers' distal geoms be near ANY object (not just the target):
-        # they hug the object they're leaving at q_start and the one they're approaching at
-        # the goal, so scoping this to only the target would trap the start tree. Mirrors the
-        # IK's skip_arm_geoms (skipped vs all objects). Everything else — palm, proximal
-        # links, wrist, non-active fingers, and every geom vs the floor — stays checked.
-        ignore_pairs = {(g, obj['id_geom']) for g in _ACTIVE_SKIP_GIDS for obj in objects}
+        # Active fingers may TOUCH (0mm clearance) the object being grasped — unlike the old
+        # boolean ignore_pairs, the exact distance is still checked, so they can approach the
+        # target but never sweep through it. Vs the OTHER object they keep the full default
+        # clearance; if the start config still hugs the object just released (or the IK left
+        # a fingertip marginally inside its allowance at the goal), plan()'s endpoint grace
+        # relaxes exactly those pairs to their endpoint distance — free to move away, never
+        # deeper. Everything else — palm, proximal links, wrist, non-active fingers, and
+        # every geom vs the floor — stays checked at the full clearance.
+        pair_clearance = {(g, obj_target['id_geom']): 0.0 for g in _ACTIVE_SKIP_GIDS}
+        # Re-branch the goal's continuous (base/wrist) joints onto the turn nearest the
+        # current pose, so the arm never unwinds a near-full revolution just because the IK
+        # left a joint on a far 2pi branch. Same configuration, planner-friendly numbering.
+        q_goal = planner.rebranch(q_start, q_pregrasp)
         _t0 = time.time()
-        path = planner.plan(q_start, q_pregrasp, ignore_pairs=ignore_pairs)
+        path = planner.plan(q_start, q_goal, pair_clearance=pair_clearance)
         plan_time = time.time() - _t0
         fallback = path is None
         if fallback:
@@ -451,7 +498,7 @@ if __name__ == "__main__":
             # which would produce explosive torques and numerical instability.
             n_interp = 100
             ts = np.linspace(0, 1, n_interp)
-            path = [q_start + t * (q_pregrasp - q_start) for t in ts]
+            path = [q_start + t * (q_goal - q_start) for t in ts]
             print(f"\r\n[RRT] Planning failed — linear fallback ({n_interp} steps)")
             for i, o in enumerate(objects):
                 print(f"         obj{i+1} pos: {data.xpos[o['id_body']]}")
@@ -677,7 +724,8 @@ if __name__ == "__main__":
                             _plan_result.clear()
                             q_plan_hold   = q_start.copy()
                             plan_thread   = threading.Thread(
-                                target=_run_rrt, args=(q_start, q_pre), daemon=True)
+                                target=_run_rrt, args=(q_start, q_pre, objects[active_idx]),
+                                daemon=True)
                             plan_thread.start()
                             control_phase = 'PLAN'
                         print(f"\r\n[Control] → {targets[active_tgt]['label']}")
@@ -718,6 +766,14 @@ if __name__ == "__main__":
                     mj.mj_forward(model, data)
                     _render_kinematic_frame()
                     continue
+                # Zero qvel each step, same as the REACH final-waypoint hold. The Kd term
+                # goes through qfrc_applied (explicit), whose stability limit dt < 2*I/Kd
+                # sits right at the 1ms timestep for the wrist (and far below it for the
+                # fingers) — without this, holding at a pregrasp posture diverges at the
+                # wrist DOF within ~30ms (observed x1.77/step growth, no contacts), trips
+                # MuJoCo's BADQACC auto-reset to qpos0, and the hold then explodes against
+                # the huge post-reset PD error for as long as planning runs.
+                data.qvel[:N_ROBOT] = 0.0
                 tau_ctrl = np.zeros(model.nv)
                 tau_ctrl[:N_ROBOT] = Kp * (q_plan_hold - data.qpos[:N_ROBOT]) + Kd * (0 - data.qvel[:N_ROBOT])
 
