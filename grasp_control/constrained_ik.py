@@ -5,18 +5,24 @@ Formulation:
     minimize_q  Σ_k ||site_pos_k(q) - target_k||²  +  posture_weight * ||q - q_bias||²
     subject to:
         q_lo[i] <= q[i] <= q_hi[i]                          (joint limits, hard)
-        mj_geomDistance(arm_geom_i, obj_geom_j, q) >= d_min  (collision avoidance, hard)
+        sphere_box_distance(arm_geom_i, obj_geom_j, q) >= d_min  (collision avoidance, hard)
 
-Both the fingertip-position task and the collision constraints are evaluated through
-MuJoCo forward kinematics wrapped in CasADi external callbacks; IPOPT uses
-finite-difference Jacobians (no hand-coded gradients needed). Each callback owns a
-private MjData copy so that IPOPT's FD perturbation of one constraint doesn't corrupt
-the state seen by another.
+FK callbacks are CasADi external Callbacks with enable_fd=True so CasADi computes
+finite-difference Jacobians for them. Collision avoidance uses a smooth analytic
+sphere-vs-box/plane/cylinder SDF (not mj_geomDistance) so CasADi can differentiate
+the distance expressions via its own AD after chaining through the FK callback Jacobians.
 
-See also: simulation/tamp_manager.py (_SDCActuated) for the same callback pattern
-used in the TAMP approach controller.
+IPOPT is run with jacobian_approximation="finite-difference-values", meaning IPOPT
+computes its own FD of the full NLP (not just the callbacks). This smooths kinks at
+face/edge/vertex transitions in the box SDF that would otherwise break L-BFGS.
+
+The companion Jacobian callbacks (_SitePositionJacCallback etc.) are retained here as
+candidate analytic-Jacobian implementations. They are NOT currently used (verified
+numerically via check_analytic_jacobians()). Enabling them requires switching to
+jacobian_approximation="exact" in the solver options AND verifying no kink issues.
 """
 import itertools
+import time
 
 import casadi as ca
 import mujoco as mj
@@ -25,8 +31,31 @@ import numpy as np
 _call_counter = itertools.count()
 
 
-class _SitePositionCallback(ca.Callback):
-    """q[:n_robot] → site_xpos[site_id] (3-vector) via MuJoCo FK."""
+def _skew(v):
+    """3-vector → 3×3 skew-symmetric matrix satisfying skew(v) @ w == v × w."""
+    return np.array([[ 0.,    -v[2],  v[1]],
+                     [ v[2],  0.,    -v[0]],
+                     [-v[1],  v[0],  0.  ]])
+
+
+# ---------------------------------------------------------------------------
+# Analytic-Jacobian companion callbacks (NOT currently wired up)
+# ---------------------------------------------------------------------------
+# These implement the Jacobian of each FK callback analytically via mj_jacSite /
+# mj_jac. They are NOT enabled in the main callbacks because:
+#   1. _sphere_box_distance has kinks at face/edge/vertex transitions; CasADi's
+#      symbolic AD exposes them, while IPOPT's own FD smooths them — so
+#      jacobian_approximation="finite-difference-values" converges better here.
+#   2. The has_jacobian()/get_jacobian() API contract has not been validated end-
+#      to-end against the CasADi version in use (check_analytic_jacobians() below).
+#
+# To enable: (a) fix the kinks (smooth fabs/fmax in _sphere_box_distance),
+# (b) verify check_analytic_jacobians() passes, (c) restore has_jacobian()/
+# get_jacobian() on the main callbacks, (d) switch solver to "exact".
+# ---------------------------------------------------------------------------
+
+class _SitePositionJacCallback(ca.Callback):
+    """d(site_xpos)/dq via mj_jacSite — companion for _SitePositionCallback."""
 
     def __init__(self, name, model, site_id, n_robot, obj_qpos=None):
         ca.Callback.__init__(self)
@@ -34,57 +63,66 @@ class _SitePositionCallback(ca.Callback):
         self._data  = mj.MjData(model)
         self._sid   = site_id
         self._n     = n_robot
+        self.eval_count = 0
         if obj_qpos is not None:
-            self._data.qpos[n_robot : n_robot + len(obj_qpos)] = obj_qpos
-        self.construct(name, {"enable_fd": True})
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self.construct(name, {})
 
-    def get_n_in(self):  return 1
+    def get_n_in(self):  return 2   # q, nominal_output (ignored)
     def get_n_out(self): return 1
-    def get_sparsity_in(self, i):  return ca.Sparsity.dense(self._n, 1)
-    def get_sparsity_out(self, i): return ca.Sparsity.dense(3, 1)
-    def has_jacobian(self):        return False
-
-    def eval(self, arg):
-        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
-        mj.mj_kinematics(self._model, self._data)
-        mj.mj_comPos(self._model, self._data)
-        return [self._data.site_xpos[self._sid].copy()]
-
-class _SiteAxisCallback(ca.Callback):
-    """q[:n_robot] → site_R(q) @ local_axis (world-frame unit 3-vector) via MuJoCo FK. 
-    Returns the fingerpad normal used to orient the fingerpad with the contact surface normal."""
-    def __init__(self, name, model, site_id, local_axis, n_robot, obj_qpos=None):
-        ca.Callback.__init__(self)
-        self._model = model
-        self._data = mj.MjData(model)
-        self._sid = site_id
-        self._localaxis = np.asarray(local_axis, dtype=float).flatten()
-        self._n = n_robot
-
-        if obj_qpos is not None:
-            self._data.qpos[n_robot : n_robot + len(obj_qpos)] = obj_qpos
-        self.construct(name, {"enable_fd": True})
-    def get_n_in(self): return 1
-    def get_n_out(self): return 1
-    def get_sparsity_in(self, i): return ca.Sparsity.dense(self._n, 1)
-    def get_sparsity_out(self, i): return ca.Sparsity.dense(3, 1)
+    def get_sparsity_in(self, i):
+        return ca.Sparsity.dense(self._n, 1) if i == 0 else ca.Sparsity.dense(3, 1)
+    def get_sparsity_out(self, i): return ca.Sparsity.dense(3, self._n)
     def has_jacobian(self): return False
 
     def eval(self, arg):
+        self.eval_count += 1
         self._data.qpos[:self._n] = np.array(arg[0]).flatten()
         mj.mj_kinematics(self._model, self._data)
-
-        R = self._data.site_xmat[self._sid].reshape(3,3)
-        return [R @ self._localaxis]
-
-
+        jacp = np.zeros((3, self._model.nv))
+        mj.mj_jacSite(self._model, self._data, jacp, None, self._sid)
+        return [jacp[:, :self._n]]
 
 
+class _SiteAxisJacCallback(ca.Callback):
+    """d(R @ local_axis)/dq via angular Jacobian — companion for _SiteAxisCallback.
 
-class _GeomPositionCallback(ca.Callback):
-    """q[:n_robot] → geom_xpos[geom_id] (3-vector) via MuJoCo FK. Same pattern as
-    _SitePositionCallback but for a geom origin rather than a site — used to feed an
-    arm geom's sphere center into the analytic sphere-vs-box distance formula below."""
+    Chain rule: d(R @ v)/dq_j = ω_j × (R @ v)  where ω_j = jacr[:, j].
+    In matrix form: J = -skew(R @ v) @ jacr[:, :n_robot].
+    """
+
+    def __init__(self, name, model, site_id, local_axis, n_robot, obj_qpos=None):
+        ca.Callback.__init__(self)
+        self._model     = model
+        self._data      = mj.MjData(model)
+        self._sid       = site_id
+        self._localaxis = np.asarray(local_axis, dtype=float).flatten()
+        self._n         = n_robot
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self.construct(name, {})
+
+    def get_n_in(self):  return 2
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, i):
+        return ca.Sparsity.dense(self._n, 1) if i == 0 else ca.Sparsity.dense(3, 1)
+    def get_sparsity_out(self, i): return ca.Sparsity.dense(3, self._n)
+    def has_jacobian(self): return False
+
+    def eval(self, arg):
+        self.eval_count += 1
+        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(self._model, self._data)
+        R          = self._data.site_xmat[self._sid].reshape(3, 3)
+        axis_world = R @ self._localaxis
+        jacr       = np.zeros((3, self._model.nv))
+        mj.mj_jacSite(self._model, self._data, None, jacr, self._sid)
+        return [-_skew(axis_world) @ jacr[:, :self._n]]
+
+
+class _GeomPositionJacCallback(ca.Callback):
+    """d(geom_xpos)/dq via mj_jacGeom — companion for _GeomPositionCallback."""
 
     def __init__(self, name, model, geom_id, n_robot, obj_qpos=None):
         ca.Callback.__init__(self)
@@ -92,17 +130,110 @@ class _GeomPositionCallback(ca.Callback):
         self._data  = mj.MjData(model)
         self._gid   = geom_id
         self._n     = n_robot
+        self.eval_count = 0
         if obj_qpos is not None:
-            self._data.qpos[n_robot : n_robot + len(obj_qpos)] = obj_qpos
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self.construct(name, {})
+
+    def get_n_in(self):  return 2
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, i):
+        return ca.Sparsity.dense(self._n, 1) if i == 0 else ca.Sparsity.dense(3, 1)
+    def get_sparsity_out(self, i): return ca.Sparsity.dense(3, self._n)
+    def has_jacobian(self): return False
+
+    def eval(self, arg):
+        self.eval_count += 1
+        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(self._model, self._data)
+        jacp    = np.zeros((3, self._model.nv))
+        pt      = self._data.geom_xpos[self._gid].copy()
+        body_id = int(self._model.geom_bodyid[self._gid])
+        mj.mj_jac(self._model, self._data, jacp, None, pt, body_id)
+        return [jacp[:, :self._n]]
+
+
+# ---------------------------------------------------------------------------
+# Main FK callbacks (function evaluation only — Jacobians delegated above)
+# ---------------------------------------------------------------------------
+
+class _SitePositionCallback(ca.Callback):
+    """q[:n_robot] → site_xpos[site_id] (3-vector) via MuJoCo FK."""
+
+    def __init__(self, name, model, site_id, n_robot, obj_qpos=None):
+        ca.Callback.__init__(self)
+        self._model    = model
+        self._data     = mj.MjData(model)
+        self._sid      = site_id
+        self._n        = n_robot
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
         self.construct(name, {"enable_fd": True})
 
     def get_n_in(self):  return 1
     def get_n_out(self): return 1
     def get_sparsity_in(self, i):  return ca.Sparsity.dense(self._n, 1)
     def get_sparsity_out(self, i): return ca.Sparsity.dense(3, 1)
-    def has_jacobian(self):        return False
 
     def eval(self, arg):
+        self.eval_count += 1
+        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(self._model, self._data)
+        return [self._data.site_xpos[self._sid].copy()]
+
+
+class _SiteAxisCallback(ca.Callback):
+    """q[:n_robot] → site_R(q) @ local_axis (world-frame 3-vector) via MuJoCo FK."""
+
+    def __init__(self, name, model, site_id, local_axis, n_robot, obj_qpos=None):
+        ca.Callback.__init__(self)
+        self._model     = model
+        self._data      = mj.MjData(model)
+        self._sid       = site_id
+        self._localaxis = np.asarray(local_axis, dtype=float).flatten()
+        self._n         = n_robot
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self.construct(name, {"enable_fd": True})
+
+    def get_n_in(self):  return 1
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, i):  return ca.Sparsity.dense(self._n, 1)
+    def get_sparsity_out(self, i): return ca.Sparsity.dense(3, 1)
+
+    def eval(self, arg):
+        self.eval_count += 1
+        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(self._model, self._data)
+        R = self._data.site_xmat[self._sid].reshape(3, 3)
+        return [R @ self._localaxis]
+
+
+
+class _GeomPositionCallback(ca.Callback):
+    """q[:n_robot] → geom_xpos[geom_id] (3-vector) via MuJoCo FK. Used to feed an
+    arm geom's sphere center into the analytic sphere-vs-box distance formula below."""
+
+    def __init__(self, name, model, geom_id, n_robot, obj_qpos=None):
+        ca.Callback.__init__(self)
+        self._model    = model
+        self._data     = mj.MjData(model)
+        self._gid      = geom_id
+        self._n        = n_robot
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self.construct(name, {"enable_fd": True})
+
+    def get_n_in(self):  return 1
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, i):  return ca.Sparsity.dense(self._n, 1)
+    def get_sparsity_out(self, i): return ca.Sparsity.dense(3, 1)
+
+    def eval(self, arg):
+        self.eval_count += 1
         self._data.qpos[:self._n] = np.array(arg[0]).flatten()
         mj.mj_kinematics(self._model, self._data)
         return [self._data.geom_xpos[self._gid].copy()]
@@ -255,6 +386,13 @@ class ConstrainedIKSolver:
         self._solver_opts = {
             "print_time": False,
             "ipopt": {
+                # IPOPT computes its own FD Jacobian of the NLP (not CasADi's chain-rule
+                # Jacobian). This is intentional: CasADi's chain-rule differentiates
+                # _sphere_box_distance symbolically, exposing kinks at face/edge/vertex
+                # transitions where the SDF gradient is discontinuous. IPOPT's FD straddles
+                # those kinks in the full distance expression, giving effectively smoothed
+                # gradients that L-BFGS handles far better than the exact one-sided derivatives.
+                # Switching to "exact" here requires smoothing the box SDF kinks first.
                 "jacobian_approximation": "finite-difference-values",
                 "hessian_approximation":  "limited-memory",
                 "print_level":  5 if verbose else 0,
@@ -262,19 +400,10 @@ class ConstrainedIKSolver:
                 "max_iter":     max_iter,
                 "tol":          1e-4,
                 "constr_viol_tol": 1e-6,
-                # mj_geomDistance has genuine kinks (closest point jumps between a box's
-                # face/edge/vertex as q varies) — limited-memory BFGS fed FD gradients across
-                # those kinks can take wild steps and either grind to max_iter or report a
-                # spurious Infeasible_Problem_Detected, even when a perfectly good iterate was
-                # visited along the way. "adaptive" mu_strategy is IPOPT's standard robustness
-                # recommendation for exactly this class of poorly-conditioned/noisy problem.
-                # acceptable_* lets IPOPT return the best iterate once progress stalls near a
-                # decent point, instead of continuing to chase full first-order optimality
-                # through more non-smooth terrain and potentially wandering somewhere worse.
                 "mu_strategy":              "adaptive",
-                "acceptable_tol":           1e-2,
-                "acceptable_iter":          15,
-                "acceptable_constr_viol_tol": 1e-4,
+                "acceptable_tol":           1e-3,
+                "acceptable_iter":          10,
+                "acceptable_constr_viol_tol": 1e-5,
             },
         }
 
@@ -318,6 +447,7 @@ class ConstrainedIKSolver:
         n        = self._n
         ctr      = next(_call_counter)
         obj_qpos = data.qpos[n:].copy()
+        _t0_solve = time.time()
 
         site_cbs = [
             _SitePositionCallback(f"cik_site_{ctr}_{i}", self._model, sid, n, obj_qpos)
@@ -375,11 +505,13 @@ class ConstrainedIKSolver:
         # symbolic output is consumed — without holding a Python reference for the rest of
         # this solve they get garbage-collected and IPOPT's later gradient pass fails with
         # "Callback object has been deleted".
-        # Each entry is (distance_expr, required_clearance). Active grasping fingers get a
-        # reduced clearance vs objects so they can reach the surface, but the FULL clearance
-        # is always kept against a plane (the floor) so no finger drops underground.
+        # Each entry is (distance_expr, required_clearance, arm_geom_name, obj_geom_name).
+        # Active grasping fingers get a reduced clearance vs objects so they can reach the
+        # surface, but the FULL clearance is always kept against a plane so no finger drops
+        # underground.
         dist_exprs   = []
         _cb_keepalive = []
+        geom_cbs      = {}   # arm_geom_name → _GeomPositionCallback (for eval_count reporting)
         for ag, gid1 in zip(self._arm_geom_names, self._arm_gids):
             if ag in skip_arm_geoms:
                 continue
@@ -390,42 +522,49 @@ class ConstrainedIKSolver:
                 obj_clr = reduced_clearance if ag in reduced_clearance_geoms else self._clearance
             pos_cb = _GeomPositionCallback(f"cik_gp_{ctr}_{gid1}", self._model, gid1, n, obj_qpos)
             _cb_keepalive.append(pos_cb)
+            geom_cbs[ag] = pos_cb
             p_arm = pos_cb(q)
-            for j in range(len(self._obj_gids)):
+            for j, ogn in enumerate(self._obj_geom_names):
                 center, R = obj_pose[j]
                 if self._obj_is_box[j]:
-                    dist_exprs.append((_sphere_box_distance(
+                    expr = _sphere_box_distance(
                         p_arm, arm_radius,
-                        ca.DM(center), ca.DM(R), ca.DM(self._obj_half_extents[j])), obj_clr))
+                        ca.DM(center), ca.DM(R), ca.DM(self._obj_half_extents[j]))
+                    clr = obj_clr
                 elif self._obj_is_plane[j]:
-                    # Plane outward normal is its local +z axis (3rd column of geom_xmat).
-                    # Floor always uses the full clearance, never the reduced one.
-                    dist_exprs.append((_sphere_plane_distance(
-                        p_arm, arm_radius, ca.DM(center), ca.DM(R[:, 2])), self._clearance))
+                    expr = _sphere_plane_distance(
+                        p_arm, arm_radius, ca.DM(center), ca.DM(R[:, 2]))
+                    clr = self._clearance  # floor always full clearance
                 elif self._obj_is_cyl[j]:
-                    # geom_size = (radius, half_height, _) for a cylinder.
-                    dist_exprs.append((_sphere_cylinder_distance(
+                    expr = _sphere_cylinder_distance(
                         p_arm, arm_radius, ca.DM(center), ca.DM(R),
-                        float(self._obj_half_extents[j][0]), float(self._obj_half_extents[j][1])), obj_clr))
+                        float(self._obj_half_extents[j][0]), float(self._obj_half_extents[j][1]))
+                    clr = obj_clr
                 else:
-                    dist_exprs.append((_sphere_sphere_distance(
-                        p_arm, arm_radius, ca.DM(center), self._obj_rbound[j]), obj_clr))
+                    expr = _sphere_sphere_distance(
+                        p_arm, arm_radius, ca.DM(center), self._obj_rbound[j])
+                    clr = obj_clr
+                dist_exprs.append((expr, clr, ag, ogn))
 
-        for d, clr in dist_exprs:
+        for d, clr, _ag, _og in dist_exprs:
             opti.subject_to(d >= clr)
 
         q0 = (q_init if q_init is not None
               else (q_bias if q_bias is not None else np.zeros(n)))
         opti.set_initial(q, q0)
+        t_setup = time.time() - _t0_solve
         opti.solver("ipopt", self._solver_opts)
+        t_setup_ms = (time.time() - _t0_solve) * 1e3
 
-        def _diagnostics(value_fn):
-            """value_fn: sol.value or opti.debug.value — evaluates a casadi expr at
-            the current iterate. Reports the physically meaningful quantities (mm of
-            site error, mm of collision slack) that IPOPT's scaled `tol`/`obj` don't
-            directly convey, so a converged-but-still-far-off solution is visible.
-            Also stashes the numeric values into self.last_metrics for external
-            consumers (e.g. the live dashboard in kinova_leap_pick_place.py)."""
+        print(f"[IPOPT] setup {t_setup_ms:.0f}ms  |  "
+              f"{n} vars  {len(dist_exprs)} constraints  "
+              f"({len(geom_cbs)} geom + {len(site_cbs)} site + {len(axis_cbs)} axis cbs)")
+
+        def _diagnostics(value_fn, t_solve_ms, iters):
+            """value_fn: sol.value or opti.debug.value.
+            Reports site error, posture, collision slack, orientation, callback counts,
+            and timing so it is clear where time is going.
+            Stashes results into self.last_metrics for the live dashboard."""
             site_err_mm = [
                 float(np.linalg.norm(value_fn(cb(q)) - ca.DM(tgt))) * 1000.0
                 for cb, tgt in zip(site_cbs, targets)
@@ -433,18 +572,26 @@ class ConstrainedIKSolver:
             self.last_metrics['site_err_mm'] = site_err_mm
             print(f"[IPOPT]   site errors (mm): "
                   f"{['%.2f' % e for e in site_err_mm]}  max={max(site_err_mm):.2f}")
+
             if q_bias is not None:
                 dq = np.array(value_fn(q)).flatten() - np.asarray(q_bias)
                 print(f"[IPOPT]   posture term: {self._posture_weight * float(dq @ dq):.4g}"
                       f"  (||q-q_bias||={float(np.linalg.norm(dq)):.3g} rad)")
+
             if dist_exprs:
-                # Margin above each constraint's own required clearance (mixed: reduced for
-                # active fingers vs objects, full vs the floor).
-                slacks_mm = [(float(value_fn(expr)) - clr) * 1000.0 for expr, clr in dist_exprs]
-                i_min = int(np.argmin(slacks_mm))
+                # One pass: evaluate slack and keep geom names together.
+                slack_rows = [((float(value_fn(expr)) - clr) * 1000.0, ag, og)
+                              for expr, clr, ag, og in dist_exprs]
+                slacks_mm = [r[0] for r in slack_rows]
+                i_min  = int(np.argmin(slacks_mm))
+                n_bind = sum(s < 0.1 for s in slacks_mm)
                 self.last_metrics['min_slack_mm'] = slacks_mm[i_min]
                 print(f"[IPOPT]   collision margin (mm): min={slacks_mm[i_min]:.2f}"
-                      f"  n_binding(<0.1mm)={sum(s < 0.1 for s in slacks_mm)}/{len(slacks_mm)}")
+                      f"  n_binding(<0.1mm)={n_bind}/{len(slacks_mm)}")
+                # Top-5 tightest pairs — the main signal for what's bottlenecking convergence
+                for sl, ag, og in sorted(slack_rows, key=lambda r: r[0])[:5]:
+                    print(f"[IPOPT]     {sl:+7.2f}mm  {ag}  vs  {og}")
+
             if inward_dirs is not None and self._orient_weight > 0:
                 ang = [float(np.degrees(np.arccos(np.clip(
                         float(np.dot(np.array(value_fn(cb(q))).flatten(), d_in)), -1.0, 1.0))))
@@ -453,25 +600,126 @@ class ConstrainedIKSolver:
                 print(f"[IPOPT]   pad-normal error (deg): "
                     f"{['%.1f' % a for a in ang]}  max={max(ang):.1f}")
 
+            # FK call counts (enable_fd: IPOPT perturbs each of n DOFs and re-evaluates
+            # the full NLP, so eval_count ≈ n_iters × (n_robot + 1) × n_line_search_steps).
+            site_fk  = sum(cb.eval_count for cb in site_cbs)
+            axis_fk  = sum(cb.eval_count for cb in axis_cbs)
+            geom_fk  = sum(cb.eval_count for cb in geom_cbs.values())
+            total_fk = site_fk + axis_fk + geom_fk
+            ms_per_iter = t_solve_ms / iters if iters else float('nan')
+            self.last_metrics.update(
+                total_fk_calls=total_fk, t_setup_ms=t_setup_ms,
+                t_solve_ms=t_solve_ms, ms_per_iter=ms_per_iter)
+            print(f"[IPOPT]   timing: setup={t_setup_ms:.0f}ms  solve={t_solve_ms:.0f}ms"
+                  f"  {ms_per_iter:.1f}ms/iter")
+            print(f"[IPOPT]   FK calls: {total_fk:,}  "
+                  f"(site={site_fk}  axis={axis_fk}  geom={geom_fk})"
+                  f"  ≈ {total_fk / max(iters, 1):.0f} FK/iter")
+
         # Reset per-solve metrics; _diagnostics fills in the physical quantities and the
         # try/except branches add solver status. Read via solver.last_metrics after solve().
         self.last_metrics = {}
+        _t0_ipopt = time.time()
         try:
             sol  = opti.solve()
+            t_solve_ms = (time.time() - _t0_ipopt) * 1e3
             st   = opti.stats()
-            self.last_metrics.update(status=st['return_status'], iters=st['iter_count'],
+            iters = st['iter_count']
+            self.last_metrics.update(status=st['return_status'], iters=iters,
                                      obj=float(sol.value(opti.f)), success=True)
-            print(f"[IPOPT] {st['return_status']}  iters={st['iter_count']}"
+            print(f"[IPOPT] {st['return_status']}  iters={iters}"
                   f"  obj={float(sol.value(opti.f)):.4g}")
-            _diagnostics(sol.value)
+            _diagnostics(sol.value, t_solve_ms, iters)
             return np.array(sol.value(q))
         except RuntimeError:
-            st = opti.stats()
+            t_solve_ms = (time.time() - _t0_ipopt) * 1e3
+            st    = opti.stats()
+            iters = st.get('iter_count', 0)
             self.last_metrics.update(status=st.get('return_status', '?'),
-                                     iters=st.get('iter_count', '?'), success=False)
-            print(f"[IPOPT] FAILED: {st.get('return_status','?')}  iters={st.get('iter_count','?')}")
-            _diagnostics(opti.debug.value)
+                                     iters=iters, success=False)
+            print(f"[IPOPT] FAILED: {st.get('return_status','?')}  iters={iters}")
+            _diagnostics(opti.debug.value, t_solve_ms, iters)
             return np.array(opti.debug.value(q))
+
+
+def check_analytic_jacobians(model, n_robot, site_ids, geom_ids,
+                              pad_axis=(-1., 0., 0.), eps=1e-6, atol=1e-3):
+    """Numerically verify the analytic-Jacobian companion callbacks against FD.
+
+    Call this once at startup (with the model and a representative set of site/geom
+    IDs) to confirm the analytic Jacobians are correct before enabling them in the
+    main solver. Prints pass/fail per callback type and returns True if all pass.
+
+    Parameters
+    ----------
+    model      : MjModel
+    n_robot    : int — number of robot DOFs
+    site_ids   : list[int] — fingertip site IDs to check
+    geom_ids   : list[int] — arm geom IDs to check
+    pad_axis   : local pad axis for SiteAxis check
+    eps        : FD step size (m or rad)
+    atol       : absolute tolerance for max Jacobian element error
+
+    Returns True if all checks pass, False if any fail.
+    """
+    import mujoco as _mj
+    q_test = np.zeros(n_robot)
+    obj_qpos = np.zeros(model.nq - n_robot)
+
+    d = _mj.MjData(model)
+    d.qpos[:n_robot] = q_test
+    _mj.mj_kinematics(model, d)
+
+    all_ok = True
+
+    def _fd_jacobian(eval_fn, q, n):
+        f0 = np.array(eval_fn(q)).flatten()
+        J  = np.zeros((len(f0), n))
+        for j in range(n):
+            dq = q.copy(); dq[j] += eps
+            J[:, j] = (np.array(eval_fn(dq)).flatten() - f0) / eps
+        return J
+
+    for i, sid in enumerate(site_ids[:2]):  # check first 2 sites
+        cb  = _SitePositionJacCallback(f"_chk_spos_{i}", model, sid, n_robot, obj_qpos)
+        def _f(q): return _SitePositionCallback(f"_tmp_{i}", model, sid, n_robot, obj_qpos).eval([q])[0]
+        J_analytic = np.array(cb.eval([q_test, np.zeros(3)])[0])
+        J_fd       = _fd_jacobian(_f, q_test, n_robot)
+        err = np.abs(J_analytic - J_fd).max()
+        ok  = err < atol
+        print(f"[Jac check] SitePosition  site={sid}  max_err={err:.2e}  {'OK' if ok else 'FAIL'}")
+        all_ok = all_ok and ok
+
+    for i, sid in enumerate(site_ids[:2]):
+        cb  = _SiteAxisJacCallback(f"_chk_sax_{i}", model, sid, pad_axis, n_robot, obj_qpos)
+        def _f(q):
+            d2 = _mj.MjData(model)
+            d2.qpos[:n_robot] = q
+            _mj.mj_kinematics(model, d2)
+            R = d2.site_xmat[sid].reshape(3, 3)
+            return R @ np.array(pad_axis)
+        J_analytic = np.array(cb.eval([q_test, np.zeros(3)])[0])
+        J_fd       = _fd_jacobian(_f, q_test, n_robot)
+        err = np.abs(J_analytic - J_fd).max()
+        ok  = err < atol
+        print(f"[Jac check] SiteAxis      site={sid}  max_err={err:.2e}  {'OK' if ok else 'FAIL'}")
+        all_ok = all_ok and ok
+
+    for i, gid in enumerate(geom_ids[:3]):  # check first 3 geoms
+        cb  = _GeomPositionJacCallback(f"_chk_gpos_{i}", model, gid, n_robot, obj_qpos)
+        def _f(q):
+            d2 = _mj.MjData(model)
+            d2.qpos[:n_robot] = q
+            _mj.mj_kinematics(model, d2)
+            return d2.geom_xpos[gid].copy()
+        J_analytic = np.array(cb.eval([q_test, np.zeros(3)])[0])
+        J_fd       = _fd_jacobian(_f, q_test, n_robot)
+        err = np.abs(J_analytic - J_fd).max()
+        ok  = err < atol
+        print(f"[Jac check] GeomPosition  geom={gid}  max_err={err:.2e}  {'OK' if ok else 'FAIL'}")
+        all_ok = all_ok and ok
+
+    return all_ok
 
 
 def build_arm_geom_names(model, body_names):

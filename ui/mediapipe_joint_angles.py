@@ -365,7 +365,7 @@ def trigger_calibration():
         print("[USER] Calibration Trigger Sent!")
 
 
-def publish_hand_config(angles, wrist_pose, flexion_angles=None):
+def publish_hand_config(angles, wrist_pose, flexion_angles=None, world_landmarks=None):
     global joint_angles_pub, ros_node
     if not joint_angles_pub:
         return
@@ -384,6 +384,11 @@ def publish_hand_config(angles, wrist_pose, flexion_angles=None):
     # [idx_mcp, idx_pip, idx_dip, th_mcp, th_ip, th_ip*0.5]
     if flexion_angles is not None:
         joint_config.extend(flexion_angles)
+
+    # Append world landmark positions: 21 landmarks × 3 coords = 63 floats [57:120]
+    # Metric units (metres), wrist approximately at origin.
+    if world_landmarks is not None:
+        joint_config.extend(world_landmarks)
 
     msg.data = joint_config
     joint_angles_pub.publish(msg)
@@ -526,8 +531,9 @@ def main():
     #
     # Wrist gets slightly higher beta so base motion feels responsive.
     # Flexion gets a lower min_cutoff for heavier smoothing of finger jitter.
-    filter_wrist   = OneEuroFilterArray(6, freq=30.0, min_cutoff=1.0, beta=0.3)
-    filter_flexion = OneEuroFilterArray(6, freq=30.0, min_cutoff=1.5, beta=0.2)
+    filter_wrist    = OneEuroFilterArray(6,  freq=30.0, min_cutoff=1.0, beta=0.3)
+    filter_flexion  = OneEuroFilterArray(6,  freq=30.0, min_cutoff=1.5, beta=0.2)
+    filter_world_lm = OneEuroFilterArray(63, freq=30.0, min_cutoff=1.5, beta=0.2)
     last_frame = None
     last_hand_data = None
     show_debug = False  # toggled with 'D' — overlays flexion angles on video
@@ -595,8 +601,13 @@ def main():
 
                     wrist_pose_f = (wrist_state[:3], wrist_state[3:])
 
-                    # Publish to ROS (Euler block + filtered flexion angles)
-                    publish_hand_config(angles, wrist_pose_f, flexion_f.tolist())
+                    world_flat = np.array(
+                        [[lm.x, lm.y, lm.z] for lm in world_lm]).flatten()
+                    world_flat_f = filter_world_lm(world_flat, t)
+
+                    # Publish to ROS (Euler + flexion + world landmarks)
+                    publish_hand_config(angles, wrist_pose_f,
+                                        flexion_f.tolist(), world_flat_f.tolist())
 
                     if show_debug:
                         labels = ["idx_mcp", "idx_pip", "idx_dip",
@@ -619,6 +630,7 @@ def main():
                     # the first frame when the hand reappears.
                     filter_wrist.reset()
                     filter_flexion.reset()
+                    filter_world_lm.reset()
 
                 # UI Overlay
                 dbg_label = "[D:ON]" if show_debug else "D:Debug"

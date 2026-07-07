@@ -98,7 +98,7 @@ if __name__ == "__main__":
     Kd_obj     = 5.0   # object position damping, N·s/m (GRASP)
     Kp_theta   = 5.0   # object orientation stiffness, N·m/rad (GRASP)
     Kd_theta   = 0.5   # object orientation damping, N·m·s/rad (GRASP)
-    Kp_contact = 100.0   # weak per-finger slip-correction stiffness, N/m (GRASP)
+    Kp_contact = 50.0   # weak per-finger slip-correction stiffness, N/m (GRASP)
     Kd_contact = 10.0   # weak per-finger slip-correction damping, N·s/m (GRASP)
     gamma   = 50.0    # internal squeeze force scale; negate if fingers pull apart
     force_allocator = GraspForceAllocator(gamma)

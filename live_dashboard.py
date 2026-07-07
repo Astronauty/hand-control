@@ -13,7 +13,8 @@ Message protocol (plain dicts put on the queue):
     {'type': 'rrt',   'n_wp': int, 'plan_time': float, 'fallback': bool}
     {'type': 'ipopt', 'phase': str, 'status': str, 'iters': int|str,
                       'max_site_mm': float, 'max_pad_deg': float|None,
-                      'min_slack_mm': float|None}
+                      'min_slack_mm': float|None,
+                      'dls_ms': float|None, 'ipopt_ms': float|None}
     {'type': 'active', 'label': str}     # active-object/phase label (optional)
     None                                 # sentinel: quit
 
@@ -87,7 +88,7 @@ def _run(queue, fingers, horizon_s, dt_hint):
     grid.addWidget(ipopt_log, 3, 1)
     grid.setRowStretch(1, 3)
     grid.setRowStretch(3, 1)
-    win.resize(950, 680)
+    win.resize(1150, 700)
     win.show()
 
     def drain():
@@ -113,14 +114,19 @@ def _run(queue, fingers, horizon_s, dt_hint):
                     f"{kind}: {msg.get('n_wp', '?')} wp  "
                     f"{msg.get('plan_time', float('nan'))*1e3:.0f} ms")
             elif mt == 'ipopt':
-                pad = msg.get('max_pad_deg')
-                slack = msg.get('min_slack_mm')
+                pad     = msg.get('max_pad_deg')
+                slack   = msg.get('min_slack_mm')
+                dls_ms  = msg.get('dls_ms')
+                ipo_ms  = msg.get('ipopt_ms')
+                t_str   = (f"  DLS={dls_ms:.0f}ms IPOPT={ipo_ms:.0f}ms"
+                           if dls_ms is not None and ipo_ms is not None else "")
                 ipopt_log.appendPlainText(
-                    f"{msg.get('phase', '?'):<9} {msg.get('status', '?')[:22]:<22} "
+                    f"{msg.get('phase', '?'):<14} {msg.get('status', '?')[:18]:<18} "
                     f"it={msg.get('iters', '?')!s:>4}  "
                     f"site={msg.get('max_site_mm', float('nan')):.1f}mm  "
                     f"pad={'—' if pad is None else f'{pad:.1f}°'}  "
-                    f"slack={'—' if slack is None else f'{slack:.1f}mm'}")
+                    f"slack={'—' if slack is None else f'{slack:.1f}mm'}"
+                    + t_str)
             elif mt == 'active':
                 active_lbl.setText(f"active: {msg.get('label', '—')}")
         if got_dist:

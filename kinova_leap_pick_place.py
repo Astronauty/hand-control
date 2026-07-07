@@ -98,6 +98,84 @@ def make_key_callback(key_queue):
     return _cb
 
 
+_RANDOMIZE_OBJ_INFO = [
+    # (body_name, geom_name, base_rgb)
+    ('obj_red_box',        'obj_red_box_geom',        [0.85, 0.15, 0.15]),
+    ('obj_red_sphere',     'obj_red_sphere_geom',     [0.80, 0.20, 0.10]),
+    ('obj_blue_cylinder',  'obj_blue_cylinder_geom',  [0.15, 0.25, 0.85]),
+    ('obj_blue_capsule',   'obj_blue_capsule_geom',   [0.20, 0.15, 0.75]),
+    ('obj_green_box',      'obj_green_box_geom',      [0.15, 0.75, 0.20]),
+    ('obj_green_cylinder', 'obj_green_cylinder_geom', [0.10, 0.70, 0.30]),
+]
+
+
+def _randomize_objects(model, data, rng):
+    """Randomize positions, colors, and sizes for all pickable objects.
+
+    Must be called after MjData creation and before the first mj_forward.
+    Updates both data.qpos and model.qpos0 so mj_resetData preserves
+    the randomized object positions throughout the IK precomputation loop.
+    """
+    PICK_CENTER = np.array([0.5, 0.5])
+    PICK_HALF   = np.array([0.27, 0.27])   # centers in [0.23, 0.77]² to keep objects on marker
+    MIN_SEP     = 0.10                      # minimum centre-to-centre separation (m)
+    MAX_TRIES   = 2000
+
+    n = len(_RANDOMIZE_OBJ_INFO)
+    size_scales = rng.uniform(0.88, 1.12, n)  # ±12% uniform size scale per object
+
+    # Rejection-sample 2-D positions with minimum separation
+    xy_list: list[np.ndarray] = []
+    for _ in range(n):
+        for _ in range(MAX_TRIES):
+            xy = PICK_CENTER + rng.uniform(-PICK_HALF, PICK_HALF)
+            if all(np.linalg.norm(xy - p) >= MIN_SEP for p in xy_list):
+                xy_list.append(xy)
+                break
+        else:
+            xy_list.append(PICK_CENTER + rng.uniform(-PICK_HALF, PICK_HALF))
+
+    for i, (bname, gname, base_rgb) in enumerate(_RANDOMIZE_OBJ_INFO):
+        s   = float(size_scales[i])
+        bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, bname)
+        gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, gname)
+
+        # Size: scale geom_size and bounding sphere uniformly
+        model.geom_size[gid]   *= s
+        model.geom_rbound[gid] *= s
+
+        # Color: ±10 % per channel, clamped to [0.05, 1.0]
+        rgb = np.clip(np.array(base_rgb, float) + rng.uniform(-0.10, 0.10, 3), 0.05, 1.0)
+        model.geom_rgba[gid, :3] = rgb
+
+        # Contact sites: scale the x offset (contact-normal direction) in body frame
+        for sit_id in range(model.nsite):
+            if model.site_bodyid[sit_id] == bid:
+                model.site_pos[sit_id, 0] *= s
+
+        # Position: derive rest height from scaled geom size, then write freejoint qpos
+        sz    = model.geom_size[gid]          # already scaled
+        gtype = model.geom_type[gid]
+        if gtype == mj.mjtGeom.mjGEOM_SPHERE:
+            z_rest = float(sz[0])
+        elif gtype == mj.mjtGeom.mjGEOM_BOX:
+            z_rest = float(sz[2])
+        elif gtype == mj.mjtGeom.mjGEOM_CYLINDER:
+            z_rest = float(sz[1])             # half-height; rests on flat face
+        elif gtype == mj.mjtGeom.mjGEOM_CAPSULE:
+            z_rest = float(sz[0] + sz[1])     # radius + half-cylinder-length
+        else:
+            z_rest = float(sz[0])
+
+        jnt_adr = model.body_jntadr[bid]
+        if jnt_adr < 0:
+            continue
+        qadr = model.jnt_qposadr[jnt_adr]
+        pos7 = np.array([xy_list[i][0], xy_list[i][1], z_rest, 1.0, 0.0, 0.0, 0.0])
+        data.qpos[qadr:qadr + 7]   = pos7
+        model.qpos0[qadr:qadr + 7] = pos7    # preserve across mj_resetData calls
+
+
 if __name__ == "__main__":
     _arg_parser = argparse.ArgumentParser(
         description="Kinova+LEAP pick-place: RRT + internal-force grasp controller.")
@@ -122,6 +200,8 @@ if __name__ == "__main__":
     # randomize those joints. Give them a generous sampling bound before the planner reads it.
     for j in (0, 2, 4, 6):
         model.jnt_range[j] = [-np.pi, np.pi]
+
+    _randomize_objects(model, data, np.random.default_rng())
 
     mj.mj_forward(model, data)
 
@@ -162,8 +242,12 @@ if __name__ == "__main__":
     # natural place to later turn finger->contact-site into an optimized assignment
     # rather than a fixed lookup.
     object_defs = [
-        ({'index': 'obj_box_c2', 'thumb': 'obj_box_c1'}, 'obj_box'),
-        ({'index': 'obj_cylinder_c2', 'thumb': 'obj_cylinder_c1'}, 'obj_cylinder'),
+        ({'index': 'obj_red_box_c2',        'thumb': 'obj_red_box_c1'},        'obj_red_box'),
+        ({'index': 'obj_red_sphere_c2',     'thumb': 'obj_red_sphere_c1'},     'obj_red_sphere'),
+        ({'index': 'obj_blue_cylinder_c2',  'thumb': 'obj_blue_cylinder_c1'},  'obj_blue_cylinder'),
+        ({'index': 'obj_blue_capsule_c2',   'thumb': 'obj_blue_capsule_c1'},   'obj_blue_capsule'),
+        ({'index': 'obj_green_box_c2',      'thumb': 'obj_green_box_c1'},      'obj_green_box'),
+        ({'index': 'obj_green_cylinder_c2', 'thumb': 'obj_green_cylinder_c1'}, 'obj_green_cylinder'),
     ]
     objects = []
     for contact_sites, body_name in object_defs:
@@ -205,7 +289,12 @@ if __name__ == "__main__":
                 or _bname in ('leap_palm', 'bracelet_link')):
             _robot_geom_names.append(_gname)
     # 'floor' is the ground plane — keep every checked hand geom above it (both IK and RRT).
-    _OBJ_GEOM_NAMES = ['obj_box_geom', 'obj_cylinder_geom', 'floor']
+    _OBJ_GEOM_NAMES = [
+        'obj_red_box_geom', 'obj_red_sphere_geom',
+        'obj_blue_cylinder_geom', 'obj_blue_capsule_geom',
+        'obj_green_box_geom', 'obj_green_cylinder_geom',
+        'floor',
+    ]
     constrained_ik = ConstrainedIKSolver(
         model, N_ROBOT,
         arm_geom_names=_robot_geom_names,
@@ -234,9 +323,9 @@ if __name__ == "__main__":
         dash.start()
         print("[dashboard] launched (separate process)")
 
-    def _push_ipopt(phase):
-        """Forward ConstrainedIKSolver.last_metrics from the most recent solve() to the
-        dashboard's IPOPT panel. No-op when the dashboard is disabled."""
+    def _push_ipopt(phase, dls_ms=None, ipopt_ms=None):
+        """Forward ConstrainedIKSolver.last_metrics + stage timing to the dashboard's
+        IPOPT panel. No-op when the dashboard is disabled."""
         if dash is None:
             return
         m = constrained_ik.last_metrics
@@ -248,6 +337,8 @@ if __name__ == "__main__":
             'max_site_mm':  max(m.get('site_err_mm', [0.0])),
             'max_pad_deg':  (max(m['pad_deg']) if m.get('pad_deg') else None),
             'min_slack_mm': m.get('min_slack_mm'),
+            'dls_ms':       dls_ms,
+            'ipopt_ms':     ipopt_ms,
         })
 
     # Arm home pose from gen3.xml's "home" keyframe (the composite model has its keyframes
@@ -311,74 +402,10 @@ if __name__ == "__main__":
     print(f"[IK] active-finger geoms (tiered object clearance, floor kept): "
           f"{len(_active_finger_geoms)}")
 
-    for i, obj in enumerate(objects):
-        mj.mj_resetData(model, data)
-        data.qpos[:N_ROBOT] = Q_BIAS   # DLS warm-start pose (qpos0 is no longer Q_BIAS)
-        mj.mj_forward(model, data)
-        p_obj   = data.xpos[obj['id_body']].copy()
-        normals = [(p - p_obj) / np.linalg.norm(p - p_obj) for p in obj['p_S_W']]
-
-        # Stage 1: DLS IK (position-only, null_gain=0.3 for grasp approach direction)
-        print(f"[IK] Object {i+1}: DLS grasp …")
-        q_dls_grasp = dls_ik.solve(model, data, id_C, obj['p_S_W'],
-                                    q_bias=Q_BIAS, null_gain=0.3)
-        # Stage 2: IPOPT collision refinement from DLS warm start
-        print(f"[IK] Object {i+1}: IPOPT grasp (collision refinement) …")
-        obj['q_target'] = constrained_ik.solve(data, id_C, obj['p_S_W'],
-                                                q_bias=Q_BIAS, q_init=q_dls_grasp,
-                                                reduced_clearance_geoms=_active_clearance_by_geom,
-                                                inward_dirs=obj['inward_S_W'])
-        _push_ipopt(f'obj{i+1} grasp')
-
-        mj.mj_resetData(model, data)
-        data.qpos[:N_ROBOT] = Q_BIAS   # DLS warm-start pose (qpos0 is no longer Q_BIAS)
-        mj.mj_forward(model, data)
-        pregrasp_targets = [p + PREGRASP_OFFSET * n for p, n in zip(obj['p_S_W'], normals)]
-
-        # Stage 1: DLS pregrasp (null_gain=0.0 — HOME_ARM bias fights low-z targets)
-        print(f"[IK] Object {i+1}: DLS pregrasp …")
-        q_dls_pre = dls_ik.solve(model, data, id_C, pregrasp_targets,
-                                  q_bias=Q_BIAS, null_gain=0.0)
-        q_dls_pre[11:19] = Q_BIAS[11:19]   # warm-start the mf/rf fingers curled (not a final override)
-        # Stage 2: IPOPT collision refinement (all geoms constrained). The mf/rf curl is
-        # only the warm start above — we let IPOPT keep those joints collision-consistent
-        # rather than overwriting them back to Q_BIAS afterward, which previously reinstated
-        # a curled-fingertip-into-neighbouring-object penetration that the collision-aware
-        # solve had avoided (and made the RRT pregrasp goal infeasible).
-        print(f"[IK] Object {i+1}: IPOPT pregrasp (collision refinement) …")
-        q_pg = constrained_ik.solve(data, id_C, pregrasp_targets,
-                                     q_bias=Q_BIAS, q_init=q_dls_pre,
-                                     reduced_clearance_geoms=_active_clearance_by_geom,
-                                     inward_dirs=obj['inward_S_W'])
-        _push_ipopt(f'obj{i+1} pregrasp')
-        obj['q_pregrasp'] = q_pg
-
-        _d_chk = mj.MjData(model)
-        for label, q_sol, tgts in [('grasp',    obj['q_target'], obj['p_S_W']),
-                                    ('pregrasp', q_pg,            pregrasp_targets)]:
-            _d_chk.qpos[:N_ROBOT] = q_sol
-            mj.mj_forward(model, _d_chk)
-            errs = [f"{np.linalg.norm(_d_chk.site_xpos[s] - t)*1e3:.1f} mm"
-                    for s, t in zip(id_C, tgts)]
-            print(f"[IK] Object {i+1} {label}: tip errors = {errs}")
-            # Exact (mj_geomDistance, no bounding sphere) audit of every active-finger geom
-            # vs the target object at the solution — the IK's sphere model can't see true
-            # penetration, so this is the guardrail that makes it visible. Contact-tier
-            # geoms (ds/tip) legitimately read ~0 at grasp; anything below -2mm is flagged.
-            # Each query is clamped from below by the bounding-sphere bound: MuJoCo 3.3.x
-            # GJK can spuriously return 0.0 for well-separated box-box pairs, and the true
-            # distance can never be under ||c1-c2|| - rb1 - rb2.
-            _ft = np.zeros(6)
-            _pen = {}
-            for g in _active_finger_geoms:
-                _gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g)
-                _lb  = (np.linalg.norm(_d_chk.geom_xpos[obj['id_geom']] - _d_chk.geom_xpos[_gid])
-                        - model.geom_rbound[_gid] - model.geom_rbound[obj['id_geom']])
-                _pen[g] = max(mj.mj_geomDistance(model, _d_chk, _gid, obj['id_geom'], 1.0, _ft), _lb)
-            _worst_g, _worst_d = min(_pen.items(), key=lambda kv: kv[1])
-            _flag = '  ** PENETRATION **' if _worst_d < -0.002 else ''
-            print(f"[IK] Object {i+1} {label}: active-finger min exact dist = "
-                  f"{_worst_d*1e3:.1f} mm ({_worst_g}){_flag}")
+    # Dedicated MjData for background IK solves so the IK thread never touches the main
+    # simulation data. Object positions come from model.qpos0 (set by _randomize_objects).
+    _ik_data   = mj.MjData(model)
+    _ik_solved = set()   # object indices whose IK has been solved and cached
 
     # Per-joint PD gains for REACH phase: 7 arm joints + 16 LEAP finger joints.
     # Arm gains sized for Gen3's forcerange (±105/±52 Nm); finger gains mirror the small
@@ -389,7 +416,7 @@ if __name__ == "__main__":
     Kd_obj     = 5.0   # object position damping, N·s/m (GRASP)
     Kp_theta   = 5.0   # object orientation stiffness, N·m/rad (GRASP)
     Kd_theta   = 0.5   # object orientation damping, N·m·s/rad (GRASP)
-    Kp_contact = 100.0  # weak per-finger slip-correction stiffness, N/m (GRASP)
+    Kp_contact = 20.0  # weak per-finger slip-correction stiffness, N/m (GRASP)
     Kd_contact = 10.0   # weak per-finger slip-correction damping, N·s/m (GRASP)
     gamma   = 5.0     # internal squeeze force scale; negate if fingers pull apart
     force_allocator = GraspForceAllocator(gamma)
@@ -399,7 +426,11 @@ if __name__ == "__main__":
     # proximal links / wrist sweep straight through objects unnoticed. The historical reason
     # for tips-only (the active fingers legitimately pass near the target at the goal) is now
     # handled by the per-plan target-aware pair-clearance overrides below.
-    OBJ_BODIES   = ['obj_box', 'obj_cylinder']
+    OBJ_BODIES = [
+        'obj_red_box', 'obj_red_sphere',
+        'obj_blue_cylinder', 'obj_blue_capsule',
+        'obj_green_box', 'obj_green_cylinder',
+    ]
     planner = RRTPlanner(model, _robot_geom_names, OBJ_BODIES,
                          extra_obj_geom_names=['floor'], n_robot=N_ROBOT,
                          n_plan=7,            # plan only the 7 arm joints; finger DOF fixed at goal
@@ -427,13 +458,13 @@ if __name__ == "__main__":
     _GHOST_SITES    = id_C  # same sites driven by IK, so the ghost path matches the IK target
     _N_GHOST        = 15   # max waypoints to sample for ghost display
 
-    # Static IK config markers: computed once at startup for each object.
+    # Static IK config markers: built lazily after each object's IK is solved.
     # cyan  (0, 0.8, 0.8) = pregrasp   gold (1, 0.8, 0) = grasp
-    # Indexed by object index so the render loop shows only the active object's configs.
-    def _make_ik_markers(obj):
+    # Indexed by object index; None until the object's IK has been solved.
+    def _make_ik_markers(obj, obj_qpos_snap):
         markers = []
         _d = mj.MjData(model)
-        _d.qpos[N_ROBOT:] = data.qpos[N_ROBOT:].copy()
+        _d.qpos[N_ROBOT:] = obj_qpos_snap
         for q_cfg, rgba in [
             (obj['q_pregrasp'], np.array([0.0, 0.8, 0.8, 0.55], dtype=np.float32)),
             (obj['q_target'],   np.array([1.0, 0.8, 0.0, 0.55], dtype=np.float32)),
@@ -444,7 +475,7 @@ if __name__ == "__main__":
             markers.append((positions, rgba))
         return markers
 
-    _ik_markers_by_obj = [_make_ik_markers(obj) for obj in objects]
+    _ik_markers_by_obj = [None] * len(objects)
 
     def _update_ghost_markers(waypoints):
         n = len(waypoints)
@@ -510,13 +541,91 @@ if __name__ == "__main__":
         _plan_result['waypoints'] = path
         _update_ghost_markers(path)
 
-    # Build target list: index 0 = home pose (Q_BIAS), 1..N = object IK solutions
-    targets = [{'q_target': Q_BIAS.copy(), 'label': 'init pose'}]
-    for i, obj in enumerate(objects):
-        targets.append({'q_target': obj['q_target'], 'label': f'object {i+1}'})
+    def _run_ik(obj_idx, obj, obj_qpos_snap):
+        """Solve grasp + pregrasp IK for one object, storing q_target and q_pregrasp.
+        Runs inside the background plan_thread — uses _ik_data, never touches main data.
+        Each DLS and IPOPT stage is timed individually and pushed to the dashboard."""
+        mj.mj_resetData(model, _ik_data)
+        _ik_data.qpos[:N_ROBOT] = Q_BIAS
+        mj.mj_forward(model, _ik_data)
+        p_obj   = _ik_data.xpos[obj['id_body']].copy()
+        normals = [(p - p_obj) / np.linalg.norm(p - p_obj) for p in obj['p_S_W']]
+
+        # --- Grasp IK ---
+        _t0 = time.time()
+        q_dls_grasp = dls_ik.solve(model, _ik_data, id_C, obj['p_S_W'],
+                                    q_bias=Q_BIAS, null_gain=0.3)
+        dls_grasp_ms = (time.time() - _t0) * 1e3
+        _t0 = time.time()
+        obj['q_target'] = constrained_ik.solve(_ik_data, id_C, obj['p_S_W'],
+                                                q_bias=Q_BIAS, q_init=q_dls_grasp,
+                                                reduced_clearance_geoms=_active_clearance_by_geom,
+                                                inward_dirs=obj['inward_S_W'])
+        ipopt_grasp_ms = (time.time() - _t0) * 1e3
+        _push_ipopt(f'obj{obj_idx+1} grasp',
+                    dls_ms=dls_grasp_ms, ipopt_ms=ipopt_grasp_ms)
+
+        # --- Pregrasp IK ---
+        mj.mj_resetData(model, _ik_data)
+        _ik_data.qpos[:N_ROBOT] = Q_BIAS
+        mj.mj_forward(model, _ik_data)
+        pregrasp_targets = [p + PREGRASP_OFFSET * n for p, n in zip(obj['p_S_W'], normals)]
+        _t0 = time.time()
+        q_dls_pre = dls_ik.solve(model, _ik_data, id_C, pregrasp_targets,
+                                  q_bias=Q_BIAS, null_gain=0.0)
+        dls_pre_ms = (time.time() - _t0) * 1e3
+        q_dls_pre[11:19] = Q_BIAS[11:19]
+        _t0 = time.time()
+        obj['q_pregrasp'] = constrained_ik.solve(_ik_data, id_C, pregrasp_targets,
+                                                  q_bias=Q_BIAS, q_init=q_dls_pre,
+                                                  reduced_clearance_geoms=_active_clearance_by_geom,
+                                                  inward_dirs=obj['inward_S_W'])
+        ipopt_pre_ms = (time.time() - _t0) * 1e3
+        _push_ipopt(f'obj{obj_idx+1} pregrasp',
+                    dls_ms=dls_pre_ms, ipopt_ms=ipopt_pre_ms)
+
+        total_ms = dls_grasp_ms + ipopt_grasp_ms + dls_pre_ms + ipopt_pre_ms
+        print(f"\r\n[IK] obj{obj_idx+1}: grasp DLS {dls_grasp_ms:.0f}ms + IPOPT {ipopt_grasp_ms:.0f}ms"
+              f"  |  pregrasp DLS {dls_pre_ms:.0f}ms + IPOPT {ipopt_pre_ms:.0f}ms"
+              f"  |  total {total_ms:.0f}ms")
+
+        # Tip-error + penetration audit (same checks as the old upfront loop)
+        _d_chk = mj.MjData(model)
+        for label, q_sol, tgts in [('grasp',    obj['q_target'],   obj['p_S_W']),
+                                    ('pregrasp', obj['q_pregrasp'], pregrasp_targets)]:
+            _d_chk.qpos[:N_ROBOT] = q_sol
+            mj.mj_forward(model, _d_chk)
+            errs = [f"{np.linalg.norm(_d_chk.site_xpos[s] - t)*1e3:.1f} mm"
+                    for s, t in zip(id_C, tgts)]
+            print(f"\r\n[IK] obj{obj_idx+1} {label}: tip errors = {errs}")
+            _ft  = np.zeros(6)
+            _pen = {}
+            for g in _active_finger_geoms:
+                _gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g)
+                _lb  = (np.linalg.norm(_d_chk.geom_xpos[obj['id_geom']] - _d_chk.geom_xpos[_gid])
+                        - model.geom_rbound[_gid] - model.geom_rbound[obj['id_geom']])
+                _pen[g] = max(mj.mj_geomDistance(model, _d_chk, _gid, obj['id_geom'], 1.0, _ft), _lb)
+            _worst_g, _worst_d = min(_pen.items(), key=lambda kv: kv[1])
+            _flag = '  ** PENETRATION **' if _worst_d < -0.002 else ''
+            print(f"\r\n[IK] obj{obj_idx+1} {label}: min exact dist = "
+                  f"{_worst_d*1e3:.1f} mm ({_worst_g}){_flag}")
+
+        _ik_markers_by_obj[obj_idx] = _make_ik_markers(obj, obj_qpos_snap)
+        _ik_solved.add(obj_idx)
+
+    def _run_ik_then_rrt(obj_idx, obj, q_start, obj_qpos_snap):
+        """Background thread: solve IK for obj (if not cached), then run RRT."""
+        _run_ik(obj_idx, obj, obj_qpos_snap)
+        _run_rrt(q_start, obj['q_pregrasp'], obj)
+
+    # Build target list: index 0 = home pose, 1..N = one entry per object (label only —
+    # q_target is not precomputed; it is solved lazily on first selection).
+    targets = [{'label': 'init pose'}]
+    for i in range(len(objects)):
+        targets.append({'label': f'object {i+1}'})
 
     keys = queue.Queue()
-    print("[Control] Ctrl+0/1/2: select target  |  ←→: jog x  |  ↑↓: jog z  |  Enter: GRASP  |  K: IK vis  |  B: coll spheres  |  Q/Esc: quit")
+    print("[Control] Ctrl+0..6: select target  |  ←→: jog x  |  ↑↓: jog z  |  Enter: GRASP  |  K: IK vis  |  B: coll spheres  |  Q/Esc: quit")
     print("[Control] Active target: init pose")
 
     # Simulation — start at Q_BIAS so PD error at t=0 is zero and qfrc_bias is correct.
@@ -632,7 +741,7 @@ if __name__ == "__main__":
                     mj.mjv_connector(scn.geoms[scn.ngeom], mj.mjtGeom.mjGEOM_CAPSULE,
                                       0.004, p0, p1)
                     scn.ngeom += 1
-                if active_tgt > 0:
+                if active_tgt > 0 and _ik_markers_by_obj[active_idx] is not None:
                     for positions, rgba in _ik_markers_by_obj[active_idx]:
                         for pos in positions:
                             if scn.ngeom >= scn.maxgeom: break
@@ -695,7 +804,7 @@ if __name__ == "__main__":
                     control_phase  = 'REACH'
                     print(f"\r\n[Control] → REACH  (released — returning to pregrasp)")
 
-                elif key == 'ik_vis' and active_tgt > 0:
+                elif key == 'ik_vis' and active_tgt > 0 and active_idx in _ik_solved:
                     _ik_vis_mode = {None: 'pregrasp', 'pregrasp': 'grasp', 'grasp': None}[_ik_vis_mode]
                     label = f'showing {_ik_vis_mode} config' if _ik_vis_mode else 'off'
                     print(f"\r\n[IK vis] {label}  (K to cycle)")
@@ -715,17 +824,28 @@ if __name__ == "__main__":
                         with _ghost_markers_lock:   # clear stale ghosts while planning
                             _ghost_markers.clear()
                         if active_tgt == 0:
-                            traj_waypoints = [targets[0]['q_target']]
+                            traj_waypoints = [Q_BIAS.copy()]
                             traj_wp_idx    = 0
                             traj_wp_step   = 0
                             control_phase  = 'REACH'
                         else:
-                            q_pre = objects[active_idx]['q_pregrasp']
+                            obj_i = active_idx
                             _plan_result.clear()
-                            q_plan_hold   = q_start.copy()
-                            plan_thread   = threading.Thread(
-                                target=_run_rrt, args=(q_start, q_pre, objects[active_idx]),
-                                daemon=True)
+                            q_plan_hold    = q_start.copy()
+                            obj_qpos_snap  = data.qpos[N_ROBOT:].copy()
+                            if obj_i in _ik_solved:
+                                # IK cached — go straight to RRT
+                                plan_thread = threading.Thread(
+                                    target=_run_rrt,
+                                    args=(q_start, objects[obj_i]['q_pregrasp'],
+                                          objects[obj_i]),
+                                    daemon=True)
+                            else:
+                                # IK not yet solved — run IK then chain into RRT
+                                plan_thread = threading.Thread(
+                                    target=_run_ik_then_rrt,
+                                    args=(obj_i, objects[obj_i], q_start, obj_qpos_snap),
+                                    daemon=True)
                             plan_thread.start()
                             control_phase = 'PLAN'
                         print(f"\r\n[Control] → {targets[active_tgt]['label']}")
@@ -797,8 +917,7 @@ if __name__ == "__main__":
                 elif args.viz_only:
                     # Final waypoint reached: keep holding it kinematically — never
                     # hand off to physics, so the IK solution can be inspected as-is.
-                    wp = (traj_waypoints[-1] if traj_waypoints
-                          else targets[active_tgt]['q_target'])
+                    wp = traj_waypoints[-1] if traj_waypoints else Q_BIAS.copy()
                     data.qpos[:N_ROBOT] = wp
                     data.qvel[:N_ROBOT] = 0.0
                     mj.mj_forward(model, data)
@@ -807,8 +926,7 @@ if __name__ == "__main__":
 
                 else:
                     # Last waypoint reached: switch to physics PD hold.
-                    wp = (traj_waypoints[-1] if traj_waypoints
-                          else targets[active_tgt]['q_target'])
+                    wp = traj_waypoints[-1] if traj_waypoints else Q_BIAS.copy()
                     data.qvel[:N_ROBOT] = 0.0   # damp out kinematic-replay residual velocity
                     tau_ctrl = np.zeros(model.nv)
                     tau_ctrl[:N_ROBOT] = Kp * (wp - data.qpos[:N_ROBOT]) + Kd * (0 - data.qvel[:N_ROBOT])
@@ -906,7 +1024,7 @@ if __name__ == "__main__":
                     mj.mjv_connector(scn.geoms[scn.ngeom], mj.mjtGeom.mjGEOM_CAPSULE,
                                       0.004, p0, p1)
                     scn.ngeom += 1
-                if active_tgt > 0:
+                if active_tgt > 0 and _ik_markers_by_obj[active_idx] is not None:
                     for positions, rgba in _ik_markers_by_obj[active_idx]:
                         for pos in positions:
                             if scn.ngeom >= scn.maxgeom:
