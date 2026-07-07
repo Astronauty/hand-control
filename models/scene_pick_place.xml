@@ -3,11 +3,21 @@
 
   <worldbody>
     <!-- Pick area: reference marker (visual only) -->
-    <geom name="pick_area_marker" type="cylinder" size="0.12 0.0005" pos="0.45 0.25 0.001"
+    <!-- <geom name="pick_area_marker" type="cylinder" size="0.12 0.0005" pos="0.45 0.25 0.001"
+      rgba="0.6 0.6 0.6 0.35" contype="0" conaffinity="0"/> -->
+
+    <geom name="pick_area_marker" type="box" size="0.25 0.25 0.0005" pos="0.5 0.5 0.001"
       rgba="0.6 0.6 0.6 0.35" contype="0" conaffinity="0"/>
 
-    <!-- Objects, clustered in the pick area -->
-    <body name="obj_box" pos="0.40 0.22 0.03">
+    <!-- Table to hold the objects -->
+    <!-- <body name="table" pos="0.0 0.0 0.5">
+      <geom name="table"  type="box" size="1.0 1.0 0.01" rgba="1.0 1.0 1.0 1.0" 
+        mass="0.05" friction="1. 0.05 0.001" condim="3"/>
+    </body> -->
+
+    <!-- Objects, centered on the pick_area_marker (0.5 0.5), spread apart to avoid overlap.
+         z = each geom's half-height, so they rest exactly on the floor (z=0) at startup. -->
+    <body name="obj_box" pos="0.42 0.5 0.035">
       <freejoint/>
       <geom name="obj_box_geom" type="box" size="0.03 0.03 0.03" rgba="0.8 0.2 0.2 1"
         mass="0.05" friction="1 0.05 0.001" condim="3"/>
@@ -18,14 +28,14 @@
       <site name="obj_box_c2" pos="0.03 0 0" quat="0 0 1 0"/>
     </body>
 
-    <body name="obj_cylinder" pos="0.45 0.25 0.025">
+    <body name="obj_cylinder" pos="0.58 0.5 0.035">
       <freejoint/>
-      <geom name="obj_cylinder_geom" type="cylinder" size="0.025 0.025" rgba="0.2 0.7 0.2 1"
+      <geom name="obj_cylinder_geom" type="cylinder" size="0.03 0.03" rgba="0.2 0.7 0.2 1"
         mass="0.05" friction="1 0.05 0.001" condim="3"/>
       <!-- Antipodal contact sites on the curved surface at mid-height, same inward-normal
            convention as obj_box's contact sites. -->
-      <site name="obj_cylinder_c1" pos="-0.025 0 0" quat="1 0 0 0"/>
-      <site name="obj_cylinder_c2" pos="0.025 0 0" quat="0 0 1 0"/>
+      <site name="obj_cylinder_c1" pos="-0.03 0 0" quat="1 0 0 0"/>
+      <site name="obj_cylinder_c2" pos="0.03 0 0" quat="0 0 1 0"/>
     </body>
 
     <!-- Deformable object: soft cube via flexcomp (native MuJoCo, no plugin) -->

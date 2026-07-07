@@ -16,7 +16,7 @@
       <site name="obj_box_c2" pos="0.03 0 0" quat="0 0 1 0"/>
     </body>
 
-    <body name="obj_cylinder" pos="0.45 0.25 0.025">
+    <body name="obj_cylinder" pos="0.52 0.22 0.025">
       <freejoint/>
       <geom name="obj_cylinder_geom" type="cylinder" size="0.025 0.025" rgba="0.2 0.7 0.2 1"
         mass="0.05" friction="1 0.05 0.001" condim="3"/>

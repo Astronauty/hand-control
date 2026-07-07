@@ -16,6 +16,13 @@
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
   </asset>
 
+  <!-- Exclude the base_link/shoulder_link self-contact: these mesh geoms overlap by ~12mm
+       at the gen3 home keyframe (verified in standalone gen3.xml — inherent to the model).
+       Without this exclusion the persistent contact forces destabilise the PD controller. -->
+  <contact>
+    <exclude body1="base_link" body2="shoulder_link"/>
+  </contact>
+
   <worldbody>
     <light pos="0 0 1.5" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
