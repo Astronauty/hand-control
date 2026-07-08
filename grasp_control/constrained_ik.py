@@ -79,6 +79,7 @@ class _SitePositionJacCallback(ca.Callback):
         self.eval_count += 1
         self._data.qpos[:self._n] = np.array(arg[0]).flatten()
         mj.mj_kinematics(self._model, self._data)
+        mj.mj_comPos(self._model, self._data)   # needed: populates cdof for mj_jacSite
         jacp = np.zeros((3, self._model.nv))
         mj.mj_jacSite(self._model, self._data, jacp, None, self._sid)
         return [jacp[:, :self._n]]
@@ -114,6 +115,7 @@ class _SiteAxisJacCallback(ca.Callback):
         self.eval_count += 1
         self._data.qpos[:self._n] = np.array(arg[0]).flatten()
         mj.mj_kinematics(self._model, self._data)
+        mj.mj_comPos(self._model, self._data)   # needed: populates cdof for mj_jacSite
         R          = self._data.site_xmat[self._sid].reshape(3, 3)
         axis_world = R @ self._localaxis
         jacr       = np.zeros((3, self._model.nv))
@@ -146,6 +148,7 @@ class _GeomPositionJacCallback(ca.Callback):
         self.eval_count += 1
         self._data.qpos[:self._n] = np.array(arg[0]).flatten()
         mj.mj_kinematics(self._model, self._data)
+        mj.mj_comPos(self._model, self._data)   # needed: populates cdof for mj_jac
         jacp    = np.zeros((3, self._model.nv))
         pt      = self._data.geom_xpos[self._gid].copy()
         body_id = int(self._model.geom_bodyid[self._gid])
@@ -239,6 +242,31 @@ class _GeomPositionCallback(ca.Callback):
         return [self._data.geom_xpos[self._gid].copy()]
 
 
+def _softplus(x, alpha=500.0):
+    """Smooth approximation to max(x, 0), element-wise on a CasADi expression.
+
+    softplus(x, α) = max(x,0) + log(1 + exp(−α|x|)) / α
+
+    This is C∞ everywhere (gradient = sigmoid 1/(1+exp(−αx))).  Max error
+    vs true max(x,0) is log(2)/α ≈ 1.4 mm at α=500 — acceptable against
+    a 5 mm clearance budget.  Error decays exponentially: at ±5 mm < 0.2 mm.
+
+    Using the max(x,0)+correction form keeps both tails numerically stable:
+    exp(−α|x|) → 0 in both tails so log(1+~0)/α → 0.
+
+    NOT currently used in the production SDFs: with jacobian_approximation=
+    "finite-difference-values" IPOPT's own FD already smooths the fmax kinks,
+    and adding softplus double-smooths the boundary, weakening repulsion and
+    changing local minima (benchmarked worse in 4/6 cases with DLS warm-start).
+    Kept here for the analytic-Jacobian path: switching to jacobian_approximation=
+    "exact" exposes the raw fmax kink to CasADi's AD, breaking L-BFGS — softplus
+    fixes that.  To enable: replace ca.fmax(q,0) with _softplus(q) in
+    _sphere_box_distance and _sphere_cylinder_distance, then switch the solver to
+    "exact" and restore has_jacobian()/get_jacobian() on the FK callbacks.
+    """
+    return ca.fmax(x, 0) + ca.log(1 + ca.exp(-alpha * ca.fabs(x))) / alpha
+
+
 def _sphere_box_distance(p_arm, arm_radius, box_center, box_R, half_extents):
     """Smooth, exact (not bounding-sphere) signed distance from a sphere (center
     p_arm, radius arm_radius) to an oriented box (center box_center, rotation box_R,
@@ -247,19 +275,15 @@ def _sphere_box_distance(p_arm, arm_radius, box_center, box_R, half_extents):
     Standard point-to-box clamp formula (e.g. Quilez's box SDF), evaluated in the
     box's local frame:
         q = |R^T (p_arm - box_center)| - half_extents
-        outside = ||max(q, 0)||      (0 if inside, true face/edge/vertex distance otherwise)
-        inside  = min(max(q), 0)     (negative penetration depth if inside)
-    Unlike the bounding-sphere proxy (which has to use the box's *diagonal* to never
-    underestimate clearance, e.g. 0.104m for a 0.06m half-extent cube), this uses the
-    box's true half-extents, so it isn't artificially conservative for a face-on
-    approach. It is built from plain CasADi symbolic ops (fabs/fmax/sqrt), so CasADi
-    differentiates it exactly via autodiff instead of finite-differencing through a
-    Callback — the box still has a genuine gradient kink where the closest feature
-    switches between face/edge/vertex, but that kink is now a true zero-measure
-    crossing with a correct one-sided gradient, not a region smeared by an FD step
-    straddling it (which is what caused IPOPT to cycle with the exact mj_geomDistance
-    callback). The small epsilon under the sqrt avoids an infinite gradient exactly
-    at outside == 0 (i.e. exactly touching a face).
+        outside = ||softplus(q)||   (smooth approx to ||max(q,0)||)
+        inside  = min(max(q), 0)   (negative penetration depth if inside)
+
+    max(q,0) in the outside term is replaced by _softplus(q) to remove the
+    gradient kink at the face/edge/vertex transition (q_i = 0).  That kink
+    caused L-BFGS in IPOPT to accumulate conflicting curvature estimates
+    across the boundary and stall.  The inside term keeps fmin/fmax because
+    its kinks only arise in infeasible states (sphere inside the box) and do
+    not affect convergence from a good warm-start.
     """
     p_local = box_R.T @ (p_arm - box_center)
     q       = ca.fabs(p_local) - half_extents
@@ -383,6 +407,7 @@ class ConstrainedIKSolver:
         self._lo_vec = np.where(limited, self._lo, -1e19)
         self._hi_vec = np.where(limited, self._hi,  1e19)
 
+        self._solver_name = "ipopt"
         self._solver_opts = {
             "print_time": False,
             "ipopt": {
@@ -553,10 +578,11 @@ class ConstrainedIKSolver:
               else (q_bias if q_bias is not None else np.zeros(n)))
         opti.set_initial(q, q0)
         t_setup = time.time() - _t0_solve
-        opti.solver("ipopt", self._solver_opts)
+        opti.solver(self._solver_name, self._solver_opts)
         t_setup_ms = (time.time() - _t0_solve) * 1e3
+        _slabel = self._solver_name.upper()
 
-        print(f"[IPOPT] setup {t_setup_ms:.0f}ms  |  "
+        print(f"[{_slabel}] setup {t_setup_ms:.0f}ms  |  "
               f"{n} vars  {len(dist_exprs)} constraints  "
               f"({len(geom_cbs)} geom + {len(site_cbs)} site + {len(axis_cbs)} axis cbs)")
 
@@ -570,12 +596,12 @@ class ConstrainedIKSolver:
                 for cb, tgt in zip(site_cbs, targets)
             ]
             self.last_metrics['site_err_mm'] = site_err_mm
-            print(f"[IPOPT]   site errors (mm): "
+            print(f"[{_slabel}]   site errors (mm): "
                   f"{['%.2f' % e for e in site_err_mm]}  max={max(site_err_mm):.2f}")
 
             if q_bias is not None:
                 dq = np.array(value_fn(q)).flatten() - np.asarray(q_bias)
-                print(f"[IPOPT]   posture term: {self._posture_weight * float(dq @ dq):.4g}"
+                print(f"[{_slabel}]   posture term: {self._posture_weight * float(dq @ dq):.4g}"
                       f"  (||q-q_bias||={float(np.linalg.norm(dq)):.3g} rad)")
 
             if dist_exprs:
@@ -586,18 +612,18 @@ class ConstrainedIKSolver:
                 i_min  = int(np.argmin(slacks_mm))
                 n_bind = sum(s < 0.1 for s in slacks_mm)
                 self.last_metrics['min_slack_mm'] = slacks_mm[i_min]
-                print(f"[IPOPT]   collision margin (mm): min={slacks_mm[i_min]:.2f}"
+                print(f"[{_slabel}]   collision margin (mm): min={slacks_mm[i_min]:.2f}"
                       f"  n_binding(<0.1mm)={n_bind}/{len(slacks_mm)}")
                 # Top-5 tightest pairs — the main signal for what's bottlenecking convergence
                 for sl, ag, og in sorted(slack_rows, key=lambda r: r[0])[:5]:
-                    print(f"[IPOPT]     {sl:+7.2f}mm  {ag}  vs  {og}")
+                    print(f"[{_slabel}]     {sl:+7.2f}mm  {ag}  vs  {og}")
 
             if inward_dirs is not None and self._orient_weight > 0:
                 ang = [float(np.degrees(np.arccos(np.clip(
                         float(np.dot(np.array(value_fn(cb(q))).flatten(), d_in)), -1.0, 1.0))))
                     for cb, d_in in zip(axis_cbs, inward_dirs)]
                 self.last_metrics['pad_deg'] = ang
-                print(f"[IPOPT]   pad-normal error (deg): "
+                print(f"[{_slabel}]   pad-normal error (deg): "
                     f"{['%.1f' % a for a in ang]}  max={max(ang):.1f}")
 
             # FK call counts (enable_fd: IPOPT perturbs each of n DOFs and re-evaluates
@@ -610,9 +636,9 @@ class ConstrainedIKSolver:
             self.last_metrics.update(
                 total_fk_calls=total_fk, t_setup_ms=t_setup_ms,
                 t_solve_ms=t_solve_ms, ms_per_iter=ms_per_iter)
-            print(f"[IPOPT]   timing: setup={t_setup_ms:.0f}ms  solve={t_solve_ms:.0f}ms"
+            print(f"[{_slabel}]   timing: setup={t_setup_ms:.0f}ms  solve={t_solve_ms:.0f}ms"
                   f"  {ms_per_iter:.1f}ms/iter")
-            print(f"[IPOPT]   FK calls: {total_fk:,}  "
+            print(f"[{_slabel}]   FK calls: {total_fk:,}  "
                   f"(site={site_fk}  axis={axis_fk}  geom={geom_fk})"
                   f"  ≈ {total_fk / max(iters, 1):.0f} FK/iter")
 
@@ -627,17 +653,22 @@ class ConstrainedIKSolver:
             iters = st['iter_count']
             self.last_metrics.update(status=st['return_status'], iters=iters,
                                      obj=float(sol.value(opti.f)), success=True)
-            print(f"[IPOPT] {st['return_status']}  iters={iters}"
+            print(f"[{_slabel}] {st['return_status']}  iters={iters}"
                   f"  obj={float(sol.value(opti.f)):.4g}")
             _diagnostics(sol.value, t_solve_ms, iters)
             return np.array(sol.value(q))
         except RuntimeError:
             t_solve_ms = (time.time() - _t0_ipopt) * 1e3
-            st    = opti.stats()
+            try:
+                st = opti.stats()
+            except Exception:
+                # opti.stats() throws if solve() bailed before the solver
+                # ever ran (e.g. sqpmethod QP failure on iteration 0)
+                st = {}
             iters = st.get('iter_count', 0)
-            self.last_metrics.update(status=st.get('return_status', '?'),
+            self.last_metrics.update(status=st.get('return_status', 'failed'),
                                      iters=iters, success=False)
-            print(f"[IPOPT] FAILED: {st.get('return_status','?')}  iters={iters}")
+            print(f"[{_slabel}] FAILED: {st.get('return_status','?')}  iters={iters}")
             _diagnostics(opti.debug.value, t_solve_ms, iters)
             return np.array(opti.debug.value(q))
 
@@ -681,8 +712,8 @@ def check_analytic_jacobians(model, n_robot, site_ids, geom_ids,
         return J
 
     for i, sid in enumerate(site_ids[:2]):  # check first 2 sites
-        cb  = _SitePositionJacCallback(f"_chk_spos_{i}", model, sid, n_robot, obj_qpos)
-        def _f(q): return _SitePositionCallback(f"_tmp_{i}", model, sid, n_robot, obj_qpos).eval([q])[0]
+        cb  = _SitePositionJacCallback(f"chk_spos_{i}", model, sid, n_robot, obj_qpos)
+        def _f(q): return _SitePositionCallback(f"tmp{i}", model, sid, n_robot, obj_qpos).eval([q])[0]
         J_analytic = np.array(cb.eval([q_test, np.zeros(3)])[0])
         J_fd       = _fd_jacobian(_f, q_test, n_robot)
         err = np.abs(J_analytic - J_fd).max()
@@ -691,7 +722,7 @@ def check_analytic_jacobians(model, n_robot, site_ids, geom_ids,
         all_ok = all_ok and ok
 
     for i, sid in enumerate(site_ids[:2]):
-        cb  = _SiteAxisJacCallback(f"_chk_sax_{i}", model, sid, pad_axis, n_robot, obj_qpos)
+        cb  = _SiteAxisJacCallback(f"chk_sax_{i}", model, sid, pad_axis, n_robot, obj_qpos)
         def _f(q):
             d2 = _mj.MjData(model)
             d2.qpos[:n_robot] = q
@@ -706,7 +737,7 @@ def check_analytic_jacobians(model, n_robot, site_ids, geom_ids,
         all_ok = all_ok and ok
 
     for i, gid in enumerate(geom_ids[:3]):  # check first 3 geoms
-        cb  = _GeomPositionJacCallback(f"_chk_gpos_{i}", model, gid, n_robot, obj_qpos)
+        cb  = _GeomPositionJacCallback(f"chk_gpos_{i}", model, gid, n_robot, obj_qpos)
         def _f(q):
             d2 = _mj.MjData(model)
             d2.qpos[:n_robot] = q

@@ -62,16 +62,16 @@
     </body>
 
     <!-- Place areas: one per color category, color-matched, below the robot -->
-    <site name="place_red_site" pos="0.35 -0.15 0.001" size="0.001"/>
+    <site name="place_red_site" pos="0.2 -0.15 0.001" size="0.001"/>
     <geom name="place_red_marker" type="box" size="0.10 0.10 0.0005"
-      pos="0.35 -0.15 0.001" rgba="0.85 0.15 0.15 0.35" contype="0" conaffinity="0"/>
+      pos="0.2 -0.5 0.001" rgba="0.85 0.15 0.15 0.35" contype="0" conaffinity="0"/>
 
     <site name="place_blue_site" pos="0.50 -0.15 0.001" size="0.001"/>
     <geom name="place_blue_marker" type="box" size="0.10 0.10 0.0005"
-      pos="0.50 -0.15 0.001" rgba="0.15 0.25 0.85 0.35" contype="0" conaffinity="0"/>
+      pos="0.50 -0.5 0.001" rgba="0.15 0.25 0.85 0.35" contype="0" conaffinity="0"/>
 
-    <site name="place_green_site" pos="0.65 -0.15 0.001" size="0.001"/>
+    <site name="place_green_site" pos="0.8 -0.15 0.001" size="0.001"/>
     <geom name="place_green_marker" type="box" size="0.10 0.10 0.0005"
-      pos="0.65 -0.15 0.001" rgba="0.15 0.75 0.20 0.35" contype="0" conaffinity="0"/>
+      pos="0.8 -0.5 0.001" rgba="0.15 0.75 0.20 0.35" contype="0" conaffinity="0"/>
   </worldbody>
 </mujoco>

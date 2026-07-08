@@ -10,6 +10,8 @@ contacts generically rather than hardcoding 2.
 """
 import argparse
 import numpy as np
+import subprocess
+import sys
 import time
 import threading
 import queue
@@ -90,6 +92,7 @@ def make_key_callback(key_queue):
         256: 'quit',    # Escape
         75:  'ik_vis',  # K — cycle IK config visualization
         66:  'bspheres', # B — toggle IK collision bounding-sphere overlay
+        71:  'teleop_start', # G — (dexpilot) start/re-zero tracking at current pose
     }
     def _cb(keycode):
         event = _MAP.get(keycode)
@@ -99,13 +102,13 @@ def make_key_callback(key_queue):
 
 
 _RANDOMIZE_OBJ_INFO = [
-    # (body_name, geom_name, base_rgb)
-    ('obj_red_box',        'obj_red_box_geom',        [0.85, 0.15, 0.15]),
-    ('obj_red_sphere',     'obj_red_sphere_geom',     [0.80, 0.20, 0.10]),
-    ('obj_blue_cylinder',  'obj_blue_cylinder_geom',  [0.15, 0.25, 0.85]),
-    ('obj_blue_capsule',   'obj_blue_capsule_geom',   [0.20, 0.15, 0.75]),
-    ('obj_green_box',      'obj_green_box_geom',      [0.15, 0.75, 0.20]),
-    ('obj_green_cylinder', 'obj_green_cylinder_geom', [0.10, 0.70, 0.30]),
+    # (body_name, geom_name, base_rgb) — pure R/G/B, no colour jitter
+    ('obj_red_box',        'obj_red_box_geom',        [1.0, 0.0, 0.0]),
+    ('obj_red_sphere',     'obj_red_sphere_geom',     [1.0, 0.0, 0.0]),
+    ('obj_blue_cylinder',  'obj_blue_cylinder_geom',  [0.0, 0.0, 1.0]),
+    ('obj_blue_capsule',   'obj_blue_capsule_geom',   [0.0, 0.0, 1.0]),
+    ('obj_green_box',      'obj_green_box_geom',      [0.0, 1.0, 0.0]),
+    ('obj_green_cylinder', 'obj_green_cylinder_geom', [0.0, 1.0, 0.0]),
 ]
 
 
@@ -144,9 +147,8 @@ def _randomize_objects(model, data, rng):
         model.geom_size[gid]   *= s
         model.geom_rbound[gid] *= s
 
-        # Color: ±10 % per channel, clamped to [0.05, 1.0]
-        rgb = np.clip(np.array(base_rgb, float) + rng.uniform(-0.10, 0.10, 3), 0.05, 1.0)
-        model.geom_rgba[gid, :3] = rgb
+        # Color: fixed pure R/G/B (no jitter)
+        model.geom_rgba[gid, :3] = base_rgb
 
         # Contact sites: scale the x offset (contact-normal direction) in body frame
         for sit_id in range(model.nsite):
@@ -189,6 +191,14 @@ if __name__ == "__main__":
         '--dashboard', action='store_true',
         help="Launch a live pyqtgraph metrics dashboard (separate process): scrolling "
              "fingertip→object distances, RRT solve metrics, and IPOPT solve metrics.")
+    _arg_parser.add_argument(
+        '--mode', choices=['rrt', 'dexpilot'], default='rrt',
+        help="rrt (default): autonomous RRT+IK grasp controller  |  "
+             "dexpilot: live MediaPipe kinematic retargeting teleop via ROS 2.")
+    _arg_parser.add_argument(
+        '--camera', type=int, default=None,
+        help="Camera index forwarded to ui/mediapipe_joint_angles.py in dexpilot mode "
+             "(default: auto-select — prefers external/USB camera at index ≥1).")
     args = _arg_parser.parse_args()
 
     model = mj.MjModel.from_xml_path('models/scene_pick_place.xml')
@@ -634,6 +644,29 @@ if __name__ == "__main__":
     mj.mj_resetData(model, data)
     data.qpos[:N_ROBOT] = Q_BIAS
     mj.mj_forward(model, data)
+
+    # --- DexPilot controller (--mode dexpilot only) ---
+    _dexpilot_ctrl  = None
+    _mediapipe_proc = None
+    if args.mode == 'dexpilot':
+        # Launch the MediaPipe publisher as a subprocess so its OpenCV window
+        # appears alongside the MuJoCo viewer. The subprocess inherits the
+        # current environment (CYCLONEDDS_URI, ROS sourcing, venv Python).
+        _mp_cmd = [sys.executable,
+                   'ui/mediapipe_joint_angles.py']
+        if args.camera is not None:
+            _mp_cmd += ['--camera', str(args.camera)]
+        _mediapipe_proc = subprocess.Popen(_mp_cmd)
+        print(f"[DexPilot] MediaPipe publisher launched (pid {_mediapipe_proc.pid})")
+
+        from teleop.dexpilot_controller import DexPilotController
+        _dexpilot_ctrl = DexPilotController(model, q_bias=Q_BIAS,
+            R_cam_robot=np.eye(3), debug=True, eps=0.005)
+        _dexpilot_ctrl.init_home(data)
+        _dexpilot_ctrl.init_ros()
+        print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")
+        print("[DexPilot] Press G to start tracking (captures your current wrist "
+              "orientation as the robot's home). Q/Esc: quit")
     control_phase  = 'REACH'
     active_idx     = 0
     active_tgt     = 0        # index into targets[]
@@ -705,8 +738,9 @@ if __name__ == "__main__":
             viewer.opt.flags[mj.mjtVisFlag.mjVIS_CONTACTFORCE] = False
             viewer.opt.label = mj.mjtLabel.mjLABEL_NONE
         else:
-            viewer.opt.flags[mj.mjtVisFlag.mjVIS_CONTACTFORCE] = True
-            viewer.opt.label = mj.mjtLabel.mjLABEL_CONTACTFORCE
+            viewer.opt.flags[mj.mjtVisFlag.mjVIS_CONTACTFORCE] = False
+            # viewer.opt.label = mj.mjtLabel.mjLABEL_CONTACTFORCE
+            viewer.opt.label = mj.mjtLabel.mjLABEL_NONE
 
         def _draw_bspheres(scn):
             """Append the IK's collision bounding spheres (translucent) to the scene at the
@@ -755,6 +789,30 @@ if __name__ == "__main__":
         running = True
         while viewer.is_running() and running:
             step_start = time.time()
+
+            # --- DexPilot teleop mode: bypass the RRT/grasp state machine ---
+            if args.mode == 'dexpilot':
+                _dexpilot_ctrl.spin()
+                # Drain key queue — handle quit and teleop start/re-zero
+                while not keys.empty():
+                    _k = keys.get_nowait()
+                    if _k == 'quit':
+                        running = False
+                    elif _k == 'teleop_start':
+                        # Snapshot current human pose as home and begin tracking.
+                        _dexpilot_ctrl.start(data)
+                        print("[dexpilot] tracking started — home pose captured "
+                              "(hold your hand at the desired neutral orientation).")
+                if not running:
+                    continue
+                q_teleop = _dexpilot_ctrl.step(model, data)
+                if q_teleop is not None:
+                    data.qpos[:N_ROBOT] = q_teleop
+                    data.qvel[:N_ROBOT] = 0.0
+                    mj.mj_forward(model, data)
+                viewer.sync()
+                time.sleep(max(0, model.opt.timestep - (time.time() - step_start)))
+                continue
 
             # --- Dashboard: stream fingertip→active-object distances + active label ---
             if dash is not None:
@@ -1041,3 +1099,8 @@ if __name__ == "__main__":
     _kb_listener.stop()
     if dash is not None:
         dash.close()
+    if _dexpilot_ctrl is not None:
+        _dexpilot_ctrl.shutdown()
+    if _mediapipe_proc is not None:
+        _mediapipe_proc.terminate()
+        _mediapipe_proc.wait()
