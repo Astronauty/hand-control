@@ -1,7 +1,17 @@
 import numpy as np
 from scipy.spatial import ConvexHull
 from scipy import optimize
+from scipy.optimize import linprog
+from scipy.optimize import Bounds
 from itertools import product as iterproduct
+
+# TODO: write methods section overleaf
+# -> equations and explanation of this script 
+# -> follow convention for variable names, update variable name section as needed
+# TODO: change brute force convex hull method to LP and make sure it still works
+# TODO: add soft contact model as an option 
+# -> implement soft contact model, similar to how implemented coulomb friction model
+# -> make sure it werk
 
 class WrenchCheck:
     def __init__(self, n, pos, R, ncf, tan_y, tan_z, mu):
@@ -35,7 +45,7 @@ class WrenchCheck:
         elif len(mu) != n:
             raise ValueError('No. of tangential friction coefficients (mu) given not equal to n')  
 
-        self.n = n
+        self.n = n # no. of contacts
         self.pos = pos
         self.R = R
         self.ncf = ncf
@@ -50,6 +60,9 @@ class WrenchCheck:
                          3: 'Fx',
                          4: 'Fy',
                          5: 'Fz'}
+        
+        self.ndims = 6 # 3D, ndims for wrench 
+        self.nverts = 5 # no. of vertices per contact
 
     def single_wrench_cone(self, gamma, pos_bc, R_bc, ncf, mu):
         '''
@@ -60,8 +73,10 @@ class WrenchCheck:
         -> assume coulomb friction (which assumes isotropic)
 
         (Convex hull is smallest convex set that contains all points in the set)
+        (if convex hull has vertices x, y, z, then any vector a*x + b*y + c*z where 
+         a, b, c >= 0 and a + b + c <= 1, is in the convex hull)
         ---------
-        :param float gamma[0]: where f_contact = f_manipulation + gamma * f_internal
+        :param float gamma: where f_contact = f_manipulation + gamma * f_internal
         :param np.array(3, 1) pos_b: position of contact in body frame 
         :param np.array(3, 3) R_bc: contact frame (x: normal, y: tangential, z: tangential) in terms of body frame 
                                     (rotates contact frame to body frame)
@@ -72,7 +87,7 @@ class WrenchCheck:
         '''
         # 3D friction cone vertices in contact frame
         # Use square pyramidal cone to underestimate actual friction cone 
-        ncf = ncf*gamma[0]
+        ncf = ncf*gamma
         f0_c = np.array([[0], [0], [0]])
         f1_c = np.array([[ncf], [0], [-mu*ncf]])
         f2_c = np.array([[ncf], [-mu*ncf], [0]])
@@ -108,79 +123,60 @@ class WrenchCheck:
         Total wrench space is minkowski sum (sumset of n subsets in Euclidean space) of n wrench cones, each bounded by vertices 
 
         (Minkowski sum of n convex polygons is equal to the convex hull of Minkowski sum (i.e. all possible combinations of sums) of set of vertices of each polygon)
-        (e.g. Minkowski sum is the sumset of 3 subsets A & B & C in Euclidean space, i.e. A + B + C = {a + b + c, where a in A & b in B})
+        (e.g. Minkowski sum is the sumset of 3 subsets A & B & C in Euclidean space, i.e. A + B + C = {a + b + c, where a in A & b in B & c in C})
         --------------
         :param np.array(6, 1) wrench: candidate wrench in body frame
-        :param list of np.array(5, 6) verts_list: array of vertices [Tx, Ty, Tz, Fx, Fy, Fz] bounding each contact wrench cone           
+        :param np.array(no. of contacts * no. of wrench vertices per contact, 6) verts_list: array of vertices [Tx, Ty, Tz, Fx, Fy, Fz] bounding each contact wrench cone           
 
         :return np.array(no. of constraint eqns,) lhs: right hand side value of wrench space constraint equations
                 ^ does not return bool! to be consistent with constraint building for optimizer
         '''
-        vert_sums = []
 
-        # Get all possible combinations of sums of verts 
-        # (warning: scales to 5^5 = 3125 vertices for 5 contacts)
-        # alternative wld be LP -- check if wrench is convex combination of wrench cones of each contact) 
-        for combo in iterproduct(*[range(len(v)) for v in verts_list]):  
-            s = []
-            for i, idx in enumerate(combo):                               
-                s.append(verts_list[i][idx])
-            vert_sums.append(sum(s))
+        # Check if wrench is linear combination of wrench cones of each contact, 
+        # where sum of coefficients of vertices from each contact < 1
+        ntotal_verts = self.n * self.nverts
 
-        vert_sums = np.array(vert_sums)
+        # wrench = verts_list.T @ coeffs
+        # A_eq @ x == b_eq
+        A_eq = verts_list.T
+        b_eq = wrench.flatten()
 
-        # Checks bc convexhull error when 1 dimension of wrench is 0
-        active_dims = np.where(vert_sums.std(axis=0) > self.num_tol)[0]
-        degenerate_dims = np.where(vert_sums.std(axis=0) <= self.num_tol)[0]
+        # sum of coefficients of vertices for each contact <= 1
+        # A_ub @ x <= b_ub
+        A_ub = np.zeros((self.n, ntotal_verts)) 
+        for i in range(self.n):
+            A_ub[i, i*self.nverts:(i+1)*self.nverts] = 1 # select coefficients from same contact
+        b_ub = np.ones(self.n) # enforces that coefficients from same contact sum to 1
+
+        # each coefficient should be between 0 and 1 
+        bounds = [(0, 1)] * ntotal_verts
+
+        res = linprog(c=np.zeros(ntotal_verts), 
+                      A_eq=A_eq, b_eq=b_eq, A_ub=A_ub, b_ub=b_ub, bounds=bounds)
         
-        # If contact only able to generate one value in one dim, check if wrench fulfils that 
-        for dim in degenerate_dims:
-            if abs(wrench.flatten()[dim] - vert_sums[0][dim]) > self.num_tol:
-                print(f'Contacts are only able to generate {self.dim_dict[dim]} = {vert_sums[0][dim]}')
-                print(f'Wrench requested {self.dim_dict[dim]} = {wrench.flatten()[dim]}')
-                return np.inf
-
-        # If contact unable to generate any non-zero wrench and wrench is non-zero, return infeasible
-        if len(active_dims) == 0:
-            print('Contacts are unable to generate any non-zero wrench.')
-            return [0.0] if np.allclose(wrench, 0) else np.inf
-        
-        # Go on with active_dims if above checks pass
-        active_vert_sums = vert_sums[:, active_dims]
-        active_wrench = wrench.flatten()[active_dims]
-
-        hull = ConvexHull(active_vert_sums)
-
-        lhs = []
-        for equation in hull.equations:
-            # shows coefficient order: https://stackoverflow.com/questions/42248202/find-the-projection-of-a-point-on-the-convex-hull-with-scipy
-            val = (equation[:-1] @ active_wrench + equation[-1])
-            lhs.append(val) 
-
-        # lhs <= 0
-        # http://www.qhull.org/html/index.htm#description
-        return max(lhs)
+        # (0: wrench IS IN total wrench space)
+        # (1: wrench is NOT in total wrench space) 
+        return 0.0 if res.success else 1.0
 
     def wrench_feasibility(self, gamma, wrench):
         '''
         Determines feasibility of wrench on object based on n null space contacts in 3-D
         -----------
-        :param float gamma[0]: where f_contact = f_manipulation + gamma * f_internal
+        :param float gamma: where f_contact = f_manipulation + gamma * f_internal
         :param np.array(6, 1) wrench
 
         :return np.array(no. of constraint eqns,) lhs: left hand side value of wrench space constraint equations (lhs <= 0), given gamma  
         '''
-        verts_list = []
+        verts_list = np.array([np.zeros(self.ndims)]) # will result in first element of verts_list being irrelevant
         torques_list = []
         tans_list = []
 
         for i in range(self.n):
             vert = self.single_wrench_cone(gamma, self.pos[i], self.R[i], self.ncf[i], self.mu[i])
-            verts_list.append(vert)
+            verts_list = np.concatenate([verts_list, vert], axis=0)
 
             # Tangential component of gamma * f_interval in contact frame 
-            # Gamma[0] to access float from optimizer 
-            tan_c = np.array([[0], [gamma[0] * self.tan_y[i]], [gamma[0] * self.tan_z[i]]])
+            tan_c = np.array([[0], [gamma * self.tan_y[i]], [gamma * self.tan_z[i]]])
 
             # Tangential component of gamma * f_interval in body frame 
             tan_b = self.R[i] @ tan_c # (3,1)
@@ -190,6 +186,8 @@ class WrenchCheck:
             torque_b = np.cross(self.pos[i], tan_b, axisa=0, axisb=0)[0] # (3,)
             torques_list.append(torque_b)
 
+        verts_list = verts_list[1:] # first element is irrelevant 
+        # verts_list: np.array(no. of contacts * no. of wrench vertices per contact,)
         tans_arr = np.array(tans_list)
         torques_arr = np.array(torques_list)
 
@@ -223,37 +221,56 @@ def min_gamma_for_accel(max_norm_accelx, max_norm_accely, max_norm_accelz,
 
     :return float min_gamma: where minimum normal contact force = normal component of (min_gamma * f_internal)
     '''
+
     wrench_checker = WrenchCheck(n, pos, R, ncf, tan_y, tan_z, mu)
-    
-    constraints = []
+
+    # collect unique nonzero wrenches
+    possible_wrenches = []
+    seen = set()
     for tx in [-max_norm_Tx, max_norm_Tx]:
         for ty in [-max_norm_Ty, max_norm_Ty]:
             for tz in [-max_norm_Tz, max_norm_Tz]:
                 for ax in [-max_norm_accelx, max_norm_accelx]:
                     for ay in [-max_norm_accely, max_norm_accely]:
                         for az in [-max_norm_accelz, max_norm_accelz]:
-                            possible_wrench = np.array([[tx], [ty], [tz], [ax], [ay], [az]])
+                            possible_wrench = np.array([[tx],[ty],[tz],[ax],[ay],[az]])
 
-                            if wrench_checker.wrench_feasibility([1], possible_wrench) == np.inf:
-                                return None
-                            
-                            # f(gamma) <= 0 
-                            # https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.NonlinearConstraint.html#scipy.optimize.NonlinearConstraint
-                            f = lambda gamma: wrench_checker.wrench_feasibility(gamma, possible_wrench)
-                            constraint = optimize.NonlinearConstraint(f, lb=-np.inf, ub=0)
-                            constraints.append(constraint)
+                            # skip if zero wrench (trivially feasible)
+                            # (makes binary search way quicker)
+                            if np.allclose(possible_wrench, 0):
+                                continue
 
-    # objective function (since gamma is positive)
-    gamma_squared = lambda gamma: gamma[0]**2
+                            # skip if duplicate possible wrench
+                            # (makes binary search way quicker)
+                            possible_duplicate = tuple(possible_wrench.flatten())
+                            if possible_duplicate in seen:
+                                continue
+                            seen.add(possible_duplicate)
 
-    res = optimize.minimize(gamma_squared, x0=1, method='trust-constr', 
-                            constraints=constraints)
+                            possible_wrenches.append(possible_wrench)
 
-    return res.x[0] # min_gamma 
+    def all_feasible(gamma):
+        return all(wrench_checker.wrench_feasibility(gamma, possible_wrench) < wrench_checker.num_tol
+                   for possible_wrench in possible_wrenches)
+
+    # check geometric feasibility at high gamma
+    if not all_feasible(1000):
+        return None
+
+    # binary search for minimum gamma
+    lo, hi = 0.0, 1000.0
+    for _ in range(60):  # 60 iterations → precision ~1e-15
+        mid = (lo + hi) / 2
+        if all_feasible(mid):
+            hi = mid
+        else:
+            lo = mid
+
+    return hi
 
 if __name__ ==  "__main__":
 
-    # sign convention: z↑ x-> y⊗
+    print('sign convention: z↑ x-> y⊗')
 
     # ->▢ <- from spatial_grasp_map.py
     n_contacts = 2
