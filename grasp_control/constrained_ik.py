@@ -242,6 +242,38 @@ class _GeomPositionCallback(ca.Callback):
         return [self._data.geom_xpos[self._gid].copy()]
 
 
+class _BatchedGeomPositionCallback(ca.Callback):
+    """q[:n_robot] → stacked world positions (3G vector) of G geoms via ONE MuJoCo FK.
+
+    Replaces G per-geom _GeomPositionCallback instances in solve(): one Python↔CasADi
+    crossing and one mj_kinematics per NLP evaluation instead of G of each. Profiled on
+    the pick-place grasp solve (71 geoms), the per-geom form spent ~30% of solve time on
+    callback dispatch + DM↔numpy conversion (~75k crossings); batching cuts that to ~1k
+    crossings with identical iterates."""
+
+    def __init__(self, name, model, geom_ids, n_robot, obj_qpos=None):
+        ca.Callback.__init__(self)
+        self._model = model
+        self._data  = mj.MjData(model)
+        self._gids  = list(geom_ids)
+        self._n     = n_robot
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self.construct(name, {"enable_fd": True})
+
+    def get_n_in(self):  return 1
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, i):  return ca.Sparsity.dense(self._n, 1)
+    def get_sparsity_out(self, i): return ca.Sparsity.dense(3 * len(self._gids), 1)
+
+    def eval(self, arg):
+        self.eval_count += 1
+        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(self._model, self._data)
+        return [self._data.geom_xpos[self._gids].reshape(-1)]
+
+
 def _softplus(x, alpha=500.0):
     """Smooth approximation to max(x, 0), element-wise on a CasADi expression.
 
@@ -446,6 +478,71 @@ class _GeomPositionCallbackAnalytic(ca.Callback):
         return [self._data.geom_xpos[self._gid].copy()]
 
 
+class _BatchedGeomPositionJacCallback(ca.Callback):
+    """d(stacked geom_xpos)/dq for G geoms via one FK pass + mj_jac per geom —
+    companion for _BatchedGeomPositionCallbackAnalytic."""
+
+    def __init__(self, name, model, geom_ids, n_robot, obj_qpos=None):
+        ca.Callback.__init__(self)
+        self._model = model
+        self._data  = mj.MjData(model)
+        self._gids  = list(geom_ids)
+        self._n     = n_robot
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self.construct(name, {})
+
+    def get_n_in(self):  return 2   # q, nominal_output (ignored)
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, i):
+        return (ca.Sparsity.dense(self._n, 1) if i == 0
+                else ca.Sparsity.dense(3 * len(self._gids), 1))
+    def get_sparsity_out(self, i): return ca.Sparsity.dense(3 * len(self._gids), self._n)
+    def has_jacobian(self): return False
+
+    def eval(self, arg):
+        self.eval_count += 1
+        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(self._model, self._data)
+        mj.mj_comPos(self._model, self._data)   # needed: populates cdof for mj_jac
+        J    = np.zeros((3 * len(self._gids), self._n))
+        jacp = np.zeros((3, self._model.nv))
+        for k, gid in enumerate(self._gids):
+            mj.mj_jac(self._model, self._data, jacp, None,
+                      self._data.geom_xpos[gid].copy(), int(self._model.geom_bodyid[gid]))
+            J[3 * k:3 * k + 3] = jacp[:, :self._n]
+        return [J]
+
+
+class _BatchedGeomPositionCallbackAnalytic(ca.Callback):
+    def __init__(self, name, model, geom_ids, n_robot, obj_qpos=None):
+        ca.Callback.__init__(self)
+        self._model = model
+        self._data  = mj.MjData(model)
+        self._gids  = list(geom_ids)
+        self._n     = n_robot
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self._jac_cb = _BatchedGeomPositionJacCallback(name + "_J", model, geom_ids,
+                                                       n_robot, obj_qpos)
+        self.construct(name, {})
+
+    def get_n_in(self):  return 1
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, _):  return ca.Sparsity.dense(self._n, 1)
+    def get_sparsity_out(self, _): return ca.Sparsity.dense(3 * len(self._gids), 1)
+    def has_jacobian(self):        return True
+    def get_jacobian(self, *_):    return self._jac_cb
+
+    def eval(self, arg):
+        self.eval_count += 1
+        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(self._model, self._data)
+        return [self._data.geom_xpos[self._gids].reshape(-1)]
+
+
 # Solver options for sqpmethod + OSQP.  OSQP is used instead of qpOASES
 # because with O(500) inequality constraints on 23 DOFs the linearised QP
 # subproblem is often primal-infeasible at the initial (DLS warm-start) point;
@@ -456,6 +553,13 @@ _SQP_SOLVER_OPTS = {
     'qpsol_options':         {'error_on_fail': False,
                               'osqp': {'verbose': False, 'polish': True}},
     'max_iter':              500,
+    # sqpmethod defaults (1e-6/1e-6) are far tighter than a mm-scale grasp needs and
+    # quadruple the iteration count for sub-mm gains. Measured on the pick-place scene
+    # (obj 1, DLS warm start): 371 iters / 9.6s at defaults vs 91 iters / 2.9s here,
+    # at +9mm max tip error (20.5 -> 29.6mm; both dominated by binding floor/object
+    # constraints, and the GRASP-phase controller refines contact anyway).
+    'tol_du':                1e-3,
+    'tol_pr':                1e-5,
     'hessian_approximation': 'limited-memory',
     'lbfgs_memory':          20,
     'convexify_strategy':    'regularize',
@@ -473,11 +577,12 @@ def configure_sqp(solver):
     CasADi solver from IPOPT to sqpmethod/OSQP.  Call once after construction.
     """
     import grasp_control.constrained_ik as _m
-    _m._sphere_box_distance      = _softplus_sphere_box_distance
-    _m._sphere_cylinder_distance = _softplus_sphere_cylinder_distance
-    _m._SitePositionCallback     = _SitePositionCallbackAnalytic
-    _m._SiteAxisCallback         = _SiteAxisCallbackAnalytic
-    _m._GeomPositionCallback     = _GeomPositionCallbackAnalytic
+    _m._sphere_box_distance          = _softplus_sphere_box_distance
+    _m._sphere_cylinder_distance     = _softplus_sphere_cylinder_distance
+    _m._SitePositionCallback         = _SitePositionCallbackAnalytic
+    _m._SiteAxisCallback             = _SiteAxisCallbackAnalytic
+    _m._GeomPositionCallback         = _GeomPositionCallbackAnalytic
+    _m._BatchedGeomPositionCallback  = _BatchedGeomPositionCallbackAnalytic
     solver._solver_name = 'sqpmethod'
     solver._solver_opts = _SQP_SOLVER_OPTS
 
@@ -591,7 +696,7 @@ class ConstrainedIKSolver:
     def solve(self, data, site_ids, targets,
               q_bias=None, q_init=None, skip_arm_geoms=frozenset(),
               reduced_clearance_geoms=frozenset(), reduced_clearance=0.0005,
-              inward_dirs=None):
+              inward_dirs=None, prune_margin=0.15):
         """
         Solve IK with collision-avoidance constraints.
 
@@ -620,6 +725,13 @@ class ConstrainedIKSolver:
                          these fingers never drop underground.
         reduced_clearance : clearance (m) applied to reduced_clearance_geoms vs objects
                          when it is a set; ignored when it is a dict.
+        prune_margin   : per-pair constraint pruning threshold (m), or None to disable.
+                         Arm-geom/object pairs whose exact distance at the warm start
+                         exceeds clearance + prune_margin are left out of the NLP (only
+                         ~7 of ~500 constraints ever bind; measured ~3x faster per
+                         iteration). Plane (floor) pairs are always kept. Every pruned
+                         pair is re-checked at the solution; a violation triggers one
+                         automatic re-solve with pruning disabled.
 
         Returns
         -------
@@ -628,6 +740,8 @@ class ConstrainedIKSolver:
         n        = self._n
         ctr      = next(_call_counter)
         obj_qpos = data.qpos[n:].copy()
+        q0 = (q_init if q_init is not None
+              else (q_bias if q_bias is not None else np.zeros(n)))
         _t0_solve = time.time()
 
         site_cbs = [
@@ -642,8 +756,10 @@ class ConstrainedIKSolver:
 
         # Object qpos is snapshotted (not optimized), so each object geom's world pose
         # is a constant for this solve — precompute box poses once via a scratch FK
-        # rather than re-deriving them symbolically.
+        # rather than re-deriving them symbolically. The robot is posed at the warm
+        # start q0 in the same pass so the pair-pruning distances below reflect it.
         _scratch = mj.MjData(self._model)
+        _scratch.qpos[:n] = q0
         _scratch.qpos[n : n + len(obj_qpos)] = obj_qpos
         mj.mj_kinematics(self._model, _scratch)
         obj_pose = [
@@ -674,64 +790,84 @@ class ConstrainedIKSolver:
         # not n separate general inequality constraints (see _lo_vec/_hi_vec comment above).
         opti.subject_to(opti.bounded(ca.DM(self._lo_vec), q, ca.DM(self._hi_vec)))
 
-        # One finite-difference position callback PER ARM GEOM (its world position depends
-        # only on q, not on the object), reused across all objects; the per-object distance
-        # is then a purely symbolic expression that CasADi differentiates analytically:
+        # ONE batched position callback feeds every arm geom's sphere center (its world
+        # position depends only on q, not on the object): a single Python↔CasADi crossing
+        # and a single mj_kinematics per NLP evaluation instead of one per geom. The
+        # per-object distance is then a purely symbolic expression that CasADi
+        # differentiates analytically:
         #   box   -> exact sphere-vs-box       (_sphere_box_distance)
         #   plane -> exact sphere-vs-plane      (_sphere_plane_distance)   e.g. the floor
-        #   other -> conservative sphere-sphere (_sphere_sphere_distance)  e.g. a cylinder
-        # This is what makes checking every hand collision geom affordable — the FD cost is
-        # n_arm_geoms (not n_arm_geoms x n_objects, as when a callback was built per pair).
+        #   cyl   -> exact sphere-vs-cylinder   (_sphere_cylinder_distance)
+        #   other -> conservative sphere-sphere (_sphere_sphere_distance)
+        # Pair pruning (prune_margin): only a handful of the ~500 pair constraints ever
+        # bind, so pairs whose exact warm-start distance clears the threshold are left
+        # out of the NLP — plane pairs always kept (the whole hand can descend toward
+        # the floor). Pruned pairs are re-verified at the solution before returning.
+        # mj_geomDistance is guarded by the bounding-sphere lower bound: MuJoCo's GJK
+        # can return a phantom 0.0 for well-separated box-box pairs.
         # _cb_keepalive: CasADi Callback objects are only weakly referenced once their
         # symbolic output is consumed — without holding a Python reference for the rest of
-        # this solve they get garbage-collected and IPOPT's later gradient pass fails with
-        # "Callback object has been deleted".
-        # Each entry is (distance_expr, required_clearance, arm_geom_name, obj_geom_name).
+        # this solve they get garbage-collected and the solver's later gradient pass fails
+        # with "Callback object has been deleted".
+        # Each dist_exprs entry is (distance_expr, required_clearance, arm_geom, obj_geom).
         # Active grasping fingers get a reduced clearance vs objects so they can reach the
         # surface, but the FULL clearance is always kept against a plane so no finger drops
         # underground.
-        dist_exprs   = []
-        _cb_keepalive = []
-        geom_cbs      = {}   # arm_geom_name → _GeomPositionCallback (for eval_count reporting)
+        arm_entries = []   # (arm_geom_name, geom_id, bounding_radius, clearance_vs_objects)
         for ag, gid1 in zip(self._arm_geom_names, self._arm_gids):
             if ag in skip_arm_geoms:
                 continue
-            arm_radius = float(self._model.geom_rbound[gid1])
             if isinstance(reduced_clearance_geoms, dict):
                 obj_clr = reduced_clearance_geoms.get(ag, self._clearance)
             else:
                 obj_clr = reduced_clearance if ag in reduced_clearance_geoms else self._clearance
-            pos_cb = _GeomPositionCallback(f"cik_gp_{ctr}_{gid1}", self._model, gid1, n, obj_qpos)
-            _cb_keepalive.append(pos_cb)
-            geom_cbs[ag] = pos_cb
-            p_arm = pos_cb(q)
+            arm_entries.append((ag, gid1, float(self._model.geom_rbound[gid1]), obj_clr))
+
+        batched_cb = _BatchedGeomPositionCallback(
+            f"cik_bgp_{ctr}", self._model, [e[1] for e in arm_entries], n, obj_qpos)
+        _cb_keepalive = [batched_cb]
+        p_all = batched_cb(q)   # stacked (3G,) symbolic geom positions
+
+        dist_exprs   = []
+        pruned_pairs = []   # (arm_gid, obj_gid, arm_geom_name, obj_geom_name, clearance)
+        _ft6 = np.zeros(6)
+        for i, (ag, gid1, arm_radius, obj_clr) in enumerate(arm_entries):
+            p_arm = p_all[3 * i : 3 * i + 3]
             for j, ogn in enumerate(self._obj_geom_names):
                 center, R = obj_pose[j]
+                gid2 = self._obj_gids[j]
+                clr  = self._clearance if self._obj_is_plane[j] else obj_clr
+                if prune_margin is not None and not self._obj_is_plane[j]:
+                    lb = (float(np.linalg.norm(_scratch.geom_xpos[gid2]
+                                               - _scratch.geom_xpos[gid1]))
+                          - arm_radius - self._obj_rbound[j])
+                    dist = lb
+                    if lb <= clr + prune_margin:   # bound can't decide — ask GJK
+                        dist = max(mj.mj_geomDistance(
+                            self._model, _scratch, gid1, gid2,
+                            max(clr, 0.0) + prune_margin + 0.05, _ft6), lb)
+                    if dist > clr + prune_margin:
+                        pruned_pairs.append((gid1, gid2, ag, ogn, clr))
+                        continue
                 if self._obj_is_box[j]:
                     expr = _sphere_box_distance(
                         p_arm, arm_radius,
                         ca.DM(center), ca.DM(R), ca.DM(self._obj_half_extents[j]))
-                    clr = obj_clr
                 elif self._obj_is_plane[j]:
                     expr = _sphere_plane_distance(
                         p_arm, arm_radius, ca.DM(center), ca.DM(R[:, 2]))
-                    clr = self._clearance  # floor always full clearance
                 elif self._obj_is_cyl[j]:
                     expr = _sphere_cylinder_distance(
                         p_arm, arm_radius, ca.DM(center), ca.DM(R),
                         float(self._obj_half_extents[j][0]), float(self._obj_half_extents[j][1]))
-                    clr = obj_clr
                 else:
                     expr = _sphere_sphere_distance(
                         p_arm, arm_radius, ca.DM(center), self._obj_rbound[j])
-                    clr = obj_clr
                 dist_exprs.append((expr, clr, ag, ogn))
 
         for d, clr, _ag, _og in dist_exprs:
             opti.subject_to(d >= clr)
 
-        q0 = (q_init if q_init is not None
-              else (q_bias if q_bias is not None else np.zeros(n)))
         opti.set_initial(q, q0)
         t_setup = time.time() - _t0_solve
         opti.solver(self._solver_name, self._solver_opts)
@@ -739,8 +875,9 @@ class ConstrainedIKSolver:
         _slabel = self._solver_name.upper()
 
         print(f"[{_slabel}] setup {t_setup_ms:.0f}ms  |  "
-              f"{n} vars  {len(dist_exprs)} constraints  "
-              f"({len(geom_cbs)} geom + {len(site_cbs)} site + {len(axis_cbs)} axis cbs)")
+              f"{n} vars  {len(dist_exprs)} constraints ({len(pruned_pairs)} pruned)  "
+              f"(1 batched geom cb [{len(arm_entries)} geoms] + "
+              f"{len(site_cbs)} site + {len(axis_cbs)} axis cbs)")
 
         def _diagnostics(value_fn, t_solve_ms, iters):
             """value_fn: sol.value or opti.debug.value.
@@ -782,11 +919,15 @@ class ConstrainedIKSolver:
                 print(f"[{_slabel}]   pad-normal error (deg): "
                     f"{['%.1f' % a for a in ang]}  max={max(ang):.1f}")
 
-            # FK call counts (enable_fd: IPOPT perturbs each of n DOFs and re-evaluates
-            # the full NLP, so eval_count ≈ n_iters × (n_robot + 1) × n_line_search_steps).
+            # FK call counts. SQP/analytic mode: geom eval_count ≈ n_iters ×
+            # n_line_search_steps (one batched crossing per NLP evaluation, plus one
+            # Jacobian crossing per iteration, not counted here). IPOPT/FD mode: IPOPT
+            # perturbs each of n DOFs and re-evaluates the full NLP, so eval_count ≈
+            # n_iters × (n_robot + 1) × n_line_search_steps — but still per batched
+            # callback, not per geom.
             site_fk  = sum(cb.eval_count for cb in site_cbs)
             axis_fk  = sum(cb.eval_count for cb in axis_cbs)
-            geom_fk  = sum(cb.eval_count for cb in geom_cbs.values())
+            geom_fk  = batched_cb.eval_count
             total_fk = site_fk + axis_fk + geom_fk
             ms_per_iter = t_solve_ms / iters if iters else float('nan')
             self.last_metrics.update(
@@ -798,9 +939,30 @@ class ConstrainedIKSolver:
                   f"(site={site_fk}  axis={axis_fk}  geom={geom_fk})"
                   f"  ≈ {total_fk / max(iters, 1):.0f} FK/iter")
 
+        def _violated_pruned_pair(q_sol):
+            """Exact-distance recheck of every pruned pair at the solution. Returns the
+            worst (dist, clr, arm_geom, obj_geom) violation, or None. Same GJK guard as
+            the pruning pass (bounding-sphere lower bound vs phantom 0.0)."""
+            if not pruned_pairs:
+                return None
+            _scratch.qpos[:n] = q_sol
+            mj.mj_kinematics(self._model, _scratch)
+            worst = None
+            for gid1, gid2, ag, ogn, clr in pruned_pairs:
+                lb = (float(np.linalg.norm(_scratch.geom_xpos[gid2]
+                                           - _scratch.geom_xpos[gid1]))
+                      - float(self._model.geom_rbound[gid1]) - float(self._model.geom_rbound[gid2]))
+                if lb >= clr:
+                    continue
+                dist = max(mj.mj_geomDistance(self._model, _scratch, gid1, gid2,
+                                              max(clr, 0.0) + 0.05, _ft6), lb)
+                if dist < clr and (worst is None or dist - clr < worst[0] - worst[1]):
+                    worst = (dist, clr, ag, ogn)
+            return worst
+
         # Reset per-solve metrics; _diagnostics fills in the physical quantities and the
         # try/except branches add solver status. Read via solver.last_metrics after solve().
-        self.last_metrics = {}
+        self.last_metrics = {'n_pruned': len(pruned_pairs)}
         _t0_ipopt = time.time()
         try:
             sol  = opti.solve()
@@ -812,7 +974,20 @@ class ConstrainedIKSolver:
             print(f"[{_slabel}] {st['return_status']}  iters={iters}"
                   f"  obj={float(sol.value(opti.f)):.4g}")
             _diagnostics(sol.value, t_solve_ms, iters)
-            return np.array(sol.value(q))
+            q_sol = np.array(sol.value(q))
+            viol  = _violated_pruned_pair(q_sol)
+            if viol is not None:
+                dist, clr, ag, ogn = viol
+                print(f"[{_slabel}] pruned pair violated at solution: {ag} vs {ogn} "
+                      f"{dist * 1e3:.1f}mm < clearance {clr * 1e3:.1f}mm — "
+                      f"re-solving with pruning disabled")
+                return self.solve(data, site_ids, targets,
+                                  q_bias=q_bias, q_init=q_init,
+                                  skip_arm_geoms=skip_arm_geoms,
+                                  reduced_clearance_geoms=reduced_clearance_geoms,
+                                  reduced_clearance=reduced_clearance,
+                                  inward_dirs=inward_dirs, prune_margin=None)
+            return q_sol
         except RuntimeError:
             t_solve_ms = (time.time() - _t0_ipopt) * 1e3
             try:

@@ -17,7 +17,7 @@
       <site name="obj_red_box_c2" pos=" 0.030 0 0" quat="0 0 1 0"/>
     </body>
 
-    <body name="obj_red_sphere" pos="0.54 0.38 0.028">
+    <body name="obj_red_sphere" pos="0.64 0.38 0.028">
       <freejoint/>
       <geom name="obj_red_sphere_geom" type="sphere" size="0.028"
         rgba="0.80 0.20 0.10 1" mass="0.05" friction="1 0.05 0.001" condim="3"/>
@@ -53,7 +53,7 @@
       <site name="obj_green_box_c2" pos=" 0.026 0 0" quat="0 0 1 0"/>
     </body>
 
-    <body name="obj_green_cylinder" pos="0.60 0.70 0.034">
+    <body name="obj_green_cylinder" pos="0.80 0.70 0.034">
       <freejoint/>
       <geom name="obj_green_cylinder_geom" type="cylinder" size="0.034 0.034"
         rgba="0.10 0.70 0.30 1" mass="0.05" friction="1 0.05 0.001" condim="3"/>

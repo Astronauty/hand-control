@@ -286,6 +286,7 @@ def run_one(model, data, Q_BIAS, id_C, obj,
     orig_site        = cik_mod._SitePositionCallback
     orig_axis        = cik_mod._SiteAxisCallback
     orig_geom        = cik_mod._GeomPositionCallback
+    orig_batched     = cik_mod._BatchedGeomPositionCallback
     orig_solver_name = constrained_ik._solver_name
     orig_solver_opts = constrained_ik._solver_opts
 
@@ -296,6 +297,7 @@ def run_one(model, data, Q_BIAS, id_C, obj,
             cik_mod._SitePositionCallback     = _SitePositionCallbackAnalytic
             cik_mod._SiteAxisCallback         = _SiteAxisCallbackAnalytic
             cik_mod._GeomPositionCallback     = _GeomPositionCallbackAnalytic
+            cik_mod._BatchedGeomPositionCallback = cik_mod._BatchedGeomPositionCallbackAnalytic
 
         if variant == 'analytic':
             constrained_ik._solver_name = 'ipopt'
@@ -331,6 +333,7 @@ def run_one(model, data, Q_BIAS, id_C, obj,
         cik_mod._SitePositionCallback     = orig_site
         cik_mod._SiteAxisCallback         = orig_axis
         cik_mod._GeomPositionCallback     = orig_geom
+        cik_mod._BatchedGeomPositionCallback = orig_batched
         constrained_ik._solver_name       = orig_solver_name
         constrained_ik._solver_opts       = orig_solver_opts
 

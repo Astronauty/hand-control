@@ -2,6 +2,7 @@ from grasp_control.grasp_map import PlanarGraspMapComputer, SpatialGraspMapCompu
 from grasp_control.ik import PlanarIKSolver, SpatialIKSolver
 from grasp_control.force_control import GraspForceAllocator
 from grasp_control.constrained_ik import ConstrainedIKSolver, build_arm_geom_names
+from grasp_control.grasp_controller import GraspController
 
 __all__ = [
     "PlanarGraspMapComputer",
@@ -11,4 +12,5 @@ __all__ = [
     "GraspForceAllocator",
     "ConstrainedIKSolver",
     "build_arm_geom_names",
+    "GraspController",
 ]
