@@ -45,6 +45,7 @@ Requires a sourced ROS 2 environment and `CYCLONEDDS_URI` set to an UP interface
 | Flag | Default | Description |
 |---|---|---|
 | `--mode {rrt,dexpilot}` | `rrt` | **rrt**: autonomous RRT+IK grasp. **dexpilot**: live MediaPipe retargeting teleop via ROS 2. |
+| `--ik-solver {sqp,ipopt}` | `sqp` | IK solver backend (see below). |
 | `--dashboard` | off | Launch a live pyqtgraph metrics dashboard (separate process): scrolling fingertip→object distances, RRT solve times, and IPOPT iteration counts. |
 | `--viz-only` | off | Debug mode: disables arm/hand collision physics and never calls `mj_step`. REACH and GRASP phases hold their IK solution kinematically so you can inspect the IK/RRT result without dynamics interference. |
 | `--camera N` | auto | *(dexpilot only)* Camera index forwarded to the MediaPipe publisher. Defaults to auto-select (prefers external/USB camera at index ≥ 1). Run `python ui/mediapipe_joint_angles.py --list-cameras` to see available indices. |
@@ -53,7 +54,26 @@ Flags can be combined, e.g.:
 ```bash
 python kinova_leap_pick_place.py --mode dexpilot --camera 1
 python kinova_leap_pick_place.py --viz-only --dashboard
+python kinova_leap_pick_place.py --ik-solver ipopt
 ```
+
+---
+
+### IK solver modes
+
+The constrained IK problem has ~500 collision-avoidance inequality constraints (71 arm/hand geoms × 7 scene objects) on 23 DOFs. Two solver backends are available:
+
+#### `sqp` (default) — sqpmethod + OSQP + softplus SDF + analytic Jacobians
+
+Each IK iteration solves a quadratic programme (QP subproblem) over a linearisation of the constraints, using an L-BFGS Hessian approximation. Constraint Jacobians are computed analytically via `mj_jacSite` / `mj_jac` rather than by finite-differencing each DOF, so each iteration requires ~1 MuJoCo FK evaluation per callback instead of 24.
+
+The signed distance functions (box, cylinder) use a softplus-smoothed `max(x, 0)` — i.e. `softplus(x) = max(x,0) + log(1+exp(−αx))/α` with α = 500 — so the gradient is C∞ everywhere and CasADi's chain-rule AD is valid. OSQP (ADMM) is used as the QP solver because with ~500 constraints on 23 DOFs the linearised QP is often primal-infeasible at the initial warm-start point; OSQP finds the minimum-constraint-violation step direction and lets SQP continue, whereas qpOASES fails hard.
+
+Benchmarked against 6 object shapes with a DLS warm-start: **4/6 objects faster** in wall time vs the IPOPT baseline, with ~10× fewer FK evaluations per iteration (160–220 vs 2100–2200).
+
+#### `ipopt` — IPOPT L-BFGS + finite-difference Jacobians
+
+IPOPT's interior-point method with L-BFGS Hessian approximation. Constraint Jacobians are computed by IPOPT's own finite-difference perturbation (`jacobian_approximation = finite-difference-values`), which evaluates each callback at `q ± ε` for all 23 DOFs per iteration. This is slower per iteration but the FD averaging inadvertently smooths the kinks in the raw `max(x,0)` SDF, which helps L-BFGS accumulate a consistent curvature estimate. Useful as a fallback when SQP stalls (e.g. objects with complex concavities where the QP subproblem is repeatedly infeasible).
 
 ---
 

@@ -411,14 +411,19 @@ def main():
 
     # --- 3-way summary ---
     def _cmp(base, cand, label):
-        """Return (Δiters, Δms, note) comparing cand against base."""
+        """Return (Δiters, Δms, note) comparing cand against base.
+        Note is based on wall time (solve_ms), not iteration count — SQP's
+        iterations are cheaper than FD's so raw iteration count is misleading."""
         bi = base['iters'];  ci = cand['iters']
         bt = base['solve_ms']; ct = cand['solve_ms']
         di = (ci - bi) if isinstance(bi, int) and isinstance(ci, int) else '?'
         dt = ct - bt
-        note = ''
-        if isinstance(di, int):
-            note = f'{label} faster' if di < 0 else ('same' if di == 0 else f'{label} SLOWER')
+        if dt < -200:
+            note = f'{label} faster'
+        elif dt > 200:
+            note = f'{label} SLOWER'
+        else:
+            note = 'similar'
         return di, dt, note
 
     print(f"\n{'--- Summary vs FD baseline ---':}")
@@ -442,11 +447,11 @@ def main():
 
         if 'analytic' in row:
             an_di, an_dt, an_note = _cmp(fd, row['analytic'], 'analytic')
-            if isinstance(an_di, int) and an_di < 0:
+            if an_dt < -200:
                 an_wins += 1
         if 'sqp' in row:
             sqp_di, sqp_dt, sqp_note = _cmp(fd, row['sqp'], 'sqp')
-            if isinstance(sqp_di, int) and sqp_di < 0:
+            if sqp_dt < -200:
                 sqp_wins += 1
 
         fpi_fd  = fd['fk_per_iter']

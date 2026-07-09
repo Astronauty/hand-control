@@ -326,6 +326,162 @@ def _sphere_sphere_distance(p_arm, arm_radius, obj_center, obj_radius):
     return ca.norm_2(p_arm - obj_center) - arm_radius - obj_radius
 
 
+# ---------------------------------------------------------------------------
+# Softplus SDF variants — used by the SQP solver path.
+#
+# Replace ca.fmax → _softplus in the outside term only so the SDF is C∞.
+# The inside term keeps fmin/fmax: its kinks only appear deep inside the
+# geometry (infeasible), which the warm-start never reaches.
+# ---------------------------------------------------------------------------
+
+def _softplus_sphere_box_distance(p_arm, arm_radius, box_center, box_R, half_extents):
+    p_local = box_R.T @ (p_arm - box_center)
+    q       = ca.fabs(p_local) - half_extents
+    outside = ca.sqrt(ca.sumsqr(_softplus(q)) + 1e-12)
+    inside  = ca.fmin(ca.fmax(ca.fmax(q[0], q[1]), q[2]), 0)
+    return outside + inside - arm_radius
+
+
+def _softplus_sphere_cylinder_distance(p_arm, arm_radius, cyl_center, cyl_R,
+                                       cyl_radius, cyl_halfheight):
+    p       = cyl_R.T @ (p_arm - cyl_center)
+    radial  = ca.sqrt(p[0] * p[0] + p[1] * p[1] + 1e-12)
+    dr      = radial - cyl_radius
+    dz      = ca.fabs(p[2]) - cyl_halfheight
+    outside = ca.sqrt(_softplus(dr) ** 2 + _softplus(dz) ** 2 + 1e-12)
+    inside  = ca.fmin(ca.fmax(dr, dz), 0)
+    return outside + inside - arm_radius
+
+
+# ---------------------------------------------------------------------------
+# Analytic-Jacobian FK callback wrappers — used by the SQP solver path.
+#
+# Each wraps a companion JacCallback and exposes it via has_jacobian() /
+# get_jacobian() so CasADi uses the analytic Jacobian in its chain-rule
+# differentiation of the NLP instead of FD-perturbing the callback.
+# self._jac_cb is held as an instance variable to prevent GC.
+# ---------------------------------------------------------------------------
+
+class _SitePositionCallbackAnalytic(ca.Callback):
+    def __init__(self, name, model, site_id, n_robot, obj_qpos=None):
+        ca.Callback.__init__(self)
+        self._model = model
+        self._data  = mj.MjData(model)
+        self._sid   = site_id
+        self._n     = n_robot
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self._jac_cb = _SitePositionJacCallback(name + "_J", model, site_id, n_robot, obj_qpos)
+        self.construct(name, {})
+
+    def get_n_in(self):  return 1
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, _):  return ca.Sparsity.dense(self._n, 1)
+    def get_sparsity_out(self, _): return ca.Sparsity.dense(3, 1)
+    def has_jacobian(self):        return True
+    def get_jacobian(self, *_):    return self._jac_cb
+
+    def eval(self, arg):
+        self.eval_count += 1
+        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(self._model, self._data)
+        return [self._data.site_xpos[self._sid].copy()]
+
+
+class _SiteAxisCallbackAnalytic(ca.Callback):
+    def __init__(self, name, model, site_id, local_axis, n_robot, obj_qpos=None):
+        ca.Callback.__init__(self)
+        self._model     = model
+        self._data      = mj.MjData(model)
+        self._sid       = site_id
+        self._localaxis = np.asarray(local_axis, dtype=float).flatten()
+        self._n         = n_robot
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self._jac_cb = _SiteAxisJacCallback(name + "_J", model, site_id, local_axis,
+                                            n_robot, obj_qpos)
+        self.construct(name, {})
+
+    def get_n_in(self):  return 1
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, _):  return ca.Sparsity.dense(self._n, 1)
+    def get_sparsity_out(self, _): return ca.Sparsity.dense(3, 1)
+    def has_jacobian(self):        return True
+    def get_jacobian(self, *_):    return self._jac_cb
+
+    def eval(self, arg):
+        self.eval_count += 1
+        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(self._model, self._data)
+        R = self._data.site_xmat[self._sid].reshape(3, 3)
+        return [R @ self._localaxis]
+
+
+class _GeomPositionCallbackAnalytic(ca.Callback):
+    def __init__(self, name, model, geom_id, n_robot, obj_qpos=None):
+        ca.Callback.__init__(self)
+        self._model = model
+        self._data  = mj.MjData(model)
+        self._gid   = geom_id
+        self._n     = n_robot
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self._jac_cb = _GeomPositionJacCallback(name + "_J", model, geom_id, n_robot, obj_qpos)
+        self.construct(name, {})
+
+    def get_n_in(self):  return 1
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, _):  return ca.Sparsity.dense(self._n, 1)
+    def get_sparsity_out(self, _): return ca.Sparsity.dense(3, 1)
+    def has_jacobian(self):        return True
+    def get_jacobian(self, *_):    return self._jac_cb
+
+    def eval(self, arg):
+        self.eval_count += 1
+        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(self._model, self._data)
+        return [self._data.geom_xpos[self._gid].copy()]
+
+
+# Solver options for sqpmethod + OSQP.  OSQP is used instead of qpOASES
+# because with O(500) inequality constraints on 23 DOFs the linearised QP
+# subproblem is often primal-infeasible at the initial (DLS warm-start) point;
+# OSQP finds the minimum-constraint-violation direction and lets SQP continue.
+_SQP_SOLVER_OPTS = {
+    'print_time':            False,
+    'qpsol':                 'osqp',
+    'qpsol_options':         {'error_on_fail': False,
+                              'osqp': {'verbose': False, 'polish': True}},
+    'max_iter':              500,
+    'hessian_approximation': 'limited-memory',
+    'lbfgs_memory':          20,
+    'convexify_strategy':    'regularize',
+    'print_iteration':       False,
+    'print_header':          False,
+    'print_status':          False,
+}
+
+
+def configure_sqp(solver):
+    """Switch a ConstrainedIKSolver instance to the SQP + softplus-SDF mode.
+
+    Replaces the module-level SDF functions and FK callbacks with their
+    analytic-Jacobian / softplus-smoothed counterparts, and switches the
+    CasADi solver from IPOPT to sqpmethod/OSQP.  Call once after construction.
+    """
+    import grasp_control.constrained_ik as _m
+    _m._sphere_box_distance      = _softplus_sphere_box_distance
+    _m._sphere_cylinder_distance = _softplus_sphere_cylinder_distance
+    _m._SitePositionCallback     = _SitePositionCallbackAnalytic
+    _m._SiteAxisCallback         = _SiteAxisCallbackAnalytic
+    _m._GeomPositionCallback     = _GeomPositionCallbackAnalytic
+    solver._solver_name = 'sqpmethod'
+    solver._solver_opts = _SQP_SOLVER_OPTS
+
+
 class ConstrainedIKSolver:
     """
     IPOPT-based IK with hard joint-limit and collision-avoidance constraints.
