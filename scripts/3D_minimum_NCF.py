@@ -268,6 +268,71 @@ def min_gamma_for_accel(max_norm_accelx, max_norm_accely, max_norm_accelz,
 
     return hi
 
+def min_gamma_for_accel_lp(max_norm_accelx, max_norm_accely, max_norm_accelz,
+                           max_norm_Tx, max_norm_Ty, max_norm_Tz,
+                           n, pos, R, ncf, tan_y, tan_z, mu):
+    '''
+    Alternative to min_gamma_for_accel: solves minimum gamma directly with one LP per corner wrench
+    instead of binary search over feasibility LPs (exact answer, ~60x fewer LP solves)
+
+    Wrench cone vertices scale linearly with gamma (V(gamma) = gamma * V(1)), so substituting
+    y = gamma * x (valid since gamma >= 0) makes the problem linear in (y, gamma):
+        min  gamma
+        s.t. V(1).T @ y - gamma * w_tan = wrench       (w_tan: wrench due to tangential component of f_internal at gamma = 1)
+             sum of y coefficients within each contact - gamma <= 0
+             y >= 0, gamma >= 0
+    Infeasible LP <=> grasp geometrically cannot resist wrench (no gamma cap needed)
+    -----------------------------------------------------------------------------------
+    :params: same as min_gamma_for_accel
+
+    :return float min_gamma: where minimum normal contact force = normal component of (min_gamma * f_internal)
+                             None if no gamma can resist the requested wrenches
+    '''
+    wrench_checker = WrenchCheck(n, pos, R, ncf, tan_y, tan_z, mu)
+    nverts = wrench_checker.nverts
+
+    # cone vertices and tangential-internal-force wrench at gamma = 1
+    V1 = np.vstack([wrench_checker.single_wrench_cone(1.0, pos[i], R[i], ncf[i], mu[i])
+                    for i in range(n)]) # (n * nverts, 6)
+    w_tan = np.zeros(6)
+    for i in range(n):
+        tan_b = R[i] @ np.array([[0.0], [tan_y[i]], [tan_z[i]]])
+        w_tan[:3] += np.cross(pos[i], tan_b, axisa=0, axisb=0)[0]
+        w_tan[3:] += tan_b.flatten()
+
+    # variables: [y (n * nverts), gamma]
+    nvar = n * nverts + 1
+    c = np.zeros(nvar)
+    c[-1] = 1.0 # min gamma
+    A_eq = np.hstack([V1.T, -w_tan.reshape(6, 1)]) # (6, nvar)
+    A_ub = np.zeros((n, nvar))
+    for k in range(n):
+        A_ub[k, k*nverts:(k+1)*nverts] = 1 # select coefficients from same contact
+        A_ub[k, -1] = -1
+    b_ub = np.zeros(n)
+    bounds = [(0, None)] * nvar
+
+    # collect unique nonzero corner wrenches
+    corners = set()
+    for tx in [-max_norm_Tx, max_norm_Tx]:
+        for ty in [-max_norm_Ty, max_norm_Ty]:
+            for tz in [-max_norm_Tz, max_norm_Tz]:
+                for ax in [-max_norm_accelx, max_norm_accelx]:
+                    for ay in [-max_norm_accely, max_norm_accely]:
+                        for az in [-max_norm_accelz, max_norm_accelz]:
+                            corner = (tx, ty, tz, ax, ay, az)
+                            if any(corner):
+                                corners.add(corner)
+
+    min_gamma = 0.0
+    for corner in corners:
+        res = linprog(c=c, A_eq=A_eq, b_eq=np.array(corner), A_ub=A_ub, b_ub=b_ub, bounds=bounds)
+        if not res.success:
+            return None
+        min_gamma = max(min_gamma, res.x[-1])
+
+    return min_gamma
+
 if __name__ ==  "__main__":
 
     print('sign convention: z↑ x-> y⊗')
@@ -284,26 +349,32 @@ if __name__ ==  "__main__":
     # Test 1: ->▢ <- with wrench ->
     print('Test 1: ->▢ <- with wrench ->')
     print(f'When fx=1 wrench, gamma = {min_gamma_for_accel(1, 0, 0, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(1, 0, 0, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
 
     # Test 2: ->▢ <- with wrench ⊗
     print('Test 2: ->▢ <- with wrench ⊗')
     print(f'When fy=1 wrench, gamma = {min_gamma_for_accel(0, 1, 0, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(0, 1, 0, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
 
     # Test 3: ->▢ <- with wrench ↑
     print('Test 3: ->▢ <- with wrench  ↑')
-    print(f'When Tx=1 wrench, gamma = {min_gamma_for_accel(0, 0, 1, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'When fz=1 wrench, gamma = {min_gamma_for_accel(0, 0, 1, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(0, 0, 1, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
 
     # Test 4: ->▢ <- with wrench torque about x-axis
     print('Test 4: ->▢ <- with wrench torque about x-axis')
     print(f'When Tx=1 wrench, gamma = {min_gamma_for_accel(0, 0, 0, 1, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(0, 0, 0, 1, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
 
-    # Test 5: ->▢ <- with wrench torque about x-axis
+    # Test 5: ->▢ <- with wrench torque about y-axis
     print('Test 5: ->▢ <- with wrench torque about y-axis')
-    print(f'When Tx=1 wrench, gamma = {min_gamma_for_accel(0, 0, 0, 0, 1, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'When Ty=1 wrench, gamma = {min_gamma_for_accel(0, 0, 0, 0, 1, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(0, 0, 0, 0, 1, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
 
-    # Test 6: ->▢ <- with wrench torque about x-axis
+    # Test 6: ->▢ <- with wrench torque about z-axis
     print('Test 6: ->▢ <- with wrench torque about z-axis')
-    print(f'When Tx=1 wrench, gamma = {min_gamma_for_accel(0, 0, 0, 0, 0, 1, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'When Tz=1 wrench, gamma = {min_gamma_for_accel(0, 0, 0, 0, 0, 1, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(0, 0, 0, 0, 0, 1, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
 
     print()
 
