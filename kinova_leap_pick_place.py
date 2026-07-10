@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import threading
+import traceback
 import queue
 
 import mujoco as mj
@@ -21,7 +22,7 @@ import mujoco.viewer  # noqa: F401
 from pynput import keyboard as _pynput_kb
 
 from scripts.rrt_planner import RRTPlanner
-from grasp_control import SpatialIKSolver, ConstrainedIKSolver
+from grasp_control import SpatialIKSolver, ConstrainedIKSolver, GraspController
 from grasp_control.constrained_ik import configure_sqp
 from live_dashboard import Dashboard
 
@@ -86,14 +87,20 @@ def make_key_callback(key_queue):
     """Return a GLFW key callback for the MuJoCo passive viewer.
     Handles only Enter / Q / Esc; target selection is handled via pynput
     (Ctrl+digit) so modifier state is available without fighting GLFW."""
+    # Keycodes chosen to NOT collide with the viewer's built-in single-key toggles
+    # (mjVISSTRING/mjRNDSTRING shortcuts claim nearly every letter: R=Reflection,
+    # K=Skybox, B=Perturb Force, G=Fog, ...). 'N' is the only unbound letter; the
+    # viewer only uses digits 0-5 (geom groups), so 6-8 are free. Q still overlaps
+    # the Camera-frustum toggle, but we quit on it so the toggle never matters.
     _MAP = {
         257: 'enter',   # GLFW_KEY_ENTER (main keyboard)
         335: 'enter',   # GLFW_KEY_KP_ENTER (numpad)
         81:  'quit',    # Q
         256: 'quit',    # Escape
-        75:  'ik_vis',  # K — cycle IK config visualization
-        66:  'bspheres', # B — toggle IK collision bounding-sphere overlay
-        71:  'teleop_start', # G — (dexpilot) start/re-zero tracking at current pose
+        78:  'release',  # N — (GRASP) open fingers and return to REACH
+        54:  'ik_vis',  # 6 — cycle IK config visualization
+        55:  'bspheres', # 7 — toggle IK collision bounding-sphere overlay
+        56:  'teleop_start', # 8 — (dexpilot) start/re-zero tracking at current pose
     }
     def _cb(keycode):
         event = _MAP.get(keycode)
@@ -278,6 +285,9 @@ if __name__ == "__main__":
             'id_body': mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, body_name),
             'id_geom': mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, body_name + '_geom'),
         }
+        # Initial values only — _run_ik refreshes both from the object's live pose at
+        # solve time (the contact sites are children of the object body, so they move
+        # with it).
         obj['p_S_W'] = [data.site_xpos[sid].copy() for sid in obj['id_S']]
         # Inward surface normal at each contact site (the site's world-frame local
         # x-axis, per the scene XML convention) — the direction each fingerpad normal is
@@ -416,6 +426,16 @@ if __name__ == "__main__":
             'ipopt_ms':     ipopt_ms,
         })
 
+    def _push_squeeze(on):
+        """Forward the GRASP internal-force state to the dashboard header. The commanded
+        value is static for now (gamma set at startup, ~gamma/sqrt(2) N per contact for
+        the 2-contact pinch) — becomes live once w_des tracking / LP-gamma lands.
+        No-op when the dashboard is disabled."""
+        if dash is None:
+            return
+        dash.push({'type': 'squeeze', 'on': bool(on), 'gamma': GAMMA,
+                   'f_contact': GAMMA / np.sqrt(2)})
+
     # Arm home pose from gen3.xml's "home" keyframe (the composite model has its keyframes
     # stripped in build_kinova_leap.py, since a 7-DOF arm keyframe no longer fits the larger
     # composite nq — so read it from the source arm model instead of hardcoding).
@@ -479,15 +499,28 @@ if __name__ == "__main__":
           f"{len(_active_finger_geoms)}")
 
     # Dedicated MjData for background IK solves so the IK thread never touches the main
-    # simulation data. Object positions come from model.qpos0 (set by _randomize_objects).
+    # simulation data. Object positions are set per solve from the live-scene snapshot
+    # taken at selection time (obj_qpos_snap), so IK always targets current object poses.
     _ik_data   = mj.MjData(model)
     _ik_solved = set()   # object indices whose IK has been solved and cached
+    # Cached IK is reused only while the scene still matches the snapshot it was solved
+    # against (see obj['ik_obj_qpos'] and the selection handler). Component-wise qpos
+    # tolerance: ignores settling jitter, catches jogs/pushes/re-placement (~>5mm).
+    IK_STALE_TOL = 5e-3
 
     # Per-joint PD gains for REACH phase: 7 arm joints + 16 LEAP finger joints.
     # Arm gains sized for Gen3's forcerange (±105/±52 Nm); finger gains mirror the small
     # values used for the planar model's tiny finger actuators.
     Kp = np.concatenate([np.full(7, 40.0), np.full(16, 0.8)])
     Kd = np.concatenate([np.full(7, 4.0),  np.full(16, 0.05)])
+
+    # Internal squeeze force scale (GRASP, toggled with Enter): f_c = null(G) @ GAMMA,
+    # ~GAMMA/sqrt(2) N normal force per contact for the 2-contact antipodal pinch.
+    # Sized for lifting: every object is 0.5 kg with mu=1 (scene XML), so supporting
+    # mg ~ 4.9 N by friction across 2 contacts needs >= mg/(2*mu) ~ 2.45 N of normal
+    # force each. GAMMA=8 -> ~5.7 N per contact, ~2.3x margin for the finger PD
+    # fighting the squeeze, contact compliance, and dynamic loads while jogging.
+    GAMMA = 50.0
 
     # Give the RRT the SAME full hand-geom set the IK constrains (_robot_geom_names) plus
     # the floor, instead of only the fingertips — checking just the tips let the palm /
@@ -527,7 +560,7 @@ if __name__ == "__main__":
     _N_GHOST        = 15   # max waypoints to sample for ghost display
 
     # Static IK config markers: built lazily after each object's IK is solved.
-    # gold (1, 0.8, 0) = grasp; cyan (0.2, 0.8, 1) = standoff (RRT goal)
+    # gold (1, 0.8, 0) = grasp
     # Indexed by object index; None until the object's IK has been solved.
     def _make_ik_markers(obj, obj_qpos_snap):
         markers = []
@@ -535,7 +568,6 @@ if __name__ == "__main__":
         _d.qpos[N_ROBOT:] = obj_qpos_snap
         for q_cfg, rgba in [
             (obj['q_target'],   np.array([1.0, 0.8, 0.0, 0.55], dtype=np.float32)),
-            (obj['q_standoff'], np.array([0.2, 0.8, 1.0, 0.55], dtype=np.float32)),
         ]:
             _d.qpos[:N_ROBOT] = q_cfg
             mj.mj_forward(model, _d)
@@ -571,25 +603,26 @@ if __name__ == "__main__":
             _ghost_markers.clear()
             _ghost_markers.extend(segments)
 
-    def _run_rrt(q_start, q_goal_cfg, obj_target):
+    def _run_rrt(q_start, q_grasp, obj_target):
         # Snapshot current object positions so collision checks reflect the live scene.
         planner._data.qpos[N_ROBOT:] = data.qpos[N_ROBOT:].copy()
-        # The goal is the STANDOFF config (fingertips STANDOFF_OFFSET off the contact
-        # sites), so unlike the old grasp-config goal it normally sits clear of the
-        # target object. The two-part admissibility mask is kept as a safety net —
-        # proximal/adjacent finger links can still come close on small objects, and the
-        # start config may hug an object the hand just released:
+        # The goal is the GRASP config itself (fingertips on the contact sites), so the
+        # goal node necessarily touches — or, per the IK's disabled contact tier /
+        # -10mm adjacent tier, marginally penetrates — the target object. Two-part mask
+        # makes it admissible without opening holes elsewhere:
         #   1. Active-finger geoms get 0mm clearance vs the TARGET object only — exact
         #      distance is still checked, so they may touch but never sweep through it.
         #   2. plan()'s endpoint grace then relaxes any pair still violating at the
-        #      endpoints to its endpoint distance — free to move away, never deeper.
+        #      endpoints (tip/ds at ~0 or slightly inside at the grasp goal, or the start
+        #      config hugging an object just released) to its endpoint distance — free to
+        #      move away, never deeper.
         # Everything else — palm, proximal links, wrist, non-active fingers, and every
         # geom vs the floor — stays checked at the full clearance.
         pair_clearance = {(g, obj_target['id_geom']): 0.0 for g in _ACTIVE_SKIP_GIDS}
         # Re-branch the goal's continuous (base/wrist) joints onto the turn nearest the
         # current pose, so the arm never unwinds a near-full revolution just because the IK
         # left a joint on a far 2pi branch. Same configuration, planner-friendly numbering.
-        q_goal = planner.rebranch(q_start, q_goal_cfg)
+        q_goal = planner.rebranch(q_start, q_grasp)
         _t0 = time.time()
         path = planner.plan(q_start, q_goal, pair_clearance=pair_clearance)
         plan_time = time.time() - _t0
@@ -612,23 +645,30 @@ if __name__ == "__main__":
         _plan_result['waypoints'] = path
         _update_ghost_markers(path)
 
-    # Standoff distance for the approach config: the RRT goal / REACH endpoint keeps each
-    # fingertip this far off its contact site, backed out along the site's outward surface
-    # normal (-inward_S_W). The GRASP phase then closes the gap by PD-holding q_target
-    # (the on-surface grasp config) — hovering here instead of at the surface keeps the
-    # planned goal cleanly out of contact.
-    STANDOFF_OFFSET = 0.025
-
     def _run_ik(obj_idx, obj, obj_qpos_snap):
-        """Solve the two IK configs for one object:
-          q_target   — fingertips directly on the contact sites; the GRASP-phase hold pose.
-          q_standoff — fingertips STANDOFF_OFFSET off the sites along the outward surface
-                       normals; the RRT goal and REACH endpoint.
-        Runs inside the background plan_thread — uses _ik_data, never touches main data.
-        Each stage is timed individually and pushed to the dashboard."""
+        """Solve grasp IK for one object (fingertips directly on the contact sites),
+        storing q_target — the single IK solution per object, used both as the RRT goal
+        and the GRASP-phase hold pose. Runs inside the background plan_thread — uses
+        _ik_data, never touches main data. Each DLS and SQP stage is timed
+        individually and pushed to the dashboard."""
         mj.mj_resetData(model, _ik_data)
         _ik_data.qpos[:N_ROBOT] = Q_BIAS
+        # Pose every object at the live-scene snapshot (mj_resetData above put them back
+        # at model.qpos0, i.e. their spawn poses) so both the fingertip targets and the
+        # solver's collision constraints reflect where the objects actually ARE now.
+        _ik_data.qpos[N_ROBOT:] = obj_qpos_snap
         mj.mj_forward(model, _ik_data)
+
+        # Refresh the targets from the object's current pose: the contact sites are
+        # children of the object body, so this FK carries them with it. Without the
+        # refresh, IK for an object that moved (jogged, pushed, released elsewhere)
+        # would still aim at wherever it spawned.
+        obj['p_S_W']      = [_ik_data.site_xpos[sid].copy() for sid in obj['id_S']]
+        obj['inward_S_W'] = [_ik_data.site_xmat[sid].reshape(3, 3)[:, 0].copy()
+                             for sid in obj['id_S']]
+        # Scene snapshot this solve is valid for — the selection handler re-solves
+        # instead of reusing the cache once the scene drifts past IK_STALE_TOL.
+        obj['ik_obj_qpos'] = obj_qpos_snap.copy()
 
         # --- Grasp IK ---
         _t0 = time.time()
@@ -644,25 +684,15 @@ if __name__ == "__main__":
         _push_ipopt(obj['name'],
                     dls_ms=dls_grasp_ms, ipopt_ms=ipopt_grasp_ms)
 
-        # --- Standoff IK (warm-started from the grasp config, which is ~2.5cm away) ---
-        obj['p_standoff_W'] = [p - STANDOFF_OFFSET * d
-                               for p, d in zip(obj['p_S_W'], obj['inward_S_W'])]
-        _t0 = time.time()
-        obj['q_standoff'] = constrained_ik.solve(_ik_data, id_C, obj['p_standoff_W'],
-                                                  q_bias=Q_BIAS, q_init=obj['q_target'],
-                                                  reduced_clearance_geoms=_active_clearance_by_geom,
-                                                  inward_dirs=obj['inward_S_W'])
-        ipopt_standoff_ms = (time.time() - _t0) * 1e3
-        _push_ipopt(f"{obj['name']} standoff", ipopt_ms=ipopt_standoff_ms)
-
-        total_ms = dls_grasp_ms + ipopt_grasp_ms + ipopt_standoff_ms
+        total_ms = dls_grasp_ms + ipopt_grasp_ms
         print(f"\r\n[IK] obj{obj_idx+1}: grasp DLS {dls_grasp_ms:.0f}ms + SQP {ipopt_grasp_ms:.0f}ms"
-              f"  +  standoff SQP {ipopt_standoff_ms:.0f}ms  |  total {total_ms:.0f}ms")
+              f"  |  total {total_ms:.0f}ms")
 
-        # Tip-error + penetration audit (same checks as the old upfront loop)
+        # Tip-error + penetration audit (same checks as the old upfront loop), with the
+        # objects posed at the same snapshot the solve used.
         _d_chk = mj.MjData(model)
-        for label, q_sol, tgts in [('grasp',    obj['q_target'],   obj['p_S_W']),
-                                   ('standoff', obj['q_standoff'], obj['p_standoff_W'])]:
+        _d_chk.qpos[N_ROBOT:] = obj_qpos_snap
+        for label, q_sol, tgts in [('grasp', obj['q_target'], obj['p_S_W'])]:
             _d_chk.qpos[:N_ROBOT] = q_sol
             mj.mj_forward(model, _d_chk)
             errs = [f"{np.linalg.norm(_d_chk.site_xpos[s] - t)*1e3:.1f} mm"
@@ -686,7 +716,18 @@ if __name__ == "__main__":
     def _run_ik_then_rrt(obj_idx, obj, q_start, obj_qpos_snap):
         """Background thread: solve IK for obj (if not cached), then run RRT."""
         _run_ik(obj_idx, obj, obj_qpos_snap)
-        _run_rrt(q_start, obj['q_standoff'], obj)
+        _run_rrt(q_start, obj['q_target'], obj)
+
+    def _plan_thread_main(fn, *args):
+        """Wrapper for every plan_thread target: an uncaught exception in _run_ik /
+        _run_rrt must not die silently — before this, a failed solve left _plan_result
+        empty and the finished-plan handler crashed the main loop on a missing
+        'q_target' (every key, including target selection, then went dead)."""
+        try:
+            fn(*args)
+        except Exception:
+            traceback.print_exc()
+            _plan_result['error'] = True
 
     # Build target list: index 0 = home pose, 1..N = one entry per object (label only —
     # q_target is not precomputed; it is solved lazily on first selection).
@@ -695,7 +736,7 @@ if __name__ == "__main__":
         targets.append({'label': f'object {i+1}'})
 
     keys = queue.Queue()
-    print("[Control] Ctrl+0..6: select target  |  ←→: jog x  |  ↑↓: jog z  |  Enter: GRASP  |  K: IK vis  |  B: coll spheres  |  Q/Esc: quit")
+    print("[Control] Ctrl+0..6: select target  |  ←→: jog x  |  ↑↓: jog z  |  Enter: GRASP / toggle squeeze  |  N: release  |  6: IK vis  |  7: coll spheres  |  Q/Esc: quit")
     print("[Control] Active target: init pose")
 
     # Simulation — start at Q_BIAS so PD error at t=0 is zero and qfrc_bias is correct.
@@ -725,7 +766,7 @@ if __name__ == "__main__":
         _dexpilot_ctrl.init_home(data)
         _dexpilot_ctrl.init_ros()
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")
-        print("[DexPilot] Press G to start tracking (captures your current wrist "
+        print("[DexPilot] Press 8 to start tracking (captures your current wrist "
               "orientation as the robot's home). Q/Esc: quit")
     control_phase  = 'REACH'
     active_idx     = 0
@@ -736,11 +777,14 @@ if __name__ == "__main__":
     traj_wp_step   = 0    # counts sim steps since last waypoint advance
     plan_thread    = None
     q_plan_hold    = np.zeros(N_ROBOT)    # robot DOFs only
-    jog_xz         = np.zeros(2)   # [x, z] manual jog offset, added to the frozen grasp pose
     _held_arrows   = set()         # arrow keys currently held
     _ctrl_held     = set()         # Ctrl_L / Ctrl_R currently held
+    squeeze_on     = False         # GRASP: internal force toggled by Enter
+    grasp_ctrl     = None          # GraspController, built at each REACH→GRASP transition
+    q_grasp_hold   = None          # GRASP PD target; arm part integrated by arrow-key jog
+    _PALM_BID      = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'leap_palm')
     _ik_vis_mode   = None          # None | 'grasp': freeze physics to show IK config
-    _show_bspheres = False         # B: overlay the IK's per-geom collision bounding spheres
+    _show_bspheres = False         # 7: overlay the IK's per-geom collision bounding spheres
 
     # Precomputed (geom_id, bounding-sphere radius) for every hand geom the IK constrains —
     # this is the coarse sphere model the IK actually "sees" (finger links 15-24mm), which
@@ -928,13 +972,19 @@ if __name__ == "__main__":
 
             # --- Check if background RRT finished ---
             if plan_thread is not None and not plan_thread.is_alive():
-                plan_thread    = None
-                traj_waypoints = _plan_result.get('waypoints', [objects[active_idx]['q_standoff']])
+                plan_thread = None
+                if 'waypoints' in _plan_result:
+                    traj_waypoints = _plan_result['waypoints']
+                    print(f"\r\n[Control] REACH  |  path: {len(traj_waypoints)} waypoints")
+                else:
+                    # Planning died (see _plan_thread_main traceback) — hold the pose we
+                    # were already holding so the sim stays alive; reselect to retry.
+                    traj_waypoints = [q_plan_hold.copy()]
+                    print("\r\n[Control] REACH  |  planning FAILED — holding pose "
+                          "(Ctrl+digit to retry)")
                 traj_wp_idx    = 0
                 traj_wp_step   = 0
-                jog_xz[:]      = 0.0
                 control_phase  = 'REACH'
-                print(f"\r\n[Control] REACH  |  path: {len(traj_waypoints)} waypoints")
 
             # --- Process key events ---
             while not keys.empty():
@@ -942,19 +992,40 @@ if __name__ == "__main__":
 
                 if key == 'enter' and control_phase == 'REACH':
                     control_phase = 'GRASP'
-                    jog_xz[:] = 0.0
-                    # Freeze the object's pose at grasp time — jogging targets an offset
-                    # from this frozen pose, not the object's live pose.
+                    squeeze_on = False
+                    # Object pose frozen at grasp time — reference anchor for the
+                    # upcoming w_des (object wrench) tracking; unused by the jog.
                     obj_grasp = objects[active_idx]
                     obj_grasp['p_obj0'] = data.xpos[obj_grasp['id_body']].copy()
                     obj_grasp['R_obj0'] = data.xmat[obj_grasp['id_body']].reshape(3, 3).copy()
-                    print(f"\r\n[Control] → GRASP  ({targets[active_tgt]['label']})")
+                    # Internal-force machinery for the Enter-toggled squeeze. Only
+                    # internal_force_torques() is used — the joint PD hold stays in the
+                    # GRASP branch below, on top of the shared bias comp.
+                    grasp_ctrl = GraspController(
+                        model, N_ROBOT,
+                        tip_site_ids=id_C,
+                        obj_site_ids=obj_grasp['id_S'],
+                        obj_body_id=obj_grasp['id_body'],
+                        kp=Kp, kd=Kd, gamma=GAMMA)
+                    q_grasp_hold = obj_grasp['q_target'].copy()
+                    _push_squeeze(False)
+                    print(f"\r\n[Control] → GRASP  ({targets[active_tgt]['label']})  "
+                          f"|  Enter: toggle squeeze (gamma={GAMMA:.0f})  |  N: release")
 
                 elif key == 'enter' and control_phase == 'GRASP':
+                    squeeze_on = not squeeze_on
+                    _push_squeeze(squeeze_on)
+                    print(f"\r\n[Control] squeeze {'ON' if squeeze_on else 'off'}  "
+                          f"(gamma={GAMMA:.0f}, ~{GAMMA/np.sqrt(2):.2f} N/contact)")
+
+                elif key == 'release' and control_phase == 'GRASP':
                     # Release: no pregrasp config exists anymore, so open the active
                     # fingers back to their Q_BIAS posture while the arm stays at the
-                    # grasp arm config — a small, PD-holdable motion off the object.
-                    q_release      = objects[active_idx]['q_target'].copy()
+                    # (possibly jogged) grasp arm config q_grasp_hold — snapping back
+                    # to the original IK pose would drag the object with it.
+                    squeeze_on     = False
+                    _push_squeeze(False)
+                    q_release      = q_grasp_hold.copy()
                     q_release[7:]  = Q_BIAS[7:]
                     traj_waypoints = [q_release]
                     traj_wp_idx    = 0
@@ -963,19 +1034,31 @@ if __name__ == "__main__":
                     print(f"\r\n[Control] → REACH  (released — opening fingers)")
 
                 elif key == 'ik_vis' and active_tgt > 0 and active_idx in _ik_solved:
-                    _ik_vis_mode = {None: 'grasp', 'grasp': 'standoff',
-                                    'standoff': None}[_ik_vis_mode]
+                    _ik_vis_mode = {None: 'grasp', 'grasp': None}[_ik_vis_mode]
                     label = f'showing {_ik_vis_mode} config' if _ik_vis_mode else 'off'
-                    print(f"\r\n[IK vis] {label}  (K to cycle)")
+                    print(f"\r\n[IK vis] {label}  (6 to toggle)")
 
                 elif key == 'bspheres':
                     _show_bspheres = not _show_bspheres
                     print(f"\r\n[bspheres] IK collision bounding-sphere overlay "
-                          f"{'ON' if _show_bspheres else 'off'}  (B to toggle)")
+                          f"{'ON' if _show_bspheres else 'off'}  (7 to toggle)")
 
-                elif key.startswith('sel_') and control_phase != 'GRASP':
+                elif key.startswith('sel_') and control_phase == 'GRASP':
+                    print("\r\n[Control] target selection blocked during GRASP — "
+                          "press N to release first")
+
+                elif key.startswith('sel_') and plan_thread is not None:
+                    # One plan at a time: the IK/RRT threads share _ik_data, the
+                    # constrained solver, and planner._data — a second concurrent
+                    # thread corrupts the running solve.
+                    print("\r\n[Control] still planning — selection ignored, retry "
+                          "when REACH starts")
+
+                elif key.startswith('sel_'):
+                    # Re-selecting the CURRENT target is allowed: it re-plans from the
+                    # live scene (IK staleness check below re-solves if objects moved).
                     new_tgt = int(key[4:])
-                    if 0 <= new_tgt < len(targets) and new_tgt != active_tgt:
+                    if 0 <= new_tgt < len(targets):
                         active_tgt = new_tgt
                         active_idx = max(0, active_tgt - 1)  # map back to objects[]
                         _ik_vis_mode = None   # exit vis mode when switching target
@@ -992,18 +1075,30 @@ if __name__ == "__main__":
                             _plan_result.clear()
                             q_plan_hold    = q_start.copy()
                             obj_qpos_snap  = data.qpos[N_ROBOT:].copy()
-                            if obj_i in _ik_solved:
-                                # IK cached — go straight to RRT
+                            # Cached IK is valid only while the scene still matches the
+                            # snapshot it was solved against — the targets AND the
+                            # collision constraints both depend on object poses, and any
+                            # object (not just the target) may have moved into or out of
+                            # the way since. mj_step never advances during PLAN/REACH
+                            # holds beyond settling jitter, so a component-wise qpos
+                            # comparison against IK_STALE_TOL is a stable test.
+                            _ik_fresh = (obj_i in _ik_solved
+                                         and np.max(np.abs(
+                                             obj_qpos_snap
+                                             - objects[obj_i]['ik_obj_qpos'])) < IK_STALE_TOL)
+                            if _ik_fresh:
+                                # IK cached and scene unchanged — go straight to RRT
                                 plan_thread = threading.Thread(
-                                    target=_run_rrt,
-                                    args=(q_start, objects[obj_i]['q_standoff'],
-                                          objects[obj_i]),
+                                    target=_plan_thread_main,
+                                    args=(_run_rrt, q_start,
+                                          objects[obj_i]['q_target'], objects[obj_i]),
                                     daemon=True)
                             else:
-                                # IK not yet solved — run IK then chain into RRT
+                                # IK missing or stale (object moved) — solve, then RRT
                                 plan_thread = threading.Thread(
-                                    target=_run_ik_then_rrt,
-                                    args=(obj_i, objects[obj_i], q_start, obj_qpos_snap),
+                                    target=_plan_thread_main,
+                                    args=(_run_ik_then_rrt, obj_i, objects[obj_i],
+                                          q_start, obj_qpos_snap),
                                     daemon=True)
                             plan_thread.start()
                             control_phase = 'PLAN'
@@ -1012,19 +1107,15 @@ if __name__ == "__main__":
                 elif key == 'quit':
                     running = False
 
-            # --- Continuous jog: drive jog_xz from currently-held arrow keys ---
-            # left/right -> x, up/down -> z (lift) — y (depth) stays at the frozen value.
+            # --- Continuous jog: world-frame palm velocity from currently-held arrow
+            # keys, consumed by the GRASP branch's resolved-rate target integration.
+            # left/right -> x, up/down -> z (lift) — y (depth) is never commanded.
             _jv_x = (JOG_VEL if 'right' in _held_arrows else 0) - (JOG_VEL if 'left' in _held_arrows else 0)
             _jv_z = (JOG_VEL if 'up'    in _held_arrows else 0) - (JOG_VEL if 'down' in _held_arrows else 0)
-            if _jv_x or _jv_z:
-                dt = model.opt.timestep
-                jog_xz[0] += _jv_x * dt
-                jog_xz[1] += _jv_z * dt
 
             # --- IK visualization: freeze physics, show full arm in stored IK config ---
             if _ik_vis_mode is not None and active_tgt > 0:
-                q_vis = objects[active_idx]['q_target' if _ik_vis_mode == 'grasp'
-                                            else 'q_standoff']
+                q_vis = objects[active_idx]['q_target']
                 data.qpos[:N_ROBOT] = q_vis
                 data.qvel[:N_ROBOT] = 0.0
                 mj.mj_forward(model, data)
@@ -1091,15 +1182,15 @@ if __name__ == "__main__":
                     tau_ctrl = np.zeros(model.nv)
                     tau_ctrl[:N_ROBOT] = Kp * (wp - data.qpos[:N_ROBOT]) + Kd * (0 - data.qvel[:N_ROBOT])
 
-            # --- GRASP: zero-internal-force grasp, grasp_controller_demo strategy —
-            # quasi-static joint-space PD hold of the grasp IK config (gravity comp added
-            # at the shared mj_step handoff below). Contact force comes only from the
-            # finger PD error at the surface, so this validates the IK handoff + hold
-            # without any force allocation; arrow-key jogging is inert in this phase.
-            # Object tracking via a desired external wrench (grasp map + allocator,
-            # superimposed on this hold) comes next — a Cartesian-only version lived
-            # here before but was unstable: the fingertip J^T forces leave the arm's
-            # ~17-dim contact null space unstiffened/undamped (see git history).
+            # --- GRASP: grasp_controller_demo strategy — quasi-static joint-space PD
+            # hold of the grasp IK config (gravity comp added at the shared mj_step
+            # handoff below), plus a pure internal (pinching) force
+            # f_c = null(G) @ GAMMA toggled with Enter, mapped through the fingertip
+            # Jacobians. The full-rank joint PD stays on throughout — a Cartesian-only
+            # version lived here before but was unstable: the fingertip J^T forces
+            # leave the arm's ~17-dim contact null space unstiffened/undamped (see git
+            # history). Arrow-key jogging translates the whole grasp by resolved-rate
+            # motion of the arm PD target (palm velocity tracked, orientation held).
             # (--viz-only: kinematic hold of the grasp IK pose.) ---
             elif control_phase == 'GRASP':
                 if args.viz_only:
@@ -1108,12 +1199,33 @@ if __name__ == "__main__":
                     mj.mj_forward(model, data)
                     _render_kinematic_frame()
                     continue
+                # Resolved-rate jog: map the commanded world-frame palm velocity
+                # [vx, 0, vz] (orientation held) to arm joint rates via 6-DOF DLS on
+                # the live config, and integrate them into the PD target.
+                qdot_jog = np.zeros(7)
+                if _jv_x or _jv_z:
+                    Jp = np.zeros((3, model.nv))
+                    Jr = np.zeros((3, model.nv))
+                    mj.mj_jacBody(model, data, Jp, Jr, _PALM_BID)
+                    J6 = np.vstack([Jp[:, :7], Jr[:, :7]])
+                    v6 = np.array([_jv_x, 0.0, _jv_z, 0.0, 0.0, 0.0])
+                    qdot_jog = J6.T @ np.linalg.solve(J6 @ J6.T + 1e-6 * np.eye(6), v6)
+                    q_grasp_hold[:7] += qdot_jog * model.opt.timestep
                 # Zero qvel each step like the PLAN / REACH final-waypoint holds — the
                 # explicit qfrc_applied damping is marginal at the wrist (dt < 2*I/Kd,
-                # see the PLAN comment above).
+                # see the PLAN comment above). While jogging, inject the commanded
+                # joint rates instead of zero: under the quasi-static hold the PD alone
+                # would need a huge position error to generate motion (velocity is
+                # rebuilt from a single qacc step), so the target would run away from
+                # the arm — feedforwarding qdot_jog keeps tracking tight and still
+                # pins every DOF's velocity each step.
                 data.qvel[:N_ROBOT] = 0.0
+                data.qvel[:7] = qdot_jog
                 tau_ctrl = np.zeros(model.nv)
-                tau_ctrl[:N_ROBOT] = Kp * (obj['q_target'] - data.qpos[:N_ROBOT]) + Kd * (0 - data.qvel[:N_ROBOT])
+                tau_ctrl[:N_ROBOT] = (Kp * (q_grasp_hold - data.qpos[:N_ROBOT])
+                                      + Kd * (np.r_[qdot_jog, np.zeros(16)] - data.qvel[:N_ROBOT]))
+                if squeeze_on:
+                    tau_ctrl[:N_ROBOT] += grasp_ctrl.internal_force_torques(data)
 
             data.qfrc_applied[:] = tau_ctrl
             data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]

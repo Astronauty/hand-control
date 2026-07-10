@@ -85,15 +85,37 @@ class GraspController:
         tau[:n] = kp * (self.q_target - data.qpos[:n]) + kd * (0 - data.qvel[:n])
 
         if self.squeeze:
-            tau[:n] += self._internal_force_torques(data)
+            tau[:n] += self.internal_force_torques(data)
 
         # Gravity/bias compensation for the robot chain only.
         tau[:n] += data.qfrc_bias[:n]
         return tau
 
-    def _internal_force_torques(self, data):
+    def slip_correction_torques(self, data, kp=200.0):
+        """Anchor each fingertip to its object contact site:
+        tau = sum_k J_k^T kp (p_Sk - p_tipk), applied through the FINGER joints only
+        (active_joint_slices). The object sites move with the object, so this is
+        contact-frame position feedback that counters tangential slip of the grasp
+        under load — the soft finger joint PD alone cannot hold the tangential
+        friction force, so the tips shear off the object during transport. Kept off
+        the arm columns deliberately: there the same virtual spring acts as a
+        constant drag opposing arm motion (any accumulated tip-site offset never
+        resets), fighting the jog instead of maintaining the grip."""
+        n = self.n_robot
+        tau = np.zeros(n)
+        for sid_obj, sid_tip in zip(self.obj_site_ids, self.tip_site_ids):
+            J = np.zeros((3, self.model.nv))
+            mj.mj_jacSite(self.model, data, J, None, sid_tip)
+            f_k = kp * (data.site_xpos[sid_obj] - data.site_xpos[sid_tip])
+            for lo, hi in self.active_joint_slices:
+                tau[lo:hi] += J[:3, lo:hi].T @ f_k
+        return tau
+
+    def internal_force_torques(self, data):
         """Pure internal force from the live grasp map's null space, mapped to
-        joint torques through the fingertip Jacobians."""
+        joint torques through the fingertip Jacobians. Public so callers that own
+        their PD hold (e.g. kinova_leap_pick_place's GRASP phase) can superimpose
+        just the squeeze; updates last_f_c."""
         n = self.n_robot
         p_WoO = data.xpos[self.obj_body_id]
         R_WO = data.xmat[self.obj_body_id].reshape(3, 3)

@@ -553,10 +553,13 @@ _SQP_SOLVER_OPTS = {
     'qpsol_options':         {'error_on_fail': False,
                               'osqp': {'verbose': False, 'polish': True}},
     'max_iter':              500,
-    # Tolerances left at the sqpmethod defaults (tol_pr/tol_du = 1e-6). Relaxing to
-    # 1e-3/1e-5 cuts iterations ~4x at +9mm max tip error if solve latency ever needs
-    # trading against accuracy again — affordable at full tightness now that the FK
-    # callbacks are batched and far pairs are pruned (see solve()).
+    # Slightly relaxed from the sqpmethod defaults (tol_pr/tol_du = 1e-6): the dual
+    # tolerance drives most of the tail iterations (sub-mm cost polishing), while the
+    # primal tolerance is kept tight so constraint (collision) feasibility is unaffected.
+    # Measured on the pick-place scene: defaults ran 285-500 iters/object (one hitting
+    # max_iter); 1e-4 cuts that roughly in half at <2mm tip-error change. tol_du=1e-3 /
+    # tol_pr=1e-5 is the next notch (~90 iters, +9mm) if latency ever matters more.
+    'tol_du':                1e-4,
     'hessian_approximation': 'limited-memory',
     'lbfgs_memory':          20,
     'convexify_strategy':    'regularize',

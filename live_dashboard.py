@@ -20,6 +20,9 @@ Message protocol (plain dicts put on the queue):
                         'dls_ms': float|None, 'ipopt_ms': float|None}
     {'type': 'mode',    'mode': str, 'target': str}   # Approach / Grasp / Transport
     {'type': 'active_obj', 'name': str}               # proximity-based active object
+    {'type': 'squeeze', 'on': bool, 'gamma': float,   # GRASP internal-force toggle;
+                        'f_contact': float}           #   commanded N per contact (static
+                                                      #   gamma/sqrt(2) for now)
     None                                              # sentinel: quit
 
 Usage from the sim process:
@@ -64,12 +67,18 @@ def _run(queue, fingers, horizon_s, dt_hint):
     target_lbl.setStyleSheet("font-size: 12px; color: #999999;")
     active_obj_lbl = QtWidgets.QLabel("active object: —")
     active_obj_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #55cc88;")
+    _SQUEEZE_OFF_STYLE = "font-size: 16px; font-weight: bold; color: #777777;"
+    _SQUEEZE_ON_STYLE  = "font-size: 16px; font-weight: bold; color: #ff9944;"
+    squeeze_lbl = QtWidgets.QLabel("internal force: off")
+    squeeze_lbl.setStyleSheet(_SQUEEZE_OFF_STYLE)
     mode_box = QtWidgets.QVBoxLayout()
     mode_box.addWidget(mode_lbl)
     mode_box.addWidget(target_lbl)
     header = QtWidgets.QHBoxLayout()
     header.addLayout(mode_box)
     header.addStretch(1)
+    header.addWidget(squeeze_lbl)
+    header.addSpacing(30)
     header.addWidget(active_obj_lbl)
     grid.addLayout(header, 0, 0, 1, 2)
 
@@ -190,6 +199,15 @@ def _run(queue, fingers, horizon_s, dt_hint):
                 target_lbl.setText(f"target: {msg.get('target', '—')}")
             elif mt == 'active_obj':
                 active_obj_lbl.setText(f"active object: {msg.get('name', '—')}")
+            elif mt == 'squeeze':
+                if msg.get('on'):
+                    squeeze_lbl.setText(
+                        f"internal force: ON   γ={msg.get('gamma', float('nan')):.1f}"
+                        f"  (~{msg.get('f_contact', float('nan')):.2f} N/contact)")
+                    squeeze_lbl.setStyleSheet(_SQUEEZE_ON_STYLE)
+                else:
+                    squeeze_lbl.setText("internal force: off")
+                    squeeze_lbl.setStyleSheet(_SQUEEZE_OFF_STYLE)
         if got_dist:
             x = list(dist_t)
             for f in fingers:
