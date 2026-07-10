@@ -21,7 +21,7 @@ import mujoco.viewer  # noqa: F401
 from pynput import keyboard as _pynput_kb
 
 from scripts.rrt_planner import RRTPlanner
-from grasp_control import SpatialGraspMapComputer, SpatialIKSolver, GraspForceAllocator, ConstrainedIKSolver
+from grasp_control import SpatialIKSolver, ConstrainedIKSolver
 from grasp_control.constrained_ik import configure_sqp
 from live_dashboard import Dashboard
 
@@ -190,8 +190,10 @@ if __name__ == "__main__":
              "RRT path can be inspected without any dynamics interference.")
     _arg_parser.add_argument(
         '--dashboard', action='store_true',
-        help="Launch a live pyqtgraph metrics dashboard (separate process): scrolling "
-             "fingertip→object distances, RRT solve metrics, and IPOPT solve metrics.")
+        help="Launch a live pyqtgraph metrics dashboard (separate process): planning mode "
+             "(Approach/Grasp/Transport), proximity-based active object, scrolling "
+             "fingertip→object distances, net hand→object wrench, per-finger contact "
+             "normal forces, and a combined RRT+IK planner solution log.")
     _arg_parser.add_argument(
         '--mode', choices=['rrt', 'dexpilot'], default='rrt',
         help="rrt (default): autonomous RRT+IK grasp controller  |  "
@@ -270,6 +272,7 @@ if __name__ == "__main__":
         assert not missing, (
             f"{body_name} has no contact site mapped for finger(s) {missing}")
         obj = {
+            'name':    body_name,
             'id_S':    [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, contact_sites[f])
                         for f in FINGER_SET],
             'id_body': mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, body_name),
@@ -284,7 +287,6 @@ if __name__ == "__main__":
                              for sid in obj['id_S']]
         objects.append(obj)
 
-    grasp_map_computer = SpatialGraspMapComputer()
     dls_ik = SpatialIKSolver(n_robot=N_ROBOT)
 
     # Collision geoms to keep clear during IK and RRT: EVERY collision geom on all four
@@ -334,6 +336,59 @@ if __name__ == "__main__":
     _TIP_GEOM_IDS = {f: mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, f'leap_{FINGER_CODE[f]}_tip')
                      for f in FINGER_SET}
 
+    # All four fingertip tip geoms — used to pick the proximity-based "active object":
+    # the object with the smallest AVERAGE signed tip→object distance. This is what the
+    # in-scene hover marker and the dashboard's "active object" label / wrench plots
+    # track, independent of which target the user selected.
+    _ALL_TIP_GIDS = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, f'leap_{c}_tip')
+                     for c in FINGER_CODE.values()]
+
+    def _guarded_geom_dist(g1, g2, distmax=2.0):
+        """mj_geomDistance guarded with the bounding-sphere lower bound — 3.3.5's GJK
+        can return a phantom 0.0 for well-separated convex pairs."""
+        lb = (np.linalg.norm(data.geom_xpos[g1] - data.geom_xpos[g2])
+              - model.geom_rbound[g1] - model.geom_rbound[g2])
+        return max(mj.mj_geomDistance(model, data, g1, g2, distmax, None), lb)
+
+    # Contact bookkeeping for the dashboard's net-wrench and normal-force plots.
+    _HAND_GIDS      = {mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g) for g in _robot_geom_names}
+    _OBJ_GID_TO_IDX = {o['id_geom']: i for i, o in enumerate(objects)}
+    _FINGER_BY_GID  = {mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g): f
+                       for f in FINGER_SET for g in _finger_collision_geoms(model, f)}
+
+    def _hand_object_contact_metrics(obj_idx):
+        """Scan live contacts once and return
+          (f_net, tau_net): net world-frame wrench the HAND applies to objects[obj_idx],
+                            torque taken about the object's COM;
+          normals: each FINGER_SET finger's summed contact normal force vs ANY object.
+        Convention (verified empirically, MuJoCo 3.3.5): contact.frame rows are the
+        contact-frame axes with row 0 = normal pointing geom1→geom2, and mj_contactForce
+        returns the force applied TO geom2 expressed in that frame — so the force on the
+        object is +R.T@f when the object is geom2 and -R.T@f when it is geom1."""
+        f_net, tau_net = np.zeros(3), np.zeros(3)
+        normals = {f: 0.0 for f in FINGER_SET}
+        com = data.xipos[objects[obj_idx]['id_body']]
+        ft = np.zeros(6)
+        for ci in range(data.ncon):
+            con = data.contact[ci]
+            g1, g2 = con.geom1, con.geom2
+            if g1 in _HAND_GIDS and g2 in _OBJ_GID_TO_IDX:
+                hand_gid, obj_gid, sgn = g1, g2, 1.0
+            elif g2 in _HAND_GIDS and g1 in _OBJ_GID_TO_IDX:
+                hand_gid, obj_gid, sgn = g2, g1, -1.0
+            else:
+                continue
+            mj.mj_contactForce(model, data, ci, ft)
+            fname = _FINGER_BY_GID.get(hand_gid)
+            if fname is not None:
+                normals[fname] += ft[0]   # normal component (>= 0, along frame row 0)
+            if _OBJ_GID_TO_IDX[obj_gid] == obj_idx:
+                R_con = con.frame.reshape(3, 3)
+                f_W = sgn * (R_con.T @ ft[:3])
+                f_net   += f_W
+                tau_net += np.cross(con.pos - com, f_W) + sgn * (R_con.T @ ft[3:6])
+        return f_net, tau_net, normals
+
     # Live metrics dashboard (separate process; opt-in via --dashboard). Started before the
     # IK precompute so the grasp IPOPT solves below are reported too. dash is None
     # when disabled; every push site is guarded on it.
@@ -343,15 +398,15 @@ if __name__ == "__main__":
         dash.start()
         print("[dashboard] launched (separate process)")
 
-    def _push_ipopt(phase, dls_ms=None, ipopt_ms=None):
+    def _push_ipopt(obj_name, dls_ms=None, ipopt_ms=None):
         """Forward ConstrainedIKSolver.last_metrics + stage timing to the dashboard's
-        IPOPT panel. No-op when the dashboard is disabled."""
+        combined planner panel. No-op when the dashboard is disabled."""
         if dash is None:
             return
         m = constrained_ik.last_metrics
         dash.push({
             'type':         'ipopt',
-            'phase':        phase,
+            'object':       obj_name,
             'status':       m.get('status', '?'),
             'iters':        m.get('iters', '?'),
             'max_site_mm':  max(m.get('site_err_mm', [0.0])),
@@ -401,7 +456,8 @@ if __name__ == "__main__":
     #   adjacent tier (if_md / th_px links): -10mm    — tolerates bounding-sphere slack
     #                                                    (~1-2cm over-approximation) while
     #                                                    still bounding gross penetration
-    #   proximal tier (everything else):     +2mm     — should never be near the surface
+    #   proximal tier (everything else):     +2mm     — should never be near
+    # e surface
     # All tiers KEEP full clearance vs the floor plane (the solver never reduces the plane
     # constraint), so no active finger drops underground and grasp goals stay valid.
     # Palm, wrist, and the non-active fingers stay fully constrained against everything.
@@ -432,14 +488,6 @@ if __name__ == "__main__":
     # values used for the planar model's tiny finger actuators.
     Kp = np.concatenate([np.full(7, 40.0), np.full(16, 0.8)])
     Kd = np.concatenate([np.full(7, 4.0),  np.full(16, 0.05)])
-    Kp_obj     = 50.0  # object position stiffness, N/m (GRASP)
-    Kd_obj     = 5.0   # object position damping, N·s/m (GRASP)
-    Kp_theta   = 5.0   # object orientation stiffness, N·m/rad (GRASP)
-    Kd_theta   = 0.5   # object orientation damping, N·m·s/rad (GRASP)
-    Kp_contact = 20.0  # weak per-finger slip-correction stiffness, N/m (GRASP)
-    Kd_contact = 10.0   # weak per-finger slip-correction damping, N·s/m (GRASP)
-    gamma   = 5.0     # internal squeeze force scale; negate if fingers pull apart
-    force_allocator = GraspForceAllocator(gamma)
 
     # Give the RRT the SAME full hand-geom set the IK constrains (_robot_geom_names) plus
     # the floor, instead of only the fingertips — checking just the tips let the palm /
@@ -479,7 +527,7 @@ if __name__ == "__main__":
     _N_GHOST        = 15   # max waypoints to sample for ghost display
 
     # Static IK config markers: built lazily after each object's IK is solved.
-    # gold (1, 0.8, 0) = grasp
+    # gold (1, 0.8, 0) = grasp; cyan (0.2, 0.8, 1) = standoff (RRT goal)
     # Indexed by object index; None until the object's IK has been solved.
     def _make_ik_markers(obj, obj_qpos_snap):
         markers = []
@@ -487,6 +535,7 @@ if __name__ == "__main__":
         _d.qpos[N_ROBOT:] = obj_qpos_snap
         for q_cfg, rgba in [
             (obj['q_target'],   np.array([1.0, 0.8, 0.0, 0.55], dtype=np.float32)),
+            (obj['q_standoff'], np.array([0.2, 0.8, 1.0, 0.55], dtype=np.float32)),
         ]:
             _d.qpos[:N_ROBOT] = q_cfg
             mj.mj_forward(model, _d)
@@ -522,26 +571,25 @@ if __name__ == "__main__":
             _ghost_markers.clear()
             _ghost_markers.extend(segments)
 
-    def _run_rrt(q_start, q_grasp, obj_target):
+    def _run_rrt(q_start, q_goal_cfg, obj_target):
         # Snapshot current object positions so collision checks reflect the live scene.
         planner._data.qpos[N_ROBOT:] = data.qpos[N_ROBOT:].copy()
-        # The goal is the GRASP config itself (fingertips on the contact sites), so the
-        # goal node necessarily touches — or, per the IK's disabled contact tier /
-        # -10mm adjacent tier, marginally penetrates — the target object. Two-part mask
-        # makes it admissible without opening holes elsewhere:
+        # The goal is the STANDOFF config (fingertips STANDOFF_OFFSET off the contact
+        # sites), so unlike the old grasp-config goal it normally sits clear of the
+        # target object. The two-part admissibility mask is kept as a safety net —
+        # proximal/adjacent finger links can still come close on small objects, and the
+        # start config may hug an object the hand just released:
         #   1. Active-finger geoms get 0mm clearance vs the TARGET object only — exact
         #      distance is still checked, so they may touch but never sweep through it.
         #   2. plan()'s endpoint grace then relaxes any pair still violating at the
-        #      endpoints (tip/ds at ~0 or slightly inside at the grasp goal, or the start
-        #      config hugging an object just released) to its endpoint distance — free to
-        #      move away, never deeper.
+        #      endpoints to its endpoint distance — free to move away, never deeper.
         # Everything else — palm, proximal links, wrist, non-active fingers, and every
         # geom vs the floor — stays checked at the full clearance.
         pair_clearance = {(g, obj_target['id_geom']): 0.0 for g in _ACTIVE_SKIP_GIDS}
         # Re-branch the goal's continuous (base/wrist) joints onto the turn nearest the
         # current pose, so the arm never unwinds a near-full revolution just because the IK
         # left a joint on a far 2pi branch. Same configuration, planner-friendly numbering.
-        q_goal = planner.rebranch(q_start, q_grasp)
+        q_goal = planner.rebranch(q_start, q_goal_cfg)
         _t0 = time.time()
         path = planner.plan(q_start, q_goal, pair_clearance=pair_clearance)
         plan_time = time.time() - _t0
@@ -559,17 +607,25 @@ if __name__ == "__main__":
         else:
             print(f"\r\n[RRT] {len(path)} waypoints")
         if dash is not None:
-            dash.push({'type': 'rrt', 'n_wp': len(path),
+            dash.push({'type': 'rrt', 'object': obj_target['name'], 'n_wp': len(path),
                        'plan_time': plan_time, 'fallback': fallback})
         _plan_result['waypoints'] = path
         _update_ghost_markers(path)
 
+    # Standoff distance for the approach config: the RRT goal / REACH endpoint keeps each
+    # fingertip this far off its contact site, backed out along the site's outward surface
+    # normal (-inward_S_W). The GRASP phase then closes the gap by PD-holding q_target
+    # (the on-surface grasp config) — hovering here instead of at the surface keeps the
+    # planned goal cleanly out of contact.
+    STANDOFF_OFFSET = 0.025
+
     def _run_ik(obj_idx, obj, obj_qpos_snap):
-        """Solve grasp IK for one object (fingertips directly on the contact sites),
-        storing q_target — the single IK solution per object, used both as the RRT goal
-        and the GRASP-phase hold pose. Runs inside the background plan_thread — uses
-        _ik_data, never touches main data. Each DLS and IPOPT stage is timed
-        individually and pushed to the dashboard."""
+        """Solve the two IK configs for one object:
+          q_target   — fingertips directly on the contact sites; the GRASP-phase hold pose.
+          q_standoff — fingertips STANDOFF_OFFSET off the sites along the outward surface
+                       normals; the RRT goal and REACH endpoint.
+        Runs inside the background plan_thread — uses _ik_data, never touches main data.
+        Each stage is timed individually and pushed to the dashboard."""
         mj.mj_resetData(model, _ik_data)
         _ik_data.qpos[:N_ROBOT] = Q_BIAS
         mj.mj_forward(model, _ik_data)
@@ -585,16 +641,28 @@ if __name__ == "__main__":
                                                 reduced_clearance_geoms=_active_clearance_by_geom,
                                                 inward_dirs=obj['inward_S_W'])
         ipopt_grasp_ms = (time.time() - _t0) * 1e3
-        _push_ipopt(f'obj{obj_idx+1} grasp',
+        _push_ipopt(obj['name'],
                     dls_ms=dls_grasp_ms, ipopt_ms=ipopt_grasp_ms)
 
-        total_ms = dls_grasp_ms + ipopt_grasp_ms
-        print(f"\r\n[IK] obj{obj_idx+1}: grasp DLS {dls_grasp_ms:.0f}ms + IPOPT {ipopt_grasp_ms:.0f}ms"
-              f"  |  total {total_ms:.0f}ms")
+        # --- Standoff IK (warm-started from the grasp config, which is ~2.5cm away) ---
+        obj['p_standoff_W'] = [p - STANDOFF_OFFSET * d
+                               for p, d in zip(obj['p_S_W'], obj['inward_S_W'])]
+        _t0 = time.time()
+        obj['q_standoff'] = constrained_ik.solve(_ik_data, id_C, obj['p_standoff_W'],
+                                                  q_bias=Q_BIAS, q_init=obj['q_target'],
+                                                  reduced_clearance_geoms=_active_clearance_by_geom,
+                                                  inward_dirs=obj['inward_S_W'])
+        ipopt_standoff_ms = (time.time() - _t0) * 1e3
+        _push_ipopt(f"{obj['name']} standoff", ipopt_ms=ipopt_standoff_ms)
+
+        total_ms = dls_grasp_ms + ipopt_grasp_ms + ipopt_standoff_ms
+        print(f"\r\n[IK] obj{obj_idx+1}: grasp DLS {dls_grasp_ms:.0f}ms + SQP {ipopt_grasp_ms:.0f}ms"
+              f"  +  standoff SQP {ipopt_standoff_ms:.0f}ms  |  total {total_ms:.0f}ms")
 
         # Tip-error + penetration audit (same checks as the old upfront loop)
         _d_chk = mj.MjData(model)
-        for label, q_sol, tgts in [('grasp', obj['q_target'], obj['p_S_W'])]:
+        for label, q_sol, tgts in [('grasp',    obj['q_target'],   obj['p_S_W']),
+                                   ('standoff', obj['q_standoff'], obj['p_standoff_W'])]:
             _d_chk.qpos[:N_ROBOT] = q_sol
             mj.mj_forward(model, _d_chk)
             errs = [f"{np.linalg.norm(_d_chk.site_xpos[s] - t)*1e3:.1f} mm"
@@ -618,7 +686,7 @@ if __name__ == "__main__":
     def _run_ik_then_rrt(obj_idx, obj, q_start, obj_qpos_snap):
         """Background thread: solve IK for obj (if not cached), then run RRT."""
         _run_ik(obj_idx, obj, obj_qpos_snap)
-        _run_rrt(q_start, obj['q_target'], obj)
+        _run_rrt(q_start, obj['q_standoff'], obj)
 
     # Build target list: index 0 = home pose, 1..N = one entry per object (label only —
     # q_target is not precomputed; it is solved lazily on first selection).
@@ -681,12 +749,16 @@ if __name__ == "__main__":
                     mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g)]))
                  for g in _robot_geom_names]
 
-    # Dashboard streaming state: wall-clock t0 for the scrolling x-axis, a step counter to
-    # throttle distance pushes, and the last active-label pushed (so we only push on change).
+    # Dashboard streaming state: wall-clock t0 for the scrolling x-axis, a step counter
+    # to throttle streaming pushes, and last-pushed mode/active-object (push on change).
+    # _prox_idx is the proximity-based "active object" (min average tip distance) — it
+    # drives the in-scene hover marker too, so it is updated even without --dashboard.
     _dash_t0        = time.time()
     _dash_i         = 0
-    DASH_PUSH_EVERY = 3            # push fingertip distances every N loop iterations
-    _dash_last_lbl  = None
+    DASH_PUSH_EVERY = 3            # push streaming metrics every N loop iterations
+    _dash_last_mode = None
+    _dash_last_prox = None
+    _prox_idx       = 0
 
     def _on_press(key):
         try:
@@ -749,6 +821,21 @@ if __name__ == "__main__":
                                 np.array([rb, rb, rb]), data.geom_xpos[gid].copy(), _eye9, rgba)
                 scn.ngeom += 1
 
+        def _draw_active_marker(scn):
+            """Translucent sphere hovering above the proximity-based 'active object'
+            (min average fingertip signed distance, _prox_idx) so the viewer always
+            shows which object the hand is currently nearest."""
+            if scn is None or scn.ngeom >= scn.maxgeom:
+                return
+            o = objects[_prox_idx]
+            pos = data.xpos[o['id_body']].copy()
+            pos[2] += model.geom_rbound[o['id_geom']] + 0.06
+            mj.mjv_initGeom(scn.geoms[scn.ngeom], mj.mjtGeom.mjGEOM_SPHERE,
+                            np.array([0.022, 0.022, 0.022]), pos,
+                            np.eye(3, dtype=np.float64).flatten(),
+                            np.array([0.25, 1.0, 0.55, 0.4], dtype=np.float32))
+            scn.ngeom += 1
+
         def _render_kinematic_frame():
             """Push ghost/IK markers to the scene and sync the viewer for one
             non-physics frame (no mj_step) — shared by REACH replay, REACH/GRASP
@@ -775,6 +862,7 @@ if __name__ == "__main__":
                                             _sz, pos, _eye9, rgba)
                             scn.ngeom += 1
                 _draw_bspheres(scn)
+                _draw_active_marker(scn)
             viewer.sync()
             time.sleep(model.opt.timestep)
 
@@ -806,26 +894,42 @@ if __name__ == "__main__":
                 time.sleep(max(0, model.opt.timestep - (time.time() - step_start)))
                 continue
 
-            # --- Dashboard: stream fingertip→active-object distances + active label ---
+            # --- Proximity "active object" (min average tip→object signed distance) +
+            # dashboard streams: planning mode, distances, net wrench, normal forces ---
+            if _dash_i % DASH_PUSH_EVERY == 0:
+                _avg_d = [np.mean([_guarded_geom_dist(_tg, _o['id_geom'])
+                                   for _tg in _ALL_TIP_GIDS]) for _o in objects]
+                _prox_idx = int(np.argmin(_avg_d))
             if dash is not None:
-                _lbl = f"{targets[active_tgt]['label']} — {control_phase}"
-                if _lbl != _dash_last_lbl:
-                    dash.push({'type': 'active', 'label': _lbl})
-                    _dash_last_lbl = _lbl
+                # Display terminology: PLAN/REACH → Approach; GRASP → Grasp, or
+                # Transport while the object is being jogged (arrow keys held).
+                _mode = ('Approach' if control_phase in ('PLAN', 'REACH')
+                         else ('Transport' if _held_arrows else 'Grasp'))
+                if (_mode, active_tgt) != _dash_last_mode:
+                    dash.push({'type': 'mode', 'mode': _mode,
+                               'target': targets[active_tgt]['label']})
+                    _dash_last_mode = (_mode, active_tgt)
+                if _prox_idx != _dash_last_prox:
+                    dash.push({'type': 'active_obj', 'name': objects[_prox_idx]['name']})
+                    _dash_last_prox = _prox_idx
                 if _dash_i % DASH_PUSH_EVERY == 0:
-                    _ogid = objects[active_idx]['id_geom']
+                    _t = time.time() - _dash_t0
                     # distmax=2.0 (scene ~1 m): distances above this clamp to 2.0, so the
                     # cap is set high enough to show most of the reach, not just contact.
-                    _dvals = {f: mj.mj_geomDistance(model, data, _TIP_GEOM_IDS[f],
-                                                    _ogid, 2.0, None)
+                    _ogid = objects[_prox_idx]['id_geom']
+                    _dvals = {f: _guarded_geom_dist(_TIP_GEOM_IDS[f], _ogid)
                               for f in FINGER_SET}
-                    dash.push({'type': 'dist', 't': time.time() - _dash_t0, 'd': _dvals})
-                _dash_i += 1
+                    dash.push({'type': 'dist', 't': _t, 'd': _dvals})
+                    _f_net, _tau_net, _normals = _hand_object_contact_metrics(_prox_idx)
+                    dash.push({'type': 'wrench', 't': _t,
+                               'f': _f_net.tolist(), 'tau': _tau_net.tolist()})
+                    dash.push({'type': 'normals', 't': _t, 'n': _normals})
+            _dash_i += 1
 
             # --- Check if background RRT finished ---
             if plan_thread is not None and not plan_thread.is_alive():
                 plan_thread    = None
-                traj_waypoints = _plan_result.get('waypoints', [objects[active_idx]['q_target']])
+                traj_waypoints = _plan_result.get('waypoints', [objects[active_idx]['q_standoff']])
                 traj_wp_idx    = 0
                 traj_wp_step   = 0
                 jog_xz[:]      = 0.0
@@ -859,9 +963,10 @@ if __name__ == "__main__":
                     print(f"\r\n[Control] → REACH  (released — opening fingers)")
 
                 elif key == 'ik_vis' and active_tgt > 0 and active_idx in _ik_solved:
-                    _ik_vis_mode = {None: 'grasp', 'grasp': None}[_ik_vis_mode]
+                    _ik_vis_mode = {None: 'grasp', 'grasp': 'standoff',
+                                    'standoff': None}[_ik_vis_mode]
                     label = f'showing {_ik_vis_mode} config' if _ik_vis_mode else 'off'
-                    print(f"\r\n[IK vis] {label}  (K to toggle)")
+                    print(f"\r\n[IK vis] {label}  (K to cycle)")
 
                 elif key == 'bspheres':
                     _show_bspheres = not _show_bspheres
@@ -891,7 +996,7 @@ if __name__ == "__main__":
                                 # IK cached — go straight to RRT
                                 plan_thread = threading.Thread(
                                     target=_run_rrt,
-                                    args=(q_start, objects[obj_i]['q_target'],
+                                    args=(q_start, objects[obj_i]['q_standoff'],
                                           objects[obj_i]),
                                     daemon=True)
                             else:
@@ -918,13 +1023,15 @@ if __name__ == "__main__":
 
             # --- IK visualization: freeze physics, show full arm in stored IK config ---
             if _ik_vis_mode is not None and active_tgt > 0:
-                q_vis = objects[active_idx]['q_target']
+                q_vis = objects[active_idx]['q_target' if _ik_vis_mode == 'grasp'
+                                            else 'q_standoff']
                 data.qpos[:N_ROBOT] = q_vis
                 data.qvel[:N_ROBOT] = 0.0
                 mj.mj_forward(model, data)
                 if viewer.user_scn is not None:
                     viewer.user_scn.ngeom = 0   # suppress ghost markers; arm pose is the vis
                     _draw_bspheres(viewer.user_scn)
+                    _draw_active_marker(viewer.user_scn)
                 viewer.sync()
                 time.sleep(model.opt.timestep)
                 continue
@@ -984,8 +1091,16 @@ if __name__ == "__main__":
                     tau_ctrl = np.zeros(model.nv)
                     tau_ctrl[:N_ROBOT] = Kp * (wp - data.qpos[:N_ROBOT]) + Kd * (0 - data.qvel[:N_ROBOT])
 
-            # --- GRASP: Cartesian impedance + null-space squeeze, generalized to
-            # N_FINGERS contacts (or, in --viz-only, kinematic hold of the grasp IK pose) ---
+            # --- GRASP: zero-internal-force grasp, grasp_controller_demo strategy —
+            # quasi-static joint-space PD hold of the grasp IK config (gravity comp added
+            # at the shared mj_step handoff below). Contact force comes only from the
+            # finger PD error at the surface, so this validates the IK handoff + hold
+            # without any force allocation; arrow-key jogging is inert in this phase.
+            # Object tracking via a desired external wrench (grasp map + allocator,
+            # superimposed on this hold) comes next — a Cartesian-only version lived
+            # here before but was unstable: the fingertip J^T forces leave the arm's
+            # ~17-dim contact null space unstiffened/undamped (see git history).
+            # (--viz-only: kinematic hold of the grasp IK pose.) ---
             elif control_phase == 'GRASP':
                 if args.viz_only:
                     data.qpos[:N_ROBOT] = obj['q_target']
@@ -993,68 +1108,12 @@ if __name__ == "__main__":
                     mj.mj_forward(model, data)
                     _render_kinematic_frame()
                     continue
-                p_WoO_cur = data.xpos[obj['id_body']]
-                R_WO_cur  = data.xmat[obj['id_body']].reshape(3, 3)
-
-                contacts  = []
-                inward_dirs = []
-                R_WS_cur, p_WoS_cur, J_list = [], [], []
-                for k in range(N_FINGERS):
-                    R_WSk = data.site_xmat[obj['id_S'][k]].reshape(3, 3)
-                    p_WoSk = data.site_xpos[obj['id_S'][k]].copy()
-                    R_WS_cur.append(R_WSk)
-                    p_WoS_cur.append(p_WoSk)
-
-                    p_OSk_O = R_WO_cur.T @ (p_WoSk - p_WoO_cur)
-                    R_OSk   = R_WO_cur.T @ R_WSk
-                    contacts.append({'p': p_OSk_O, 'R': R_OSk})
-
-                    if k == 0:
-                        inward_dirs.append(R_OSk.T @ (-p_OSk_O / np.linalg.norm(p_OSk_O)))
-                    else:
-                        inward_dirs.append(None)
-
-                    Jk_full = np.zeros((3, model.nv))
-                    mj.mj_jacSite(model, data, Jk_full, None, id_C[k])
-                    J_list.append(Jk_full[:3, :N_ROBOT])
-
-                G_cur = grasp_map_computer.compute(contacts)
-
-                # Desired object pose: jog defines an [x, z] offset from the pose frozen
-                # at grasp time (y/depth held fixed). Orientation held at its grasp-time value.
-                p_obj_des = obj['p_obj0'] + np.array([jog_xz[0], 0.0, jog_xz[1]])
-                e_p = p_obj_des - p_WoO_cur
-                # SO(3) orientation error: sum of cross products of corresponding columns
-                # of current vs. desired rotation matrices (standard Cartesian-impedance
-                # error; reduces to the planar scalar e_theta when rotation is about z only).
-                R_des = obj['R_obj0']
-                e_omega = 0.5 * sum(np.cross(R_WO_cur[:, i], R_des[:, i]) for i in range(3))
-
-                # Object velocity via body Jacobian (no need to track per-object qvel indices)
-                Jp_o, Jr_o = np.zeros((3, model.nv)), np.zeros((3, model.nv))
-                mj.mj_jacBodyCom(model, data, Jp_o, Jr_o, obj['id_body'])
-                v_obj     = Jp_o @ data.qvel
-                omega_obj = Jr_o @ data.qvel
-
-                # Desired object wrench (world-frame force + moment), rotated into the
-                # object frame to match SpatialGraspMapComputer's convention.
-                f_des_W = Kp_obj * e_p + Kd_obj * (-v_obj)
-                m_des_W = Kp_theta * e_omega + Kd_theta * (-omega_obj)
-                w_des_O = np.concatenate([R_WO_cur.T @ f_des_W, R_WO_cur.T @ m_des_W])
-
-                # Allocate desired wrench to contact forces (min-norm) + null-space squeeze
-                f_c = force_allocator.allocate(G_cur, w_des_O, contact_dof=3,
-                                                inward_dirs=inward_dirs)
-
+                # Zero qvel each step like the PLAN / REACH final-waypoint holds — the
+                # explicit qfrc_applied damping is marginal at the wrist (dt < 2*I/Kd,
+                # see the PLAN comment above).
+                data.qvel[:N_ROBOT] = 0.0
                 tau_ctrl = np.zeros(model.nv)
-                for k in range(N_FINGERS):
-                    # Low-gain hybrid contact correction: resists slip without overpowering
-                    # the wrench-allocated motion above.
-                    dpk = J_list[k] @ data.qvel[:N_ROBOT]
-                    f_corr_k = (Kp_contact * (p_WoS_cur[k] - data.site_xpos[id_C[k]])
-                                + Kd_contact * (-dpk))
-                    f_ck_W = R_WS_cur[k] @ f_c[3*k:3*k+3] + f_corr_k
-                    tau_ctrl[:N_ROBOT] += J_list[k].T @ f_ck_W
+                tau_ctrl[:N_ROBOT] = Kp * (obj['q_target'] - data.qpos[:N_ROBOT]) + Kd * (0 - data.qvel[:N_ROBOT])
 
             data.qfrc_applied[:] = tau_ctrl
             data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
@@ -1087,6 +1146,7 @@ if __name__ == "__main__":
                                             _sz, pos, _eye9, rgba)
                             scn.ngeom += 1
                 _draw_bspheres(scn)
+                _draw_active_marker(scn)
 
             viewer.sync()
             time.sleep(max(0, model.opt.timestep - (time.time() - step_start)))

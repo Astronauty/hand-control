@@ -79,7 +79,8 @@ class RRTPlanner:
         # spuriously returns 0.0 for well-SEPARATED box-box pairs at near-face-parallel
         # poses (flips with a 1-ulp qpos change) — those phantom "contacts" rejected huge
         # swaths of genuinely free space and starved the planner. Planes have rbound == 0
-        # (no bounding sphere), so plane pairs always take the exact query.
+        # (no bounding sphere); they get an analytic point-plane bound instead (see
+        # _pair_lower_bounds).
         self._rbound = model.geom_rbound.copy()
 
         self._obj_geoms = []
@@ -93,35 +94,74 @@ class RRTPlanner:
         for gname in extra_obj_geom_names:
             self._obj_geoms.append(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, gname))
 
+        # Vectorized-broadphase precomputation. _is_free runs tens of thousands of times
+        # per plan and profiling showed it at ~97% of plan() wall time, dominated by (a)
+        # the pure-Python pair loop over all finger×obstacle pairs and (b) exact
+        # mj_geomDistance queries against the floor PLANE, which rbound==0 exempted from
+        # the sphere prefilter (measured: 100% of all GJK calls). Both are fixed by
+        # computing every pair's distance lower bound in one numpy pass (sphere-sphere
+        # for finite geoms, point-plane for planes) and only running the exact query on
+        # pairs whose bound fails to clear their required clearance (~0.3 per check).
+        self._fg_arr     = np.array(self._finger_geoms, dtype=int)
+        self._og_arr     = np.array(self._obj_geoms, dtype=int)
+        self._rb_f       = self._rbound[self._fg_arr]
+        self._rb_o       = self._rbound[self._og_arr]
+        self._plane_cols = np.nonzero(np.array(
+            [model.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE for g in self._obj_geoms]))[0]
+        self._fg_index   = {g: i for i, g in enumerate(self._finger_geoms)}
+        self._og_index   = {g: j for j, g in enumerate(self._obj_geoms)}
+        # Per-pair clearance matrix — the vectorized counterpart of _pair_clearance,
+        # rebuilt by plan() and updated in place by _endpoint_grace.
+        self._rebuild_clearance_matrix()
+
     # ------------------------------------------------------------------
     # Collision checking
     # ------------------------------------------------------------------
 
+    def _rebuild_clearance_matrix(self):
+        """Bake self._pair_clearance into the (n_finger, n_obj) matrix _is_free compares
+        the pair lower bounds against. Must be called whenever _pair_clearance is
+        replaced wholesale (plan() does); _endpoint_grace maintains both in step."""
+        C = np.full((len(self._fg_arr), len(self._og_arr)), self.clearance)
+        for (fg, og), clr in self._pair_clearance.items():
+            i = self._fg_index.get(fg)
+            j = self._og_index.get(og)
+            if i is not None and j is not None:
+                C[i, j] = clr
+        self._clr_mat = C
+
+    def _pair_lower_bounds(self):
+        """(n_finger, n_obj) matrix of distance lower bounds at the pose currently in
+        self._data (mj_kinematics already run). Finite-geom pairs use the bounding-sphere
+        bound ||c1-c2|| - rb1 - rb2; plane columns use the exact point-plane bound
+        n̂·(c - p_plane) - rb (the plane's world normal is local +z, i.e. the third
+        column of its geom_xmat). Every entry is a true lower bound on the exact
+        geom-geom distance, so comparing it against the clearance matrix can only skip
+        pairs mj_geomDistance provably could not flag."""
+        xpos = self._data.geom_xpos
+        P_f  = xpos[self._fg_arr]
+        P_o  = xpos[self._og_arr]
+        lb   = (np.linalg.norm(P_f[:, None, :] - P_o[None, :, :], axis=2)
+                - self._rb_f[:, None] - self._rb_o[None, :])
+        for k in self._plane_cols:
+            n_hat     = self._data.geom_xmat[self._og_arr[k]].reshape(3, 3)[:, 2]
+            lb[:, k]  = (P_f - P_o[k]) @ n_hat - self._rb_f
+        return lb
+
     def _is_free(self, q):
         self._data.qpos[:self._n_robot] = q   # only set robot DOFs; objects stay at snapshot
         mujoco.mj_kinematics(self.model, self._data)
+        # Broadphase: one vectorized pass over all pairs; the exact query below runs only
+        # for pairs whose lower bound fails their clearance. Per-pair clearance overrides
+        # (e.g. active fingertips vs the target object at 0.0 so a close grasp goal isn't
+        # self-disqualified) live in _clr_mat — the distance is still CHECKED, so an
+        # exempted finger may touch but can never sweep through the object.
+        lb = self._pair_lower_bounds()
         fromto = np.zeros(6)
-        xpos = self._data.geom_xpos
-        for fg in self._finger_geoms:
-            rb_f = self._rbound[fg]
-            p_f  = xpos[fg]
-            for og in self._obj_geoms:
-                # Per-pair clearance override — e.g. the active fingertips vs the object
-                # they're deliberately approaching get 0.0 so a close pregrasp goal isn't
-                # self-disqualified. Unlike the old boolean ignore, the distance is still
-                # CHECKED: the pair may come as close as its override but never deeper, so
-                # an exempted finger can touch yet cannot sweep through the object.
-                clr = self._pair_clearance.get((fg, og), self.clearance)
-                # Bounding-sphere prefilter (see __init__): skip the exact query when the
-                # sphere lower bound already clears clr. rbound==0 means "no sphere"
-                # (planes) — always take the exact query then.
-                rb_o = self._rbound[og]
-                if rb_f > 0 and rb_o > 0:
-                    lb = np.linalg.norm(xpos[og] - p_f) - rb_f - rb_o
-                    if lb >= clr:
-                        continue
-                if mujoco.mj_geomDistance(self.model, self._data, fg, og, 10.0, fromto) < clr:
-                    return False
+        for i, j in zip(*np.nonzero(lb < self._clr_mat)):
+            if mujoco.mj_geomDistance(self.model, self._data, int(self._fg_arr[i]),
+                                      int(self._og_arr[j]), 10.0, fromto) < self._clr_mat[i, j]:
+                return False
         return True
 
     def _wrap_diff(self, d):
@@ -269,23 +309,18 @@ class RRTPlanner:
         it already is. Pairs satisfying their clearance at q are untouched."""
         self._data.qpos[:self._n_robot] = q
         mujoco.mj_kinematics(self.model, self._data)
+        # Same vectorized broadphase as _is_free: a pair whose lower bound clears its
+        # requirement can't need grace (and the exact query is the one vulnerable to
+        # phantom 0.0 results — see __init__). Grace updates the clearance matrix and
+        # the dict together so the two views never diverge.
+        lb = self._pair_lower_bounds()
         fromto = np.zeros(6)
-        xpos = self._data.geom_xpos
-        for fg in self._finger_geoms:
-            rb_f = self._rbound[fg]
-            p_f  = xpos[fg]
-            for og in self._obj_geoms:
-                req = self._pair_clearance.get((fg, og), self.clearance)
-                # Same bounding-sphere prefilter as _is_free: a pair whose sphere lower
-                # bound clears its requirement can't need grace (and the exact query is
-                # the one vulnerable to phantom 0.0 results — see __init__).
-                rb_o = self._rbound[og]
-                if rb_f > 0 and rb_o > 0 and \
-                        np.linalg.norm(xpos[og] - p_f) - rb_f - rb_o >= req:
-                    continue
-                d = mujoco.mj_geomDistance(self.model, self._data, fg, og, 10.0, fromto)
-                if d < req:
-                    self._pair_clearance[(fg, og)] = d - 1e-4
+        for i, j in zip(*np.nonzero(lb < self._clr_mat)):
+            fg, og = int(self._fg_arr[i]), int(self._og_arr[j])
+            d = mujoco.mj_geomDistance(self.model, self._data, fg, og, 10.0, fromto)
+            if d < self._clr_mat[i, j]:
+                self._pair_clearance[(fg, og)] = d - 1e-4
+                self._clr_mat[i, j]            = d - 1e-4
 
     def plan(self, q_start, q_goal, pair_clearance=None):
         """
@@ -304,6 +339,7 @@ class RRTPlanner:
                          endpoint distance (see _endpoint_grace), never below it.
         """
         self._pair_clearance = dict(pair_clearance or {})
+        self._rebuild_clearance_matrix()
         self._endpoint_grace(q_start)
         self._endpoint_grace(q_goal)
         # Stable references to start/goal trees — names never change even after swap.

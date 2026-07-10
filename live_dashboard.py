@@ -9,14 +9,18 @@ The process is spawned (not forked) so the GUI interpreter starts clean and does
 inherit the parent's MuJoCo/GL state.
 
 Message protocol (plain dicts put on the queue):
-    {'type': 'dist',  't': float, 'd': {finger: signed_distance_m}}   # streaming, per step
-    {'type': 'rrt',   'n_wp': int, 'plan_time': float, 'fallback': bool}
-    {'type': 'ipopt', 'phase': str, 'status': str, 'iters': int|str,
-                      'max_site_mm': float, 'max_pad_deg': float|None,
-                      'min_slack_mm': float|None,
-                      'dls_ms': float|None, 'ipopt_ms': float|None}
-    {'type': 'active', 'label': str}     # active-object/phase label (optional)
-    None                                 # sentinel: quit
+    {'type': 'dist',    't': float, 'd': {finger: signed_distance_m}}   # streaming
+    {'type': 'wrench',  't': float, 'f': [fx,fy,fz], 'tau': [tx,ty,tz]} # streaming
+    {'type': 'normals', 't': float, 'n': {finger: normal_force_N}}      # streaming
+    {'type': 'rrt',     'object': str, 'n_wp': int, 'plan_time': float,
+                        'fallback': bool}
+    {'type': 'ipopt',   'object': str, 'status': str, 'iters': int|str,
+                        'max_site_mm': float, 'max_pad_deg': float|None,
+                        'min_slack_mm': float|None,
+                        'dls_ms': float|None, 'ipopt_ms': float|None}
+    {'type': 'mode',    'mode': str, 'target': str}   # Approach / Grasp / Transport
+    {'type': 'active_obj', 'name': str}               # proximity-based active object
+    None                                              # sentinel: quit
 
 Usage from the sim process:
     dash = Dashboard(FINGER_SET, horizon_s=10.0)
@@ -36,6 +40,9 @@ FINGER_COLORS = {
     'thumb':  (255, 95, 95),
 }
 
+# x / y / z curve colours for the wrench plots.
+AXIS_COLORS = ((255, 90, 90), (110, 220, 110), (80, 160, 255))
+
 
 def _run(queue, fingers, horizon_s, dt_hint):
     """Dashboard process entry point. Imports Qt lazily so the parent never loads it."""
@@ -50,49 +57,87 @@ def _run(queue, fingers, horizon_s, dt_hint):
     win.setWindowTitle("hand-control — live dashboard")
     grid = QtWidgets.QGridLayout(win)
 
-    # --- (1) scrolling fingertip→object distance plot ---
-    plot = pg.PlotWidget(title="Fingertip → active object  (signed geom distance)")
-    plot.addLegend(offset=(-10, 10))
-    plot.showGrid(x=True, y=True, alpha=0.3)
-    plot.setLabel('bottom', 'time', 's')
-    plot.setLabel('left', 'distance', 'm')
-    plot.addLine(y=0.0, pen=pg.mkPen((150, 150, 150), width=1,
-                                     style=QtCore.Qt.DashLine))  # contact / penetration line
+    # --- header: planning mode (big) + selected target + proximity-active object ---
+    mode_lbl = QtWidgets.QLabel("—")
+    mode_lbl.setStyleSheet("font-size: 30px; font-weight: bold;")
+    target_lbl = QtWidgets.QLabel("target: —")
+    target_lbl.setStyleSheet("font-size: 12px; color: #999999;")
+    active_obj_lbl = QtWidgets.QLabel("active object: —")
+    active_obj_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #55cc88;")
+    mode_box = QtWidgets.QVBoxLayout()
+    mode_box.addWidget(mode_lbl)
+    mode_box.addWidget(target_lbl)
+    header = QtWidgets.QHBoxLayout()
+    header.addLayout(mode_box)
+    header.addStretch(1)
+    header.addWidget(active_obj_lbl)
+    grid.addLayout(header, 0, 0, 1, 2)
 
     maxlen = max(10, int(horizon_s / max(dt_hint, 1e-3)))
-    tbuf = deque(maxlen=maxlen)
-    curves, dbuf = {}, {}
+
+    def _scroll_plot(title, ylabel, yunit):
+        p = pg.PlotWidget(title=title)
+        p.addLegend(offset=(-10, 10))
+        p.showGrid(x=True, y=True, alpha=0.3)
+        p.setLabel('bottom', 'time', 's')
+        p.setLabel('left', ylabel, yunit)
+        p.addLine(y=0.0, pen=pg.mkPen((150, 150, 150), width=1,
+                                      style=QtCore.Qt.DashLine))
+        return p
+
+    # --- (1) scrolling fingertip→active-object distance plot ---
+    dist_plot = _scroll_plot("Fingertip → active object  (signed geom distance)",
+                             'distance', 'm')
+    dist_t = deque(maxlen=maxlen)
+    dist_curves, dist_buf = {}, {}
     for f in fingers:
         col = FINGER_COLORS.get(f, (200, 200, 200))
-        curves[f] = plot.plot(pen=pg.mkPen(col, width=2), name=f)
-        dbuf[f] = deque(maxlen=maxlen)
+        dist_curves[f] = dist_plot.plot(pen=pg.mkPen(col, width=2), name=f)
+        dist_buf[f] = deque(maxlen=maxlen)
 
-    # --- (2) RRT metrics + (3) IPOPT metrics: monospace scrollback logs ---
-    def _log_widget():
-        w = QtWidgets.QPlainTextEdit()
-        w.setReadOnly(True)
-        w.setMaximumBlockCount(200)
-        w.setStyleSheet("font-family: monospace; font-size: 11px;")
-        return w
+    # --- (2) per-finger contact normal force (hand ↔ any object) ---
+    norm_plot = _scroll_plot("Contact normal force  (per finger, hand ↔ objects)",
+                             'force', 'N')
+    norm_t = deque(maxlen=maxlen)
+    norm_curves, norm_buf = {}, {}
+    for f in fingers:
+        col = FINGER_COLORS.get(f, (200, 200, 200))
+        norm_curves[f] = norm_plot.plot(pen=pg.mkPen(col, width=2), name=f)
+        norm_buf[f] = deque(maxlen=maxlen)
 
-    rrt_log = _log_widget()
-    ipopt_log = _log_widget()
-    active_lbl = QtWidgets.QLabel("active: —")
-    active_lbl.setStyleSheet("font-weight: bold;")
+    # --- (3)+(4) net hand→active-object wrench: force + torque about object COM ---
+    force_plot  = _scroll_plot("Net hand → object force  (world frame)", 'force', 'N')
+    torque_plot = _scroll_plot("Net hand → object torque  (about object COM)",
+                               'torque', 'N·m')
+    wrench_t = deque(maxlen=maxlen)
+    force_curves, torque_curves = [], []
+    force_buf  = [deque(maxlen=maxlen) for _ in range(3)]
+    torque_buf = [deque(maxlen=maxlen) for _ in range(3)]
+    for i, ax in enumerate('xyz'):
+        pen = pg.mkPen(AXIS_COLORS[i], width=2)
+        force_curves.append(force_plot.plot(pen=pen, name=f'F{ax}'))
+        torque_curves.append(torque_plot.plot(pen=pen, name=f'τ{ax}'))
 
-    grid.addWidget(active_lbl, 0, 0, 1, 2)
-    grid.addWidget(plot, 1, 0, 1, 2)
-    grid.addWidget(QtWidgets.QLabel("<b>RRT solutions</b>"), 2, 0)
-    grid.addWidget(QtWidgets.QLabel("<b>IPOPT solutions</b>"), 2, 1)
-    grid.addWidget(rrt_log, 3, 0)
-    grid.addWidget(ipopt_log, 3, 1)
-    grid.setRowStretch(1, 3)
-    grid.setRowStretch(3, 1)
-    win.resize(1150, 700)
+    # --- (5) combined planner log: RRT + IK solutions, grouped per solve ---
+    plan_log = QtWidgets.QPlainTextEdit()
+    plan_log.setReadOnly(True)
+    plan_log.setMaximumBlockCount(400)
+    plan_log.setStyleSheet("font-family: monospace; font-size: 11px;")
+
+    grid.addWidget(dist_plot,   1, 0)
+    grid.addWidget(force_plot,  1, 1)
+    grid.addWidget(norm_plot,   2, 0)
+    grid.addWidget(torque_plot, 2, 1)
+    grid.addWidget(QtWidgets.QLabel("<b>Planner solutions (RRT + IK)</b>"), 3, 0, 1, 2)
+    grid.addWidget(plan_log, 4, 0, 1, 2)
+    grid.setRowStretch(1, 2)
+    grid.setRowStretch(2, 2)
+    grid.setRowStretch(4, 1)
+    win.resize(1250, 950)
     win.show()
 
     def drain():
-        got_dist = False
+        got_dist = got_norm = got_wrench = False
         # Bounded drain so a burst can't starve the event loop.
         for _ in range(20000):
             try:
@@ -104,35 +149,60 @@ def _run(queue, fingers, horizon_s, dt_hint):
                 return
             mt = msg.get('type')
             if mt == 'dist':
-                tbuf.append(msg['t'])
+                dist_t.append(msg['t'])
                 for f in fingers:
-                    dbuf[f].append(msg['d'].get(f, float('nan')))
+                    dist_buf[f].append(msg['d'].get(f, float('nan')))
                 got_dist = True
+            elif mt == 'normals':
+                norm_t.append(msg['t'])
+                for f in fingers:
+                    norm_buf[f].append(msg['n'].get(f, float('nan')))
+                got_norm = True
+            elif mt == 'wrench':
+                wrench_t.append(msg['t'])
+                for i in range(3):
+                    force_buf[i].append(msg['f'][i])
+                    torque_buf[i].append(msg['tau'][i])
+                got_wrench = True
             elif mt == 'rrt':
-                kind = "linear-fallback" if msg.get('fallback') else "RRT"
-                rrt_log.appendPlainText(
-                    f"{kind}: {msg.get('n_wp', '?')} wp  "
-                    f"{msg.get('plan_time', float('nan'))*1e3:.0f} ms")
+                plan_log.appendPlainText(
+                    f"{msg.get('object', '?')} — RRT\n"
+                    f"    {msg.get('n_wp', '?')} waypoints   "
+                    f"plan time {msg.get('plan_time', float('nan'))*1e3:.0f} ms"
+                    + ("   ** LINEAR FALLBACK **" if msg.get('fallback') else ""))
             elif mt == 'ipopt':
-                pad     = msg.get('max_pad_deg')
-                slack   = msg.get('min_slack_mm')
-                dls_ms  = msg.get('dls_ms')
-                ipo_ms  = msg.get('ipopt_ms')
-                t_str   = (f"  DLS={dls_ms:.0f}ms IPOPT={ipo_ms:.0f}ms"
-                           if dls_ms is not None and ipo_ms is not None else "")
-                ipopt_log.appendPlainText(
-                    f"{msg.get('phase', '?'):<14} {msg.get('status', '?')[:18]:<18} "
-                    f"it={msg.get('iters', '?')!s:>4}  "
-                    f"site={msg.get('max_site_mm', float('nan')):.1f}mm  "
-                    f"pad={'—' if pad is None else f'{pad:.1f}°'}  "
-                    f"slack={'—' if slack is None else f'{slack:.1f}mm'}"
-                    + t_str)
-            elif mt == 'active':
-                active_lbl.setText(f"active: {msg.get('label', '—')}")
+                pad    = msg.get('max_pad_deg')
+                slack  = msg.get('min_slack_mm')
+                dls_ms = msg.get('dls_ms')
+                ipo_ms = msg.get('ipopt_ms')
+                lines = [
+                    f"{msg.get('object', '?')} — IK",
+                    f"    {msg.get('status', '?')}   iters={msg.get('iters', '?')}",
+                    f"    site err {msg.get('max_site_mm', float('nan')):.1f} mm   "
+                    f"pad {'—' if pad is None else f'{pad:.1f}°'}   "
+                    f"slack {'—' if slack is None else f'{slack:.1f} mm'}",
+                ]
+                if dls_ms is not None and ipo_ms is not None:
+                    lines.append(f"    DLS {dls_ms:.0f} ms + NLP {ipo_ms:.0f} ms")
+                plan_log.appendPlainText("\n".join(lines))
+            elif mt == 'mode':
+                mode_lbl.setText(msg.get('mode', '—'))
+                target_lbl.setText(f"target: {msg.get('target', '—')}")
+            elif mt == 'active_obj':
+                active_obj_lbl.setText(f"active object: {msg.get('name', '—')}")
         if got_dist:
-            x = list(tbuf)
+            x = list(dist_t)
             for f in fingers:
-                curves[f].setData(x, list(dbuf[f]))
+                dist_curves[f].setData(x, list(dist_buf[f]))
+        if got_norm:
+            x = list(norm_t)
+            for f in fingers:
+                norm_curves[f].setData(x, list(norm_buf[f]))
+        if got_wrench:
+            x = list(wrench_t)
+            for i in range(3):
+                force_curves[i].setData(x, list(force_buf[i]))
+                torque_curves[i].setData(x, list(torque_buf[i]))
 
     timer = QtCore.QTimer()
     timer.timeout.connect(drain)

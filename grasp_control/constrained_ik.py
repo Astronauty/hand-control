@@ -553,13 +553,10 @@ _SQP_SOLVER_OPTS = {
     'qpsol_options':         {'error_on_fail': False,
                               'osqp': {'verbose': False, 'polish': True}},
     'max_iter':              500,
-    # sqpmethod defaults (1e-6/1e-6) are far tighter than a mm-scale grasp needs and
-    # quadruple the iteration count for sub-mm gains. Measured on the pick-place scene
-    # (obj 1, DLS warm start): 371 iters / 9.6s at defaults vs 91 iters / 2.9s here,
-    # at +9mm max tip error (20.5 -> 29.6mm; both dominated by binding floor/object
-    # constraints, and the GRASP-phase controller refines contact anyway).
-    'tol_du':                1e-3,
-    'tol_pr':                1e-5,
+    # Tolerances left at the sqpmethod defaults (tol_pr/tol_du = 1e-6). Relaxing to
+    # 1e-3/1e-5 cuts iterations ~4x at +9mm max tip error if solve latency ever needs
+    # trading against accuracy again — affordable at full tightness now that the FK
+    # callbacks are batched and far pairs are pruned (see solve()).
     'hessian_approximation': 'limited-memory',
     'lbfgs_memory':          20,
     'convexify_strategy':    'regularize',
