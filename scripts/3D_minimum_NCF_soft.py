@@ -1,0 +1,502 @@
+import numpy as np
+from scipy.spatial import ConvexHull
+from scipy import optimize
+from scipy.optimize import linprog
+from scipy.optimize import Bounds
+from itertools import product as iterproduct
+
+# TODO: write methods section overleaf
+# -> equations and explanation of this script 
+# -> follow convention for variable names, update variable name section as needed
+# TODO: change brute force convex hull method to LP and make sure it still works
+# TODO: add soft contact model as an option 
+# -> implement soft contact model, similar to how implemented coulomb friction model
+# -> make sure it werk
+
+class WrenchCheck:
+    def __init__(self, n, pos, R, ncf, tan_y, tan_z, mu, mu_t=None):
+        '''
+        Contact forces (ncf, tan) should result in zero wrench on object 
+        (i.e. null space of grasp map)
+
+        Currently assumes n contacts in 3D
+        -----------------------------------
+        :param float n: no. of contacts
+        :param list of np.array(3, 1) pos_b: position of contacts in object body frame 
+        :param list of np.array(3, 3) R_bc: contact frame (x: normal, y: tangential, z: tangential) in terms of body frame 
+                                    (rotates contact frame to body frame)
+        :param list of float ncf: normal contact force magnitude
+        :param list of float tan_y: tangential contact force magnitude and direction (+ve along y-dir defined by R_bc)
+        :param list of float tan_z: tangential contact force magnitude and direction (+ve along z-dir defined by R_bc)
+        :param list of float mu: tangential friction coefficient
+        :param list of float mu_t: (optional) torsional friction coefficient [m] per contact.
+            None (default) -> hard point contact (Coulomb only), exact legacy behaviour.
+            Given -> soft-finger contact: each contact can transmit a spin moment about its
+            own normal, |tau_n| <= mu_t * f_n.  Physically mu_t ~ 0.5..0.67 * mu * r_patch
+            for a circular contact patch of radius r_patch (units: metres, since it maps
+            force [N] -> moment [N*m]).
+        '''
+        
+        # check that all inputs are list of length n (internal size errors not checked) 
+        if len(pos) != n:
+            raise ValueError('No. of contact positions (pos) given not equal to n')
+        elif len(R) != n:
+            raise ValueError('No. of contact frames (R) given not equal to n')
+        elif len(ncf) != n:
+            raise ValueError('No. of normal contact force magnitudes (ncf) given not equal to n')
+        elif len(tan_y) != n:
+            raise ValueError('No. of tangential contact force magnitude & direction in y-dir (tan_y) given not equal to n')
+        elif len(tan_z) != n:
+            raise ValueError('No. of tangential contact force magnitude & direction in z-dir (tan_z) given not equal to n')  
+        elif len(mu) != n:
+            raise ValueError('No. of tangential friction coefficients (mu) given not equal to n')  
+        elif mu_t is not None and len(mu_t) != n:
+            raise ValueError('No. of torsional friction coefficients (mu_t) given not equal to n')
+
+        self.n = n # no. of contacts
+        self.pos = pos
+        self.R = R
+        self.ncf = ncf
+        self.tan_y = tan_y
+        self.tan_z = tan_z
+        self.mu = mu
+        self.soft = mu_t is not None          # soft-finger contact model enabled?
+        self.mu_t = mu_t if self.soft else [0.0] * n
+
+        self.num_tol = 1e-10
+        self.dim_dict = {0: 'Tx',
+                         1: 'Ty',
+                         2: 'Tz',
+                         3: 'Fx',
+                         4: 'Fy',
+                         5: 'Fz'}
+        
+        self.ndims = 6 # 3D, ndims for wrench 
+        # no. of vertices per contact:
+        #   hard point contact: 5 (zero + 4 pyramid)
+        #   soft finger:        7 (zero + 4 pyramid + 2 torsion)
+        self.nverts = 7 if self.soft else 5
+
+    def single_wrench_cone(self, gamma, pos_bc, R_bc, ncf, mu, mu_t=0.0):
+        '''
+        Calculate wrench vertices (Tx, Ty, Tz, Fx, Fy, Fz) bounding contact wrench cone 
+        Wrench cone is then the convex hull of calculated wrench vertices
+        -> in body frame 
+        -> for a single contact in 3D
+        -> assume coulomb friction (which assumes isotropic)
+        -> optionally soft-finger contact (mu_t > 0): contact also transmits a spin
+           moment about its own normal, |tau_n| <= mu_t * f_n
+
+        Soft-finger linearisation (L1-coupled, conservative):
+            Two extra vertices are added, each carrying pure normal force ncf plus
+            torsion +/- mu_t*ncf about the contact normal.  Convex combinations then
+            satisfy   |f_tan|_1 / mu  +  |tau_n| / mu_t  <=  f_n,
+            which is INSCRIBED in the true elliptic soft-finger limit surface
+            (f_tan/(mu*f_n))^2 + (tau_n/(mu_t*f_n))^2 <= 1  — an underestimate,
+            consistent with the square pyramid underestimating the Coulomb cone.
+            (A decoupled box |f_tan|<=mu*f_n AND |tau|<=mu_t*f_n would OVERestimate
+            at the corners and could certify grasps that actually slip.)
+
+        (Convex hull is smallest convex set that contains all points in the set)
+        (if convex hull has vertices x, y, z, then any vector a*x + b*y + c*z where 
+         a, b, c >= 0 and a + b + c <= 1, is in the convex hull)
+        ---------
+        :param float gamma: where f_contact = f_manipulation + gamma * f_internal
+        :param np.array(3, 1) pos_b: position of contact in body frame 
+        :param np.array(3, 3) R_bc: contact frame (x: normal, y: tangential, z: tangential) in terms of body frame 
+                                    (rotates contact frame to body frame)
+        :param float ncf: normal contact force magnitude
+        :param float mu: tangential friction coefficient (mu_y = mu_z since assume isotropic friction)
+        :param float mu_t: torsional friction coefficient [m]; 0 -> hard point contact
+
+        :return np.array(nverts, 6): wrench vertices in body frame [Tx, Ty, Tz, Fx, Fy, Fz]
+                                     bounding contact wrench cone (5 rows hard, 7 rows soft)
+        '''
+        # 3D friction cone vertices in contact frame
+        # Use square pyramidal cone to underestimate actual friction cone 
+        ncf = ncf*gamma
+        f0_c = np.array([[0], [0], [0]])
+        f1_c = np.array([[ncf], [0], [-mu*ncf]])
+        f2_c = np.array([[ncf], [-mu*ncf], [0]])
+        f3_c = np.array([[ncf], [mu*ncf], [0]])
+        f4_c = np.array([[ncf], [0], [mu*ncf]])
+
+        # 3D friction cone vertices in body frame
+        f0_b = R_bc @ f0_c
+        f1_b = R_bc @ f1_c
+        f2_b = R_bc @ f2_c
+        f3_b = R_bc @ f3_c
+        f4_b = R_bc @ f4_c
+
+        # Torque generated by each contact friction cone vertex, in body frame 
+        t0_b = np.cross(pos_bc, f0_b, axisa=0, axisb=0)[0]
+        t1_b = np.cross(pos_bc, f1_b, axisa=0, axisb=0)[0]
+        t2_b = np.cross(pos_bc, f2_b, axisa=0, axisb=0)[0]
+        t3_b = np.cross(pos_bc, f3_b, axisa=0, axisb=0)[0]
+        t4_b = np.cross(pos_bc, f4_b, axisa=0, axisb=0)[0]
+
+        # Wrench cone vertices [Tx, Ty, Tz, Fx, Fy, Fz] in body frame 
+        F0_b = np.append(t0_b, f0_b)
+        F1_b = np.append(t1_b, f1_b)
+        F2_b = np.append(t2_b, f2_b)
+        F3_b = np.append(t3_b, f3_b)
+        F4_b = np.append(t4_b, f4_b)
+
+        if not self.soft:
+            return np.array([F0_b, F1_b, F2_b, F3_b, F4_b])
+
+        # ── Soft-finger torsion vertices ────────────────────────────────────
+        # Pure normal force + spin moment about the contact normal.
+        # The moment is a free vector: it does NOT depend on pos_bc (no lever
+        # arm), so it enters the torque rows directly, not via pos x f.
+        n_b  = (R_bc @ np.array([[1.0], [0.0], [0.0]])).flatten()  # contact normal, body frame
+        f5_c = np.array([[ncf], [0], [0]])
+        f6_c = np.array([[ncf], [0], [0]])
+        f5_b = R_bc @ f5_c
+        f6_b = R_bc @ f6_c
+        t5_b = np.cross(pos_bc, f5_b, axisa=0, axisb=0)[0] + mu_t * ncf * n_b
+        t6_b = np.cross(pos_bc, f6_b, axisa=0, axisb=0)[0] - mu_t * ncf * n_b
+        F5_b = np.append(t5_b, f5_b)
+        F6_b = np.append(t6_b, f6_b)
+
+        return np.array([F0_b, F1_b, F2_b, F3_b, F4_b, F5_b, F6_b])
+    
+    def in_total_wrench_space(self, wrench, verts_list):
+        '''
+        Determines whether candidate wrench is in total wrench space generated by n contacts 
+        Total wrench space is minkowski sum (sumset of n subsets in Euclidean space) of n wrench cones, each bounded by vertices 
+
+        (Minkowski sum of n convex polygons is equal to the convex hull of Minkowski sum (i.e. all possible combinations of sums) of set of vertices of each polygon)
+        (e.g. Minkowski sum is the sumset of 3 subsets A & B & C in Euclidean space, i.e. A + B + C = {a + b + c, where a in A & b in B & c in C})
+        --------------
+        :param np.array(6, 1) wrench: candidate wrench in body frame
+        :param np.array(no. of contacts * no. of wrench vertices per contact, 6) verts_list: array of vertices [Tx, Ty, Tz, Fx, Fy, Fz] bounding each contact wrench cone           
+
+        :return np.array(no. of constraint eqns,) lhs: right hand side value of wrench space constraint equations
+                ^ does not return bool! to be consistent with constraint building for optimizer
+        '''
+
+        # Check if wrench is linear combination of wrench cones of each contact, 
+        # where sum of coefficients of vertices from each contact < 1
+        ntotal_verts = self.n * self.nverts
+
+        # wrench = verts_list.T @ coeffs
+        # A_eq @ x == b_eq
+        A_eq = verts_list.T
+        b_eq = wrench.flatten()
+
+        # sum of coefficients of vertices for each contact <= 1
+        # A_ub @ x <= b_ub
+        A_ub = np.zeros((self.n, ntotal_verts)) 
+        for i in range(self.n):
+            A_ub[i, i*self.nverts:(i+1)*self.nverts] = 1 # select coefficients from same contact
+        b_ub = np.ones(self.n) # enforces that coefficients from same contact sum to 1
+
+        # each coefficient should be between 0 and 1 
+        bounds = [(0, 1)] * ntotal_verts
+
+        res = linprog(c=np.zeros(ntotal_verts), 
+                      A_eq=A_eq, b_eq=b_eq, A_ub=A_ub, b_ub=b_ub, bounds=bounds)
+        
+        # (0: wrench IS IN total wrench space)
+        # (1: wrench is NOT in total wrench space) 
+        return 0.0 if res.success else 1.0
+
+    def wrench_feasibility(self, gamma, wrench):
+        '''
+        Determines feasibility of wrench on object based on n null space contacts in 3-D
+        -----------
+        :param float gamma: where f_contact = f_manipulation + gamma * f_internal
+        :param np.array(6, 1) wrench
+
+        :return np.array(no. of constraint eqns,) lhs: left hand side value of wrench space constraint equations (lhs <= 0), given gamma  
+        '''
+        verts_list = np.array([np.zeros(self.ndims)]) # will result in first element of verts_list being irrelevant
+        torques_list = []
+        tans_list = []
+
+        for i in range(self.n):
+            vert = self.single_wrench_cone(gamma, self.pos[i], self.R[i], self.ncf[i], self.mu[i], self.mu_t[i])
+            verts_list = np.concatenate([verts_list, vert], axis=0)
+
+            # Tangential component of gamma * f_interval in contact frame 
+            tan_c = np.array([[0], [gamma * self.tan_y[i]], [gamma * self.tan_z[i]]])
+
+            # Tangential component of gamma * f_interval in body frame 
+            tan_b = self.R[i] @ tan_c # (3,1)
+            tans_list.append(tan_b)
+
+            # Torque generated by gamma * f_interval in body frame
+            torque_b = np.cross(self.pos[i], tan_b, axisa=0, axisb=0)[0] # (3,)
+            torques_list.append(torque_b)
+
+        verts_list = verts_list[1:] # first element is irrelevant 
+        # verts_list: np.array(no. of contacts * no. of wrench vertices per contact,)
+        tans_arr = np.array(tans_list)
+        torques_arr = np.array(torques_list)
+
+        # Normal contact forces need to support f_manipulation and tangential component of internal forces 
+        # Thus to check wrench feasibility of wrench =
+        # wrench + wrench due to tangential component of (gamma * f_interval)
+        tan_wrench = np.append(torques_arr.sum(axis=0), tans_arr.sum(axis=0)) # (6,)
+        tan_wrench = tan_wrench.reshape(6, 1)
+        wrench = wrench + tan_wrench
+
+        return self.in_total_wrench_space(wrench, verts_list)
+    
+def min_gamma_for_accel(max_norm_accelx, max_norm_accely, max_norm_accelz, 
+                        max_norm_Tx, max_norm_Ty, max_norm_Tz, 
+                        n, pos, R, ncf, tan_y, tan_z, mu, mu_t=None):
+    '''
+    Finds minimum gamma (where f_contact = f_manipulation + gamma * f_internal)
+    required to ensure no-slip grasp given desired max accelerations and torques in each object body axis
+
+    Assuming m = 1 for now (so accel == force)
+    -----------------------------------------------------------------------------------
+    :param float max_norm_accelx, max_norm_accely, max_norm_accelz: maximum magnitude of acceleration along each of x, y, z axis in object body frame
+    :param float max_norm_Tx, max_norm_Ty, max_norm_Tz: maximum magnitude of torque about each of x, y, z axis in object body frame
+    :param float n: no. of contacts
+    :param list of np.array(3, 1) pos_b: position of contacts in body frame 
+    :param list of np.array(3, 3) R_bc: contact frame (x: normal, y: tangential) in terms of body frame 
+                                (rotates contact frame to body frame)
+    :param list of float ncf: zero wrench normal contact force magnitude
+    :param list of float tan: zero wrench tangential contact force magnitude and direction (+ve along dir defined by R_bc)
+    :param list of float mu: tangential friction coefficient
+    :param list of float mu_t: (optional) torsional friction coefficient [m] per contact
+                               None -> hard point contact; see WrenchCheck docstring
+
+    :return float min_gamma: where minimum normal contact force = normal component of (min_gamma * f_internal)
+    '''
+
+    wrench_checker = WrenchCheck(n, pos, R, ncf, tan_y, tan_z, mu, mu_t=mu_t)
+
+    # collect unique nonzero wrenches
+    possible_wrenches = []
+    seen = set()
+    for tx in [-max_norm_Tx, max_norm_Tx]:
+        for ty in [-max_norm_Ty, max_norm_Ty]:
+            for tz in [-max_norm_Tz, max_norm_Tz]:
+                for ax in [-max_norm_accelx, max_norm_accelx]:
+                    for ay in [-max_norm_accely, max_norm_accely]:
+                        for az in [-max_norm_accelz, max_norm_accelz]:
+                            possible_wrench = np.array([[tx],[ty],[tz],[ax],[ay],[az]])
+
+                            # skip if zero wrench (trivially feasible)
+                            # (makes binary search way quicker)
+                            if np.allclose(possible_wrench, 0):
+                                continue
+
+                            # skip if duplicate possible wrench
+                            # (makes binary search way quicker)
+                            possible_duplicate = tuple(possible_wrench.flatten())
+                            if possible_duplicate in seen:
+                                continue
+                            seen.add(possible_duplicate)
+
+                            possible_wrenches.append(possible_wrench)
+
+    def all_feasible(gamma):
+        return all(wrench_checker.wrench_feasibility(gamma, possible_wrench) < wrench_checker.num_tol
+                   for possible_wrench in possible_wrenches)
+
+    # check geometric feasibility at high gamma
+    if not all_feasible(1000):
+        return None
+
+    # binary search for minimum gamma
+    lo, hi = 0.0, 1000.0
+    for _ in range(60):  # 60 iterations → precision ~1e-15
+        mid = (lo + hi) / 2
+        if all_feasible(mid):
+            hi = mid
+        else:
+            lo = mid
+
+    return hi
+
+def min_gamma_for_accel_lp(max_norm_accelx, max_norm_accely, max_norm_accelz,
+                           max_norm_Tx, max_norm_Ty, max_norm_Tz,
+                           n, pos, R, ncf, tan_y, tan_z, mu,
+                           mu_t=None,
+                           return_sensitivity=False):
+    '''
+    Alternative to min_gamma_for_accel: solves minimum gamma directly with one LP per corner wrench
+    instead of binary search over feasibility LPs (exact answer, ~60x fewer LP solves)
+
+    Wrench cone vertices scale linearly with gamma (V(gamma) = gamma * V(1)), so substituting
+    y = gamma * x (valid since gamma >= 0) makes the problem linear in (y, gamma):
+        min  gamma
+        s.t. V(1).T @ y - gamma * w_tan = wrench       (w_tan: wrench due to tangential component of f_internal at gamma = 1)
+             sum of y coefficients within each contact - gamma <= 0
+             y >= 0, gamma >= 0
+    Infeasible LP <=> grasp geometrically cannot resist wrench (no gamma cap needed)
+    -----------------------------------------------------------------------------------
+    :params: same as min_gamma_for_accel
+    :param list of float mu_t: (optional) torsional friction coefficient [m] per contact.
+        None -> hard point contact (legacy).  Given -> soft-finger contact model; each
+        contact can additionally transmit a spin moment |tau_n| <= mu_t * f_n about its
+        own normal.  See WrenchCheck / single_wrench_cone docstrings for the (conservative,
+        L1-coupled) linearisation used.
+    :param bool return_sensitivity: if True, also return (d_gamma_dp1, d_gamma_dp2) — the
+        gradient of min_gamma w.r.t. the two contact positions, computed via LP dual variables
+        (envelope theorem).  Returns (None, None, None) on infeasibility.
+        NOTE: the soft-finger torsion moments are free vectors (no lever arm), so they add
+        no pos-dependence to the LP data; the envelope-theorem gradient formula below is
+        unchanged and remains exact for the soft model.
+
+    :return float min_gamma: where minimum normal contact force = normal component of (min_gamma * f_internal)
+                             None if no gamma can resist the requested wrenches
+                             When return_sensitivity=True, returns (min_gamma, d_gamma_dp1, d_gamma_dp2)
+    '''
+    wrench_checker = WrenchCheck(n, pos, R, ncf, tan_y, tan_z, mu, mu_t=mu_t)
+    nverts = wrench_checker.nverts
+    mu_t_list = wrench_checker.mu_t
+
+    # cone vertices and tangential-internal-force wrench at gamma = 1
+    V1 = np.vstack([wrench_checker.single_wrench_cone(1.0, pos[i], R[i], ncf[i], mu[i], mu_t_list[i])
+                    for i in range(n)]) # (n * nverts, 6)
+    w_tan = np.zeros(6)
+    for i in range(n):
+        tan_b = R[i] @ np.array([[0.0], [tan_y[i]], [tan_z[i]]])
+        w_tan[:3] += np.cross(pos[i], tan_b, axisa=0, axisb=0)[0]
+        w_tan[3:] += tan_b.flatten()
+
+    # variables: [y (n * nverts), gamma]
+    nvar = n * nverts + 1
+    c = np.zeros(nvar)
+    c[-1] = 1.0 # min gamma
+    A_eq = np.hstack([V1.T, -w_tan.reshape(6, 1)]) # (6, nvar)
+    A_ub = np.zeros((n, nvar))
+    for k in range(n):
+        A_ub[k, k*nverts:(k+1)*nverts] = 1 # select coefficients from same contact
+        A_ub[k, -1] = -1
+    b_ub = np.zeros(n)
+    bounds = [(0, None)] * nvar
+
+    # collect unique nonzero corner wrenches
+    corners = set()
+    for tx in [-max_norm_Tx, max_norm_Tx]:
+        for ty in [-max_norm_Ty, max_norm_Ty]:
+            for tz in [-max_norm_Tz, max_norm_Tz]:
+                for ax in [-max_norm_accelx, max_norm_accelx]:
+                    for ay in [-max_norm_accely, max_norm_accely]:
+                        for az in [-max_norm_accelz, max_norm_accelz]:
+                            corner = (tx, ty, tz, ax, ay, az)
+                            if any(corner):
+                                corners.add(corner)
+
+    min_gamma = 0.0
+    worst_res = None
+    for corner in corners:
+        res = linprog(c=c, A_eq=A_eq, b_eq=np.array(corner), A_ub=A_ub, b_ub=b_ub,
+                      bounds=bounds, method='highs')
+        if not res.success:
+            return (None, None, None) if return_sensitivity else None
+        if res.x[-1] > min_gamma:
+            min_gamma = res.x[-1]
+            worst_res = res
+
+    if not return_sensitivity:
+        return min_gamma
+
+    if worst_res is None:
+        # all corners gave gamma=0 (e.g. zero task wrench)
+        return 0.0, np.zeros(3), np.zeros(3)
+
+    # Analytical gradient via LP dual variables (envelope theorem).
+    # The equality constraint A_eq x = b_eq (wrench balance) has dual lambda_eq.
+    # dV*/dr_i = lambda_torque x f_jac_i  where:
+    #   f_jac_i = effective world-frame force from contact i's cone vertices
+    #             minus the tangential-squeeze correction (from w_tan's r-dependency)
+    lambda_eq     = worst_res.eqlin.marginals   # (6,) dγ_min/d(corner_wrench)
+    lambda_torque = lambda_eq[:3]               # dual for torque-balance rows
+    y_star        = worst_res.x[:-1]            # (n*nverts,) cone coefficients
+    gamma_star    = worst_res.x[-1]
+
+    d_gamma_dpos = []
+    for i in range(n):
+        sl = slice(i * nverts, (i + 1) * nverts)
+        f_cone_i = V1[sl, 3:6].T @ y_star[sl]                              # (3,) world-frame force
+        tan_bi   = (R[i] @ np.array([[0.], [tan_y[i]], [tan_z[i]]])).flatten()
+        f_jac_i  = f_cone_i - gamma_star * tan_bi                          # subtract squeeze correction
+        d_gamma_dpos.append(np.cross(lambda_torque, f_jac_i))
+
+    return min_gamma, d_gamma_dpos[0], d_gamma_dpos[1]
+
+if __name__ ==  "__main__":
+
+    print('sign convention: z↑ x-> y⊗')
+
+    # ->▢ <- from spatial_grasp_map.py
+    n_contacts = 2
+    pos_list = [np.array([[-0.05], [0], [0]]), np.array([[0.05], [0], [0]])]
+    R_list = [np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]]), np.array([[-1, 0, 0], [0, 1, 0], [0, 0, 1]])]
+    ncf_list = [1, 1]
+    tany_list = [0, 0]
+    tanz_list = [0, 0]
+    mu_list = [1, 1]
+    
+    # Test 1: ->▢ <- with wrench ->
+    print('Test 1: ->▢ <- with wrench ->')
+    print(f'When fx=1 wrench, gamma = {min_gamma_for_accel(1, 0, 0, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(1, 0, 0, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+
+    # Test 2: ->▢ <- with wrench ⊗
+    print('Test 2: ->▢ <- with wrench ⊗')
+    print(f'When fy=1 wrench, gamma = {min_gamma_for_accel(0, 1, 0, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(0, 1, 0, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+
+    # Test 3: ->▢ <- with wrench ↑
+    print('Test 3: ->▢ <- with wrench  ↑')
+    print(f'When fz=1 wrench, gamma = {min_gamma_for_accel(0, 0, 1, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(0, 0, 1, 0, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+
+    # Test 4: ->▢ <- with wrench torque about x-axis
+    print('Test 4: ->▢ <- with wrench torque about x-axis')
+    print(f'When Tx=1 wrench, gamma = {min_gamma_for_accel(0, 0, 0, 1, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(0, 0, 0, 1, 0, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+
+    # Test 5: ->▢ <- with wrench torque about y-axis
+    print('Test 5: ->▢ <- with wrench torque about y-axis')
+    print(f'When Ty=1 wrench, gamma = {min_gamma_for_accel(0, 0, 0, 0, 1, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(0, 0, 0, 0, 1, 0, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+
+    # Test 6: ->▢ <- with wrench torque about z-axis
+    print('Test 6: ->▢ <- with wrench torque about z-axis')
+    print(f'When Tz=1 wrench, gamma = {min_gamma_for_accel(0, 0, 0, 0, 0, 1, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+    print(f'              (single LP) {min_gamma_for_accel_lp(0, 0, 0, 0, 0, 1, n_contacts, pos_list, R_list, ncf_list, tany_list, tanz_list, mu_list)}')
+
+    print()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Soft-finger contact model tests
+    # Torque about the squeeze axis (Tx here: normals are +/-x) is structurally
+    # unreachable for hard point contacts unless the two contacts are point-
+    # antisymmetric about the torque-balance origin.  Soft-finger torsion
+    # (|tau_n| <= mu_t * f_n about each contact normal) makes it reachable
+    # everywhere, at a gamma cost proportional to the demanded spin moment.
+    # ─────────────────────────────────────────────────────────────────────────
+    print('Soft-finger contact model (mu_t > 0)')
+    mu_t_list = [0.005, 0.005]   # e.g. ~0.6 * mu * r_patch, r_patch ~ 8 mm
+
+    # Test 7: spin about the squeeze axis — impossible for hard contacts at
+    # these positions (contacts lie ON the x-axis: zero lever arm for Tx)
+    print('Test 7: ->▢ <- with wrench torque about x-axis (squeeze axis)')
+    g_hard = min_gamma_for_accel_lp(0, 0, 0, 0.001, 0, 0, n_contacts, pos_list,
+                                    R_list, ncf_list, tany_list, tanz_list, mu_list)
+    g_soft = min_gamma_for_accel_lp(0, 0, 0, 0.001, 0, 0, n_contacts, pos_list,
+                                    R_list, ncf_list, tany_list, tanz_list, mu_list,
+                                    mu_t=mu_t_list)
+    print(f'When Tx=0.001 wrench, hard contact gamma = {g_hard}   (expected: None)')
+    print(f'                      soft finger  gamma = {g_soft}   (expected: 0.001/(2*0.005) = 0.1)')
+
+    # Test 8: mu_t = 0 soft model must reproduce hard-contact result exactly
+    print('Test 8: consistency — soft model with mu_t = 0 == hard model')
+    g_hard = min_gamma_for_accel_lp(1, 0, 0, 0, 0, 0, n_contacts, pos_list,
+                                    R_list, ncf_list, tany_list, tanz_list, mu_list)
+    g_soft0 = min_gamma_for_accel_lp(1, 0, 0, 0, 0, 0, n_contacts, pos_list,
+                                     R_list, ncf_list, tany_list, tanz_list, mu_list,
+                                     mu_t=[0.0, 0.0])
+    print(f'fx=1: hard = {g_hard},  soft(mu_t=0) = {g_soft0}')
+
+    print()
