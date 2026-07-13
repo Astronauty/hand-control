@@ -552,14 +552,16 @@ _SQP_SOLVER_OPTS = {
     'qpsol':                 'osqp',
     'qpsol_options':         {'error_on_fail': False,
                               'osqp': {'verbose': False, 'polish': True}},
-    'max_iter':              500,
-    # Slightly relaxed from the sqpmethod defaults (tol_pr/tol_du = 1e-6): the dual
-    # tolerance drives most of the tail iterations (sub-mm cost polishing), while the
-    # primal tolerance is kept tight so constraint (collision) feasibility is unaffected.
-    # Measured on the pick-place scene: defaults ran 285-500 iters/object (one hitting
-    # max_iter); 1e-4 cuts that roughly in half at <2mm tip-error change. tol_du=1e-3 /
-    # tol_pr=1e-5 is the next notch (~90 iters, +9mm) if latency ever matters more.
-    'tol_du':                1e-4,
+    'max_iter':              800,
+    # tol_du is a KKT-residual (dual) tolerance, so it scales with the objective:
+    # with the tip task weight at 100 (see kinova_leap_pick_place's tip_weight),
+    # 1e-2 here is equivalent to the old well-behaved 1e-4 at unit weights. What
+    # actually bought tip accuracy was the weight rebalance, not a tighter tol —
+    # measured at tip_weight=100 on the 6 pick-place objects: tol_du=1e-4 burned
+    # to the 800-iter cap on every solve (1.5-10s) for accuracy identical to
+    # 1e-2, which converges in 49-212 iters (0.1-1.2s) at ~0.5-2.5mm tips. If the
+    # task weights change by 100x again, rescale this in the same direction.
+    'tol_du':                1e-2,
     'hessian_approximation': 'limited-memory',
     'lbfgs_memory':          20,
     'convexify_strategy':    'regularize',
@@ -602,6 +604,11 @@ class ConstrainedIKSolver:
     clearance      : minimum signed distance (m) required between each arm/obj geom pair.
     posture_weight : weight on ||q - q_bias||² in the cost. Small (0.01–0.1) keeps the
                      position task dominant while still regularizing the null space.
+    tip_weight     : weight on the fingertip position term Σ||site_k(q) - target_k||².
+                     The default 1.0 (raw metres²) makes millimetre-scale tip errors
+                     numerically tiny next to the posture/orientation regularizers, so
+                     the optimizer trades away ~cm of tip placement — raise this
+                     (e.g. 100) when the tips must land on the targets to sub-mm.
     pad_axis       : selects the direction (as a unit vector) in the frame of the finger end 
                      effector to attempt to orient to the normal of object surface during grasping
     orient_weight  : weight in the IK cost function for orienting the finger pad with the object surface normal 
@@ -611,6 +618,7 @@ class ConstrainedIKSolver:
                  arm_geom_names, obj_geom_names,
                  clearance=0.005, posture_weight=0.05,
                  pad_axis=(-1.0, 0.0, 0.0), orient_weight=0.0,
+                 tip_weight=1.0,
                  max_iter=500, verbose=False):
         self._model          = model
         self._n              = n_robot
@@ -618,6 +626,7 @@ class ConstrainedIKSolver:
         self._obj_geom_names = list(obj_geom_names)
         self._clearance      = clearance
         self._posture_weight = posture_weight
+        self._tip_weight     = tip_weight
         self._max_iter       = max_iter
         self._verbose        = verbose
         self._pad_axis = np.asarray(pad_axis, dtype=float).flatten()
@@ -684,7 +693,7 @@ class ConstrainedIKSolver:
                 "print_level":  5 if verbose else 0,
                 "sb":           "yes",
                 "max_iter":     max_iter,
-                "tol":          1e-4,
+                "tol":          1e-6,   # tightened for max fingertip-placement accuracy (was 1e-4)
                 "constr_viol_tol": 1e-6,
                 "mu_strategy":              "adaptive",
                 "acceptable_tol":           1e-3,
@@ -773,7 +782,7 @@ class ConstrainedIKSolver:
         cost = ca.MX(0)
         for cb, tgt in zip(site_cbs, targets):
             diff = cb(q) - ca.DM(tgt)
-            cost = cost + ca.dot(diff, diff)
+            cost = cost + self._tip_weight * ca.dot(diff, diff)
 
         if q_bias is not None:
             dq   = q - ca.DM(q_bias)

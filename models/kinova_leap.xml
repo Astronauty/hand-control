@@ -1,5 +1,5 @@
 <mujoco model="gen3">
-  <compiler angle="radian" meshdir="assets/"/>
+  <compiler angle="radian"/>
 
   <option integrator="implicitfast"/>
 
@@ -72,24 +72,24 @@
   <asset>
     <material name="leap_black" rgba="0.2 0.2 0.2 1"/>
     <material name="leap_white"/>
-    <mesh name="base_link" content_type="model/stl" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/kinova_gen3/assets/base_link.stl"/>
-    <mesh name="shoulder_link" content_type="model/stl" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/kinova_gen3/assets/shoulder_link.stl"/>
-    <mesh name="half_arm_1_link" content_type="model/stl" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/kinova_gen3/assets/half_arm_1_link.stl"/>
-    <mesh name="half_arm_2_link" content_type="model/stl" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/kinova_gen3/assets/half_arm_2_link.stl"/>
-    <mesh name="forearm_link" content_type="model/stl" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/kinova_gen3/assets/forearm_link.stl"/>
-    <mesh name="spherical_wrist_1_link" content_type="model/stl" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/kinova_gen3/assets/spherical_wrist_1_link.stl"/>
-    <mesh name="spherical_wrist_2_link" content_type="model/stl" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/kinova_gen3/assets/spherical_wrist_2_link.stl"/>
-    <mesh name="bracelet_with_vision_link" content_type="model/stl" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/kinova_gen3/assets/bracelet_with_vision_link.stl"/>
-    <mesh name="leap_palm" content_type="model/obj" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/leap_hand/assets/palm_right.obj"/>
-    <mesh name="leap_base" content_type="model/obj" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/leap_hand/assets/base.obj"/>
-    <mesh name="leap_proximal" content_type="model/obj" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/leap_hand/assets/proximal.obj"/>
-    <mesh name="leap_medial" content_type="model/obj" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/leap_hand/assets/medial.obj"/>
-    <mesh name="leap_distal" content_type="model/obj" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/leap_hand/assets/distal.obj"/>
-    <mesh name="leap_tip" content_type="model/obj" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/leap_hand/assets/tip.obj"/>
-    <mesh name="leap_thumb_base" content_type="model/obj" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/leap_hand/assets/thumb_base.obj"/>
-    <mesh name="leap_thumb_proximal" content_type="model/obj" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/leap_hand/assets/thumb_proximal.obj"/>
-    <mesh name="leap_thumb_distal" content_type="model/obj" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/leap_hand/assets/thumb_distal.obj"/>
-    <mesh name="leap_thumb_tip" content_type="model/obj" file="/home/aipexws5/daniel/hand-control/mujoco_menagerie/leap_hand/assets/thumb_tip.obj"/>
+    <mesh name="base_link" content_type="model/stl" file="../mujoco_menagerie/kinova_gen3/assets/base_link.stl"/>
+    <mesh name="shoulder_link" content_type="model/stl" file="../mujoco_menagerie/kinova_gen3/assets/shoulder_link.stl"/>
+    <mesh name="half_arm_1_link" content_type="model/stl" file="../mujoco_menagerie/kinova_gen3/assets/half_arm_1_link.stl"/>
+    <mesh name="half_arm_2_link" content_type="model/stl" file="../mujoco_menagerie/kinova_gen3/assets/half_arm_2_link.stl"/>
+    <mesh name="forearm_link" content_type="model/stl" file="../mujoco_menagerie/kinova_gen3/assets/forearm_link.stl"/>
+    <mesh name="spherical_wrist_1_link" content_type="model/stl" file="../mujoco_menagerie/kinova_gen3/assets/spherical_wrist_1_link.stl"/>
+    <mesh name="spherical_wrist_2_link" content_type="model/stl" file="../mujoco_menagerie/kinova_gen3/assets/spherical_wrist_2_link.stl"/>
+    <mesh name="bracelet_with_vision_link" content_type="model/stl" file="../mujoco_menagerie/kinova_gen3/assets/bracelet_with_vision_link.stl"/>
+    <mesh name="leap_palm" content_type="model/obj" file="../mujoco_menagerie/leap_hand/assets/palm_right.obj"/>
+    <mesh name="leap_base" content_type="model/obj" file="../mujoco_menagerie/leap_hand/assets/base.obj"/>
+    <mesh name="leap_proximal" content_type="model/obj" file="../mujoco_menagerie/leap_hand/assets/proximal.obj"/>
+    <mesh name="leap_medial" content_type="model/obj" file="../mujoco_menagerie/leap_hand/assets/medial.obj"/>
+    <mesh name="leap_distal" content_type="model/obj" file="../mujoco_menagerie/leap_hand/assets/distal.obj"/>
+    <mesh name="leap_tip" content_type="model/obj" file="../mujoco_menagerie/leap_hand/assets/tip.obj"/>
+    <mesh name="leap_thumb_base" content_type="model/obj" file="../mujoco_menagerie/leap_hand/assets/thumb_base.obj"/>
+    <mesh name="leap_thumb_proximal" content_type="model/obj" file="../mujoco_menagerie/leap_hand/assets/thumb_proximal.obj"/>
+    <mesh name="leap_thumb_distal" content_type="model/obj" file="../mujoco_menagerie/leap_hand/assets/thumb_distal.obj"/>
+    <mesh name="leap_thumb_tip" content_type="model/obj" file="../mujoco_menagerie/leap_hand/assets/thumb_tip.obj"/>
   </asset>
 
   <worldbody>

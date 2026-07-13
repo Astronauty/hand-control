@@ -32,11 +32,28 @@ FINGER_TIPS = {
 }
 
 
+MODELS_DIR = os.path.join(REPO_ROOT, "models")
+
+
 def _absolutize_meshes(spec, assets_dir):
-    """Rewrite mesh file paths to absolute so merging two specs with
-    different meshdirs doesn't collide."""
+    """Rewrite mesh file paths to absolute (forward-slash) so merging two specs with
+    different meshdirs doesn't collide, and so MjSpec can actually resolve the files
+    at compile/to_xml time regardless of the process's current working directory.
+    _portabilize_paths() rewrites these back to relative paths before the XML is
+    written to disk, so the checked-in file has no machine-specific absolute paths."""
+    assets_dir_fwd = assets_dir.replace(os.sep, "/")
     for mesh in spec.meshes:
-        mesh.file = os.path.join(assets_dir, mesh.file)
+        mesh.file = f"{assets_dir_fwd}/{mesh.file}"
+
+
+def _portabilize_paths(xml_str, assets_dirs):
+    """Replace absolute assets_dir prefixes with paths relative to models/ (where the
+    built XML lives), so the checked-in file works across machines/OSes instead of
+    hardcoding whichever machine last ran this script."""
+    for assets_dir in assets_dirs:
+        rel = os.path.relpath(assets_dir, MODELS_DIR).replace(os.sep, "/")
+        xml_str = xml_str.replace(assets_dir.replace(os.sep, "/"), rel)
+    return xml_str
 
 
 def _add_fingertip_sites(hand_spec):
@@ -68,8 +85,10 @@ def _build(use_motors: bool, out_name: str):
     arm_spec = mujoco.MjSpec.from_file(os.path.join(KINOVA_DIR, "gen3.xml"))
     hand_spec = mujoco.MjSpec.from_file(os.path.join(LEAP_DIR, "right_hand.xml"))
 
-    _absolutize_meshes(arm_spec, os.path.join(KINOVA_DIR, "assets"))
-    _absolutize_meshes(hand_spec, os.path.join(LEAP_DIR, "assets"))
+    kinova_assets = os.path.join(KINOVA_DIR, "assets")
+    leap_assets = os.path.join(LEAP_DIR, "assets")
+    _absolutize_meshes(arm_spec, kinova_assets)
+    _absolutize_meshes(hand_spec, leap_assets)
 
     _add_fingertip_sites(hand_spec)
 
@@ -81,12 +100,20 @@ def _build(use_motors: bool, out_name: str):
     mount_site = bracelet.add_site(name="hand_mount", pos=MOUNT_POS, quat=MOUNT_QUAT)
     arm_spec.attach(hand_spec, site=mount_site, prefix="leap_")
 
+    # Clear the inherited meshdir="assets/" (from gen3.xml) so mesh file paths are
+    # resolved directly relative to the output XML's own directory (models/) — the
+    # compiler silently strips leading ".." when combining a relative mesh.file with
+    # a non-empty meshdir, which broke the "../mujoco_menagerie/..." paths below.
+    arm_spec.compiler.meshdir = ""
+
     for key in list(arm_spec.keys):
         arm_spec.delete(key)
 
-    out_path = os.path.join(REPO_ROOT, "models", out_name)
+    xml_str = _portabilize_paths(arm_spec.to_xml(), [kinova_assets, leap_assets])
+
+    out_path = os.path.join(MODELS_DIR, out_name)
     with open(out_path, "w") as f:
-        f.write(arm_spec.to_xml())
+        f.write(xml_str)
     print(f"Successfully wrote {out_path}")
 
 

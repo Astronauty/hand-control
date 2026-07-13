@@ -17,6 +17,12 @@ import threading
 import traceback
 import queue
 
+# Windows consoles often report a legacy codepage (e.g. cp1252) for stdout even in
+# UTF-8-capable terminals (Git Bash/Windows Terminal), which crashes on the arrow
+# glyphs (←→↑↓) used in the on-screen control hints below.
+if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+
 import mujoco as mj
 import mujoco.viewer  # noqa: F401
 from pynput import keyboard as _pynput_kb
@@ -329,8 +335,18 @@ if __name__ == "__main__":
         clearance=0.005,
         posture_weight=0.0005,
         pad_axis=(-1.0, 0.0, 0.0),  # LEAP fingerpad normal in the fingertip-site frame
-        orient_weight=0.01,         # align each fingerpad with the contact inward normal
-        max_iter=500,   # DLS warm-start puts us near solution; few iters needed
+        # Weight the tip-position task above the posture regularizer: at 1.0 (raw m²)
+        # a 15mm tip error costs 2e-4 vs a posture term of ~3e-3, so the solver traded
+        # ~cm of placement for posture comfort — and the GRASP squeeze then computed
+        # its grasp map against contacts that never landed where the plan assumed.
+        # orient_weight rides along at tip:pad = 1000:1 (A/B'd across the 6 objects:
+        # 10000:1 starved pad alignment to ~58 deg on the capsule, 100:1 let the pad
+        # term drag tips into 20mm+ local minima on sphere/capsule; 1000:1 gives
+        # ~0.5-2.5mm tips at <5 deg pads on 4/6 objects).
+        # NOTE: _SQP_SOLVER_OPTS' tol_du (1e-2) is calibrated to this cost scale.
+        tip_weight=100.0,
+        orient_weight=0.1,
+        max_iter=800,   # DLS warm-start puts us near solution; headroom for the tightened tol
     )
     if args.ik_solver == 'sqp':
         configure_sqp(constrained_ik)
@@ -345,6 +361,32 @@ if __name__ == "__main__":
     # (mj_geomDistance from each finger's tip mesh geom to the active object's geom).
     _TIP_GEOM_IDS = {f: mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, f'leap_{FINGER_CODE[f]}_tip')
                      for f in FINGER_SET}
+
+    # Pad-surface offset per finger: distance from the fingertip SITE (which sits at the
+    # tip mesh's centroid, per build_kinova_leap's FINGER_TIPS) to the actual fingerpad
+    # SURFACE along the pad normal (pad_axis = -x of the site frame). The IK targets the
+    # site, but physical contact happens at the pad surface — aiming the site directly at
+    # a contact site on the object buries the tip mesh ~this deep into the object
+    # (measured -8.4mm index / -10.0mm thumb on the red box), which shoves the object
+    # around during the GRASP hold and breaks the squeeze's grasp-map geometry.
+    # Site and geom are rigid on the same body, so one kinematics pass at any config
+    # gives the constant offset: max projection of the tip-mesh vertices onto the pad
+    # direction, relative to the site.
+    def _pad_surface_offset(f):
+        d0 = mj.MjData(model)
+        mj.mj_kinematics(model, d0)
+        gid = _TIP_GEOM_IDS[f]
+        sid = id_C[FINGER_SET.index(f)]
+        mid = model.geom_dataid[gid]
+        adr, num = model.mesh_vertadr[mid], model.mesh_vertnum[mid]
+        verts_W = (d0.geom_xmat[gid].reshape(3, 3) @ model.mesh_vert[adr:adr + num].T).T \
+                  + d0.geom_xpos[gid]
+        pad_dir_W = -d0.site_xmat[sid].reshape(3, 3)[:, 0]   # world dir of pad_axis (-x)
+        return float(np.max((verts_W - d0.site_xpos[sid]) @ pad_dir_W))
+
+    _PAD_OFFSET = {f: _pad_surface_offset(f) for f in FINGER_SET}
+    print(f"[IK] fingerpad surface offsets: "
+          + "  ".join(f"{f}={_PAD_OFFSET[f]*1e3:.1f}mm" for f in FINGER_SET))
 
     # All four fingertip tip geoms — used to pick the proximity-based "active object":
     # the object with the smallest AVERAGE signed tip→object distance. This is what the
@@ -370,13 +412,17 @@ if __name__ == "__main__":
         """Scan live contacts once and return
           (f_net, tau_net): net world-frame wrench the HAND applies to objects[obj_idx],
                             torque taken about the object's COM;
-          normals: each FINGER_SET finger's summed contact normal force vs ANY object.
+          normals: each FINGER_SET finger's summed contact normal force vs ANY object;
+          tangentials: same, but the summed tangential (friction) force magnitude —
+                       tangential/normal vs mu is the friction-cone utilization, i.e.
+                       how close each contact is to slipping.
         Convention (verified empirically, MuJoCo 3.3.5): contact.frame rows are the
         contact-frame axes with row 0 = normal pointing geom1→geom2, and mj_contactForce
         returns the force applied TO geom2 expressed in that frame — so the force on the
         object is +R.T@f when the object is geom2 and -R.T@f when it is geom1."""
         f_net, tau_net = np.zeros(3), np.zeros(3)
-        normals = {f: 0.0 for f in FINGER_SET}
+        normals     = {f: 0.0 for f in FINGER_SET}
+        tangentials = {f: 0.0 for f in FINGER_SET}
         com = data.xipos[objects[obj_idx]['id_body']]
         ft = np.zeros(6)
         for ci in range(data.ncon):
@@ -391,13 +437,14 @@ if __name__ == "__main__":
             mj.mj_contactForce(model, data, ci, ft)
             fname = _FINGER_BY_GID.get(hand_gid)
             if fname is not None:
-                normals[fname] += ft[0]   # normal component (>= 0, along frame row 0)
+                normals[fname]     += ft[0]   # normal component (>= 0, along frame row 0)
+                tangentials[fname] += float(np.hypot(ft[1], ft[2]))
             if _OBJ_GID_TO_IDX[obj_gid] == obj_idx:
                 R_con = con.frame.reshape(3, 3)
                 f_W = sgn * (R_con.T @ ft[:3])
                 f_net   += f_W
                 tau_net += np.cross(con.pos - com, f_W) + sgn * (R_con.T @ ft[3:6])
-        return f_net, tau_net, normals
+        return f_net, tau_net, normals, tangentials
 
     # Live metrics dashboard (separate process; opt-in via --dashboard). Started before the
     # IK precompute so the grasp IPOPT solves below are reported too. dash is None
@@ -435,6 +482,36 @@ if __name__ == "__main__":
             return
         dash.push({'type': 'squeeze', 'on': bool(on), 'gamma': GAMMA,
                    'f_contact': GAMMA / np.sqrt(2)})
+
+    def _squeeze_diag(d, period_s=1.0):
+        """Once per period while squeezing: commanded vs measured per-contact force,
+        friction-cone utilization, and tip↔contact-site slip distance. Separates the
+        two failure modes: measured normal ≪ commanded → force-delivery problem (PD
+        fight / grasp-map geometry error); utilization near 100% and slip growing →
+        tangential shear (raise gamma or stiffen the slip correction)."""
+        now = time.time()
+        if now - _squeeze_diag.last < period_s:
+            return
+        _squeeze_diag.last = now
+        f_c = grasp_ctrl.last_f_c
+        _, _, normals, tangentials = _hand_object_contact_metrics(active_idx)
+        mu = float(model.geom_friction[obj_grasp['id_geom'], 0])
+        parts = []
+        for k, f in enumerate(FINGER_SET):
+            cmd = (float(np.linalg.norm(f_c[3 * k:3 * k + 3]))
+                   if f_c is not None else float('nan'))
+            n_meas, t_meas = normals[f], tangentials[f]
+            util = t_meas / (mu * n_meas) if n_meas > 1e-6 else float('inf')
+            # Slip vs the pad-offset anchor (where the tip SITE sits when the pad
+            # surface is flush), not the raw surface site 10mm ahead of it.
+            sid_S = obj_grasp['id_S'][k]
+            inward_W = d.site_xmat[sid_S].reshape(3, 3)[:, 0]
+            anchor_W = d.site_xpos[sid_S] - _PAD_OFFSET[f] * inward_W
+            slip_mm = 1e3 * float(np.linalg.norm(d.site_xpos[id_C[k]] - anchor_W))
+            parts.append(f"{f}: cmd={cmd:.1f}N meas={n_meas:.1f}N "
+                         f"fric={util:.0%} slip={slip_mm:.1f}mm")
+        print("\r\n[Squeeze] " + "  |  ".join(parts))
+    _squeeze_diag.last = 0.0
 
     # Arm home pose from gen3.xml's "home" keyframe (the composite model has its keyframes
     # stripped in build_kinova_leap.py, since a 7-DOF arm keyframe no longer fits the larger
@@ -521,6 +598,22 @@ if __name__ == "__main__":
     # force each. GAMMA=8 -> ~5.7 N per contact, ~2.3x margin for the finger PD
     # fighting the squeeze, contact compliance, and dynamic loads while jogging.
     GAMMA = 50.0
+
+    # Softens Kp/Kd on the active (grasping) finger joints while squeezing, via
+    # GraspController.effective_gains(). Without this the full-strength joint PD
+    # hold fights the internal-force torques: as GAMMA pushes the fingers to press
+    # harder, the position spring (anchored at the fixed pre-squeeze q_grasp_hold)
+    # pulls back proportionally, so measured contact force saturates well below
+    # GAMMA/sqrt(2) instead of scaling with it.
+    SQUEEZE_PD_SCALE = 0.25
+
+    # Ramp the squeeze force 0->GAMMA over this many seconds of sim time after each
+    # squeeze-on. The internal force pair only cancels once BOTH contacts exist; at
+    # toggle time the pads typically hover ~mm off the surface (object settled after
+    # REACH), and full force while a finger is still closing that gap arrives as an
+    # unbalanced shove that knocks the object across the table (measured: 35N commanded
+    # -> box launched 400mm; with the ramp the contacts form at ~N-level forces first).
+    SQUEEZE_RAMP_S = 0.5
 
     # Give the RRT the SAME full hand-geom set the IK constrains (_robot_geom_names) plus
     # the floor, instead of only the fingertips — checking just the tips let the palm /
@@ -671,12 +764,18 @@ if __name__ == "__main__":
         obj['ik_obj_qpos'] = obj_qpos_snap.copy()
 
         # --- Grasp IK ---
+        # Target the tip SITES at the contact sites backed off by the pad-surface
+        # offset along each contact's inward normal, so the fingerpad SURFACE (not
+        # the tip-mesh centroid the site sits at) lands flush on the object.
+        obj['ik_targets'] = [p - _PAD_OFFSET[f] * n
+                             for f, p, n in zip(FINGER_SET, obj['p_S_W'],
+                                                obj['inward_S_W'])]
         _t0 = time.time()
-        q_dls_grasp = dls_ik.solve(model, _ik_data, id_C, obj['p_S_W'],
+        q_dls_grasp = dls_ik.solve(model, _ik_data, id_C, obj['ik_targets'],
                                     q_bias=Q_BIAS, null_gain=0.3)
         dls_grasp_ms = (time.time() - _t0) * 1e3
         _t0 = time.time()
-        obj['q_target'] = constrained_ik.solve(_ik_data, id_C, obj['p_S_W'],
+        obj['q_target'] = constrained_ik.solve(_ik_data, id_C, obj['ik_targets'],
                                                 q_bias=Q_BIAS, q_init=q_dls_grasp,
                                                 reduced_clearance_geoms=_active_clearance_by_geom,
                                                 inward_dirs=obj['inward_S_W'])
@@ -692,7 +791,7 @@ if __name__ == "__main__":
         # objects posed at the same snapshot the solve used.
         _d_chk = mj.MjData(model)
         _d_chk.qpos[N_ROBOT:] = obj_qpos_snap
-        for label, q_sol, tgts in [('grasp', obj['q_target'], obj['p_S_W'])]:
+        for label, q_sol, tgts in [('grasp', obj['q_target'], obj['ik_targets'])]:
             _d_chk.qpos[:N_ROBOT] = q_sol
             mj.mj_forward(model, _d_chk)
             errs = [f"{np.linalg.norm(_d_chk.site_xpos[s] - t)*1e3:.1f} mm"
@@ -780,6 +879,7 @@ if __name__ == "__main__":
     _held_arrows   = set()         # arrow keys currently held
     _ctrl_held     = set()         # Ctrl_L / Ctrl_R currently held
     squeeze_on     = False         # GRASP: internal force toggled by Enter
+    _squeeze_steps = 0             # sim steps since squeeze-on, drives the force ramp
     grasp_ctrl     = None          # GraspController, built at each REACH→GRASP transition
     q_grasp_hold   = None          # GRASP PD target; arm part integrated by arrow-key jog
     _PALM_BID      = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'leap_palm')
@@ -964,7 +1064,7 @@ if __name__ == "__main__":
                     _dvals = {f: _guarded_geom_dist(_TIP_GEOM_IDS[f], _ogid)
                               for f in FINGER_SET}
                     dash.push({'type': 'dist', 't': _t, 'd': _dvals})
-                    _f_net, _tau_net, _normals = _hand_object_contact_metrics(_prox_idx)
+                    _f_net, _tau_net, _normals, _ = _hand_object_contact_metrics(_prox_idx)
                     dash.push({'type': 'wrench', 't': _t,
                                'f': _f_net.tolist(), 'tau': _tau_net.tolist()})
                     dash.push({'type': 'normals', 't': _t, 'n': _normals})
@@ -1006,14 +1106,20 @@ if __name__ == "__main__":
                         tip_site_ids=id_C,
                         obj_site_ids=obj_grasp['id_S'],
                         obj_body_id=obj_grasp['id_body'],
-                        kp=Kp, kd=Kd, gamma=GAMMA)
+                        kp=Kp, kd=Kd, gamma=GAMMA,
+                        squeeze_pd_scale=SQUEEZE_PD_SCALE,
+                        support_weight=True,
+                        pad_offsets=[_PAD_OFFSET[f] for f in FINGER_SET])
                     q_grasp_hold = obj_grasp['q_target'].copy()
+                    grasp_ctrl.set_squeeze(False)
                     _push_squeeze(False)
                     print(f"\r\n[Control] → GRASP  ({targets[active_tgt]['label']})  "
                           f"|  Enter: toggle squeeze (gamma={GAMMA:.0f})  |  N: release")
 
                 elif key == 'enter' and control_phase == 'GRASP':
                     squeeze_on = not squeeze_on
+                    _squeeze_steps = 0   # restart the force ramp on every toggle-on
+                    grasp_ctrl.set_squeeze(squeeze_on)
                     _push_squeeze(squeeze_on)
                     print(f"\r\n[Control] squeeze {'ON' if squeeze_on else 'off'}  "
                           f"(gamma={GAMMA:.0f}, ~{GAMMA/np.sqrt(2):.2f} N/contact)")
@@ -1024,6 +1130,7 @@ if __name__ == "__main__":
                     # (possibly jogged) grasp arm config q_grasp_hold — snapping back
                     # to the original IK pose would drag the object with it.
                     squeeze_on     = False
+                    grasp_ctrl.set_squeeze(False)
                     _push_squeeze(False)
                     q_release      = q_grasp_hold.copy()
                     q_release[7:]  = Q_BIAS[7:]
@@ -1222,10 +1329,23 @@ if __name__ == "__main__":
                 data.qvel[:N_ROBOT] = 0.0
                 data.qvel[:7] = qdot_jog
                 tau_ctrl = np.zeros(model.nv)
-                tau_ctrl[:N_ROBOT] = (Kp * (q_grasp_hold - data.qpos[:N_ROBOT])
-                                      + Kd * (np.r_[qdot_jog, np.zeros(16)] - data.qvel[:N_ROBOT]))
+                # Softened on the active finger joints while squeezing (see
+                # SQUEEZE_PD_SCALE) so the position hold doesn't fight the
+                # internal-force torques added below.
+                kp_eff, kd_eff = grasp_ctrl.effective_gains()
+                tau_ctrl[:N_ROBOT] = (kp_eff * (q_grasp_hold - data.qpos[:N_ROBOT])
+                                      + kd_eff * (np.r_[qdot_jog, np.zeros(16)] - data.qvel[:N_ROBOT]))
                 if squeeze_on:
-                    tau_ctrl[:N_ROBOT] += grasp_ctrl.internal_force_torques(data)
+                    _squeeze_steps += 1
+                    _ramp = min(1.0, _squeeze_steps * model.opt.timestep / SQUEEZE_RAMP_S)
+                    tau_ctrl[:N_ROBOT] += grasp_ctrl.internal_force_torques(data, scale=_ramp)
+                    # Contact-frame position feedback anchoring each fingertip to its
+                    # object contact site — holds the TANGENTIAL friction load that the
+                    # softened finger PD can't (the softening that helps normal-force
+                    # delivery makes the fingers 4x more compliant in exactly the
+                    # direction gravity shears the contact).
+                    tau_ctrl[:N_ROBOT] += grasp_ctrl.slip_correction_torques(data)
+                    _squeeze_diag(data)
 
             data.qfrc_applied[:] = tau_ctrl
             data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
