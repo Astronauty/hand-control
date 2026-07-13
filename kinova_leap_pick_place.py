@@ -32,6 +32,105 @@ from grasp_control import SpatialIKSolver, ConstrainedIKSolver, GraspController
 from grasp_control.constrained_ik import configure_sqp
 from live_dashboard import Dashboard
 
+# 3D_minimum_NCF.py isn't an importable module name (leading digit), so load it by path.
+import importlib.util as _ilu
+_ncf_spec = _ilu.spec_from_file_location(
+    '_ncf', __file__.rsplit('/', 1)[0] + '/scripts/3D_minimum_NCF.py')
+_ncf = _ilu.module_from_spec(_ncf_spec)
+_ncf_spec.loader.exec_module(_ncf)
+
+
+def solve_gamma_live(p_O, R_O_inward, mu, mass, accel_box_xyz, ang_accel_box_xyz,
+                     inertia_diag):
+    """Minimum internal-force scale gamma that keeps the grasp no-slip for the given
+    acceleration/torque disturbance box, from the live grasp geometry. Wraps
+    3D_minimum_NCF.min_gamma_for_accel_lp; verified against its native antipodal cases
+    (see scratchpad/verify_gamma_solve.py). Handles the two convention mismatches:
+      * normal sign: spatial_grasp_map / GraspController give col0 = INWARD normal;
+        the NCF cone is built with col0 = OUTWARD (force pushing ON the object) -> flip.
+      * unit mass: min_gamma_for_accel_lp assumes m=1, so the "accel box" is really a
+        FORCE box (m*a) and the "torque box" a real torque (I*alpha) -> scale here.
+
+    Args:
+        p_O:            list of (3,) contact positions in the OBJECT body frame.
+        R_O_inward:     list of (3,3) contact->object rotations, col0 = inward normal.
+        mu:             list of per-contact friction coefficients.
+        mass:           object mass (kg).
+        accel_box_xyz:  (ax,ay,az) linear-accel budget incl. gravity, object-body axes.
+        ang_accel_box_xyz: (alpha_x,alpha_y,alpha_z) angular-accel budget, PRINCIPAL axes.
+        inertia_diag:   (Ix,Iy,Iz) principal moments (model.body_inertia). Multiplies the
+                        angular-accel budget into a torque box.
+
+    Returns:
+        gamma (float), or None if the grasp geometrically cannot resist the box.
+    """
+    n = len(p_O)
+    R_out = [R.copy() for R in R_O_inward]
+    for R in R_out:
+        R[:, 0] *= -1.0                                   # inward -> outward normal
+    pos = [np.asarray(p, float).reshape(3, 1) for p in p_O]
+    fx, fy, fz = (mass * a for a in accel_box_xyz)        # force box = m * a
+    tx, ty, tz = (I * al for I, al in zip(inertia_diag, ang_accel_box_xyz))  # torque = I*alpha
+    return _ncf.min_gamma_for_accel_lp(
+        fx, fy, fz, tx, ty, tz, n, pos, R_out, [1.0] * n,
+        [0.0] * n, [0.0] * n, list(mu))
+
+
+def _reindex_hull(hull):
+    """ConvexHull.simplices index the ORIGINAL points; remap to hull.vertices order."""
+    old_to_new = {old: new for new, old in enumerate(hull.vertices)}
+    return np.array([[old_to_new[i] for i in s] for s in hull.simplices], np.int32)
+
+
+def _flat_hull(pts3, center):
+    """Coplanar point set -> filled 2D polygon as a centroid triangle fan in 3D.
+    Used when a wrench subspace collapses to a plane (e.g. the antipodal grasp's
+    torque cone lives in Tx=0: a pinch resists no torque about the grasp axis)."""
+    from scipy.spatial import ConvexHull
+    _, _, vt = np.linalg.svd(pts3 - center)
+    p2 = (pts3 - center) @ vt[:2].T
+    ring = ConvexHull(p2).vertices
+    verts = np.vstack([center, pts3[ring]]).astype(np.float32)
+    m = len(ring)
+    faces = np.array([[0, 1 + i, 1 + (i + 1) % m] for i in range(m)], np.int32)
+    return {'verts': verts, 'faces': faces}
+
+
+def composite_wrench_cone(gamma, p_O, R_O_inward, mu):
+    """Force- and torque-subspace hulls of the composite grasp wrench cone at scale
+    gamma: the Minkowski sum of each contact's pyramidal wrench cone — the exact set
+    3D_minimum_NCF's LP tests wrench membership in. Returns
+        {'force': {'verts','faces'} | None, 'torque': {'verts','faces'} | None}
+    for the dashboard's 3D panels (None when a subspace is a point/line). Convention
+    matches solve_gamma_live (col0 inward->outward). single_wrench_cone lays out each
+    vertex as [Tx,Ty,Tz, Fx,Fy,Fz]."""
+    import itertools
+    from scipy.spatial import ConvexHull
+    n = len(p_O)
+    R_out = [R.copy() for R in R_O_inward]
+    for R in R_out:
+        R[:, 0] *= -1.0
+    wc = _ncf.WrenchCheck(n, [np.asarray(p).reshape(3, 1) for p in p_O],
+                          R_out, [1.0] * n, [0.0] * n, [0.0] * n, list(mu))
+    per_contact = [wc.single_wrench_cone(gamma, np.asarray(p_O[i]).reshape(3, 1),
+                                         R_out[i], 1.0, mu[i]) for i in range(n)]
+    # Minkowski sum: sum one vertex per contact over all combinations (nverts^n points).
+    W = np.array([sum(c) for c in itertools.product(*per_contact)])
+
+    def hull3d(pts3):
+        pts3 = np.asarray(pts3, float)
+        c = pts3.mean(0)
+        s = np.linalg.svd(pts3 - c, compute_uv=False)
+        rank = int(np.count_nonzero(s > 1e-9 * (s[0] if s[0] > 0 else 1)))
+        if rank < 2:
+            return None
+        if rank == 2:
+            return _flat_hull(pts3, c)
+        h = ConvexHull(pts3)
+        return {'verts': pts3[h.vertices].astype(np.float32), 'faces': _reindex_hull(h)}
+
+    return {'force': hull3d(W[:, 3:6]), 'torque': hull3d(W[:, 0:3])}
+
 
 # Fingertip contact sites added in models/build_kinova_leap.py (_add_fingertip_sites),
 # named "<finger-body>_tip" with the "leap_" attach() prefix.
@@ -303,7 +402,7 @@ if __name__ == "__main__":
 
     STEPS_PER_WP    = 5    # max sim steps before forcing waypoint advance (timeout, 1 step = 1ms)
     WP_REACH_TOL    = 0.02  # joint-space radius to consider a waypoint reached (rad)
-    JOG_VEL         = 0.20  # jog speed while arrow key held (m/s)
+    JOG_VEL         = 0.2  # jog speed while arrow key held (m/s)
     # Singularity-robust DLS jog damping (see the GRASP-branch resolved-rate solve):
     # JOG_SING_EPS is the smallest-singular-value threshold below which damping ramps
     # in; JOG_LAM_MAX caps the peak joint-rate gain at ~1/(2*JOG_LAM_MAX). With
@@ -498,7 +597,7 @@ if __name__ == "__main__":
     # when disabled; every push site is guarded on it.
     dash = None
     if args.dashboard:
-        dash = Dashboard(FINGER_SET, horizon_s=10.0, dt_hint=3 * model.opt.timestep)
+        dash = Dashboard(FINGER_SET, horizon_s=5.0, dt_hint=3 * model.opt.timestep)
         dash.start()
         print("[dashboard] launched (separate process)")
 
@@ -520,15 +619,38 @@ if __name__ == "__main__":
             'ipopt_ms':     ipopt_ms,
         })
 
-    def _push_squeeze(on):
-        """Forward the GRASP internal-force state to the dashboard header. The commanded
-        value is static for now (gamma set at startup, ~gamma/sqrt(2) N per contact for
-        the 2-contact pinch) — becomes live once w_des tracking / LP-gamma lands.
-        No-op when the dashboard is disabled."""
+    def _push_squeeze(on, gamma):
+        """Forward the GRASP internal-force state to the dashboard header. gamma is the
+        per-object value solved at the REACH->GRASP transition; ~gamma/sqrt(2) N per
+        contact for the 2-contact pinch. No-op when the dashboard is disabled."""
         if dash is None:
             return
-        dash.push({'type': 'squeeze', 'on': bool(on), 'gamma': GAMMA,
-                   'f_contact': GAMMA / np.sqrt(2)})
+        dash.push({'type': 'squeeze', 'on': bool(on), 'gamma': gamma,
+                   'f_contact': gamma / np.sqrt(2)})
+
+    def _push_wrench_cone(gamma, p_O, R_in, mu):
+        """Compute the composite grasp wrench cone at gamma and push its force/torque
+        hulls to the dashboard's 3D panels (as vertex/face lists). gamma=None clears
+        the meshes (e.g. at reset). No-op when the dashboard is disabled."""
+        if dash is None:
+            return
+        if gamma is None:
+            dash.push({'type': 'wrench_cone', 'force': None, 'torque': None})
+            return
+        try:
+            cone = composite_wrench_cone(gamma, p_O, R_in, mu)
+        except Exception as _e:
+            print(f"\r\n[wrench-cone] skipped ({_e})")
+            return
+        dash.push({
+            'type':   'wrench_cone',
+            'force':  None if cone['force'] is None else
+                      {'verts': cone['force']['verts'].tolist(),
+                       'faces': cone['force']['faces'].tolist()},
+            'torque': None if cone['torque'] is None else
+                      {'verts': cone['torque']['verts'].tolist(),
+                       'faces': cone['torque']['faces'].tolist()},
+        })
 
     def _squeeze_diag(d, period_s=1.0):
         """Once per period while squeezing: commanded vs measured per-contact force,
@@ -638,13 +760,33 @@ if __name__ == "__main__":
     Kp = np.concatenate([np.full(7, 40.0), np.full(16, 0.8)])
     Kd = np.concatenate([np.full(7, 4.0),  np.full(16, 0.05)])
 
-    # Internal squeeze force scale (GRASP, toggled with Enter): f_c = null(G) @ GAMMA,
-    # ~GAMMA/sqrt(2) N normal force per contact for the 2-contact antipodal pinch.
-    # Sized for lifting: every object is 0.5 kg with mu=1 (scene XML), so supporting
-    # mg ~ 4.9 N by friction across 2 contacts needs >= mg/(2*mu) ~ 2.45 N of normal
-    # force each. GAMMA=8 -> ~5.7 N per contact, ~2.3x margin for the finger PD
-    # fighting the squeeze, contact compliance, and dynamic loads while jogging.
-    GAMMA = 250.0
+    # Internal squeeze force scale (GRASP, toggled with Enter): f_c = null(G) @ gamma.
+    # gamma is now SOLVED per object at the REACH->GRASP transition (solve_gamma_live)
+    # from the live grasp geometry and the acceleration-budget box below, rather than
+    # hardcoded. GAMMA_FALLBACK is used only if the LP reports the grasp geometrically
+    # cannot resist the box (returns None) — then we squeeze at a fixed value and warn.
+    GAMMA_FALLBACK = 250.0
+
+    # Disturbance box for the gamma solve, as ACCELERATION budgets (not forces): the
+    # max linear / angular acceleration a jog will ever drive the grasped object
+    # through. solve_gamma_live converts these to a force/torque box via the object's
+    # own mass and principal inertia (m*a, I*alpha), so gamma auto-rescales per object.
+    # Gravity is added to the vertical axis at solve time. The jog is slew-rate limited
+    # to NCF_ACCEL_BUDGET_XYZ (see the GRASP branch), so the linear budget is ENFORCED
+    # by construction and gamma covers the true worst case at 1.0x margin. The angular
+    # budget is a small cushion for parasitic wrist rotation near singularities (the
+    # jog commands zero angular velocity).
+    NCF_ACCEL_BUDGET_XYZ = (0.5, 0.5, 0.5)   # m/s^2   object-frame linear-accel budget
+    NCF_ANG_ACCEL_BUDGET = (1.0, 1.0, 1.0)   # rad/s^2 principal-frame angular-accel budget
+
+    # Conservative multiplier on the solved gamma before it drives the squeeze: the LP
+    # gives the MINIMUM no-slip gamma for the box (1.0x margin), which leaves nothing for
+    # contact compliance, the finger PD lagging the internal-force torques, the
+    # pyramidal-vs-elliptic cone mismatch, and unmodeled dynamics. 2x squeezes twice as
+    # hard as the theoretical minimum. Only the value SENT TO THE CONTROLLER is scaled;
+    # the wrench-cone viz stays at the raw 1.0x gamma so the drawn cage remains the true
+    # feasible boundary the LP computed (the trace then sits well inside it).
+    GAMMA_SAFETY_FACTOR = 20.0
 
     # Softens Kp/Kd on the active (grasping) finger joints while squeezing, via
     # GraspController.effective_gains(). Without this the full-strength joint PD
@@ -652,7 +794,7 @@ if __name__ == "__main__":
     # harder, the position spring (anchored at the fixed pre-squeeze q_grasp_hold)
     # pulls back proportionally, so measured contact force saturates well below
     # GAMMA/sqrt(2) instead of scaling with it.
-    SQUEEZE_PD_SCALE = 20.0
+    SQUEEZE_PD_SCALE = 5.0
 
     # Ramp the squeeze force 0->GAMMA over this many seconds of sim time after each
     # squeeze-on. The internal force pair only cancels once BOTH contacts exist; at
@@ -930,7 +1072,9 @@ if __name__ == "__main__":
     squeeze_on     = False         # GRASP: internal force toggled by Enter
     _squeeze_steps = 0             # sim steps since squeeze-on, drives the force ramp
     grasp_ctrl     = None          # GraspController, built at each REACH→GRASP transition
+    gamma_live     = GAMMA_FALLBACK  # per-object squeeze scale solved at that transition
     q_grasp_hold   = None          # GRASP PD target; arm part integrated by arrow-key jog
+    _jog_v         = np.zeros(3)   # slew-rate-limited palm velocity command (world x,y,z)
     _PALM_BID      = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'leap_palm')
     _ik_vis_mode   = None          # None | 'grasp': freeze physics to show IK config
     _show_bspheres = False         # 7: overlay the IK's per-geom collision bounding spheres
@@ -1177,8 +1321,58 @@ if __name__ == "__main__":
                     # Object pose frozen at grasp time — reference anchor for the
                     # upcoming w_des (object wrench) tracking; unused by the jog.
                     obj_grasp = objects[active_idx]
-                    obj_grasp['p_obj0'] = data.xpos[obj_grasp['id_body']].copy()
-                    obj_grasp['R_obj0'] = data.xmat[obj_grasp['id_body']].reshape(3, 3).copy()
+                    _bid = obj_grasp['id_body']
+                    p_WoO = data.xpos[_bid].copy()
+                    R_WO  = data.xmat[_bid].reshape(3, 3).copy()
+                    obj_grasp['p_obj0'] = p_WoO
+                    obj_grasp['R_obj0'] = R_WO
+                    _jog_v[:] = 0.0    # reset the jog velocity ramp for the new grasp
+
+                    # --- Solve the internal-force scale gamma for THIS grasp geometry ---
+                    # Contact geometry in the object body frame (same transform the
+                    # GraspController's internal_force_torques uses): col0 of R_OSk is the
+                    # inward normal per the scene XML convention.
+                    _p_O   = [R_WO.T @ (data.site_xpos[s] - p_WoO) for s in obj_grasp['id_S']]
+                    _R_in  = [R_WO.T @ data.site_xmat[s].reshape(3, 3) for s in obj_grasp['id_S']]
+                    _mu    = [float(model.geom_friction[obj_grasp['id_geom'], 0])] * N_FINGERS
+                    _mass  = float(model.body_mass[_bid])
+                    # Gravity component per OBJECT-body axis, added to the linear budget.
+                    _g_O   = R_WO.T @ model.opt.gravity           # (3,), object frame
+                    _accel_box = tuple(NCF_ACCEL_BUDGET_XYZ[i] + abs(_g_O[i]) for i in range(3))
+                    _inertia   = model.body_inertia[_bid]         # principal moments (Ix,Iy,Iz)
+                    # A 2-contact antipodal pinch geometrically CANNOT resist torque about
+                    # the grasp axis (the line through the two contacts) — the friction
+                    # cones have no moment arm about it, so any nonzero angular budget on
+                    # that axis makes the LP infeasible (matches the Tx=None antipodal case
+                    # in 3D_minimum_NCF). Zero the angular budget's grasp-axis component so
+                    # the solve stays feasible; resisting that DOF needs a 3rd contact or
+                    # soft-finger torsion (deferred).
+                    # (Assumes the object's principal-inertia frame ≈ its body frame, so
+                    # the body-frame grasp axis aligns with the principal-frame angular
+                    # budget — true for the current objects, whose body_iquat is identity.)
+                    _grasp_axis = _p_O[0] - _p_O[1]
+                    _grasp_axis = _grasp_axis / (np.linalg.norm(_grasp_axis) + 1e-12)
+                    _ang_budget = np.array(NCF_ANG_ACCEL_BUDGET, float)
+                    _ang_budget -= np.dot(_ang_budget, _grasp_axis) * _grasp_axis
+                    _ang_budget = np.abs(_ang_budget)   # per-axis magnitudes for the box
+                    _gamma = solve_gamma_live(_p_O, _R_in, _mu, _mass,
+                                              _accel_box, tuple(_ang_budget), _inertia)
+                    if _gamma is None or not np.isfinite(_gamma) or _gamma <= 0.0:
+                        gamma_raw  = GAMMA_FALLBACK      # cone viz uses this too
+                        gamma_live = GAMMA_FALLBACK
+                        print(f"\r\n[gamma] LP infeasible/degenerate for "
+                              f"{obj_grasp['name']} — using fallback {GAMMA_FALLBACK:.0f}")
+                    else:
+                        # gamma_raw = the LP's minimum no-slip gamma (drives the cone viz,
+                        # the true feasible boundary). gamma_live = raw * safety factor is
+                        # what actually squeezes.
+                        gamma_raw  = float(_gamma)
+                        gamma_live = gamma_raw * GAMMA_SAFETY_FACTOR
+                        print(f"\r\n[gamma] {obj_grasp['name']}: solved gamma={gamma_raw:.2f} "
+                              f"x{GAMMA_SAFETY_FACTOR:.1f} = {gamma_live:.2f} "
+                              f"(mass={_mass:.3f}kg mu={_mu[0]:.1f}, "
+                              f"~{gamma_live/np.sqrt(2):.2f} N/contact)")
+
                     # Internal-force machinery for the Enter-toggled squeeze. Only
                     # internal_force_torques() is used — the joint PD hold stays in the
                     # GRASP branch below, on top of the shared bias comp.
@@ -1187,23 +1381,28 @@ if __name__ == "__main__":
                         tip_site_ids=id_C,
                         obj_site_ids=obj_grasp['id_S'],
                         obj_body_id=obj_grasp['id_body'],
-                        kp=Kp, kd=Kd, gamma=GAMMA,
+                        kp=Kp, kd=Kd, gamma=gamma_live,
                         squeeze_pd_scale=SQUEEZE_PD_SCALE,
                         support_weight=True,
                         pad_offsets=[_PAD_OFFSET[f] for f in FINGER_SET])
                     q_grasp_hold = obj_grasp['q_target'].copy()
                     grasp_ctrl.set_squeeze(False)
-                    _push_squeeze(False)
+                    _push_squeeze(False, gamma_live)
+                    # Show the feasible wrench set at the RAW (1.0x) gamma — the true
+                    # boundary the LP computed — behind the live trace in the 3D panels.
+                    # The controller squeezes at the safety-scaled gamma_live, so the
+                    # applied wrench sits comfortably inside this cage.
+                    _push_wrench_cone(gamma_raw, _p_O, _R_in, _mu)
                     print(f"\r\n[Control] → GRASP  ({targets[active_tgt]['label']})  "
-                          f"|  Enter: toggle squeeze (gamma={GAMMA:.0f})  |  N: release")
+                          f"|  Enter: toggle squeeze (gamma={gamma_live:.1f})  |  N: release")
 
                 elif key == 'enter' and control_phase == 'GRASP':
                     squeeze_on = not squeeze_on
                     _squeeze_steps = 0   # restart the force ramp on every toggle-on
                     grasp_ctrl.set_squeeze(squeeze_on)
-                    _push_squeeze(squeeze_on)
+                    _push_squeeze(squeeze_on, gamma_live)
                     print(f"\r\n[Control] squeeze {'ON' if squeeze_on else 'off'}  "
-                          f"(gamma={GAMMA:.0f}, ~{GAMMA/np.sqrt(2):.2f} N/contact)")
+                          f"(gamma={gamma_live:.1f}, ~{gamma_live/np.sqrt(2):.2f} N/contact)")
 
                 elif key == 'release' and control_phase == 'GRASP':
                     # Release: no pregrasp config exists anymore, so open the active
@@ -1212,7 +1411,8 @@ if __name__ == "__main__":
                     # to the original IK pose would drag the object with it.
                     squeeze_on     = False
                     grasp_ctrl.set_squeeze(False)
-                    _push_squeeze(False)
+                    _push_squeeze(False, gamma_live)
+                    _push_wrench_cone(None, None, None, None)   # clear the cone meshes
                     q_release      = q_grasp_hold.copy()
                     q_release[7:]  = Q_BIAS[7:]
                     traj_waypoints = [q_release]
@@ -1318,13 +1518,16 @@ if __name__ == "__main__":
                 traj_wp_step   = 0
                 squeeze_on     = False
                 grasp_ctrl     = None
+                gamma_live     = GAMMA_FALLBACK
                 q_grasp_hold   = None
+                _jog_v[:]      = 0.0
                 _ik_vis_mode   = None
                 tau_ctrl       = np.zeros(model.nv)
                 _last_sim_time = 0.0
                 with _ghost_markers_lock:
                     _ghost_markers.clear()
-                _push_squeeze(False)
+                _push_squeeze(False, gamma_live)
+                _push_wrench_cone(None, None, None, None)   # clear the cone meshes
                 print("\r\n[Control] RESET — arm home, objects at spawn poses; cached "
                       "IK kept (auto re-solved if stale on next selection)")
 
@@ -1421,16 +1624,27 @@ if __name__ == "__main__":
                     mj.mj_forward(model, data)
                     _render_kinematic_frame()
                     continue
-                # Resolved-rate jog: map the commanded world-frame palm velocity
+                # Slew-rate limit the commanded palm velocity toward the raw arrow-key
+                # target at NCF_ACCEL_BUDGET_XYZ, per world axis. This caps the commanded
+                # palm ACCELERATION at exactly the budget the gamma solve assumed — so
+                # pressing/releasing an arrow ramps 0<->JOG_VEL over ~JOG_VEL/budget
+                # seconds instead of stepping instantly (an unbounded accel that the old
+                # code left the arm inertia + Kp to absorb). The disturbance box is thus
+                # enforced by construction, and gamma covers it at 1.0x margin.
+                _v_target = np.array([_jv_x, _jv_y, _jv_z])
+                _dv_max   = np.array(NCF_ACCEL_BUDGET_XYZ) * model.opt.timestep
+                _jog_v   += np.clip(_v_target - _jog_v, -_dv_max, _dv_max)
+
+                # Resolved-rate jog: map the (rate-limited) world-frame palm velocity
                 # [vx, vy, vz] (orientation held) to arm joint rates via 6-DOF DLS on
                 # the live config, and integrate them into the PD target.
                 qdot_jog = np.zeros(7)
-                if _jv_x or _jv_y or _jv_z:
+                if np.any(_jog_v):
                     Jp = np.zeros((3, model.nv))
                     Jr = np.zeros((3, model.nv))
                     mj.mj_jacBody(model, data, Jp, Jr, _PALM_BID)
                     J6 = np.vstack([Jp[:, :7], Jr[:, :7]])
-                    v6 = np.array([_jv_x, _jv_y, _jv_z, 0.0, 0.0, 0.0])
+                    v6 = np.array([_jog_v[0], _jog_v[1], _jog_v[2], 0.0, 0.0, 0.0])
                     # Singularity-robust DLS: the damping lambda^2 grows as the palm
                     # Jacobian's smallest singular value falls below JOG_SING_EPS,
                     # capping the joint-rate gain at ~1/(2*lambda_max) near singular

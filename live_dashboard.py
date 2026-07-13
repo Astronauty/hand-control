@@ -10,7 +10,8 @@ inherit the parent's MuJoCo/GL state.
 
 Message protocol (plain dicts put on the queue):
     {'type': 'dist',    't': float, 'd': {finger: signed_distance_m}}   # streaming
-    {'type': 'wrench',  't': float, 'f': [fx,fy,fz], 'tau': [tx,ty,tz]} # streaming
+    {'type': 'wrench',  't': float, 'f': [fx,fy,fz], 'tau': [tx,ty,tz]} # streaming;
+                        #   rendered as 3D (Fx,Fy,Fz)/(τx,τy,τz) traces over horizon_s
     {'type': 'normals', 't': float, 'n': {finger: normal_force_N}}      # streaming
     {'type': 'rrt',     'object': str, 'n_wp': int, 'plan_time': float,
                         'fallback': bool}
@@ -21,18 +22,21 @@ Message protocol (plain dicts put on the queue):
     {'type': 'mode',    'mode': str, 'target': str}   # Approach / Grasp / Transport
     {'type': 'active_obj', 'name': str}               # proximity-based active object
     {'type': 'squeeze', 'on': bool, 'gamma': float,   # GRASP internal-force toggle;
-                        'f_contact': float}           #   commanded N per contact (static
-                                                      #   gamma/sqrt(2) for now)
+                        'f_contact': float}           #   commanded N per contact
+    {'type': 'wrench_cone',                           # composite grasp wrench cone at
+        'force':  {'verts': (nv,3), 'faces': (nf,3)} | None,   # solved gamma, projected
+        'torque': {'verts': (nv,3), 'faces': (nf,3)} | None}   # to force / torque 3-space
     None                                              # sentinel: quit
 
 Usage from the sim process:
-    dash = Dashboard(FINGER_SET, horizon_s=10.0)
+    dash = Dashboard(FINGER_SET, horizon_s=5.0)
     dash.start()
     dash.push({'type': 'dist', 't': t, 'd': {'index': 0.03, 'thumb': 0.02}})
     ...
     dash.close()
 """
 import multiprocessing as mp
+import numpy as np
 
 # Distinct, high-contrast colour per finger (RGB 0-255). Matches the four LEAP fingers;
 # unknown finger names fall back to grey.
@@ -43,14 +47,24 @@ FINGER_COLORS = {
     'thumb':  (255, 95, 95),
 }
 
-# x / y / z curve colours for the wrench plots.
-AXIS_COLORS = ((255, 90, 90), (110, 220, 110), (80, 160, 255))
+
+def _time_gradient_rgba(n, base_rgb):
+    """(n,4) RGBA ramp: oldest sample dim+transparent, newest bright+opaque, so a 3D
+    trace reads as a fading trail with the current point at the head. base_rgb 0-1."""
+    if n <= 0:
+        return np.zeros((0, 4), dtype=np.float32)
+    t = np.linspace(0.15, 1.0, n)          # brightness/alpha ramp over the window
+    rgba = np.ones((n, 4), dtype=np.float32)
+    rgba[:, :3] = np.outer(t, base_rgb)
+    rgba[:, 3] = t
+    return rgba
 
 
 def _run(queue, fingers, horizon_s, dt_hint):
     """Dashboard process entry point. Imports Qt lazily so the parent never loads it."""
     from collections import deque
     import pyqtgraph as pg
+    import pyqtgraph.opengl as gl
     from pyqtgraph.Qt import QtWidgets, QtCore
 
     app = pg.mkQApp("hand-control dashboard")
@@ -114,18 +128,50 @@ def _run(queue, fingers, horizon_s, dt_hint):
         norm_curves[f] = norm_plot.plot(pen=pg.mkPen(col, width=2), name=f)
         norm_buf[f] = deque(maxlen=maxlen)
 
-    # --- (3)+(4) net hand→active-object wrench: force + torque about object COM ---
-    force_plot  = _scroll_plot("Net hand → object force  (world frame)", 'force', 'N')
-    torque_plot = _scroll_plot("Net hand → object torque  (about object COM)",
-                               'torque', 'N·m')
-    wrench_t = deque(maxlen=maxlen)
-    force_curves, torque_curves = [], []
+    # --- (3)+(4) net hand→object wrench as 3D traces: the (Fx,Fy,Fz) and (τx,τy,τz)
+    # vectors plotted as a persistent trajectory in 3D over the SAME horizon_s window
+    # as the 2D plots, with a colour gradient (dim/old -> bright/new) showing the
+    # recent path of the applied force/moment. ---
+    def _wrench_view(title, base_rgb):
+        box = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        lbl = QtWidgets.QLabel(title)
+        lbl.setStyleSheet("font-weight: bold; font-size: 11px;")
+        lbl.setAlignment(QtCore.Qt.AlignCenter)
+        w = gl.GLViewWidget()
+        w.setCameraPosition(distance=3.0, elevation=22, azimuth=-60)
+        w.addItem(gl.GLGridItem())          # xy reference grid at the origin
+        axis = gl.GLAxisItem()
+        axis.setSize(1, 1, 1)               # unit x/y/z axis triad (R/G/B by convention)
+        w.addItem(axis)
+        # Composite wrench-cone hull as a WIREFRAME cage (the feasible force/torque set
+        # the solved gamma assumes): the live trace staying inside the cage means the
+        # grasp can supply the applied wrench. Wireframe (GLLinePlotItem) rather than a
+        # filled GLMeshItem — a translucent solid would occlude the trace, and this
+        # pyqtgraph build's GLMeshItem shader path is broken on this GL stack.
+        cone = gl.GLLinePlotItem(mode='lines', width=1.5, antialias=True,
+                                 color=(base_rgb[0], base_rgb[1], base_rgb[2], 0.5))
+        w.addItem(cone)
+        # Head marker (current sample) + the fading trajectory line.
+        line = gl.GLLinePlotItem(width=2.0, antialias=True, mode='line_strip')
+        head = gl.GLScatterPlotItem(size=9.0)
+        w.addItem(line)
+        w.addItem(head)
+        v.addWidget(lbl)
+        v.addWidget(w, 1)
+        return box, line, head, cone
+
+    force_box,  force_line,  force_head,  force_cone  = _wrench_view(
+        "Net hand → object force  (Fx,Fy,Fz world, N)",        (1.0, 0.55, 0.2))
+    torque_box, torque_line, torque_head, torque_cone = _wrench_view(
+        "Net hand → object torque  (τx,τy,τz about COM, N·m)", (0.4, 0.7, 1.0))
+    _FORCE_RGB  = np.array([1.0, 0.55, 0.2], dtype=np.float32)
+    _TORQUE_RGB = np.array([0.4, 0.7, 1.0], dtype=np.float32)
+
+    wrench_t   = deque(maxlen=maxlen)
     force_buf  = [deque(maxlen=maxlen) for _ in range(3)]
     torque_buf = [deque(maxlen=maxlen) for _ in range(3)]
-    for i, ax in enumerate('xyz'):
-        pen = pg.mkPen(AXIS_COLORS[i], width=2)
-        force_curves.append(force_plot.plot(pen=pen, name=f'F{ax}'))
-        torque_curves.append(torque_plot.plot(pen=pen, name=f'τ{ax}'))
 
     # --- (5) combined planner log: RRT + IK solutions, grouped per solve ---
     plan_log = QtWidgets.QPlainTextEdit()
@@ -134,9 +180,9 @@ def _run(queue, fingers, horizon_s, dt_hint):
     plan_log.setStyleSheet("font-family: monospace; font-size: 11px;")
 
     grid.addWidget(dist_plot,   1, 0)
-    grid.addWidget(force_plot,  1, 1)
+    grid.addWidget(force_box,   1, 1)
     grid.addWidget(norm_plot,   2, 0)
-    grid.addWidget(torque_plot, 2, 1)
+    grid.addWidget(torque_box,  2, 1)
     grid.addWidget(QtWidgets.QLabel("<b>Planner solutions (RRT + IK)</b>"), 3, 0, 1, 2)
     grid.addWidget(plan_log, 4, 0, 1, 2)
     grid.setRowStretch(1, 2)
@@ -208,6 +254,27 @@ def _run(queue, fingers, horizon_s, dt_hint):
                 else:
                     squeeze_lbl.setText("internal force: off")
                     squeeze_lbl.setStyleSheet(_SQUEEZE_OFF_STYLE)
+            elif mt == 'wrench_cone':
+                # Composite grasp wrench cone at the solved gamma, precomputed in the sim
+                # process (verts + triangle faces per subspace). Rendered as a wireframe:
+                # expand each triangle's 3 edges into a line-segment list. None clears it.
+                def _set_cone(item, key):
+                    payload = msg.get(key)
+                    if payload is None:
+                        item.setData(pos=np.zeros((0, 3), np.float32))
+                        return
+                    verts = np.asarray(payload['verts'], np.float32)
+                    faces = np.asarray(payload['faces'], np.int32)
+                    if len(faces) == 0:
+                        item.setData(pos=np.zeros((0, 3), np.float32))
+                        return
+                    # unique undirected edges from the triangle faces
+                    e = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+                    e = np.unique(np.sort(e, axis=1), axis=0)
+                    seg = verts[e.reshape(-1)]          # (2*n_edges, 3) line-segment pairs
+                    item.setData(pos=seg)
+                _set_cone(force_cone,  'force')
+                _set_cone(torque_cone, 'torque')
         if got_dist:
             x = list(dist_t)
             for f in fingers:
@@ -217,10 +284,16 @@ def _run(queue, fingers, horizon_s, dt_hint):
             for f in fingers:
                 norm_curves[f].setData(x, list(norm_buf[f]))
         if got_wrench:
-            x = list(wrench_t)
-            for i in range(3):
-                force_curves[i].setData(x, list(force_buf[i]))
-                torque_curves[i].setData(x, list(torque_buf[i]))
+            fpts = np.column_stack([np.asarray(force_buf[i], dtype=np.float32)
+                                    for i in range(3)])
+            tpts = np.column_stack([np.asarray(torque_buf[i], dtype=np.float32)
+                                    for i in range(3)])
+            n = len(fpts)
+            force_line.setData(pos=fpts, color=_time_gradient_rgba(n, _FORCE_RGB))
+            torque_line.setData(pos=tpts, color=_time_gradient_rgba(n, _TORQUE_RGB))
+            if n:
+                force_head.setData(pos=fpts[-1:], color=np.array([[1, 1, 1, 1]], np.float32))
+                torque_head.setData(pos=tpts[-1:], color=np.array([[1, 1, 1, 1]], np.float32))
 
     timer = QtCore.QTimer()
     timer.timeout.connect(drain)
@@ -232,7 +305,7 @@ class Dashboard:
     """Handle to the dashboard process. push() is non-blocking and drops messages if
     the queue is full, so instrumenting the sim loop can never stall the sim."""
 
-    def __init__(self, fingers, horizon_s=10.0, dt_hint=0.001, maxsize=20000):
+    def __init__(self, fingers, horizon_s=5.0, dt_hint=0.001, maxsize=20000):
         self._fingers = list(fingers)
         # 'spawn' → clean interpreter, no inherited MuJoCo/GL/threads from the parent.
         self._ctx = mp.get_context('spawn')
