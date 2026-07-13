@@ -107,6 +107,10 @@ def make_key_callback(key_queue):
         54:  'ik_vis',  # 6 — cycle IK config visualization
         55:  'bspheres', # 7 — toggle IK collision bounding-sphere overlay
         56:  'teleop_start', # 8 — (dexpilot) start/re-zero tracking at current pose
+        259: 'reset',   # Backspace — deliberately shadows the viewer's built-in Reset:
+                        # the viewer already mj_resetData'd the shared data from its own
+                        # thread; this event lets the control loop re-home its state
+                        # machine instead of PD-exploding against the qpos0 arm pose.
     }
     def _cb(keycode):
         event = _MAP.get(keycode)
@@ -216,6 +220,21 @@ if __name__ == "__main__":
         help="Camera index forwarded to ui/mediapipe_joint_angles.py in dexpilot mode "
              "(default: auto-select — prefers external/USB camera at index ≥1).")
     _arg_parser.add_argument(
+        '--seed', type=int, default=None,
+        help="RNG seed for object randomization — the same seed reproduces the same "
+             "layout (positions and sizes). Default: fresh entropy every run. "
+             "Ignored with --no-randomize.")
+    _arg_parser.add_argument(
+        '--no-randomize', action='store_true',
+        help="Skip object randomization: objects keep the positions, sizes, and colors "
+             "authored in models/scene_pick_place.xml (default: randomize positions on "
+             "the pick marker, ±12%% sizes, pure R/G/B colors).")
+    _arg_parser.add_argument(
+        '--hand-self-collision', action='store_true',
+        help="Re-enable LEAP hand self-collision (finger↔finger, finger↔palm contact "
+             "physics). Disabled by default: hand geoms are moved to contype=2 so "
+             "hand↔hand pairs never match, while hand↔object/floor/arm keep colliding.")
+    _arg_parser.add_argument(
         '--ik-solver', choices=['sqp', 'ipopt'], default='sqp',
         help="sqp (default): sqpmethod + OSQP + softplus SDF + analytic FK Jacobians — "
              "~3× cheaper per iteration, wins on wall time in most cases  |  "
@@ -232,7 +251,29 @@ if __name__ == "__main__":
     for j in (0, 2, 4, 6):
         model.jnt_range[j] = [-np.pi, np.pi]
 
-    _randomize_objects(model, data, np.random.default_rng())
+    # Disable LEAP hand self-collision (finger↔finger, finger↔palm) unless re-enabled
+    # via --hand-self-collision. Bitmask trick: hand collision geoms move from the
+    # compiled (contype=1, conaffinity=1) to (contype=2, conaffinity=1) — a pair
+    # collides iff (contype_A & conaffinity_B) | (contype_B & conaffinity_A), so two
+    # hand geoms (2&1 both ways) no longer match, while hand↔object/floor/arm pairs
+    # (those stay 1,1) still do via the hand geom's conaffinity. mj_step physics only:
+    # IK/RRT clearance checks run mj_geomDistance against objects/floor and never test
+    # hand↔hand pairs, so planning is unaffected. Visual geoms (contype 0) are skipped.
+    if not args.hand_self_collision:
+        _n_selfcol = 0
+        for _gi in range(model.ngeom):
+            _bname = mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, model.geom_bodyid[_gi]) or ''
+            if _bname.startswith('leap_') and model.geom_contype[_gi]:
+                model.geom_contype[_gi] = 2
+                _n_selfcol += 1
+        print(f"[collision] LEAP hand self-collision OFF ({_n_selfcol} geoms; "
+              f"--hand-self-collision to re-enable)")
+
+    # Object randomization (positions/sizes/colors + matching qpos0 so resets restore
+    # the same layout). --no-randomize keeps the XML-authored scene; qpos0 already
+    # matches the compiled spawn poses there, so reset recovery works either way.
+    if not args.no_randomize:
+        _randomize_objects(model, data, np.random.default_rng(args.seed))
 
     mj.mj_forward(model, data)
 
@@ -262,7 +303,13 @@ if __name__ == "__main__":
 
     STEPS_PER_WP    = 5    # max sim steps before forcing waypoint advance (timeout, 1 step = 1ms)
     WP_REACH_TOL    = 0.02  # joint-space radius to consider a waypoint reached (rad)
-    JOG_VEL         = 0.05  # jog speed while arrow key held (m/s)
+    JOG_VEL         = 0.20  # jog speed while arrow key held (m/s)
+    # Singularity-robust DLS jog damping (see the GRASP-branch resolved-rate solve):
+    # JOG_SING_EPS is the smallest-singular-value threshold below which damping ramps
+    # in; JOG_LAM_MAX caps the peak joint-rate gain at ~1/(2*JOG_LAM_MAX). With
+    # JOG_VEL=0.10 m/s the worst-case rate is ~JOG_VEL/(2*JOG_LAM_MAX)=1.0 rad/s.
+    JOG_SING_EPS    = 0.02  # rad·m onset of damping (raise = damp earlier/more conservative)
+    JOG_LAM_MAX     = 0.05  # peak damping (raise = gentler but sloppier near singularities)
 
     # Object definitions: rigid objects only (obj_soft deferred — vertex-level contact,
     # not a rigid grasp-map problem). Each object maps every FINGER_SET finger to the
@@ -344,8 +391,8 @@ if __name__ == "__main__":
         # term drag tips into 20mm+ local minima on sphere/capsule; 1000:1 gives
         # ~0.5-2.5mm tips at <5 deg pads on 4/6 objects).
         # NOTE: _SQP_SOLVER_OPTS' tol_du (1e-2) is calibrated to this cost scale.
-        tip_weight=100.0,
-        orient_weight=0.1,
+        tip_weight=20.0,
+        orient_weight=1.0,
         max_iter=800,   # DLS warm-start puts us near solution; headroom for the tightened tol
     )
     if args.ik_solver == 'sqp':
@@ -597,7 +644,7 @@ if __name__ == "__main__":
     # mg ~ 4.9 N by friction across 2 contacts needs >= mg/(2*mu) ~ 2.45 N of normal
     # force each. GAMMA=8 -> ~5.7 N per contact, ~2.3x margin for the finger PD
     # fighting the squeeze, contact compliance, and dynamic loads while jogging.
-    GAMMA = 50.0
+    GAMMA = 250.0
 
     # Softens Kp/Kd on the active (grasping) finger joints while squeezing, via
     # GraspController.effective_gains(). Without this the full-strength joint PD
@@ -605,7 +652,7 @@ if __name__ == "__main__":
     # harder, the position spring (anchored at the fixed pre-squeeze q_grasp_hold)
     # pulls back proportionally, so measured contact force saturates well below
     # GAMMA/sqrt(2) instead of scaling with it.
-    SQUEEZE_PD_SCALE = 0.25
+    SQUEEZE_PD_SCALE = 20.0
 
     # Ramp the squeeze force 0->GAMMA over this many seconds of sim time after each
     # squeeze-on. The internal force pair only cancels once BOTH contacts exist; at
@@ -613,7 +660,7 @@ if __name__ == "__main__":
     # REACH), and full force while a finger is still closing that gap arrives as an
     # unbalanced shove that knocks the object across the table (measured: 35N commanded
     # -> box launched 400mm; with the ramp the contacts form at ~N-level forces first).
-    SQUEEZE_RAMP_S = 0.5
+    SQUEEZE_RAMP_S = 1.0
 
     # Give the RRT the SAME full hand-geom set the IK constrains (_robot_geom_names) plus
     # the floor, instead of only the fingertips — checking just the tips let the palm /
@@ -835,7 +882,7 @@ if __name__ == "__main__":
         targets.append({'label': f'object {i+1}'})
 
     keys = queue.Queue()
-    print("[Control] Ctrl+0..6: select target  |  ←→: jog x  |  ↑↓: jog z  |  Enter: GRASP / toggle squeeze  |  N: release  |  6: IK vis  |  7: coll spheres  |  Q/Esc: quit")
+    print("[Control] Ctrl+0..6: select target  |  ←→: jog x  |  ↑↓: jog z (lift)  |  PgUp/PgDn: jog y (depth)  |  Enter: GRASP / toggle squeeze  |  N: release  |  6: IK vis  |  7: coll spheres  |  Backspace: reset  |  Q/Esc: quit")
     print("[Control] Active target: init pose")
 
     # Simulation — start at Q_BIAS so PD error at t=0 is zero and qfrc_bias is correct.
@@ -876,6 +923,8 @@ if __name__ == "__main__":
     traj_wp_step   = 0    # counts sim steps since last waypoint advance
     plan_thread    = None
     q_plan_hold    = np.zeros(N_ROBOT)    # robot DOFs only
+    _plan_discard  = False         # reset arrived while planning: drop the result
+    _last_sim_time = 0.0           # backstop reset detection (UI button / BADQACC)
     _held_arrows   = set()         # arrow keys currently held
     _ctrl_held     = set()         # Ctrl_L / Ctrl_R currently held
     squeeze_on     = False         # GRASP: internal force toggled by Enter
@@ -919,10 +968,15 @@ if __name__ == "__main__":
                     digit = str(vk - 48)
                 if digit is not None:
                     keys.put(f'sel_{digit}')
-            elif key == _pynput_kb.Key.right: _held_arrows.add('right')
-            elif key == _pynput_kb.Key.left:  _held_arrows.add('left')
-            elif key == _pynput_kb.Key.up:    _held_arrows.add('up')
-            elif key == _pynput_kb.Key.down:  _held_arrows.add('down')
+            elif key == _pynput_kb.Key.right:     _held_arrows.add('right')
+            elif key == _pynput_kb.Key.left:      _held_arrows.add('left')
+            elif key == _pynput_kb.Key.up:        _held_arrows.add('up')
+            elif key == _pynput_kb.Key.down:      _held_arrows.add('down')
+            # PageUp/PageDown jog world +Y/-Y (depth, toward/away from the base) — the
+            # out-of-plane axis the arrows don't cover. Handled via pynput like the
+            # arrows (not the GLFW callback), so no collision with MuJoCo's viewer binds.
+            elif key == _pynput_kb.Key.page_up:   _held_arrows.add('depth_fwd')
+            elif key == _pynput_kb.Key.page_down: _held_arrows.add('depth_back')
         except AttributeError:
             pass
 
@@ -930,10 +984,12 @@ if __name__ == "__main__":
         try:
             if key in (_pynput_kb.Key.ctrl_l, _pynput_kb.Key.ctrl_r):
                 _ctrl_held.discard(key)
-            elif key == _pynput_kb.Key.right: _held_arrows.discard('right')
-            elif key == _pynput_kb.Key.left:  _held_arrows.discard('left')
-            elif key == _pynput_kb.Key.up:    _held_arrows.discard('up')
-            elif key == _pynput_kb.Key.down:  _held_arrows.discard('down')
+            elif key == _pynput_kb.Key.right:     _held_arrows.discard('right')
+            elif key == _pynput_kb.Key.left:      _held_arrows.discard('left')
+            elif key == _pynput_kb.Key.up:        _held_arrows.discard('up')
+            elif key == _pynput_kb.Key.down:      _held_arrows.discard('down')
+            elif key == _pynput_kb.Key.page_up:   _held_arrows.discard('depth_fwd')
+            elif key == _pynput_kb.Key.page_down: _held_arrows.discard('depth_back')
         except AttributeError:
             pass
 
@@ -1070,27 +1126,52 @@ if __name__ == "__main__":
                     dash.push({'type': 'normals', 't': _t, 'n': _normals})
             _dash_i += 1
 
+            # --- Detect out-of-band resets: the viewer UI's Reset button and MuJoCo's
+            # BADQACC warning both mj_resetData outside our control (no key event),
+            # snapping qpos to qpos0 — the arm's compiled zero is the straight-up pose,
+            # NOT Q_BIAS — while the controller keeps pulling toward its pre-reset
+            # target. data.time jumping backwards is the fingerprint; route it through
+            # the same recovery as an explicit Backspace reset.
+            if data.time < _last_sim_time - 1e-12:
+                keys.put('reset')
+            _last_sim_time = data.time
+
             # --- Check if background RRT finished ---
             if plan_thread is not None and not plan_thread.is_alive():
                 plan_thread = None
-                if 'waypoints' in _plan_result:
-                    traj_waypoints = _plan_result['waypoints']
-                    print(f"\r\n[Control] REACH  |  path: {len(traj_waypoints)} waypoints")
+                if _plan_discard:
+                    # Plan was started before a reset — its start pose no longer
+                    # matches the arm, so replaying it would teleport the arm through
+                    # the old path. Stay in the post-reset home hold.
+                    _plan_discard = False
+                    with _ghost_markers_lock:   # thread repopulated ghosts on finish
+                        _ghost_markers.clear()
+                    print("\r\n[Control] stale plan discarded (reset during planning)")
                 else:
-                    # Planning died (see _plan_thread_main traceback) — hold the pose we
-                    # were already holding so the sim stays alive; reselect to retry.
-                    traj_waypoints = [q_plan_hold.copy()]
-                    print("\r\n[Control] REACH  |  planning FAILED — holding pose "
-                          "(Ctrl+digit to retry)")
-                traj_wp_idx    = 0
-                traj_wp_step   = 0
-                control_phase  = 'REACH'
+                    if 'waypoints' in _plan_result:
+                        traj_waypoints = _plan_result['waypoints']
+                        print(f"\r\n[Control] REACH  |  path: {len(traj_waypoints)} waypoints")
+                    else:
+                        # Planning died (see _plan_thread_main traceback) — hold the pose
+                        # we were already holding so the sim stays alive; reselect to retry.
+                        traj_waypoints = [q_plan_hold.copy()]
+                        print("\r\n[Control] REACH  |  planning FAILED — holding pose "
+                              "(Ctrl+digit to retry)")
+                    traj_wp_idx    = 0
+                    traj_wp_step   = 0
+                    control_phase  = 'REACH'
 
             # --- Process key events ---
+            _reset_req = False
             while not keys.empty():
                 key = keys.get_nowait()
 
-                if key == 'enter' and control_phase == 'REACH':
+                if key == 'reset':
+                    # One physical reset can arrive twice (Backspace key callback AND
+                    # the time-jump backstop above) — coalesce, handle after the drain.
+                    _reset_req = True
+
+                elif key == 'enter' and control_phase == 'REACH':
                     control_phase = 'GRASP'
                     squeeze_on = False
                     # Object pose frozen at grasp time — reference anchor for the
@@ -1214,11 +1295,45 @@ if __name__ == "__main__":
                 elif key == 'quit':
                     running = False
 
+            # --- Reset recovery: redo the viewer's reset on OUR terms and re-home the
+            # state machine. The viewer's built-in Reset already snapped qpos to qpos0,
+            # but the compiled arm zero is the straight-up pose and the controller
+            # would keep pulling toward its pre-reset target — exactly the explosion
+            # this handler exists to prevent. mj_resetData puts the objects back at
+            # their randomized spawn poses (qpos0, maintained by _randomize_objects);
+            # cached IK solutions are kept — the selection handler's IK_STALE_TOL check
+            # re-solves automatically if the restored scene differs from the snapshot a
+            # cache entry was solved against.
+            if _reset_req:
+                if plan_thread is not None:
+                    _plan_discard = True   # in-flight IK/RRT started pre-reset: drop it
+                mj.mj_resetData(model, data)
+                data.qpos[:N_ROBOT] = Q_BIAS   # arm/hand home (qpos0 zero = straight up)
+                mj.mj_forward(model, data)
+                control_phase  = 'REACH'
+                active_tgt     = 0
+                active_idx     = 0
+                traj_waypoints = [Q_BIAS.copy()]
+                traj_wp_idx    = 0
+                traj_wp_step   = 0
+                squeeze_on     = False
+                grasp_ctrl     = None
+                q_grasp_hold   = None
+                _ik_vis_mode   = None
+                tau_ctrl       = np.zeros(model.nv)
+                _last_sim_time = 0.0
+                with _ghost_markers_lock:
+                    _ghost_markers.clear()
+                _push_squeeze(False)
+                print("\r\n[Control] RESET — arm home, objects at spawn poses; cached "
+                      "IK kept (auto re-solved if stale on next selection)")
+
             # --- Continuous jog: world-frame palm velocity from currently-held arrow
             # keys, consumed by the GRASP branch's resolved-rate target integration.
-            # left/right -> x, up/down -> z (lift) — y (depth) is never commanded.
+            # left/right -> x, up/down -> z (lift), PageUp/PageDown -> y (depth).
             _jv_x = (JOG_VEL if 'right' in _held_arrows else 0) - (JOG_VEL if 'left' in _held_arrows else 0)
             _jv_z = (JOG_VEL if 'up'    in _held_arrows else 0) - (JOG_VEL if 'down' in _held_arrows else 0)
+            _jv_y = (JOG_VEL if 'depth_fwd' in _held_arrows else 0) - (JOG_VEL if 'depth_back' in _held_arrows else 0)
 
             # --- IK visualization: freeze physics, show full arm in stored IK config ---
             if _ik_vis_mode is not None and active_tgt > 0:
@@ -1307,16 +1422,28 @@ if __name__ == "__main__":
                     _render_kinematic_frame()
                     continue
                 # Resolved-rate jog: map the commanded world-frame palm velocity
-                # [vx, 0, vz] (orientation held) to arm joint rates via 6-DOF DLS on
+                # [vx, vy, vz] (orientation held) to arm joint rates via 6-DOF DLS on
                 # the live config, and integrate them into the PD target.
                 qdot_jog = np.zeros(7)
-                if _jv_x or _jv_z:
+                if _jv_x or _jv_y or _jv_z:
                     Jp = np.zeros((3, model.nv))
                     Jr = np.zeros((3, model.nv))
                     mj.mj_jacBody(model, data, Jp, Jr, _PALM_BID)
                     J6 = np.vstack([Jp[:, :7], Jr[:, :7]])
-                    v6 = np.array([_jv_x, 0.0, _jv_z, 0.0, 0.0, 0.0])
-                    qdot_jog = J6.T @ np.linalg.solve(J6 @ J6.T + 1e-6 * np.eye(6), v6)
+                    v6 = np.array([_jv_x, _jv_y, _jv_z, 0.0, 0.0, 0.0])
+                    # Singularity-robust DLS: the damping lambda^2 grows as the palm
+                    # Jacobian's smallest singular value falls below JOG_SING_EPS,
+                    # capping the joint-rate gain at ~1/(2*lambda_max) near singular
+                    # grasp configs instead of letting it spike to ~1/sigma_min and
+                    # lurch the arm off the object (the mechanism that threw the cube:
+                    # a runaway qdot_jog written into qvel below drags the fixed-angle
+                    # fingers across the object faster than friction can hold it).
+                    # Depth (y) jogs approach the arm's reach limits fastest, so this
+                    # matters most for the new PageUp/PageDown axis.
+                    _sigma_min = np.linalg.svd(J6, compute_uv=False)[-1]
+                    _lam2 = (0.0 if _sigma_min >= JOG_SING_EPS
+                             else (1.0 - (_sigma_min / JOG_SING_EPS) ** 2) * JOG_LAM_MAX ** 2)
+                    qdot_jog = J6.T @ np.linalg.solve(J6 @ J6.T + _lam2 * np.eye(6), v6)
                     q_grasp_hold[:7] += qdot_jog * model.opt.timestep
                 # Zero qvel each step like the PLAN / REACH final-waypoint holds — the
                 # explicit qfrc_applied damping is marginal at the wrist (dt < 2*I/Kd,

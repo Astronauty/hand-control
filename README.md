@@ -52,8 +52,10 @@ Requires a sourced ROS 2 environment and `CYCLONEDDS_URI` set to an UP interface
 |---|---|---|
 | `--mode {rrt,dexpilot}` | `rrt` | **rrt**: autonomous RRT+IK grasp. **dexpilot**: live MediaPipe retargeting teleop via ROS 2. |
 | `--ik-solver {sqp,ipopt}` | `sqp` | IK solver backend (see below). |
-| `--dashboard` | off | Launch a live pyqtgraph metrics dashboard (separate process): scrolling fingertip→object distances, RRT solve times, and IPOPT iteration counts. |
+| `--dashboard` | off | Launch a live pyqtgraph metrics dashboard (separate process): planning mode (Approach/Grasp/Transport), proximity-based active object, scrolling fingertip→object distances, net hand→object wrench, per-finger contact normal forces, and a combined RRT+IK planner solution log. |
 | `--viz-only` | off | Debug mode: disables arm/hand collision physics and never calls `mj_step`. REACH and GRASP phases hold their IK solution kinematically so you can inspect the IK/RRT result without dynamics interference. |
+| `--seed N` | none | RNG seed for object randomization — the same seed reproduces the same layout (positions and sizes). Default: fresh entropy every run. Ignored with `--no-randomize`. |
+| `--no-randomize` | off | Skip object randomization entirely: objects keep the positions, sizes, and colors authored in `models/scene_pick_place.xml`. |
 | `--camera N` | auto | *(dexpilot only)* Camera index forwarded to the MediaPipe publisher. Defaults to auto-select (prefers external/USB camera at index ≥ 1). Run `python ui/mediapipe_joint_angles.py --list-cameras` to see available indices. |
 
 Flags can be combined, e.g.:
@@ -61,6 +63,7 @@ Flags can be combined, e.g.:
 python kinova_leap_pick_place.py --mode dexpilot --camera 1
 python kinova_leap_pick_place.py --viz-only --dashboard
 python kinova_leap_pick_place.py --ik-solver ipopt
+python kinova_leap_pick_place.py --seed 42          # reproducible object layout
 ```
 
 ---
