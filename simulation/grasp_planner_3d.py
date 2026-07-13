@@ -50,10 +50,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 try:
     import importlib as _importlib
-    _ncf_mod = _importlib.import_module('3D_minimum_NCF')
+    _ncf_mod = _importlib.import_module('3D_minimum_NCF_soft')
     min_gamma_for_accel_lp = _ncf_mod.min_gamma_for_accel_lp
     _NCF_AVAILABLE = True
-except Exception:
+
+except Exception as e:
     min_gamma_for_accel_lp = None
     _NCF_AVAILABLE = False
 
@@ -89,7 +90,11 @@ log = logging.getLogger("grasp_planner_3d")
 if not log.handlers:
     log.addHandler(logging.NullHandler())
 
-
+if _NCF_AVAILABLE and _CASADI_AVAILABLE and _MJ_AVAILABLE and _CIK_AVAILABLE:
+    print("[grasp_planner_3d] all dependencies available")
+else:
+    print("[grasp_planner_3d] WARNING: some dependencies are missing; "
+          "grasp planning will fail if invoked")
 # ─────────────────────────────────────────────────────────────────────────────
 # SQP solver options — copied verbatim from constrained_ik._SQP_SOLVER_OPTS
 # (private name; do not import — copy the dict to avoid coupling)
@@ -478,7 +483,7 @@ class GraspConfig3D:
     q_scale:  float = 1.0
 
     # Constraint flags
-    joint_limits:     bool = False
+    joint_limits:     bool = True
     on_object:        bool = True    # hard surface constraint when d1/d2 not provided
     wrench_constraint: bool = True   # LP existence constraint inside the NLP
     max_iter:         int  = 120
@@ -496,14 +501,20 @@ class GraspConfig3D:
 
     # Profiling
     n_radial_seeds:   int  = 4
-    verbose_profile:  bool = False
+    verbose_profile:  bool = True
 
-    # Solver
-    use_slsqp:        bool  = True
+    # Solver — use_slsqp=True → SQP+OSQP (faster, analytic Jacobians)
+    #           use_slsqp=False → IPOPT (interior-point, more robust to infeasibility)
+    use_slsqp:        bool  = False
     smooth_sdf:       bool  = True
     slsqp_alpha:      float = 40.0
 
-    # Wrench LP task bounds
+    # Wrench LP task bounds.
+    # task_tx/ty MUST be >= 0.5 * hx (half the face width) to keep the LP feasible
+    # for contacts displaced up to hx from face centre.  For a 30 mm half-box:
+    #   min task_tx/ty = 0.5 * 0.03 = 0.015 Nm.  0.03 Nm gives full-face coverage.
+    # Setting them to 0.0 forces zero net torque, which is infeasible for any
+    # contact pair that is not perfectly antisymmetric on their faces.
     mu:       float = 1.0
     task_fx:  float = 0.5
     task_fy:  float = 0.5
@@ -880,8 +891,12 @@ class GraspPlanner3D:
                 _sqp_opts['max_iter'] = max_iter_override or cfg.max_iter
                 _opti.solver('sqpmethod', _sqp_opts)
             else:
+                # IPOPT path — uses analytic Jacobians from all callbacks
+                # (FK via mj_jacSite, wrench via LP duals, collision via mj_jac).
+                # Do NOT set jacobian_approximation='finite-difference-values': that
+                # would override the wrench callback's LP-dual Jacobian with FD of
+                # a piecewise-constant function, producing garbage search directions.
                 _ipopt_opts: dict = {
-                    'jacobian_approximation': 'finite-difference-values',
                     'hessian_approximation':  'limited-memory',
                     'max_iter':               max_iter_override or cfg.max_iter,
                     'sb':                     'no',
@@ -890,8 +905,8 @@ class GraspPlanner3D:
                     'constr_viol_tol':        1e-6,
                     'print_level':            0,
                     'mu_strategy':            'adaptive',
-                    'acceptable_tol':         0.1,
-                    'acceptable_iter':        5,
+                    'acceptable_tol':         1e-3,
+                    'acceptable_iter':        20,
                     'acceptable_constr_viol_tol': 1e-3,
                 }
                 if self.log_dir:
@@ -899,7 +914,7 @@ class GraspPlanner3D:
                     _ipopt_opts['output_file']      = os.path.join(
                         self.log_dir, f"grasp3d_ipopt_{ts}.log")
                     _ipopt_opts['file_print_level'] = 5
-                _opti.solver('ipopt', {'ipopt': _ipopt_opts, 'print_time': False})
+                _opti.solver('ipopt', {'ipopt': _ipopt_opts, 'print_time': True})
 
             # ── Per-iteration logger (DEBUG → file only) ──────────────────
             if self.log_dir:
