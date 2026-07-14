@@ -615,7 +615,7 @@ class GraspConfig3D:
     #                No external callback.  Fully smooth everywhere — bilinear in (p, y).
     wrench_mode: str   = 'embedded'   # 'hard' | 'elastic' | 'embedded'
     elastic_M:   float = 1000.0      # Phase-I penalty (elastic mode only)
-    w_gamma:     float = 0.01      # cost weight for gamma (embedded mode only)
+    w_gamma:     float = 0.1     # cost weight for gamma (embedded mode only)
 
     # Middle/ring collision avoidance (legacy — used when arm_geom_names is empty)
     col_constraint:   bool  = True
@@ -634,7 +634,7 @@ class GraspConfig3D:
 
     # Solver — use_slsqp=True → SQP+OSQP (faster, analytic Jacobians)
     #           use_slsqp=False → IPOPT (interior-point, more robust to infeasibility)
-    use_slsqp:        bool  = False
+    use_slsqp:        bool  = True
     smooth_sdf:       bool  = True
     slsqp_alpha:      float = 40.0
 
@@ -1133,7 +1133,7 @@ class GraspPlanner3D:
                     f"col_legacy={'Y' if use_legacy_col else 'N'}  "
                     f"arm_col={'Y(' + str(len(_active_arm)) + 'geoms)' if _active_arm else 'N'}")
                 lines = [
-                    f"{tag}─── solve profile ──────────────────────────────────────",
+                    f"{tag}--- solve profile ------------------------------------------",
                     f"{tag}  constraints : {con_str}",
                     f"{tag}  DOF={n_act}  cbs:"
                     f"  thumb={th_evals}  index={if_evals}"
@@ -1149,7 +1149,7 @@ class GraspPlanner3D:
                         f"{tag}  iters={n_iters}  ms/iter={dt_solve*1e3/n_iters:.0f}",
                         f"{tag}  t_wall_solver={tw_solver*1e3:.0f}ms",
                     ]
-                lines.append(f"{tag}────────────────────────────────────────────────────────")
+                lines.append(f"{tag}------------------------------------------------------------")
                 for ln in lines:
                     self.log.info(ln)
                 if cfg.verbose_profile:
