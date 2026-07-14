@@ -50,7 +50,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 try:
     import importlib as _importlib
-    _ncf_mod = _importlib.import_module('3D_minimum_NCF_soft')
+    # _ncf_mod = _importlib.import_module('3D_minimum_NCF_soft')
+    _ncf_mod = _importlib.import_module('3D_minimum_NCF')
     min_gamma_for_accel_lp = _ncf_mod.min_gamma_for_accel_lp
     _NCF_AVAILABLE = True
 
@@ -376,16 +377,21 @@ class _WrenchFeasJacCallback3D(ca.Callback):
 
 class _WrenchFeasCallback3D(ca.Callback):
     """
-    [p1(3), p2(3)] → gamma_min (LP feasible) or -1.0 (LP infeasible).
+    [p1(3), p2(3)] → gamma_min (LP feasible) or elastic infeasibility measure (LP infeasible).
 
     Input:  x = vertcat(p1, p2)  shape (6, 1)
-    Output: gamma_min >= 0 if wrench is resistible; -1.0 otherwise  shape (1, 1)
+    Output: gamma_min >= 0 if wrench is resistible;
+            -elastic_M * max_violation < 0 otherwise  shape (1, 1)
 
     At each NLP evaluation the callback runs min_gamma_for_accel_lp with
     return_sensitivity=True, caches the LP dual-variable gradient, and
     exposes it through _WrenchFeasJacCallback3D.  CasADi then uses this
     analytic Jacobian instead of FD-perturbing the callback, saving 6 LP
     solves per NLP gradient evaluation.
+
+    When infeasible, the Phase-I LP returns a negative value with a nonzero
+    gradient (from Phase-I LP duals), giving the NLP solver a recovery direction
+    instead of a zero-row QP subproblem.
 
     The NLP constraint is: _WrenchFeasCallback3D(vertcat(p1, p2)) >= 0
     SQP drives p1/p2 toward a configuration with gamma_min >= 0.
@@ -398,7 +404,8 @@ class _WrenchFeasCallback3D(ca.Callback):
                  obj_size:   np.ndarray,
                  task_fx: float, task_fy: float, task_fz: float,
                  task_tx: float, task_ty: float, task_tz: float,
-                 mu: float):
+                 mu: float,
+                 elastic_M: float = 1000.0):
         ca.Callback.__init__(self)
         self._geom_type  = geom_type
         self._obj_center = np.asarray(obj_center, float)
@@ -411,6 +418,7 @@ class _WrenchFeasCallback3D(ca.Callback):
         self._task_ty    = task_ty
         self._task_tz    = task_tz
         self._mu         = mu
+        self._elastic_M  = elastic_M   # 0.0 → hard mode (returns None on infeasible)
         self._jac_p12    = None
         self._jac_cached = None
         self._n_calls    = 0
@@ -455,18 +463,121 @@ class _WrenchFeasCallback3D(ca.Callback):
             tan_z=[0.0, 0.0],
             mu=[self._mu, self._mu],
             return_sensitivity=True,
+            elastic_M=self._elastic_M,
         )
 
-        if result[0] is None:   # LP infeasible — return -1.0; SQP finds a feasibility step
+        if result[0] is None:
+            # Phase-I LP failed unexpectedly — should not happen with elastic formulation
             self._jac_cached = np.zeros(6)
             self._jac_p12    = p12.copy()
             return [-1.0]
 
-        gamma_val, dg_dp1, dg_dp2 = result
+        # result[0]: gamma_min >= 0 (feasible) or -elastic_M * violation < 0 (infeasible)
+        # result[1], result[2]: d(value)/dp1, d(value)/dp2 — nonzero in both cases
+        g_val, dg_dp1, dg_dp2 = result
         self._jac_cached = np.concatenate([dg_dp1, dg_dp2])   # (6,) — no sign flip
         self._jac_p12    = p12.copy()
         self._n_calls   += 1
-        return [float(gamma_val)]
+        return [float(g_val)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Embedded wrench LP helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _embed_wrench_cone_ca(opti, p1, p2, obj_center_np, d1, d2, mu, task_wrench_np):
+    """
+    Add worst-case LP wrench feasibility constraints directly to a CasADi Opti problem.
+
+    One copy of the LP (y1_k, y2_k variables + wrench balance) is added per unique
+    sign-combination of the task wrench components, matching what min_gamma_for_accel_lp
+    checks.  All copies share a single gamma, so gamma is the worst-case NCF scale
+    across all acceleration directions.
+
+    Variables added to opti:
+        gamma        (scalar)     — shared worst-case NCF scale
+        y1_k, y2_k  (5,) each    — cone coefficients for the k-th corner, k=0..n_corners-1
+
+    Constraints per corner k:
+        y1_k >= 0,  y2_k >= 0
+        sum(y1_k) <= gamma,   sum(y2_k) <= gamma
+        wrench_1(p1, y1_k) + wrench_2(p2, y2_k) == signs_k * task_wrench
+
+    Parameters
+    ----------
+    d1, d2         : (3,) outward face normal at each contact (inward = -d).
+    task_wrench_np : (6,) [Tx, Ty, Tz, Fx, Fy, Fz] — only nonzero entries generate
+                    distinct sign-combinations; zero entries are held fixed.
+
+    Returns
+    -------
+    gamma    : CasADi MX scalar
+    y1_list  : list of n_corners CasADi MX (5,) variables
+    y2_list  : list of n_corners CasADi MX (5,) variables
+    """
+    import itertools
+
+    nverts = 5  # hard point-contact pyramid, 5 vertices
+
+    _gamma = opti.variable()
+    opti.subject_to(_gamma >= 0)
+
+    # Contact frames from seed directions (fixed throughout the NLP)
+    n1 = np.asarray(-d1, float)
+    _, t1_1, t2_1 = _build_contact_frame_3d(n1)
+    R1 = np.column_stack([n1, t1_1, t2_1])
+
+    n2 = np.asarray(-d2, float)
+    _, t1_2, t2_2 = _build_contact_frame_3d(n2)
+    R2 = np.column_stack([n2, t1_2, t2_2])
+
+    # Unit cone vertex forces in world frame (fixed)
+    verts_c = np.array([
+        [0.0, 0.0,  0.0],   # zero force
+        [1.0, 0.0, -mu ],
+        [1.0, -mu,  0.0],
+        [1.0,  mu,  0.0],
+        [1.0, 0.0,  mu ],
+    ])
+    forces1 = [ca.DM(R1 @ v) for v in verts_c]
+    forces2 = [ca.DM(R2 @ v) for v in verts_c]
+    obj_c   = ca.DM(obj_center_np)
+
+    def _wrench_sum(p, forces, y):
+        w = ca.MX.zeros(6)
+        for j, f_j in enumerate(forces):
+            w += y[j] * ca.vertcat(ca.cross(p - obj_c, f_j), f_j)
+        return w
+
+    # Build unique sign-combination corners (deduplicate zero components)
+    nz_idx = np.where(np.abs(task_wrench_np) > 1e-10)[0]
+    seen   = set()
+    corners = []
+    for signs in itertools.product([-1, 1], repeat=len(nz_idx)):
+        t_k = task_wrench_np.copy()
+        for i, idx in enumerate(nz_idx):
+            t_k[idx] *= signs[i]
+        key = tuple(np.round(t_k, 12))
+        if key not in seen:
+            seen.add(key)
+            corners.append(t_k)
+    if not corners:        # all-zero task wrench — trivially feasible
+        corners = [task_wrench_np]
+
+    y1_list, y2_list = [], []
+    for t_k in corners:
+        _y1_k = opti.variable(nverts)
+        _y2_k = opti.variable(nverts)
+        opti.subject_to(_y1_k >= 0)
+        opti.subject_to(_y2_k >= 0)
+        opti.subject_to(ca.sum1(_y1_k) <= _gamma)
+        opti.subject_to(ca.sum1(_y2_k) <= _gamma)
+        opti.subject_to(_wrench_sum(p1, forces1, _y1_k)
+                        + _wrench_sum(p2, forces2, _y2_k) == ca.DM(t_k))
+        y1_list.append(_y1_k)
+        y2_list.append(_y2_k)
+
+    return _gamma, y1_list, y2_list
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -478,15 +589,33 @@ class GraspConfig3D:
     """Configuration for the 3D grasp planner (Kinova Gen3 + LEAP hand)."""
 
     # Cost weights
-    w_ik:     float = 0.4
-    w_reg:    float = 0.3
+    w_ik:     float = 0.8
+    w_reg:    float = 0.005
     q_scale:  float = 1.0
+
+    # Fingertip mesh effective radius (site centroid to contact surface distance)
+    # leap_th_ds_tip and leap_if_ds_tip both have site size=0.005 m
+    r_thumb:  float = 0.005   # m
+    r_index:  float = 0.005   # m
 
     # Constraint flags
     joint_limits:     bool = True
     on_object:        bool = True    # hard surface constraint when d1/d2 not provided
     wrench_constraint: bool = True   # LP existence constraint inside the NLP
     max_iter:         int  = 120
+
+    # Wrench feasibility mode — three formulations available for comparison:
+    #   'hard'     — external callback; returns -1.0 with ZERO gradient when infeasible.
+    #                Original behaviour; NLP stalls when LP is infeasible.
+    #   'elastic'  — external callback with Phase-I fallback; returns -elastic_M*violation
+    #                with a NONZERO gradient from Phase-I LP duals when infeasible.
+    #                Gives NLP solvers a recovery direction.
+    #   'embedded' — LP constraints (wrench balance + cone membership) added directly to
+    #                NLP as bilinear CasADi expressions.  gamma added to cost with w_gamma.
+    #                No external callback.  Fully smooth everywhere — bilinear in (p, y).
+    wrench_mode: str   = 'embedded'   # 'hard' | 'elastic' | 'embedded'
+    elastic_M:   float = 1000.0      # Phase-I penalty (elastic mode only)
+    w_gamma:     float = 0.01      # cost weight for gamma (embedded mode only)
 
     # Middle/ring collision avoidance (legacy — used when arm_geom_names is empty)
     col_constraint:   bool  = True
@@ -784,13 +913,15 @@ class GraspPlanner3D:
 
             # ── Wrench feasibility callback ────────────────────────────────
             wrench_cb = None
-            if cfg.wrench_constraint and _NCF_AVAILABLE:
+            if cfg.wrench_constraint and _NCF_AVAILABLE and cfg.wrench_mode != 'embedded':
+                _em = 0.0 if cfg.wrench_mode == 'hard' else cfg.elastic_M
                 wrench_cb = _WrenchFeasCallback3D(
                     f'gp3_wf_{_uid}',
                     geom_type, obj_center_np, obj_R_np, geom_size,
                     cfg.task_fx, cfg.task_fy, cfg.task_fz,
                     cfg.task_tx, cfg.task_ty, cfg.task_tz,
-                    cfg.mu)
+                    cfg.mu,
+                    elastic_M=_em)
 
             # ── Build Opti ────────────────────────────────────────────────
             _opti = ca.Opti()
@@ -800,8 +931,8 @@ class GraspPlanner3D:
 
             _tp1   = thumb_cb(_q)
             _tp2   = index_cb(_q)
-            _d1_sq = ca.sumsqr(_tp1 - _p1)
-            _d2_sq = ca.sumsqr(_tp2 - _p2)
+            _d1_sq = ca.sumsqr(_tp1 - (_p1 + cfg.r_thumb * ca.DM(d1)))   # m²
+            _d2_sq = ca.sumsqr(_tp2 - (_p2 + cfg.r_index * ca.DM(d2)))   # m²
 
             # ── SDF for surface constraints / legacy col ───────────────────
             if cfg.smooth_sdf:
@@ -817,7 +948,8 @@ class GraspPlanner3D:
             # ── Cost ──────────────────────────────────────────────────────
             _cost = (cfg.w_ik  * (_d1_sq + _d2_sq) +
                      cfg.w_reg * ca.sumsqr((_q - ca.DM(q_ws)) / cfg.q_scale))
-            _opti.minimize(_cost)
+            # Embedded mode: gamma variable added to cost below after _embed_wrench_cone_ca
+            _gamma_lp = None
 
             # ── 1. Joint limits (vectorized) ──────────────────────────────
             if cfg.joint_limits:
@@ -842,9 +974,28 @@ class GraspPlanner3D:
                         _p[_i],
                         obj_center[_i] + _h + margin))
 
-            # ── 3. Wrench feasibility (LP existence inside NLP) ───────────
+            # ── 3. Wrench feasibility ─────────────────────────────────────
             if wrench_cb is not None:
+                # hard / elastic: external LP callback
                 _opti.subject_to(wrench_cb(ca.vertcat(_p1, _p2)) >= 0)
+            elif (cfg.wrench_constraint and _NCF_AVAILABLE
+                  and cfg.wrench_mode == 'embedded'):
+                # embedded: LP constraints added directly to NLP as bilinear exprs
+                _task_w_np = np.array([cfg.task_tx, cfg.task_ty, cfg.task_tz,
+                                       cfg.task_fx, cfg.task_fy, cfg.task_fz])
+                _gamma_lp, _y1_list, _y2_list = _embed_wrench_cone_ca(
+                    _opti, _p1, _p2, obj_center_np, d1, d2, cfg.mu, _task_w_np)
+                _opti.set_initial(_gamma_lp, 1.0)
+                _y_init = np.ones(5) / 5.0
+                for _y1_k, _y2_k in zip(_y1_list, _y2_list):
+                    _opti.set_initial(_y1_k, _y_init)
+                    _opti.set_initial(_y2_k, _y_init)
+
+            # Finalize cost (add gamma term after embedded variables exist)
+            if _gamma_lp is not None:
+                _opti.minimize(_cost + cfg.w_gamma * _gamma_lp)
+            else:
+                _opti.minimize(_cost)
 
             # ── 5a. Full-arm collision (geometry-appropriate softplus SDF) ─
             if arm_col_cb is not None:
@@ -969,9 +1120,16 @@ class GraspPlanner3D:
                 arm_evals = arm_col_cb.eval_count if arm_col_cb is not None else 0
                 wf_calls  = wrench_cb._n_calls if wrench_cb is not None else 0
 
+                if wrench_cb is not None:
+                    _wrench_str = cfg.wrench_mode   # 'hard' or 'elastic'
+                elif cfg.wrench_constraint and _NCF_AVAILABLE and cfg.wrench_mode == 'embedded':
+                    _wrench_str = 'embedded'
+                else:
+                    _wrench_str = 'N'
+
                 con_str = (
                     f"surface={'Y' if include_surface else 'N'}  "
-                    f"wrench={'Y' if wrench_cb is not None else 'N'}  "
+                    f"wrench={_wrench_str}  "
                     f"col_legacy={'Y' if use_legacy_col else 'N'}  "
                     f"arm_col={'Y(' + str(len(_active_arm)) + 'geoms)' if _active_arm else 'N'}")
                 lines = [
