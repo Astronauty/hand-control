@@ -154,6 +154,11 @@ class DexPilotController:
 
         return np.concatenate([q_arm, q_hand])
 
+    def target_frame(self):
+        """Last IK target pose (pos, R) in world coords — the frame the arm IK
+        drives pinch_site toward. Passthrough to the arm controller for viz."""
+        return self._arm.target_frame()
+
     def reset(self) -> None:
         """Reset all transient state (call when hand tracking is lost)."""
         self._retarg.reset()

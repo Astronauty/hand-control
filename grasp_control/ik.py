@@ -8,13 +8,23 @@ import numpy as np
 
 
 class IKSolver:
-    def __init__(self, pos_dim, n_robot, damping=0.01, max_iter=500, step=0.5, tol=1e-3):
+    def __init__(self, pos_dim, n_robot, damping=0.01, max_iter=500, step=0.5, tol=1e-3,
+                 adaptive_damping=False, lambda_max=0.1, w0=1e-3):
         self.pos_dim = pos_dim
         self.n_robot = n_robot
         self.damping = damping
         self.max_iter = max_iter
         self.step = step
         self.tol = tol
+        # Singularity-robust (Levenberg-Marquardt) damping. When enabled, the
+        # damping factor GROWS as the Yoshikawa manipulability w=sqrt(det(J J^T))
+        # drops below w0, keeping dq bounded near singularities instead of letting
+        # the near-singular (J J^T)^-1 blow up (the "whipping" in teleop). Away
+        # from singularities damping stays at `damping` so tracking stays crisp.
+        # Off by default so RRT/grasp callers are unchanged.
+        self.adaptive_damping = adaptive_damping
+        self.lambda_max = lambda_max
+        self.w0 = w0
 
     def solve(self, model, data, site_ids: list[int], targets: list[np.ndarray],
               orientations: list[np.ndarray] = None, q_bias=None, null_gain=0.1) -> np.ndarray:
@@ -87,7 +97,16 @@ class IKSolver:
             if np.linalg.norm(err) < self.tol:
                 break
             J = np.vstack(Js)
-            J_pinv_damped = J.T @ np.linalg.inv(J @ J.T + self.damping * np.eye(J.shape[0]))
+            JJt = J @ J.T
+            lam = self.damping
+            if self.adaptive_damping:
+                # Yoshikawa manipulability; det(JJt) >= 0. Ramp damping up
+                # quadratically once w drops below the threshold w0.
+                w = float(np.sqrt(max(np.linalg.det(JJt), 0.0)))
+                if w < self.w0:
+                    ratio = 1.0 - w / self.w0
+                    lam = self.damping + self.lambda_max * ratio * ratio
+            J_pinv_damped = J.T @ np.linalg.inv(JJt + lam * np.eye(J.shape[0]))
             dq = J_pinv_damped @ err
             if q_bias is not None:
                 null_proj = np.eye(self.n_robot) - J_pinv_damped @ J

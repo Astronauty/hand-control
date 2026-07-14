@@ -1049,8 +1049,32 @@ if __name__ == "__main__":
         print(f"[DexPilot] MediaPipe publisher launched (pid {_mediapipe_proc.pid})")
 
         from teleop.dexpilot_controller import DexPilotController
+        from teleop.dexpilot_arm_controller import load_camera_calibration
+        # Use the measured ChArUco calibration (camera_extrinsics/intrinsics.json)
+        # for the camera->robot rotation and pixel->metre scales. Falls back to a
+        # bare identity mapping if the calibration files aren't present.
+        try:
+            # Z-up world remap: the publisher flips the board frame (camera looks
+            # DOWN, board +Z points down) to MuJoCo Z-up via diag([1,-1,-1]).
+            # Pass the SAME remap here so R_cam_robot (orientation) lives in the
+            # same Z-up frame as the published position — otherwise position and
+            # orientation disagree and the wrist rotation maps wrong.
+            _world_from_board = np.diag([1.0, -1.0, -1.0])
+            _cam_kwargs = load_camera_calibration(world_from_board=_world_from_board)
+            # Absolute board-anchored positioning: the publisher sends metric
+            # board-frame wrist coords, and the arm anchors them at press-8.
+            # Only valid when calibration is present (single source of truth).
+            _cam_kwargs["absolute"] = True
+            _cam_kwargs["abs_scale"] = 1.0
+            print(f"[DexPilot] loaded camera calibration: "
+                  f"scale_x={_cam_kwargs['scale_x']:.3f} scale_z={_cam_kwargs['scale_z']:.3f} "
+                  f"| ABSOLUTE Z-up positioning + FULL 3-DOF orientation ON (abs_scale=1.0)")
+        except FileNotFoundError:
+            _cam_kwargs = {"R_cam_robot": np.eye(3), "absolute": False}
+            print("[DexPilot] no camera calibration found — using identity "
+                  "R_cam_robot, DELTA positioning. Run calibration/charuco_calibration.py.")
         _dexpilot_ctrl = DexPilotController(model, q_bias=Q_BIAS,
-            R_cam_robot=np.eye(3), debug=True, eps=0.005)
+            debug=True, eps=0.005, **_cam_kwargs)
         _dexpilot_ctrl.init_home(data)
         _dexpilot_ctrl.init_ros()
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")
@@ -1234,6 +1258,37 @@ if __name__ == "__main__":
                     data.qpos[:N_ROBOT] = q_teleop
                     data.qvel[:N_ROBOT] = 0.0
                     mj.mj_forward(model, data)
+                # Visualise BOTH the IK target frame (thick, the pose the arm IK
+                # drives pinch_site toward) AND the robot's CURRENT pinch_site
+                # frame (thin). The GAP between them is the live IK error —
+                # position gap = translation error, axis mismatch = rotation
+                # error. X=red Y=green Z=blue for both.
+                scn = viewer.user_scn
+                if scn is not None:
+                    scn.ngeom = 0
+
+                    def _draw_frame(pos, Rm, alen, arad):
+                        cols = [np.array([1., 0, 0, 1.]),
+                                np.array([0, 1., 0, 1.]),
+                                np.array([0, 0, 1., 1.])]
+                        for _i, _rgba in enumerate(cols):
+                            if scn.ngeom >= scn.maxgeom:
+                                break
+                            mj.mjv_initGeom(scn.geoms[scn.ngeom], mj.mjtGeom.mjGEOM_CAPSULE,
+                                            np.zeros(3), np.zeros(3),
+                                            np.eye(3).flatten(), _rgba)
+                            mj.mjv_connector(scn.geoms[scn.ngeom], mj.mjtGeom.mjGEOM_CAPSULE,
+                                             arad, pos, pos + alen * Rm[:, _i])
+                            scn.ngeom += 1
+
+                    _tf = _dexpilot_ctrl.target_frame()
+                    if _tf is not None:
+                        _draw_frame(_tf[0], _tf[1], 0.10, 0.007)   # target: thick, long
+                    # current pinch_site frame (thin, short)
+                    _psid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'pinch_site')
+                    _draw_frame(data.site_xpos[_psid].copy(),
+                                data.site_xmat[_psid].reshape(3, 3).copy(),
+                                0.06, 0.004)
                 viewer.sync()
                 time.sleep(max(0, model.opt.timestep - (time.time() - step_start)))
                 continue

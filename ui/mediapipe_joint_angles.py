@@ -19,6 +19,7 @@ from std_msgs.msg import Float32MultiArray, Empty
 # MediaPipe Imports
 import mediapipe as mp
 from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarker
+from mediapipe.framework.formats import landmark_pb2
 from geometry_msgs.msg import PoseStamped
 
 # drawing_utils / drawing_styles live under mp.solutions (not mp.tasks.vision).
@@ -292,14 +293,161 @@ def _hand_bbox_area(hand_landmarks) -> float:
     return (max(xs) - min(xs)) * (max(ys) - min(ys))
 
 
+# Physical wrist->middle-MCP span of an adult hand [m]. Used as the known object
+# size for monocular depth-from-apparent-size. Rough default; override per user
+# by measuring landmark-0 to landmark-9 on your own hand.
+_HAND_SPAN_M = 0.09
+
+# Board -> world axis remap. The camera looks DOWN at a flat board, so the board
+# normal (+Z) points DOWN into the table while MuJoCo world +Z is UP. This proper
+# rotation (det=+1) flips Y and Z so the published world frame is Z-up, matching
+# MuJoCo. It is applied to the loaded extrinsic so BOTH the published wrist coords
+# and the drawn board axes use the corrected frame. (A ~23° camera-tilt residual
+# remains — the board alone can't sense gravity; lay the board under a truly
+# vertical camera or add a gravity-align step to remove it. Fine for teleop.)
+_WORLD_FROM_BOARD = np.diag([1.0, -1.0, -1.0])
+
+
+def estimate_wrist_depth(hand_landmarks, fx: float, img_w: int) -> float:
+    """Monocular depth of the hand from apparent size (single RGB camera).
+
+    MediaPipe's wrist z is wrist-relative (~0), so it does NOT track distance to
+    the camera. Apparent hand SIZE does: a physically constant span projects to
+    fewer pixels as the hand recedes. With calibrated focal length fx:
+        Z = fx * HAND_SPAN_M / span_pixels
+    where span_pixels = (normalised wrist->middle-MCP distance) * img_w.
+
+    Uses the wrist(0)->middle-MCP(9) segment: rigid, roughly in-plane, and less
+    affected by finger flexion than the full bounding box. Returns metres; this
+    is a noisy monocular estimate (best used as a DELTA, not absolute), and is
+    the natural swap-in point for a RealSense depth reading later.
+    """
+    w = hand_landmarks[0]
+    m = hand_landmarks[9]
+    span_norm = float(np.hypot(m.x - w.x, m.y - w.y))
+    span_px = span_norm * img_w
+    if span_px < 1e-3:
+        return 0.0
+    return fx * _HAND_SPAN_M / span_px
+
+
+def wrist_board_position(u_px, v_px, depth_m, K, dist, R_world_cam, t_cam_world):
+    """Metric 3D wrist position in the fixed ChArUco board (world) frame.
+
+    Back-projects the wrist PIXEL through the camera intrinsics at the estimated
+    depth to a camera-frame point, then applies the (verified) extrinsic inverse
+    to express it in board coordinates:
+
+        p_cam   = [x_n*Z, y_n*Z, Z]          (x_n,y_n = undistorted normalised)
+        p_board = R_world_cam @ (p_cam - t_cam_world)
+
+    Depth Z is AXIAL (along the optical axis), matching estimate_wrist_depth's
+    Z = fx*S/px — so the ray is NOT unit-normalised before scaling by depth.
+    Returns a (3,) array in metres, board frame.
+    """
+    und = cv2.undistortPoints(np.array([[[u_px, v_px]]], dtype=float), K, dist)
+    x_n, y_n = float(und[0, 0, 0]), float(und[0, 0, 1])
+    p_cam = np.array([x_n * depth_m, y_n * depth_m, depth_m])
+    return R_world_cam @ (p_cam - t_cam_world)
+
+
+# ChArUco board geometry — must match the printed board (README: 5x7,
+# DICT_5X5_100, 0.75 marker ratio, measured 45 mm square).
+_BOARD_SQUARES = (5, 7)
+_BOARD_SQUARE_M = 0.045
+_BOARD_MARKER_RATIO = 0.75
+
+
+def _make_charuco_detector():
+    """Build the ChArUco detector for on-demand board re-calibration."""
+    d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
+    board = cv2.aruco.CharucoBoard(
+        _BOARD_SQUARES, _BOARD_SQUARE_M,
+        _BOARD_SQUARE_M * _BOARD_MARKER_RATIO, d)
+    return board, cv2.aruco.CharucoDetector(board)
+
+
+def recalibrate_board(frame, board, detector, K, dist, extr_path):
+    """Re-solve the board pose from the CURRENT frame (on-demand, key 'B').
+
+    Fixed-rig re-calibration without leaving the teleop session: detect the
+    board, solvePnP, and return fresh (R_world_cam_corrected, t_cam_world) with
+    the Z-up remap already applied — plus persist raw extrinsics to disk so the
+    next launch uses them. Returns None (pose unchanged) if the board isn't found.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    cc, ci, _, _ = detector.detectBoard(gray)
+    if ci is None or len(ci) < 6:
+        print(f"[recalib] board not detected ({0 if ci is None else len(ci)} corners) — pose unchanged.")
+        return None
+    obj_pts, img_pts = board.matchImagePoints(cc, ci)
+    ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist)
+    if not ok:
+        print("[recalib] solvePnP failed — pose unchanged.")
+        return None
+    R_cam_world, _ = cv2.Rodrigues(rvec)
+    R_world_cam_raw = R_cam_world.T
+    t_cam_world = tvec.ravel()
+    # Persist raw extrinsics (same schema as charuco_calibration.py) so a restart
+    # loads this pose; the Z-up remap is re-applied on load and here.
+    import json as _json
+    with open(extr_path, "w") as f:
+        _json.dump({
+            "R_cam_world": R_cam_world.tolist(),
+            "t_cam_world": t_cam_world.tolist(),
+            "R_world_cam": R_world_cam_raw.tolist(),
+            "camera_pos_in_world": (-R_cam_world.T @ t_cam_world).tolist(),
+            "board_distance_m": float(np.linalg.norm(t_cam_world)),
+        }, f, indent=2)
+    print(f"[recalib] board re-solved & saved ({len(ci)} corners, "
+          f"dist {np.linalg.norm(t_cam_world)*100:.1f} cm).")
+    return _WORLD_FROM_BOARD @ R_world_cam_raw, t_cam_world
+
+
 # --- Visualization ---
 
+def draw_board_axes(image, K, dist, R_cam_world, t_cam_world, axis_len=0.05):
+    """Overlay the FIXED ChArUco board world frame (X=red, Y=green, Z=blue).
+
+    drawFrameAxes needs the FORWARD extrinsic (board->camera): rvec from
+    R_cam_world, tvec = t_cam_world. The axes stay glued to the board origin,
+    perspective-correct, and serve as a live check that the calibration is valid.
+    """
+    rvec, _ = cv2.Rodrigues(R_cam_world)
+    cv2.drawFrameAxes(image, K, dist, rvec, t_cam_world.reshape(3, 1), axis_len)
+
+
+def draw_palm_frame(image, wrist_px, palm_R, length_px=40):
+    """Overlay the MOVING palm frame as short 2D segments from the wrist pixel.
+
+    palm_R columns are the palm-frame axes; we draw their image-plane (x,y)
+    components from the wrist pixel. Depth-free and always available (no
+    calibration needed). Colours match draw_board_axes: X=red, Y=green, Z=blue.
+    """
+    ox, oy = int(wrist_px[0]), int(wrist_px[1])
+    colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR: X,Y,Z
+    for i, c in enumerate(colors):
+        ax = palm_R[:, i]
+        ex = int(ox + ax[0] * length_px)
+        ey = int(oy + ax[1] * length_px)
+        cv2.line(image, (ox, oy), (ex, ey), c, 2)
+
+
 def draw_landmarks(image, hand_landmarks, handedness):
-    
+
+    # The Tasks API returns a plain list of landmarks, but mp.solutions'
+    # draw_landmarks expects a NormalizedLandmarkList proto (with .landmark).
+    # Convert before drawing.
+    proto = landmark_pb2.NormalizedLandmarkList()
+    proto.landmark.extend([
+        landmark_pb2.NormalizedLandmark(x=lm.x, y=lm.y, z=lm.z)
+        for lm in hand_landmarks
+    ])
+
     # Draw the hand landmarks.
     mp_drawing.draw_landmarks(
       image,
-      hand_landmarks,
+      proto,
       mp_hands.HAND_CONNECTIONS,
       mp_drawing_styles.get_default_hand_landmarks_style(),
       mp_drawing_styles.get_default_hand_connections_style())
@@ -523,6 +671,48 @@ def main():
         return
     print(f"[INFO] Camera {camera_index} opened.")
 
+    # Load calibrated camera model for monocular depth AND absolute board-frame
+    # wrist positioning. fx alone drives depth-from-hand-size; the full K + dist
+    # + extrinsics (R_world_cam, t_cam_world) let us back-project the wrist pixel
+    # into the fixed ChArUco board frame (see wrist_board_position). If intrinsics
+    # are missing we fall back to an fx guess (depth-as-delta only); if extrinsics
+    # are missing we publish legacy normalised wrist coords (delta teleop).
+    import json as _json
+    _calib_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "calibration")
+    _intr_path = os.path.join(_calib_dir, "camera_intrinsics.json")
+    _extr_path = os.path.join(_calib_dir, "camera_extrinsics.json")
+    _K = _dist = _R_world_cam = _t_cam_world = None
+    _calib_ok = False   # True only when BOTH intrinsics + extrinsics loaded
+    try:
+        with open(_intr_path) as _f:
+            _intr = _json.load(_f)
+        _K = np.array(_intr["camera_matrix"], dtype=float)
+        _dist = np.array(_intr["dist_coeffs"], dtype=float)
+        _fx = float(_K[0, 0])
+        print(f"[INFO] loaded fx={_fx:.1f} for depth estimation.")
+        with open(_extr_path) as _f:
+            _extr = _json.load(_f)
+        # Fold the board->world remap into the extrinsic so the published frame
+        # is Z-up (MuJoCo-consistent). _R_world_cam then maps cam -> WORLD axes.
+        _R_world_cam = _WORLD_FROM_BOARD @ np.array(_extr["R_world_cam"], dtype=float)
+        _t_cam_world = np.array(_extr["t_cam_world"], dtype=float)
+        _calib_ok = True
+        print("[INFO] loaded extrinsics — publishing ABSOLUTE Z-up world-frame wrist (metres).")
+    except (FileNotFoundError, KeyError) as _e:
+        if _K is None:
+            _fx = 600.0
+            print("[INFO] no intrinsics; using fx guess for depth (delta-only).")
+        else:
+            print("[INFO] no extrinsics; publishing LEGACY normalised wrist (delta teleop).")
+
+    # ChArUco detector for on-demand board re-calibration (key 'B'). Needs
+    # intrinsics; re-solving updates the world frame live without a restart.
+    _board = _charuco_det = None
+    if _K is not None:
+        _board, _charuco_det = _make_charuco_detector()
+        print("[INFO] press 'B' to re-solve the board pose (re-calibrate the world frame).")
+
     # One Euro Filters — applied per-channel before publishing.
     # Wrist: [x, y, z, yaw, pitch, roll]  (image-space position + orientation)
     # Flexion: [idx_mcp, idx_pip, idx_dip, thumb_spread, thumb_ip, thumb_ip*0.5]
@@ -533,7 +723,15 @@ def main():
     #
     # Wrist gets slightly higher beta so base motion feels responsive.
     # Flexion gets a lower min_cutoff for heavier smoothing of finger jitter.
-    filter_wrist    = OneEuroFilterArray(6,  freq=30.0, min_cutoff=1.0, beta=0.3)
+    #
+    # In ABSOLUTE mode the wrist x/y/z are metric board coords (~0.1-0.5 m), not
+    # normalised [0,1], and the metric depth is noisy — so smooth harder (lower
+    # min_cutoff) to keep absolute position from jittering. Euler channels are
+    # degrees in both modes; a low cutoff is fine for them too.
+    if _calib_ok:
+        filter_wrist = OneEuroFilterArray(6, freq=30.0, min_cutoff=0.5, beta=0.15)
+    else:
+        filter_wrist = OneEuroFilterArray(6, freq=30.0, min_cutoff=1.0, beta=0.3)
     filter_flexion  = OneEuroFilterArray(6,  freq=30.0, min_cutoff=1.5, beta=0.2)
     filter_world_lm = OneEuroFilterArray(63, freq=30.0, min_cutoff=1.5, beta=0.2)
     last_frame = None
@@ -564,6 +762,11 @@ def main():
                 annotated = frame.copy() # Work on BGR for display
                 hand_data = []
 
+                # Fixed ChArUco board world axes (verifies calibration validity).
+                if _calib_ok:
+                    draw_board_axes(annotated, _K, _dist,
+                                    _R_world_cam.T, _t_cam_world)
+
                 if result.hand_landmarks:
                     # Pick the closest hand: largest bounding box in image space.
                     # Draw all detected hands so the operator can see what's tracked,
@@ -591,7 +794,31 @@ def main():
 
                     angles = get_euler_angles(world_lm)
                     wrist_pos, wrist_euler = get_wrist_pose(hand_landmarks)
+                    wrist_pos = np.array(wrist_pos, dtype=float)
+
+                    # Monocular depth from apparent hand size (metres).
+                    depth_m = estimate_wrist_depth(
+                        hand_landmarks, _fx, frame.shape[1])
+                    fh, fw = frame.shape[0], frame.shape[1]
+                    u_px = hand_landmarks[0].x * fw
+                    v_px = hand_landmarks[0].y * fh
+
+                    if _calib_ok:
+                        # ABSOLUTE mode: publish the metric wrist position in the
+                        # fixed board frame (metres), so the consumer can anchor
+                        # the robot absolutely instead of on image deltas.
+                        wrist_pos = wrist_board_position(
+                            u_px, v_px, depth_m, _K, _dist,
+                            _R_world_cam, _t_cam_world)
+                    else:
+                        # LEGACY: normalised image x,y + monocular depth in z.
+                        wrist_pos[2] = depth_m
                     flexion = get_flexion_angles(world_lm)
+
+                    # Moving palm frame overlay (2D, from the wrist pixel).
+                    _pts = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
+                    _palm_R = compute_local_frame(_pts[0], _pts[5], _pts[17])
+                    draw_palm_frame(annotated, (u_px, v_px), _palm_R)
 
                     # Apply One Euro Filter before publishing.
                     # t is wall-clock seconds — used to adapt the filter's
@@ -653,6 +880,17 @@ def main():
                     trigger_calibration()
                 elif key == ord("d"):
                     show_debug = not show_debug
+                elif key == ord("b"):
+                    # On-demand board re-calibration (fixed rig, no restart).
+                    if _charuco_det is not None:
+                        _res = recalibrate_board(frame, _board, _charuco_det,
+                                                 _K, _dist, _extr_path)
+                        if _res is not None:
+                            _R_world_cam, _t_cam_world = _res
+                            _calib_ok = True
+                            print("[recalib] world frame updated live.")
+                    else:
+                        print("[recalib] no intrinsics loaded — cannot re-solve board.")
                 elif key == 32:  # SPACE
                     if DEBUG_FLAG and last_frame is not None and last_hand_data:
                         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
