@@ -116,6 +116,25 @@ def _make_detectors(board, aruco_dict):
     return aruco_detector, charuco_detector
 
 
+def _make_window(name: str) -> None:
+    """Create the display window up-front and force it in front of other apps.
+
+    Without this the imshow window can open BEHIND the editor/terminal, so you
+    never see the feed and (worse) end up typing SPACE/C/Q into the terminal
+    where they do nothing — the keys only register when this window has focus.
+    """
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(name, 1280, 720)
+    cv2.moveWindow(name, 60, 60)
+    # WND_PROP_TOPMOST raises it above other windows on WMs that honor it.
+    try:
+        cv2.setWindowProperty(name, cv2.WND_PROP_TOPMOST, 1.0)
+    except Exception:
+        pass  # older/limited builds — window still opens, just not forced top
+    print(f"[window] opened '{name}'. If you don't see it, Alt-Tab to it and "
+          f"CLICK it so it has focus before pressing keys.")
+
+
 # ----------------------------------------------------------------------------
 # intrinsics
 # ----------------------------------------------------------------------------
@@ -125,6 +144,8 @@ def cmd_intrinsics(args: argparse.Namespace) -> None:
     _, charuco_detector = _make_detectors(board, aruco_dict)
 
     cap = _open_camera(args.camera, args.width, args.height)
+    win = "intrinsics — SPACE capture, C calibrate, Q quit"
+    _make_window(win)
     print("[intrinsics] SPACE = capture a view, C = calibrate, Q = quit.")
     print(f"[intrinsics] Collect {args.min_views}+ views: vary angle, tilt, distance.")
     print("[intrinsics] Fill the frame edges/corners across the set for good distortion.")
@@ -149,7 +170,7 @@ def cmd_intrinsics(args: argparse.Namespace) -> None:
             cv2.aruco.drawDetectedCornersCharuco(vis, charuco_corners, charuco_ids)
         cv2.putText(vis, f"views: {len(all_corners)}  corners now: {n_det}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.imshow("intrinsics — SPACE capture, C calibrate, Q quit", vis)
+        cv2.imshow(win, vis)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
@@ -225,6 +246,8 @@ def cmd_extrinsics(args: argparse.Namespace) -> None:
     _, charuco_detector = _make_detectors(board, aruco_dict)
 
     cap = _open_camera(args.camera, args.width, args.height)
+    win = "extrinsics — SPACE solve, Q quit"
+    _make_window(win)
     print("[extrinsics] Fix the board at the desired WORLD ORIGIN, facing the camera.")
     print(f"[extrinsics] SPACE = average {args.n_avg} frames & solve, Q = quit.")
 
@@ -247,7 +270,7 @@ def cmd_extrinsics(args: argparse.Namespace) -> None:
                                   rvec, tvec, square_m * 2)
         cv2.putText(vis, f"corners: {n_det}  (need >=6, SPACE to solve)",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.imshow("extrinsics — SPACE solve, Q quit", vis)
+        cv2.imshow(win, vis)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):

@@ -94,8 +94,10 @@ def main() -> None:
                    help="MEASURED printed square size in mm")
     p.add_argument("--intrinsics", default=DEFAULT_INTRINSICS)
     p.add_argument("--out", default=DEFAULT_EXTRINSICS)
-    p.add_argument("--width", type=int, default=1280)
-    p.add_argument("--height", type=int, default=720)
+    # Default 640x480 to match a typical intrinsics calibration resolution;
+    # override to whatever resolution camera_intrinsics.json was captured at.
+    p.add_argument("--width", type=int, default=640)
+    p.add_argument("--height", type=int, default=480)
     p.add_argument("--window", type=int, default=30,
                    help="rolling window (frames) for jitter stats")
     args = p.parse_args()
@@ -110,6 +112,18 @@ def main() -> None:
         sys.exit(f"ERROR: cannot open camera {args.camera}")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+
+    win = "assess extrinsics — Q quit, S save"
+    # Open the window up-front and force it topmost — otherwise imshow can hide
+    # behind the editor/terminal and keys get typed into the wrong window.
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, args.width, args.height)
+    cv2.moveWindow(win, 60, 60)
+    try:
+        cv2.setWindowProperty(win, cv2.WND_PROP_TOPMOST, 1.0)
+    except Exception:
+        pass
+    print("[assess] window opened; if hidden, Alt-Tab to it and CLICK for focus.")
 
     print(f"[assess] intrinsics loaded (calib RMS={intr_rms}) ; square={args.square_mm} mm")
     print("[assess] Fix the board where you want WORLD ORIGIN, facing the camera.")
@@ -166,7 +180,7 @@ def main() -> None:
                         0.7, (0, 255, 0), 2)
             y += 30
 
-        cv2.imshow("assess extrinsics — Q quit, S save", vis)
+        cv2.imshow(win, vis)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break

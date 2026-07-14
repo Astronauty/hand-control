@@ -21,9 +21,11 @@ import mediapipe as mp
 from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarker
 from geometry_msgs.msg import PoseStamped
 
-mp_hands = mp.tasks.vision.HandLandmarksConnections
-mp_drawing = mp.tasks.vision.drawing_utils
-mp_drawing_styles = mp.tasks.vision.drawing_styles
+# drawing_utils / drawing_styles live under mp.solutions (not mp.tasks.vision).
+# draw_landmarks() expects the solutions HAND_CONNECTIONS frozenset format.
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
 
 # --- Configuration & Constants ---
 MARGIN = 10
