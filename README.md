@@ -126,6 +126,28 @@ python internal_force_control.py
 
 ---
 
+## Camera calibration (ChArUco board)
+
+Generate a printable ChArUco calibration board PNG (5×7 squares, 35 mm nominal, sized for letter paper):
+
+```bash
+python calibration/charuco_calibration.py generate
+```
+
+Writes `calibration/board.png` (~7.2 × 9.9 in at 300 DPI). Options: `--square-mm` (nominal square size, default 35), `--dpi` (default 300), `--out`.
+
+Printing:
+1. Print at **100% / Actual size** — never "fit to page", which silently rescales and invalidates the metric calibration. Note the raw PNG has no DPI metadata, so viewers that assume 96 DPI will size it wrong; if your viewer misbehaves, place the image on a letter-size 300 DPI canvas first or print from an application that lets you set the scale explicitly.
+2. Glue or tape the print completely flat to something rigid (foam board, clipboard).
+3. Measure one black square edge with calipers — printers drift a few percent — and pass the **measured** value as `--square-mm` to the calibration steps:
+
+```bash
+python calibration/charuco_calibration.py intrinsics --camera 1 --square-mm 34.8
+python calibration/charuco_calibration.py extrinsics --camera 1 --square-mm 34.8
+```
+
+---
+
 ## MediaPipe publisher (standalone)
 
 ```bash
