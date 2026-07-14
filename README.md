@@ -1,11 +1,15 @@
 ## Installation
 
-Install and source the UV environment:
+This project uses [uv](https://docs.astral.sh/uv/). Create and sync the environment:
 ```bash
-conda create -f environment.yml
-conda activate hand-control
-source .venv/bin/activate
+uv sync
 ```
+
+Run any script through uv (no manual activation needed):
+```bash
+uv run python kinova_leap_pick_place.py
+```
+Or activate the venv directly: `source .venv/bin/activate`.
 
 Pull MuJoCo Menagerie submodule models:
 ```bash
