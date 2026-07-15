@@ -182,12 +182,13 @@ class DexPilotArmController:
         # which ignored roll about the axis — the reason wrist roll didn't
         # register). Delta-based off the press-8 reference either way.
         self._full_orientation = full_orientation
-        # Constant palm->pinch_site convention offset for ABSOLUTE orientation.
-        # The MediaPipe palm frame (X=along-hand, Z=palm-normal) and the robot
-        # pinch_site frame use different axis roles; R_align (right-multiplied on
-        # palm_R) reconciles them. Default identity — tune live by watching the
-        # target vs pinch_site triads until 'palm flat' maps to the intended pose.
-        self._R_align = np.eye(3) if R_align is None else np.asarray(R_align, float)
+        # Constant world-side correction R_des = R_correct @ R_mp_to_robot @ palm_R.
+        # Reset to IDENTITY now that the MediaPipe left-handedness is fixed at the
+        # source (see human_palm_frame_robot_aligned) — the earlier measured
+        # R_correct was compensating for that broken frame and is no longer valid.
+        # Re-measure with teleop/diagnose_frame.py 'c' if a residual board-yaw
+        # offset remains, and pass R_align= to set it.
+        self._R_correct = np.eye(3) if R_align is None else np.asarray(R_align, float)
         self._R_cam_robot = R_cam_robot
 
         self._site_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, palm_site)
@@ -211,6 +212,11 @@ class DexPilotArmController:
         self._q_arm_prev: np.ndarray | None = None
         self._cam_home:   np.ndarray | None = None   # first received camera wrist xy
         self._board_ref:  np.ndarray | None = None   # hand board-pos at press-8 (absolute mode)
+        # When True, the next step() captures R_correct so the hand's CURRENT
+        # orientation maps to the robot's home wrist (auto-calibrate at press-8).
+        self._orient_calib_pending = False
+        self._last_raw: np.ndarray | None = None   # R_mp_to_robot @ palm_R (uncorrected)
+        self._calib_pairs: list = []               # (raw_i, R_site_i) for multi-pose solve
         self._home_site:  np.ndarray | None = None   # pinch_site world pos at startup
         self._palm_R_home: np.ndarray | None = None  # human palm frame (robot world) at startup
         self._axis_home:   np.ndarray | None = None  # pinch_site approach axis (world) at startup
@@ -316,43 +322,38 @@ class DexPilotArmController:
         if self._home_site is None:
             self.init_home(data)
 
-        # PRESS-8 SNAPSHOT of the human palm frame. Used ONLY for the orientation
-        # alignment (R_align) below — position uses a fixed world->robot rotation
-        # (_Rwb) and must stay independent of hand orientation, so palm_R_home is
-        # deliberately NOT mixed into the translation mapping anymore.
-        if (palm_R is not None and self._palm_R_home is None
-                and self._R_site_home is not None):
-            self._palm_R_home = palm_R.copy()
-            # Capture R_align so the ABSOLUTE orientation target equals the
-            # robot's current wrist pose at press-8 (no jump), while remaining
-            # absolute afterwards. Solve R_des(palm_R_home)=R_site_home for
-            # R_align in R_des = R_mp_to_robot @ palm_R @ R_align:
-            #   R_align = palm_R_home^T @ R_mp_to_robot^T @ R_site_home
-            if self._R_cam_robot is not None:
-                R_mp_to_cv = np.diag([1.0, -1.0, -1.0])
-                R_mp_to_robot = self._R_cam_robot @ R_mp_to_cv
-                self._R_align = (self._palm_R_home.T @ R_mp_to_robot.T
-                                 @ self._R_site_home)
-
         pos_target = self._camera_to_world(cam_wrist)
 
-        # ABSOLUTE orientation: the robot wrist mirrors the hand's ACTUAL
-        # orientation in the world, not a delta from a home pose. palm_R is in
-        # MediaPipe world axes (x-right, y-up, z-toward-cam); map it to robot
-        # world axes:
-        #   R_mp_to_robot = R_cam_robot @ R_mp_to_cv
-        # where R_mp_to_cv=diag([1,-1,-1]) converts MediaPipe-world -> OpenCV-cam
-        # (the frame R_cam_robot=WORLD_FROM_BOARD@R_world_cam expects). R_align is
-        # a constant palm->pinch_site convention offset (default identity; tune
-        # live so 'palm flat' maps to the intended wrist pose).
-        #   R_des = R_mp_to_robot @ palm_R @ R_align
-        # No home anchor -> the wrist snaps to match the hand orientation at
-        # press-8 (accepted; makes the MuJoCo target actually mirror the cam hand).
+        # ABSOLUTE orientation, DIRECT (no press-8 offset). palm_R here is the
+        # ROBOT-ALIGNED palm frame (human_palm_frame_robot_aligned): its axis
+        # roles match pinch_site (X=palm-normal, Y=toward-thumb, Z=along-fingers),
+        # so an identical physical orientation gives an identical matrix. We only
+        # need to bring it from MediaPipe world axes into robot world axes:
+        #   R_des = R_mp_to_robot @ palm_R,   R_mp_to_robot = R_cam_robot @ R_mp_to_cv
+        # R_mp_to_cv=diag([1,-1,-1]) converts MediaPipe-world (x-right,y-up,
+        # z-toward-cam) -> OpenCV-cam, the frame R_cam_robot expects. No R_align,
+        # no home anchor: palm-down -> wrist-down by construction. Wrist snaps to
+        # match the hand orientation when tracking starts (accepted).
         orientation = None
         if palm_R is not None and self._R_cam_robot is not None:
             R_mp_to_cv = np.diag([1.0, -1.0, -1.0])
             R_mp_to_robot = self._R_cam_robot @ R_mp_to_cv
-            R_des = R_mp_to_robot @ palm_R @ self._R_align
+            raw = R_mp_to_robot @ palm_R
+            # AUTO-CALIBRATE at press-8: on the first tracked frame, define the
+            # constant correction so the operator's CURRENT hand orientation maps
+            # to the robot's HOME wrist orientation. Because palm_R tracks the hand
+            # rigidly (verified), this one alignment is correct for ALL later
+            # poses — and it avoids the circular "match the moving wrist" problem
+            # (the home frame is fixed, not chasing the hand).
+            if self._orient_calib_pending and self._R_site_home is not None:
+                self._R_correct = self._R_site_home @ raw.T
+                self._orient_calib_pending = False
+                print("[arm] orientation auto-calibrated at press-8 "
+                      "(current hand pose -> robot home wrist).")
+            # Store the UNCORRECTED mapping for multi-pose calibration.
+            self._last_raw = raw.copy()
+            # R_des = R_correct @ (R_mp_to_robot @ palm_R)
+            R_des = self._R_correct @ raw
 
             if self._full_orientation:
                 orientation = R_des
@@ -401,6 +402,83 @@ class DexPilotArmController:
             return None
         R = self._tgt_R if self._tgt_R is not None else np.eye(3)
         return self._tgt_pos, R
+
+    def request_orientation_calib(self) -> None:
+        """Arm the auto-calibration: the next tracked frame maps the operator's
+        current hand orientation to the robot's home wrist. Called from press-8
+        so calibration happens against the FIXED home frame (not the live wrist,
+        which would chase the hand)."""
+        self._orient_calib_pending = True
+
+    def calibrate_orientation(self, data: mj.MjData) -> None:
+        """Capture the constant orientation correction by aligning the current
+        target to the robot's ACTUAL wrist orientation.
+
+        Call while the operator holds their hand to visually MATCH the robot's
+        current pinch_site orientation. We solve for R_correct so that the
+        current mapped target equals the real wrist frame:
+            R_correct_new @ (R_mp_to_robot @ palm_R) = R_site_current
+        Since the current target is R_des = R_correct_old @ R_mp_to_robot @ palm_R,
+        we get R_correct_new = R_site_current @ (R_mp_to_robot @ palm_R)^T
+                             = R_site_current @ (R_correct_old^T @ R_des)^T. Using
+        the stored R_des (self._tgt_R) directly:
+            raw = R_correct_old^T @ R_des      (= R_mp_to_robot @ palm_R)
+            R_correct_new = R_site_current @ raw^T
+        Because palm_R tracks the hand RIGIDLY, this single alignment makes the
+        target match the wrist for ALL subsequent poses.
+        """
+        if self._tgt_R is None:
+            print("[arm] calibrate_orientation: no target yet. Press 8 to START "
+                  "tracking first (the target only updates while tracking is "
+                  "active), then hold your hand to match the wrist and press 9.")
+            return
+        mj.mj_forward(self._model, data)
+        R_site = data.site_xmat[self._site_id].reshape(3, 3).copy()
+        raw = self._R_correct.T @ self._tgt_R          # R_mp_to_robot @ palm_R
+        self._R_correct = R_site @ raw.T
+        print("[arm] orientation calibrated to current wrist. R_correct =")
+        print(np.array2string(self._R_correct, precision=4))
+
+    # -- Multi-pose orientation calibration --------------------------------
+    # Solves the FULL rotation mapping M (not just the home) from several
+    # (hand, wrist) pairs: hold your hand to match the robot at each posed
+    # orientation, capture, then solve M with M @ raw_i = R_site_i for all i.
+    # This fixes wrong RELATIVE rotations that a single home-alignment can't.
+
+    def capture_calib_pose(self, data: mj.MjData) -> int:
+        """Record one (uncorrected-mapping, actual-wrist) pair. Returns count."""
+        if self._last_raw is None:
+            print("[arm] capture: no hand mapping yet — is a hand tracked?")
+            return len(self._calib_pairs)
+        mj.mj_forward(self._model, data)
+        R_site = data.site_xmat[self._site_id].reshape(3, 3).copy()
+        self._calib_pairs.append((self._last_raw.copy(), R_site))
+        print(f"[arm] captured calibration pose {len(self._calib_pairs)} "
+              f"(hand matched to current wrist).")
+        return len(self._calib_pairs)
+
+    def solve_calib(self) -> None:
+        """Solve R_correct from all captured pairs (least-squares, orthonormalised).
+        Needs >=2 poses; more poses -> better full-rotation fit."""
+        if len(self._calib_pairs) < 2:
+            print(f"[arm] solve: need >=2 poses, have {len(self._calib_pairs)}.")
+            return
+        A_raw = np.hstack([p[0] for p in self._calib_pairs])   # 3 x 3N
+        A_site = np.hstack([p[1] for p in self._calib_pairs])
+        M = A_site @ np.linalg.pinv(A_raw)
+        U, _, Vt = np.linalg.svd(M)
+        self._R_correct = U @ Vt                                # nearest rotation
+        det = float(np.linalg.det(self._R_correct))
+        print(f"[arm] SOLVED R_correct from {len(self._calib_pairs)} poses "
+              f"(det={det:+.2f}). Residuals:")
+        for i, (raw, site) in enumerate(self._calib_pairs):
+            err = float(np.linalg.norm(self._R_correct @ raw - site))
+            print(f"       pose {i+1}: {err:.3f}")
+        print(np.array2string(self._R_correct, precision=4))
+
+    def clear_calib(self) -> None:
+        self._calib_pairs = []
+        print("[arm] cleared captured calibration poses.")
 
     def reset(self) -> None:
         """Reset delta-tracking state (e.g., when hand tracking is lost).

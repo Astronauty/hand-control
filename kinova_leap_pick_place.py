@@ -206,6 +206,12 @@ def make_key_callback(key_queue):
         54:  'ik_vis',  # 6 — cycle IK config visualization
         55:  'bspheres', # 7 — toggle IK collision bounding-sphere overlay
         56:  'teleop_start', # 8 — (dexpilot) start/re-zero tracking at current pose
+        57:  'calib_orient', # 9 — (dexpilot) hold hand to match robot wrist, capture
+                             #     the constant orientation correction
+        # Multi-pose orientation calibration (dexpilot):
+        77:  'calib_next',   # M — pose the robot to the next calibration orientation
+        67:  'calib_capture', # C — capture (hand matched to current wrist)
+        86:  'calib_solve',  # V — solve the full rotation correction from captures
         259: 'reset',   # Backspace — deliberately shadows the viewer's built-in Reset:
                         # the viewer already mj_resetData'd the shared data from its own
                         # thread; this event lets the control loop re-home its state
@@ -1073,9 +1079,40 @@ if __name__ == "__main__":
             _cam_kwargs = {"R_cam_robot": np.eye(3), "absolute": False}
             print("[DexPilot] no camera calibration found — using identity "
                   "R_cam_robot, DELTA positioning. Run calibration/charuco_calibration.py.")
-        _dexpilot_ctrl = DexPilotController(model, q_bias=Q_BIAS,
+        # Palm-DOWN home for teleop: pinch_site palm NORMAL (+X) points down
+        # (world -Z) and FINGERS (+Z) point FORWARD (world +X) — palm flat over
+        # the table, fingers reaching away. Natural neutral (hold your palm down,
+        # fingers forward, press 8). Solved via IK (pinch_site at ~(0.55,0,0.4)):
+        # normal = world -Z, fingers = world +X; manip ~0.05, within joint limits.
+        _HOME_WRIST_DOWN = np.array([-0.283, 0.509, 3.534, -2.036,
+                                     0.076, 0.955, 2.91])
+
+        # Multi-pose orientation calibration: 4 distinct, IK-solved wrist
+        # orientations (all reachable, within limits). During calibration (key M)
+        # the robot is held at one of these while you match your hand and press C;
+        # V solves the full rotation mapping. Fixes wrong RELATIVE rotations that
+        # single-point (press-8) alignment can't. Orientations:
+        #   1 palm-down fingers-fwd  2 palm-fwd fingers-up
+        #   3 palm-left fingers-fwd  4 palm-down fingers-left
+        _CALIB_POSES = [
+            np.array([-0.271, 0.427, 3.5,  -2.193, 0.066, 1.034, 2.961]),
+            np.array([ 0.564, 1.348, 2.089,-1.634, 1.35,  2.09,  0.952]),
+            np.array([ 0.001, 0.417, 3.146,-2.183, 0.005, 1.029, 1.566]),
+            np.array([ 0.161, 0.742, 3.418,-1.519, 1.667, 1.969, 2.296]),
+        ]
+        _calib_mode = False
+        _calib_idx = -1
+        data.qpos[:7] = _HOME_WRIST_DOWN
+        data.qvel[:N_ROBOT] = 0.0
+        mj.mj_forward(model, data)
+
+        # Bias the arm IK toward the wrist-down home too, so the null-space pull
+        # matches the new neutral (Q_BIAS still points at the old forward reach).
+        _Q_BIAS_DP = Q_BIAS.copy()
+        _Q_BIAS_DP[:7] = _HOME_WRIST_DOWN
+        _dexpilot_ctrl = DexPilotController(model, q_bias=_Q_BIAS_DP,
             debug=True, eps=0.005, **_cam_kwargs)
-        _dexpilot_ctrl.init_home(data)
+        _dexpilot_ctrl.init_home(data)   # snapshots the wrist-down pose as home
         _dexpilot_ctrl.init_ros()
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")
         print("[DexPilot] Press 8 to start tracking (captures your current wrist "
@@ -1251,13 +1288,47 @@ if __name__ == "__main__":
                         _dexpilot_ctrl.start(data)
                         print("[dexpilot] tracking started — home pose captured "
                               "(hold your hand at the desired neutral orientation).")
+                    elif _k == 'calib_orient':
+                        # Hold hand to MATCH the robot wrist, then press 9 to
+                        # capture the constant orientation correction.
+                        _dexpilot_ctrl.calibrate_orientation(data)
+                    elif _k == 'calib_next':
+                        # Enter/advance multi-pose calibration: pose the robot to
+                        # the next fixed orientation and HOLD it (tracking paused)
+                        # so you can match your hand to it, then press C.
+                        _calib_mode = True
+                        _calib_idx = (_calib_idx + 1) % len(_CALIB_POSES)
+                        data.qpos[:7] = _CALIB_POSES[_calib_idx]
+                        data.qvel[:N_ROBOT] = 0.0
+                        mj.mj_forward(model, data)
+                        print(f"[dexpilot] calib pose {_calib_idx+1}/{len(_CALIB_POSES)} "
+                              f"— MATCH your hand to the wrist, then press C to capture "
+                              f"(M=next pose, V=solve).")
+                    elif _k == 'calib_capture':
+                        _dexpilot_ctrl.capture_calib_pose(data)
+                    elif _k == 'calib_solve':
+                        _dexpilot_ctrl.solve_calib()
+                        _calib_mode = False
+                        print("[dexpilot] calibration solved & applied. Resuming tracking.")
                 if not running:
                     continue
-                q_teleop = _dexpilot_ctrl.step(model, data)
-                if q_teleop is not None:
-                    data.qpos[:N_ROBOT] = q_teleop
+                # In calibration mode, HOLD the posed orientation (tracking paused)
+                # so the robot doesn't chase the hand while you match it.
+                if _calib_mode:
+                    data.qpos[:7] = _CALIB_POSES[_calib_idx]
                     data.qvel[:N_ROBOT] = 0.0
                     mj.mj_forward(model, data)
+                    # Still run step() so _last_raw (hand mapping) updates for capture,
+                    # but discard its qpos output.
+                    _dexpilot_ctrl.step(model, data)
+                    data.qpos[:7] = _CALIB_POSES[_calib_idx]
+                    mj.mj_forward(model, data)
+                else:
+                    q_teleop = _dexpilot_ctrl.step(model, data)
+                    if q_teleop is not None:
+                        data.qpos[:N_ROBOT] = q_teleop
+                        data.qvel[:N_ROBOT] = 0.0
+                        mj.mj_forward(model, data)
                 # Visualise BOTH the IK target frame (thick, the pose the arm IK
                 # drives pinch_site toward) AND the robot's CURRENT pinch_site
                 # frame (thin). The GAP between them is the live IK error —
@@ -1281,12 +1352,18 @@ if __name__ == "__main__":
                                              arad, pos, pos + alen * Rm[:, _i])
                             scn.ngeom += 1
 
+                    _psid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'pinch_site')
+                    _wrist_pos = data.site_xpos[_psid].copy()
                     _tf = _dexpilot_ctrl.target_frame()
                     if _tf is not None:
-                        _draw_frame(_tf[0], _tf[1], 0.10, 0.007)   # target: thick, long
+                        # Target orientation drawn at the TARGET position (thick).
+                        _draw_frame(_tf[0], _tf[1], 0.10, 0.007)
+                        # ALSO draw the target ORIENTATION at the actual wrist
+                        # position (medium) so you can compare pure orientation
+                        # without the position offset making it look 'wrong'.
+                        _draw_frame(_wrist_pos, _tf[1], 0.08, 0.005)
                     # current pinch_site frame (thin, short)
-                    _psid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'pinch_site')
-                    _draw_frame(data.site_xpos[_psid].copy(),
+                    _draw_frame(_wrist_pos,
                                 data.site_xmat[_psid].reshape(3, 3).copy(),
                                 0.06, 0.004)
                 viewer.sync()

@@ -156,6 +156,38 @@ class DexPilotRetargeter:
 
         return np.column_stack([x, y, z]), origin
 
+    def human_palm_frame_robot_aligned(
+        self, lm: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Palm frame whose axis ROLES match the robot pinch_site frame, so that
+        an identical physical hand/wrist orientation yields an identical rotation
+        matrix — making the arm-orientation map an IDENTITY (no R_align / no
+        press-8 offset needed). Verified against the model: pinch_site +X = palm
+        normal (= thumb×fingers), +Y = toward thumb, +Z = along fingers.
+
+        This is SEPARATE from human_palm_frame() (used by the finger retargeting
+        cost, which needs the fingers-on-X convention) — do not merge them.
+
+        Columns of the returned world-from-palm rotation:
+          [:, 0]  X — palm normal  (thumb_dir × fingers, matching robot +X)
+          [:, 1]  Y — toward the thumb/index side (across the palm)
+          [:, 2]  Z — along the fingers (wrist → knuckle midpoint)
+
+        """
+        origin  = lm[self._LM_WRIST]
+        idx_mcp = lm[self._LM_IDX_MCP]
+        pky_mcp = lm[self._LM_PKY_MCP]
+
+        z = 0.5 * (idx_mcp + pky_mcp) - origin      # along fingers -> robot +Z
+        z /= np.linalg.norm(z) + 1e-9
+        thumb_dir = idx_mcp - pky_mcp               # pinky -> index (thumb side)
+        x = np.cross(thumb_dir, z)                  # palm normal = thumb × fingers
+        x /= np.linalg.norm(x) + 1e-9
+        y = np.cross(z, x)                          # toward thumb, completes RH
+        y /= np.linalg.norm(y) + 1e-9
+
+        return np.column_stack([x, y, z]), origin
+
     # ------------------------------------------------------------------
     # Vector lists
     # ------------------------------------------------------------------

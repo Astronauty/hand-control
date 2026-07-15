@@ -162,8 +162,23 @@ def compute_local_frame(origin, point_x, point_y):
     
     y_axis = np.cross(z_axis, x_axis)
     y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-10)
-    
+
     return np.column_stack([x_axis, y_axis, z_axis])
+
+
+def _palm_frame_robot_aligned(wrist, idx_mcp, pky_mcp):
+    """Palm frame whose axis ROLES match the robot pinch_site (and the arm
+    controller's human_palm_frame_robot_aligned): X=palm normal (thumb×fingers),
+    Y=toward thumb, Z=along fingers. Used ONLY for the overlay so the triad
+    colours are consistent with the MuJoCo target triad."""
+    z = 0.5 * (idx_mcp + pky_mcp) - wrist          # along fingers
+    z = z / (np.linalg.norm(z) + 1e-10)
+    thumb_dir = idx_mcp - pky_mcp
+    x = np.cross(thumb_dir, z)                      # palm normal
+    x = x / (np.linalg.norm(x) + 1e-10)
+    y = np.cross(z, x)                              # toward thumb
+    y = y / (np.linalg.norm(y) + 1e-10)
+    return np.column_stack([x, y, z])
 
 
 def get_euler_angles(hand_landmarks):
@@ -435,8 +450,11 @@ def draw_palm_frame(image, wrist_px, palm_R, length_px=40):
     """Overlay the MOVING palm frame as short 2D segments from the wrist pixel.
 
     palm_R columns are the palm-frame axes; we draw their image-plane (x,y)
-    components from the wrist pixel. Depth-free and always available (no
-    calibration needed). Colours match draw_board_axes: X=red, Y=green, Z=blue.
+    components from the wrist pixel. With the robot-aligned palm frame the colours
+    mean the SAME roles as the MuJoCo target triad:
+      red   = column 0 = palm normal
+      green = column 1 = toward thumb
+      blue  = column 2 = along fingers
     """
     ox, oy = int(wrist_px[0]), int(wrist_px[1])
     colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR: X,Y,Z
@@ -837,9 +855,12 @@ def main():
                         wrist_pos[2] = estimate_wrist_depth(hand_landmarks, _fx, fw)
                     flexion = get_flexion_angles(world_lm)
 
-                    # Moving palm frame overlay (2D, from the wrist pixel).
+                    # Moving palm frame overlay (2D). Build with the SAME axis
+                    # ROLES the arm controller uses (X=palm-normal, Y=toward-thumb,
+                    # Z=along-fingers) so the triad colours mean the same thing as
+                    # the MuJoCo target triad: red=normal, green=thumb, blue=fingers.
                     _pts = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
-                    _palm_R = compute_local_frame(_pts[0], _pts[5], _pts[17])
+                    _palm_R = _palm_frame_robot_aligned(_pts[0], _pts[5], _pts[17])
                     draw_palm_frame(annotated, (u_px, v_px), _palm_R)
 
                     # Apply One Euro Filter before publishing.

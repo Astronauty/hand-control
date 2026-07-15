@@ -113,6 +113,9 @@ class DexPilotController:
         """
         self._arm.init_home(data)   # re-capture robot home pos + approach axis
         self._arm.reset()           # clear cam_home + palm_R_home -> re-snap next frame
+        # Auto-calibrate orientation: the hand pose held at press-8 maps to the
+        # robot's home wrist. Fixes the circular "match the moving wrist" problem.
+        self._arm.request_orientation_calib()
         self._retarg.reset()
         self._q_hand_prev = None
         self._active = True
@@ -148,8 +151,11 @@ class DexPilotController:
         self._q_hand_prev = q_hand.copy()
 
         # --- Arm: position + palm-orientation tracking (7 DOF) ---
+        # Use the ROBOT-ALIGNED palm frame so an identical physical hand
+        # orientation maps to an identical robot wrist orientation (no press-8
+        # offset). Distinct from the finger-retargeting palm frame above.
         cam_wrist      = np.array(raw[0:3], dtype=float)
-        palm_R, _      = self._retarg.human_palm_frame(world_lm)  # (3,3) world-from-palm
+        palm_R, _      = self._retarg.human_palm_frame_robot_aligned(world_lm)
         q_arm          = self._arm.step(cam_wrist, data, palm_R=palm_R)
 
         return np.concatenate([q_arm, q_hand])
@@ -158,6 +164,22 @@ class DexPilotController:
         """Last IK target pose (pos, R) in world coords — the frame the arm IK
         drives pinch_site toward. Passthrough to the arm controller for viz."""
         return self._arm.target_frame()
+
+    def calibrate_orientation(self, data: mj.MjData) -> None:
+        """Capture the constant orientation correction against the robot's actual
+        wrist. Hold your hand to match the robot wrist, then call this."""
+        self._arm.calibrate_orientation(data)
+
+    def capture_calib_pose(self, data: mj.MjData) -> int:
+        """Multi-pose calib: record one (hand, wrist) pair."""
+        return self._arm.capture_calib_pose(data)
+
+    def solve_calib(self) -> None:
+        """Multi-pose calib: solve the full rotation correction from captures."""
+        self._arm.solve_calib()
+
+    def clear_calib(self) -> None:
+        self._arm.clear_calib()
 
     def reset(self) -> None:
         """Reset all transient state (call when hand tracking is lost)."""
