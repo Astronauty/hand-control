@@ -298,6 +298,20 @@ def _hand_bbox_area(hand_landmarks) -> float:
 # by measuring landmark-0 to landmark-9 on your own hand.
 _HAND_SPAN_M = 0.09
 
+# Which hand to track/publish. MediaPipe's handedness label ("Right"/"Left")
+# assumes a NON-mirrored image (this feed is not flipped). Set to "Left" to
+# track the left hand instead.
+_TRACK_HANDEDNESS = "Right"
+
+# Freeze the monocular depth in ABSOLUTE mode. estimate_wrist_depth() reads the
+# apparent hand SIZE, which shrinks when you ROTATE your wrist (foreshortening) —
+# misread as the hand moving in depth, so rotation caused the target to TRANSLATE.
+# Since depth scales the WHOLE back-projected ray, that also skewed board-X/Y.
+# Freezing depth to a constant makes the wrist position depend only on the (u,v)
+# pixel — stable under rotation. Cost: no toward/away control on the depth axis
+# (which was unreliable anyway). Set to None to restore live monocular depth.
+_FROZEN_DEPTH_M = 0.5
+
 # Board -> world axis remap. The camera looks DOWN at a flat board, so the board
 # normal (+Z) points DOWN into the table while MuJoCo world +Z is UP. This proper
 # rotation (det=+1) flips Y and Z so the published world frame is Z-up, matching
@@ -767,22 +781,29 @@ def main():
                     draw_board_axes(annotated, _K, _dist,
                                     _R_world_cam.T, _t_cam_world)
 
+                # Track the RIGHT hand only. Among right-handed detections, pick
+                # the closest (largest bounding box). The frame is NOT mirrored,
+                # so MediaPipe's handedness labels are trustworthy. best_i is None
+                # when no right hand is visible -> treated like "hand lost".
+                best_i = None
                 if result.hand_landmarks:
-                    # Pick the closest hand: largest bounding box in image space.
-                    # Draw all detected hands so the operator can see what's tracked,
-                    # but only publish and filter the selected one.
-                    best_i = max(
-                        range(len(result.hand_landmarks)),
-                        key=lambda i: _hand_bbox_area(result.hand_landmarks[i]),
-                    )
+                    def _label(i):
+                        return (result.handedness[i][0].category_name
+                                if i < len(result.handedness) else "?")
+
+                    _right_idxs = [i for i in range(len(result.hand_landmarks))
+                                   if _label(i) == _TRACK_HANDEDNESS]
+                    if _right_idxs:
+                        best_i = max(_right_idxs,
+                                     key=lambda i: _hand_bbox_area(result.hand_landmarks[i]))
 
                     for i, lm in enumerate(result.hand_landmarks):
-                        label = (result.handedness[i][0].category_name
-                                 if i < len(result.handedness) else "?")
+                        label = _label(i)
                         draw_landmarks(annotated, lm,
                                        label if i == best_i else f"{label} (ignored)")
 
-                    # --- Process only the closest hand ---
+                if best_i is not None:
+                    # --- Process only the selected right hand ---
                     hand_landmarks = result.hand_landmarks[best_i]
                     handedness = (result.handedness[best_i][0].category_name
                                   if best_i < len(result.handedness) else "Unknown")
@@ -796,23 +817,24 @@ def main():
                     wrist_pos, wrist_euler = get_wrist_pose(hand_landmarks)
                     wrist_pos = np.array(wrist_pos, dtype=float)
 
-                    # Monocular depth from apparent hand size (metres).
-                    depth_m = estimate_wrist_depth(
-                        hand_landmarks, _fx, frame.shape[1])
                     fh, fw = frame.shape[0], frame.shape[1]
                     u_px = hand_landmarks[0].x * fw
                     v_px = hand_landmarks[0].y * fh
 
                     if _calib_ok:
                         # ABSOLUTE mode: publish the metric wrist position in the
-                        # fixed board frame (metres), so the consumer can anchor
-                        # the robot absolutely instead of on image deltas.
+                        # fixed board frame (metres). Depth is FROZEN (see
+                        # _FROZEN_DEPTH_M) so wrist rotation — which changes
+                        # apparent hand size — no longer translates the target.
+                        # The wrist position then depends only on the (u,v) pixel.
+                        depth_m = (_FROZEN_DEPTH_M if _FROZEN_DEPTH_M is not None
+                                   else estimate_wrist_depth(hand_landmarks, _fx, fw))
                         wrist_pos = wrist_board_position(
                             u_px, v_px, depth_m, _K, _dist,
                             _R_world_cam, _t_cam_world)
                     else:
                         # LEGACY: normalised image x,y + monocular depth in z.
-                        wrist_pos[2] = depth_m
+                        wrist_pos[2] = estimate_wrist_depth(hand_landmarks, _fx, fw)
                     flexion = get_flexion_angles(world_lm)
 
                     # Moving palm frame overlay (2D, from the wrist pixel).

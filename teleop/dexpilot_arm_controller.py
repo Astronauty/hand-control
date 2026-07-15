@@ -215,7 +215,6 @@ class DexPilotArmController:
         self._palm_R_home: np.ndarray | None = None  # human palm frame (robot world) at startup
         self._axis_home:   np.ndarray | None = None  # pinch_site approach axis (world) at startup
         self._R_site_home: np.ndarray | None = None  # full pinch_site rotation (world) at startup
-        self._R_board_to_robot: np.ndarray | None = None  # press-8 board->robot frame map
         # Last IK target pose (world) — the frame the IK cost drives pinch_site
         # toward. Exposed via target_frame() for visualisation/debugging.
         self._tgt_pos:  np.ndarray | None = None
@@ -265,13 +264,14 @@ class DexPilotArmController:
             if self._board_ref is None:
                 self._board_ref = cam[:3].copy()   # hand board-pos at press-8
             delta_board = cam[:3] - self._board_ref
-            # Map the board-frame displacement into the robot frame via the
-            # press-8 correspondence (falls back to _Rwb until it's captured on
-            # the first oriented frame). This is what makes hand-forward ->
-            # robot-forward regardless of how the board is yawed on the table.
-            R_map = (self._R_board_to_robot
-                     if self._R_board_to_robot is not None else self._Rwb)
-            return self._home_site + self._abs_scale * (R_map @ delta_board)
+            # Map the board/world-frame displacement into the robot frame by a
+            # FIXED world->robot rotation (_Rwb, default identity for board ==
+            # robot world). This must NOT depend on the hand orientation — using
+            # R_board_to_robot (=R_site_home @ palm_R_home^T) here coupled the
+            # translation to how the palm was tilted at press-8, so the same
+            # real-world motion mapped to different robot directions ("bad
+            # real-vs-sim correlation"). Position and orientation are independent.
+            return self._home_site + self._abs_scale * (self._Rwb @ delta_board)
 
         # cam = [image_x, image_y, depth_m]; depth from monocular hand-size in
         # the publisher (raw[2]). Delta-based like x/y: only motion relative to
@@ -316,24 +316,13 @@ class DexPilotArmController:
         if self._home_site is None:
             self.init_home(data)
 
-        # PRESS-8 EMPIRICAL ALIGNMENT (camera-mounting / board-yaw independent).
-        #
-        # On the first frame after press-8 we snapshot the human palm frame
-        # (palm_R_home) and pair it with the robot pinch_site frame at home
-        # (R_site_home) to define ONE correspondence used for BOTH position and
-        # orientation:
-        #     R_board_to_robot = R_site_home @ palm_R_home^T
-        # This maps a displacement/rotation expressed relative to your hand's
-        # press-8 pose into the robot's frame relative to its home pose. Because
-        # it's derived from the actual press-8 snapshot, it needs no measurement
-        # of how the board sits vs the robot base and is immune to camera
-        # mounting / MediaPipe-vs-OpenCV / board-yaw (all of which previously made
-        # motion map to the wrong axes — the "depth goes toward camera" and
-        # "rotation about wrong axis" bugs).
+        # PRESS-8 SNAPSHOT of the human palm frame. Used ONLY for the orientation
+        # alignment (R_align) below — position uses a fixed world->robot rotation
+        # (_Rwb) and must stay independent of hand orientation, so palm_R_home is
+        # deliberately NOT mixed into the translation mapping anymore.
         if (palm_R is not None and self._palm_R_home is None
                 and self._R_site_home is not None):
             self._palm_R_home = palm_R.copy()
-            self._R_board_to_robot = self._R_site_home @ self._palm_R_home.T
             # Capture R_align so the ABSOLUTE orientation target equals the
             # robot's current wrist pose at press-8 (no jump), while remaining
             # absolute afterwards. Solve R_des(palm_R_home)=R_site_home for
@@ -423,5 +412,4 @@ class DexPilotArmController:
         self._cam_home    = None
         self._board_ref   = None   # re-snap the absolute board zero on press-8
         self._palm_R_home = None
-        self._R_board_to_robot = None   # re-derive press-8 frame map next frame
         self._R_align     = np.eye(3)   # re-capture press-8 orientation alignment
