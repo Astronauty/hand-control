@@ -590,7 +590,7 @@ class GraspConfig3D:
 
     # Cost weights
     w_ik:     float = 0.8
-    w_reg:    float = 0.005
+    w_reg:    float = 0.2
     q_scale:  float = 1.0
 
     # Fingertip mesh effective radius (site centroid to contact surface distance)
@@ -630,7 +630,7 @@ class GraspConfig3D:
 
     # Profiling
     n_radial_seeds:   int  = 4
-    verbose_profile:  bool = True
+    verbose_profile:  bool = False
 
     # Solver — use_slsqp=True → SQP+OSQP (faster, analytic Jacobians)
     #           use_slsqp=False → IPOPT (interior-point, more robust to infeasibility)
@@ -652,9 +652,16 @@ class GraspConfig3D:
     task_ty:  float = 0.0
     task_tz:  float = 0.0
 
+    # Acceleration budgets for mass-scaled task wrench computation.
+    # Used in solve() to replace fixed task_fx/fy/fz with mass*(accel+gravity),
+    # and in verify() for the post-solve gamma check.
+    # Defaults match kinova_leap_pick_place.py NCF_ACCEL_BUDGET_XYZ / NCF_ANG_ACCEL_BUDGET.
+    accel_budget_xyz:     tuple = (0.5, 0.5, 0.5)   # m/s² linear, per world axis
+    ang_accel_budget_xyz: tuple = (1.0, 1.0, 1.0)   # rad/s² angular, principal axes
+
     # Geometry names (must match scene XML)
-    obj_geom:    str = 'obj_box_geom'
-    obj_body:    str = 'obj_box'
+    obj_geom:    str = 'obj_red_box_geom'
+    obj_body:    str = 'obj_red_box'
     thumb_site:  str = 'leap_th_ds_tip'
     index_site:  str = 'leap_if_ds_tip'
     thumb_geom:  str = 'leap_th_tip'
@@ -834,6 +841,24 @@ class GraspPlanner3D:
         n_obj_dof     = model.nq - n_act
         obj_qpos_snap = data_cb.qpos[n_act:].copy() if n_obj_dof > 0 else None
 
+        # Mass-scaled task wrench for the NLP wrench constraint.
+        # Replaces fixed task_fx/fy/fz so the NLP targets the correct squeeze
+        # capability for the actual object mass: f = mass*(accel+gravity).
+        _bid    = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, cfg.obj_body)
+        _mass   = float(model.body_mass[_bid])
+        _inert  = model.body_inertia[_bid]                 # (Ix, Iy, Iz) principal
+        _g_O    = obj_R_np.T @ model.opt.gravity            # gravity in object geom frame
+        _ab     = cfg.accel_budget_xyz
+        _aab    = cfg.ang_accel_budget_xyz
+        _nlp_fx = _mass * (_ab[0] + abs(_g_O[0]))
+        _nlp_fy = _mass * (_ab[1] + abs(_g_O[1]))
+        _nlp_fz = _mass * (_ab[2] + abs(_g_O[2]))
+        # Torques: inertia-scaled, clamped to cfg.task_tx/ty/tz floor so the embedded
+        # LP stays feasible for off-center contacts (needs tx/ty >= 0.5*hx).
+        _nlp_tx = max(float(_inert[0]) * _aab[0], cfg.task_tx)
+        _nlp_ty = max(float(_inert[1]) * _aab[1], cfg.task_ty)
+        _nlp_tz = max(float(_inert[2]) * _aab[2], cfg.task_tz)
+
         obj_center = np.asarray(obj_pos, dtype=float)
         margin     = max(hx, hy, hz)
 
@@ -918,8 +943,8 @@ class GraspPlanner3D:
                 wrench_cb = _WrenchFeasCallback3D(
                     f'gp3_wf_{_uid}',
                     geom_type, obj_center_np, obj_R_np, geom_size,
-                    cfg.task_fx, cfg.task_fy, cfg.task_fz,
-                    cfg.task_tx, cfg.task_ty, cfg.task_tz,
+                    _nlp_fx, _nlp_fy, _nlp_fz,
+                    _nlp_tx, _nlp_ty, _nlp_tz,
                     cfg.mu,
                     elastic_M=_em)
 
@@ -981,8 +1006,10 @@ class GraspPlanner3D:
             elif (cfg.wrench_constraint and _NCF_AVAILABLE
                   and cfg.wrench_mode == 'embedded'):
                 # embedded: LP constraints added directly to NLP as bilinear exprs
-                _task_w_np = np.array([cfg.task_tx, cfg.task_ty, cfg.task_tz,
-                                       cfg.task_fx, cfg.task_fy, cfg.task_fz])
+                # Note: zero out the torque components in the task wrench for the embedded LP to keep N variables limited (2^3 instead of 2^6). The torques are negligible for the grasping task and can be ignored in the LP.
+                # _task_w_np = np.array([_nlp_tx, _nlp_ty, _nlp_tz,
+                #                        _nlp_fx, _nlp_fy, _nlp_fz])
+                _task_w_np = np.array([0.0, 0.0, 0.0, _nlp_fx, _nlp_fy, _nlp_fz])
                 _gamma_lp, _y1_list, _y2_list = _embed_wrench_cone_ca(
                     _opti, _p1, _p2, obj_center_np, d1, d2, cfg.mu, _task_w_np)
                 _opti.set_initial(_gamma_lp, 1.0)
@@ -1256,13 +1283,32 @@ class GraspPlanner3D:
                 _, t1_2, t2_2 = _build_contact_frame_3d(-n2_out)
                 R1 = np.column_stack([-n1_out, t1_1, t2_1])
                 R2 = np.column_stack([-n2_out, t1_2, t2_2])
+                # Mass-scaled gamma — same approach as solve_gamma_live in
+                # kinova_leap_pick_place.py. Contacts expressed in object body frame.
+                _bid_v   = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, cfg.obj_body)
+                _mass_v  = float(model.body_mass[_bid_v])
+                _inert_v = model.body_inertia[_bid_v]
+                R_WO_v   = data_v.xmat[_bid_v].reshape(3, 3)
+                _g_O_v   = R_WO_v.T @ model.opt.gravity
+                _ab_v    = cfg.accel_budget_xyz
+                _aab_v   = np.array(cfg.ang_accel_budget_xyz, float)
+                _accel_v = tuple(_ab_v[i] + abs(_g_O_v[i]) for i in range(3))
+                # Zero angular budget along the grasp axis — a 2-contact pinch has
+                # no moment arm about the axis through the two contacts.
+                _p1_O_v  = R_WO_v.T @ (p1_np - data_v.xpos[_bid_v])
+                _p2_O_v  = R_WO_v.T @ (p2_np - data_v.xpos[_bid_v])
+                _gax_v   = _p1_O_v - _p2_O_v
+                _gax_v  /= (np.linalg.norm(_gax_v) + 1e-12)
+                _aab_v  -= np.dot(_aab_v, _gax_v) * _gax_v
+                _aab_v   = np.abs(_aab_v)
+                R1_O     = R_WO_v.T @ R1
+                R2_O     = R_WO_v.T @ R2
                 gamma_min = min_gamma_for_accel_lp(
-                    cfg.task_fx, cfg.task_fy, cfg.task_fz,
-                    cfg.task_tx, cfg.task_ty, cfg.task_tz,
+                    _mass_v * _accel_v[0], _mass_v * _accel_v[1], _mass_v * _accel_v[2],
+                    _inert_v[0] * _aab_v[0], _inert_v[1] * _aab_v[1], _inert_v[2] * _aab_v[2],
                     n=2,
-                    pos=[(p1_np - obj_pos).reshape(3, 1),
-                         (p2_np - obj_pos).reshape(3, 1)],
-                    R=[R1, R2],
+                    pos=[_p1_O_v.reshape(3, 1), _p2_O_v.reshape(3, 1)],
+                    R=[R1_O, R2_O],
                     ncf=[1.0, 1.0],
                     tan_y=[0.0, 0.0],
                     tan_z=[0.0, 0.0],

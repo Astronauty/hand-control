@@ -29,8 +29,17 @@ import mujoco as mj
 import mujoco.viewer
 from pynput import keyboard as _pynput_kb
 
+import os, sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))                   # for grasp_control
+if str(_REPO_ROOT / 'simulation') not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / 'simulation')) 
+
 from grasp_control import SpatialIKSolver
-from simulation.grasp_planner_3d import GraspConfig3D, MultiStartGraspPlanner3D
+from grasp_planner_3d import GraspConfig3D, MultiStartGraspPlanner3D
 
 # ── Module-level constants ─────────────────────────────────────────────────────
 
@@ -75,7 +84,7 @@ def main():
         format  = '%(asctime)s  %(message)s',
         datefmt = '%H:%M:%S')
 
-    model = mj.MjModel.from_xml_path('models/scene_pick_place_pos.xml')
+    model = mj.MjModel.from_xml_path('models/scene_pick_place.xml')
     data  = mj.MjData(model)
 
     for j in (0, 2, 4, 6):          # give continuous arm joints a sampling range
@@ -99,8 +108,8 @@ def main():
     dls_ik = SpatialIKSolver(n_robot=N_ROBOT)
 
     grasp_cfg = GraspConfig3D(
-        obj_geom      = 'obj_box_geom',
-        obj_body      = 'obj_box',
+        obj_geom      = 'obj_red_box_geom',
+        obj_body      = 'obj_red_box',
         max_iter      = args.max_iter,
     )
     ms_planner = MultiStartGraspPlanner3D(model, data, grasp_cfg, log_dir=log_dir)
@@ -113,8 +122,8 @@ def main():
 
     # ── Precompute approach paths ──────────────────────────────────────────────
     OBJECT_DEFS = [
-        ('obj_box',      'obj_box_geom',      True),
-        ('obj_cylinder', 'obj_cylinder_geom', False),
+        ('obj_red_box',    'obj_red_box_geom',    True),
+        ('obj_red_sphere', 'obj_red_sphere_geom', False),
     ]
 
     objects = []
@@ -135,7 +144,7 @@ def main():
         _d.qpos[:N_ROBOT] = Q_BIAS
         mj.mj_forward(model, _d)
 
-        if body_name == 'obj_cylinder':
+        if body_name == 'obj_red_sphere':
             # Task-space straight-line approach: fingertips follow a direct Cartesian
             # path from their home positions to the pregrasp targets.  Joint-space linear
             # interpolation arcs below the target Z; task-space interpolation cannot.
@@ -245,7 +254,7 @@ def main():
     kb = _pynput_kb.Listener(on_press=_on_press, on_release=_on_release)
     kb.start()
 
-    print("\n[Control]  Ctrl+1: obj_box  |  Ctrl+2: obj_cylinder  |  "
+    print("\n[Control]  Ctrl+1: obj_red_box  |  Ctrl+2: obj_red_sphere  |  "
           "Ctrl+0: home  |  Enter: next candidate  |  Q/Esc: quit\n")
 
     # ── Helper: select object ──────────────────────────────────────────────────

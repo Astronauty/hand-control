@@ -78,5 +78,15 @@
     <site name="place_green_site" pos="0.8 -0.15 0.001" size="0.001"/>
     <geom name="place_green_marker" type="box" size="0.10 0.10 0.0005"
       pos="0.8 -0.5 0.001" rgba="0.15 0.75 0.20 0.35" contype="0" conaffinity="0"/>
+
+    <!-- Contact-point marker spheres for GraspPlanner3D visualisation. -->
+    <body name="cp1_body" mocap="true">
+      <geom name="cp1" type="sphere" size="0.006"
+            rgba="1 0.2 0.2 0.6" contype="0" conaffinity="0"/>
+    </body>
+    <body name="cp2_body" mocap="true">
+      <geom name="cp2" type="sphere" size="0.006"
+            rgba="0.2 0.4 1 0.6" contype="0" conaffinity="0"/>
+    </body>
   </worldbody>
 </mujoco>
