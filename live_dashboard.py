@@ -26,6 +26,11 @@ Message protocol (plain dicts put on the queue):
     {'type': 'wrench_cone',                           # composite grasp wrench cone at
         'force':  {'verts': (nv,3), 'faces': (nf,3)} | None,   # solved gamma, projected
         'torque': {'verts': (nv,3), 'faces': (nf,3)} | None}   # to force / torque 3-space
+    {'type': 'grasp_rec',                             # NLP grasp-recommender solve stats
+        'object': str, 'status': str, 'solve_ms': float,      #   (contact_aware_teleop);
+        'gamma_min': float|None, 'wrench_feasible': bool,     #   one per completed solve.
+        'ik_thumb_mm': float|None, 'ik_index_mm': float|None,
+        'n_converged': int, 'n_seeds': int}
     None                                              # sentinel: quit
 
 Usage from the sim process:
@@ -85,16 +90,29 @@ def _run(queue, fingers, horizon_s, dt_hint):
     _SQUEEZE_ON_STYLE  = "font-size: 16px; font-weight: bold; color: #ff9944;"
     squeeze_lbl = QtWidgets.QLabel("internal force: off")
     squeeze_lbl.setStyleSheet(_SQUEEZE_OFF_STYLE)
+    # Latest NLP grasp-recommendation summary (contact_aware_teleop). Grey until the
+    # first solve lands; green when the recommendation is wrench-feasible, orange when
+    # not (grasp geometry can't resist the disturbance box at that contact pair).
+    _REC_IDLE_STYLE = "font-size: 13px; color: #777777;"
+    _REC_OK_STYLE   = "font-size: 13px; font-weight: bold; color: #55cc88;"
+    _REC_BAD_STYLE  = "font-size: 13px; font-weight: bold; color: #ff9944;"
+    grasp_rec_lbl = QtWidgets.QLabel("grasp rec: —")
+    grasp_rec_lbl.setStyleSheet(_REC_IDLE_STYLE)
     mode_box = QtWidgets.QVBoxLayout()
     mode_box.addWidget(mode_lbl)
     mode_box.addWidget(target_lbl)
     header = QtWidgets.QHBoxLayout()
     header.addLayout(mode_box)
     header.addStretch(1)
+    header.addWidget(grasp_rec_lbl)
+    header.addSpacing(30)
     header.addWidget(squeeze_lbl)
     header.addSpacing(30)
     header.addWidget(active_obj_lbl)
     grid.addLayout(header, 0, 0, 1, 2)
+
+    # Rolling counters for a compact recommender-stats summary in the log header.
+    rec_stats = {'n': 0, 'ok': 0, 'ms_sum': 0.0}
 
     maxlen = max(10, int(horizon_s / max(dt_hint, 1e-3)))
 
@@ -179,12 +197,20 @@ def _run(queue, fingers, horizon_s, dt_hint):
     plan_log.setMaximumBlockCount(400)
     plan_log.setStyleSheet("font-family: monospace; font-size: 11px;")
 
+    # --- (6) NLP grasp-recommender solve log (contact_aware_teleop) ---
+    grasp_rec_log = QtWidgets.QPlainTextEdit()
+    grasp_rec_log.setReadOnly(True)
+    grasp_rec_log.setMaximumBlockCount(400)
+    grasp_rec_log.setStyleSheet("font-family: monospace; font-size: 11px;")
+
     grid.addWidget(dist_plot,   1, 0)
     grid.addWidget(force_box,   1, 1)
     grid.addWidget(norm_plot,   2, 0)
     grid.addWidget(torque_box,  2, 1)
-    grid.addWidget(QtWidgets.QLabel("<b>Planner solutions (RRT + IK)</b>"), 3, 0, 1, 2)
-    grid.addWidget(plan_log, 4, 0, 1, 2)
+    grid.addWidget(QtWidgets.QLabel("<b>Planner solutions (RRT + IK)</b>"), 3, 0)
+    grid.addWidget(QtWidgets.QLabel("<b>Grasp recommender (NLP)</b>"),      3, 1)
+    grid.addWidget(plan_log,      4, 0)
+    grid.addWidget(grasp_rec_log, 4, 1)
     grid.setRowStretch(1, 2)
     grid.setRowStretch(2, 2)
     grid.setRowStretch(4, 1)
@@ -275,6 +301,44 @@ def _run(queue, fingers, horizon_s, dt_hint):
                     item.setData(pos=seg)
                 _set_cone(force_cone,  'force')
                 _set_cone(torque_cone, 'torque')
+            elif mt == 'grasp_rec':
+                status = msg.get('status', '?')
+                solve_ms = msg.get('solve_ms', float('nan'))
+                gm   = msg.get('gamma_min')
+                wf   = msg.get('wrench_feasible', False)
+                ik_t = msg.get('ik_thumb_mm')
+                ik_i = msg.get('ik_index_mm')
+                obj  = msg.get('object', '?')
+                nconv = msg.get('n_converged', 0)
+                nseed = msg.get('n_seeds', 0)
+
+                # Header label: latest recommendation, colour-coded by feasibility.
+                gm_s = '—' if gm is None else f"{gm:.2f}"
+                grasp_rec_lbl.setText(
+                    f"grasp rec: {obj}  {status}  γ={gm_s}  "
+                    f"{'WF' if wf else 'infeasible'}")
+                grasp_rec_lbl.setStyleSheet(
+                    _REC_OK_STYLE if (wf and status == 'converged')
+                    else _REC_BAD_STYLE if status == 'converged'
+                    else _REC_IDLE_STYLE)
+
+                # Rolling counters for the running summary line.
+                rec_stats['n'] += 1
+                rec_stats['ms_sum'] += solve_ms if solve_ms == solve_ms else 0.0
+                if status == 'converged':
+                    rec_stats['ok'] += 1
+                avg_ms = rec_stats['ms_sum'] / max(rec_stats['n'], 1)
+
+                ik_s = ('—' if ik_t is None or ik_i is None
+                        else f"({ik_t:.1f},{ik_i:.1f})mm")
+                lines = [
+                    f"{obj} — NLP",
+                    f"    {status}   seeds {nconv}/{nseed} conv   {solve_ms:.0f} ms",
+                    f"    γ_min={gm_s}   WF={'yes' if wf else 'NO'}   IK={ik_s}",
+                    f"    [session: {rec_stats['ok']}/{rec_stats['n']} conv, "
+                    f"avg {avg_ms:.0f} ms]",
+                ]
+                grasp_rec_log.appendPlainText("\n".join(lines))
         if got_dist:
             x = list(dist_t)
             for f in fingers:

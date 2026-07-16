@@ -24,14 +24,25 @@ class GraspController:
                  kp, kd, gamma=5.0, squeeze_pd_scale=1.0,
                  active_joint_slices=((7, 11), (19, 23)),
                  support_weight=False, pad_offsets=None,
-                 grasp_map_computer=None, allocator=None):
+                 grasp_map_computer=None, allocator=None,
+                 obj_contact_provider=None):
         """
         Args:
             model: MjModel.
             n_robot: number of robot DOFs (object joints follow in qpos/qvel).
             tip_site_ids: fingertip site ids, one per grasping finger.
             obj_site_ids: object contact-site ids, same order as tip_site_ids.
+                May be None when obj_contact_provider is supplied (teleop mode:
+                the recommended contacts have no MuJoCo sites).
             obj_body_id: body id of the grasped object.
+            obj_contact_provider: optional callable provider(data) -> list of
+                (p_W (3,), R_W_inward (3,3)) per contact, same order as
+                tip_site_ids, giving the live world-frame contact position and a
+                rotation whose col0 is the INWARD surface normal (same convention
+                as the contact SITES' x-axis). When None, contact geometry is read
+                from obj_site_ids exactly as before (autonomous/site-based path).
+                Used for NLP-recommended contacts that track the object body via
+                stored object-local offsets rather than authored sites.
             kp, kd: (n_robot,) PD gains for the q_target hold.
             gamma: internal squeeze force scale (null-space weight); negate if
                 fingers pull apart (the inward_dirs anchor should prevent that).
@@ -55,7 +66,11 @@ class GraspController:
         self.model = model
         self.n_robot = n_robot
         self.tip_site_ids = list(tip_site_ids)
-        self.obj_site_ids = list(obj_site_ids)
+        self.obj_site_ids = list(obj_site_ids) if obj_site_ids is not None else None
+        self.obj_contact_provider = obj_contact_provider
+        if self.obj_site_ids is None and obj_contact_provider is None:
+            raise ValueError("GraspController needs either obj_site_ids or "
+                             "obj_contact_provider")
         self.obj_body_id = obj_body_id
         self.kp = np.asarray(kp, dtype=float).copy()
         self.kd = np.asarray(kd, dtype=float).copy()
@@ -93,6 +108,18 @@ class GraspController:
             kd[lo:hi] *= self.squeeze_pd_scale
         return kp, kd
 
+    def _live_contacts(self, data):
+        """Per-contact (p_W (3,), R_W_inward (3,3)) at the current data, in
+        tip_site order. Uses obj_contact_provider when set, else reads the
+        contact SITES (col0 of site_xmat is the inward normal)."""
+        if self.obj_contact_provider is not None:
+            out = self.obj_contact_provider(data)
+            return [(np.asarray(p, float).reshape(3),
+                     np.asarray(R, float).reshape(3, 3)) for p, R in out]
+        return [(data.site_xpos[sid].copy(),
+                 data.site_xmat[sid].reshape(3, 3).copy())
+                for sid in self.obj_site_ids]
+
     def compute(self, data):
         """Return a full nv-length torque vector for data.qfrc_applied (object
         DOFs zero). Pure torque map — never mutates data; the caller owns
@@ -128,14 +155,15 @@ class GraspController:
         dislocated grasp geometry."""
         n = self.n_robot
         tau = np.zeros(n)
-        for k, (sid_obj, sid_tip) in enumerate(zip(self.obj_site_ids, self.tip_site_ids)):
+        live = self._live_contacts(data)
+        for k, (sid_tip, (p_WoSk, R_WSk)) in enumerate(zip(self.tip_site_ids, live)):
             J = np.zeros((3, self.model.nv))
             mj.mj_jacSite(self.model, data, J, None, sid_tip)
-            # Anchor = contact site backed off by the pad-surface offset along the
-            # site's inward normal (x axis) — where the tip SITE sits when the pad
-            # SURFACE is flush on the object.
-            inward_W = data.site_xmat[sid_obj].reshape(3, 3)[:, 0]
-            anchor_W = data.site_xpos[sid_obj] - self.pad_offsets[k] * inward_W
+            # Anchor = contact point backed off by the pad-surface offset along the
+            # inward normal (col0 of the contact frame) — where the tip SITE sits
+            # when the pad SURFACE is flush on the object.
+            inward_W = R_WSk[:, 0]
+            anchor_W = p_WoSk - self.pad_offsets[k] * inward_W
             f_k = kp * (anchor_W - data.site_xpos[sid_tip])
             f_norm = float(np.linalg.norm(f_k))
             if f_norm > f_max:
@@ -160,9 +188,8 @@ class GraspController:
         R_WO = data.xmat[self.obj_body_id].reshape(3, 3)
 
         contacts, inward_dirs, R_WS_list, J_list = [], [], [], []
-        for k, (sid_obj, sid_tip) in enumerate(zip(self.obj_site_ids, self.tip_site_ids)):
-            R_WSk = data.site_xmat[sid_obj].reshape(3, 3)
-            p_WoSk = data.site_xpos[sid_obj]
+        live = self._live_contacts(data)
+        for k, (sid_tip, (p_WoSk, R_WSk)) in enumerate(zip(self.tip_site_ids, live)):
             p_OSk_O = R_WO.T @ (p_WoSk - p_WoO)
             R_OSk = R_WO.T @ R_WSk
             contacts.append({'p': p_OSk_O, 'R': R_OSk})

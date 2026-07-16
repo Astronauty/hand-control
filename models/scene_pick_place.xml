@@ -88,5 +88,17 @@
       <geom name="cp2" type="sphere" size="0.006"
             rgba="0.2 0.4 1 0.6" contype="0" conaffinity="0"/>
     </body>
+
+    <!-- Live NLP grasp-recommendation markers (contact_aware_teleop mode). Larger
+         and translucent so they read as "suggested" contacts, distinct from the
+         planner's own cp1/cp2 verify markers. rec1=thumb (green), rec2=index (cyan). -->
+    <body name="rec1_body" mocap="true">
+      <geom name="rec1" type="sphere" size="0.010"
+            rgba="0.2 1 0.3 0.4" contype="0" conaffinity="0"/>
+    </body>
+    <body name="rec2_body" mocap="true">
+      <geom name="rec2" type="sphere" size="0.010"
+            rgba="0.2 0.9 1 0.4" contype="0" conaffinity="0"/>
+    </body>
   </worldbody>
 </mujoco>

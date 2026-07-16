@@ -32,6 +32,12 @@ from grasp_control import SpatialIKSolver, ConstrainedIKSolver, GraspController
 from grasp_control.constrained_ik import configure_sqp
 from live_dashboard import Dashboard
 
+# NLP grasp recommender (contact_aware_teleop mode). simulation/ hosts the planner;
+# _geom_normal_np gives the outward surface normal used to build inward contact frames.
+sys.path.insert(0, __file__.rsplit('/', 1)[0] + '/simulation')
+from grasp_planner_3d import (GraspConfig3D, MultiStartGraspPlanner3D,  # noqa: E402
+                              _geom_normal_np)
+
 # 3D_minimum_NCF.py isn't an importable module name (leading digit), so load it by path.
 import importlib.util as _ilu
 _ncf_spec = _ilu.spec_from_file_location(
@@ -203,6 +209,8 @@ def make_key_callback(key_queue):
         81:  'quit',    # Q
         256: 'quit',    # Escape
         78:  'release',  # N — (GRASP) open fingers and return to REACH
+        76:  'lock_in',  # L — (contact_aware_teleop) lock in the recommended grasp
+                        #     contacts and approach them via RRT
         54:  'ik_vis',  # 6 — cycle IK config visualization
         55:  'bspheres', # 7 — toggle IK collision bounding-sphere overlay
         56:  'teleop_start', # 8 — (dexpilot) start/re-zero tracking at current pose
@@ -317,9 +325,16 @@ if __name__ == "__main__":
              "fingertip→object distances, net hand→object wrench, per-finger contact "
              "normal forces, and a combined RRT+IK planner solution log.")
     _arg_parser.add_argument(
-        '--mode', choices=['rrt', 'dexpilot'], default='rrt',
-        help="rrt (default): autonomous RRT+IK grasp controller  |  "
-             "dexpilot: live MediaPipe kinematic retargeting teleop via ROS 2.")
+        '--mode',
+        choices=['contact_aware_autonomous', 'contact_aware_teleop', 'dexpilot',
+                 'rrt'],
+        default='contact_aware_autonomous',
+        help="contact_aware_autonomous (default): autonomous RRT+IK grasp controller, "
+             "plans to predefined per-object contact sites ('rrt' is a deprecated alias). "
+             "| contact_aware_teleop: teleop the wrist (DexPilot mapping) with MediaPipe "
+             "fingers while an NLP continuously recommends grasp contacts for the nearest "
+             "object; press L to lock in and approach via RRT, then GRASP with the NLP's "
+             "gamma.  | dexpilot: live MediaPipe kinematic retargeting teleop via ROS 2.")
     _arg_parser.add_argument(
         '--camera', type=int, default=None,
         help="Camera index forwarded to ui/mediapipe_joint_angles.py in dexpilot mode "
@@ -353,6 +368,8 @@ if __name__ == "__main__":
              "~3× cheaper per iteration, wins on wall time in most cases  |  "
              "ipopt: IPOPT L-BFGS + finite-difference Jacobians — production baseline.")
     args = _arg_parser.parse_args()
+    if args.mode == 'rrt':          # deprecated alias
+        args.mode = 'contact_aware_autonomous'
 
     model = mj.MjModel.from_xml_path('models/scene_pick_place.xml')
     data  = mj.MjData(model)
@@ -1020,6 +1037,82 @@ if __name__ == "__main__":
         _run_ik(obj_idx, obj, obj_qpos_snap)
         _run_rrt(q_start, obj['q_target'], obj)
 
+    def _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec):
+        """contact_aware_teleop lock-in: like _run_ik but the fingertip targets come
+        from the NLP-recommended contacts (rec['p1']=thumb, rec['p2']=index in world)
+        instead of the authored contact sites. Stores the recommended contacts as
+        object-LOCAL frames on obj so the GRASP provider tracks the moving object,
+        then reuses the same DLS->SQP grasp IK to get obj['q_target']."""
+        mj.mj_resetData(model, _ik_data)
+        _ik_data.qpos[:N_ROBOT] = Q_BIAS
+        _ik_data.qpos[N_ROBOT:] = obj_qpos_snap
+        mj.mj_forward(model, _ik_data)
+
+        # World contacts in FINGER_SET order ([index, thumb]): index<-p2, thumb<-p1.
+        _by_finger = {'thumb': rec['p1'], 'index': rec['p2']}
+        p_S_W = [np.asarray(_by_finger[f], float).copy() for f in FINGER_SET]
+        # Inward surface normals at those contacts (object's live geom pose).
+        n1_in, n2_in = _recommended_inward_normals(obj_idx, rec['p1'], rec['p2'])
+        _n_by_finger = {'thumb': n1_in, 'index': n2_in}
+        inward_S_W = [np.asarray(_n_by_finger[f], float).copy() for f in FINGER_SET]
+
+        obj['p_S_W']       = p_S_W
+        obj['inward_S_W']  = inward_S_W
+        obj['ik_obj_qpos'] = obj_qpos_snap.copy()
+
+        # Store object-local contact frames for the GRASP-phase provider. col0 of
+        # R_O is the inward normal (matching the site convention the provider expects).
+        bid   = obj['id_body']
+        p_WoO = _ik_data.xpos[bid].copy()
+        R_WO  = _ik_data.xmat[bid].reshape(3, 3).copy()
+
+        def _local_frame(p_W, n_in_W):
+            # Build a right-handed frame with col0 = inward normal, then express in
+            # the object body frame. Tangents are arbitrary (only col0 is used by the
+            # grasp map / slip anchor, which take col0 and the position).
+            n = n_in_W / (np.linalg.norm(n_in_W) + 1e-12)
+            ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            t1 = np.cross(n, ref);  t1 /= (np.linalg.norm(t1) + 1e-12)
+            t2 = np.cross(n, t1)
+            R_W = np.column_stack([n, t1, t2])
+            p_O = R_WO.T @ (p_W - p_WoO)
+            R_O = R_WO.T @ R_W
+            return p_O, R_O
+
+        obj['rec_local'] = [_local_frame(p, n) for p, n in zip(p_S_W, inward_S_W)]
+
+        # Grasp IK: tip SITES aimed at contacts backed off by the pad-surface offset
+        # along each inward normal (same as _run_ik).
+        obj['ik_targets'] = [p - _PAD_OFFSET[f] * n
+                             for f, p, n in zip(FINGER_SET, p_S_W, inward_S_W)]
+        _t0 = time.time()
+        q_dls_grasp = dls_ik.solve(model, _ik_data, id_C, obj['ik_targets'],
+                                    q_bias=Q_BIAS, null_gain=0.3)
+        dls_ms = (time.time() - _t0) * 1e3
+        _t0 = time.time()
+        obj['q_target'] = constrained_ik.solve(_ik_data, id_C, obj['ik_targets'],
+                                                q_bias=Q_BIAS, q_init=q_dls_grasp,
+                                                reduced_clearance_geoms=_active_clearance_by_geom,
+                                                inward_dirs=inward_S_W)
+        sqp_ms = (time.time() - _t0) * 1e3
+        print(f"\r\n[IK] obj{obj_idx+1} (recommended): grasp DLS {dls_ms:.0f}ms + "
+              f"SQP {sqp_ms:.0f}ms")
+
+        _d_chk = mj.MjData(model)
+        _d_chk.qpos[N_ROBOT:] = obj_qpos_snap
+        _d_chk.qpos[:N_ROBOT] = obj['q_target']
+        mj.mj_forward(model, _d_chk)
+        errs = [f"{np.linalg.norm(_d_chk.site_xpos[s] - t)*1e3:.1f} mm"
+                for s, t in zip(id_C, obj['ik_targets'])]
+        print(f"\r\n[IK] obj{obj_idx+1} (recommended): tip errors = {errs}")
+
+        _ik_markers_by_obj[obj_idx] = _make_ik_markers(obj, obj_qpos_snap)
+        _ik_solved.add(obj_idx)
+
+    def _run_ik_recommended_then_rrt(obj_idx, obj, q_start, obj_qpos_snap, rec):
+        _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec)
+        _run_rrt(q_start, obj['q_target'], obj)
+
     def _plan_thread_main(fn, *args):
         """Wrapper for every plan_thread target: an uncaught exception in _run_ik /
         _run_rrt must not die silently — before this, a failed solve left _plan_result
@@ -1048,10 +1141,16 @@ if __name__ == "__main__":
     data.qpos[:N_ROBOT] = Q_BIAS
     mj.mj_forward(model, data)
 
-    # --- DexPilot controller (--mode dexpilot only) ---
+    # --- DexPilot controller (dexpilot mode + contact_aware_teleop wrist/fingers) ---
+    # contact_aware_teleop reuses the SAME DexPilot wrist+finger retargeting stack;
+    # it only adds the NLP grasp recommender and the lock-in->RRT->GRASP handoff on
+    # top. The difference is hand_tracking: teleop needs real finger curling (the
+    # MediaPipe joint angles drive the grasp), while pure dexpilot debugging holds
+    # the fingers open.
+    _teleop_modes   = ('dexpilot', 'contact_aware_teleop')
     _dexpilot_ctrl  = None
     _mediapipe_proc = None
-    if args.mode == 'dexpilot':
+    if args.mode in _teleop_modes:
         # Launch the MediaPipe publisher as a subprocess so its OpenCV window
         # appears alongside the MuJoCo viewer. The subprocess inherits the
         # current environment (CYCLONEDDS_URI, ROS sourcing, venv Python).
@@ -1136,17 +1235,133 @@ if __name__ == "__main__":
         # matches the new neutral (Q_BIAS still points at the old forward reach).
         _Q_BIAS_DP = Q_BIAS.copy()
         _Q_BIAS_DP[:7] = _HOME_WRIST_DOWN
-        # debug=False silences the per-frame [retarget] print; hand_tracking=False
-        # holds the fingers OPEN so the hand orientation is easy to read during
-        # orientation calibration (re-enable both for full teleop).
+        # debug=False silences the per-frame [retarget] print. hand_tracking=False
+        # (pure dexpilot) holds the fingers OPEN so the hand orientation is easy to
+        # read during orientation calibration; contact_aware_teleop needs real
+        # finger curling (the MediaPipe joint angles ARE the grasp), so it tracks.
+        _hand_tracking = (args.mode == 'contact_aware_teleop')
         _dexpilot_ctrl = DexPilotController(model, q_bias=_Q_BIAS_DP,
-            debug=False, eps=0.005, hand_tracking=False, **_cam_kwargs)
+            debug=False, eps=0.005, hand_tracking=_hand_tracking, **_cam_kwargs)
         _dexpilot_ctrl.init_home(data)   # snapshots the wrist-down pose as home
         _dexpilot_ctrl.init_ros()
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")
         print("[DexPilot] Press 8 to start tracking (captures your current wrist "
               "orientation as the robot's home). Q/Esc: quit")
+
+    # --- contact_aware_teleop: NLP grasp recommender machinery ---
+    # A per-object MultiStartGraspPlanner3D (built lazily, box-like first) continuously
+    # recommends 2-finger contacts for whichever object the fingers are nearest. The
+    # best candidate's p1(thumb)/p2(index) are shown live via the rec1/rec2 mocap
+    # markers; pressing L locks them in and hands off to the existing IK->RRT->GRASP
+    # machinery. The NLP's gamma seeds the squeeze, re-solved on the committed geometry.
+    _CAT_MODE       = (args.mode == 'contact_aware_teleop')
+    _REC_INTERVAL_S = 2.0     # fixed re-solve cadence (NLP solve ~0.5-2s, runs in a thread)
+    _REC_NC         = 3       # planner seeds per solve
+    _rec1_mocap = int(model.body_mocapid[
+        mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'rec1_body')])
+    _rec2_mocap = int(model.body_mocapid[
+        mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'rec2_body')])
+    _REC_HIDDEN = np.array([10.0, 10.0, 10.0])   # park markers off-scene when idle
+    _cat_planners     = {}      # obj_idx -> MultiStartGraspPlanner3D (lazy)
+    _cat_planner_lock = threading.Lock()
+    _rec_thread       = None    # background recommender thread
+    _rec_result       = {}      # {'candidate': {...}, 'obj_idx': int} written by the thread
+    _rec_result_lock  = threading.Lock()
+    _rec_last_solve   = 0.0     # wall-clock of the last solve start
+    _rec_obj_idx      = -1      # object the latest recommendation is for
+
+    # Objects the NLP recommender supports (box-like first, per the plan). The planner
+    # is shape-aware but validated on boxes; extend this set as other shapes are proven.
+    _CAT_SUPPORTED = {'obj_red_box', 'obj_green_box'}
+
+    # Actuated-joint qpos indices (planner.solve wants q_ref as the nu-length actuated
+    # vector, in actuator order) — same as GraspPlanner3D._act_idx.
+    _cat_act_idx = [model.jnt_qposadr[model.actuator_trnid[i, 0]]
+                    for i in range(model.nu)]
+
+    def _get_cat_planner(obj_idx):
+        """Lazily build (and cache) a MultiStartGraspPlanner3D for one object."""
+        with _cat_planner_lock:
+            p = _cat_planners.get(obj_idx)
+            if p is not None:
+                return p
+            o = objects[obj_idx]
+            cfg = GraspConfig3D(obj_geom=o['name'] + '_geom', obj_body=o['name'],
+                                max_iter=120)
+            # Own MjData so the background solve never races the viewer's data.
+            p = MultiStartGraspPlanner3D(model, mj.MjData(model), cfg)
+            _cat_planners[obj_idx] = p
+            return p
+
+    def _fire_recommender(obj_idx, q_snap, obj_pos):
+        """Start a background NLP solve for obj_idx; store the best candidate."""
+        def _run():
+            planner = _get_cat_planner(obj_idx)
+            # The planner's own data must reflect the live object pose for its
+            # collision/surface geometry; sync qpos before solving.
+            planner._planner.data.qpos[:] = data.qpos[:]
+            mj.mj_forward(model, planner._planner.data)
+            _t0 = time.time()
+            try:
+                res = planner.solve(q_snap, obj_pos, max_seeds=_REC_NC)
+            except Exception:
+                traceback.print_exc()
+                return
+            _solve_ms = (time.time() - _t0) * 1e3
+            if res.get('p1') is None or res.get('p2') is None:
+                return
+            with _rec_result_lock:
+                _rec_result['candidate'] = {
+                    'q':  np.asarray(res['q'], float).copy(),
+                    'p1': np.asarray(res['p1'], float).copy(),   # thumb
+                    'p2': np.asarray(res['p2'], float).copy(),   # index
+                    'status': res.get('status'),
+                }
+                _rec_result['obj_idx'] = obj_idx
+
+            # --- Push solve stats to the dashboard (verify() gives gamma_min + IK) ---
+            if dash is not None:
+                _all = res.get('all_results') or [res]
+                _nconv = sum(1 for r in _all if r.get('status') == 'converged')
+                _vinfo = {}
+                try:
+                    _vinfo = planner._planner.verify(res) or {}
+                except Exception:
+                    traceback.print_exc()
+                dash.push({
+                    'type':            'grasp_rec',
+                    'object':          objects[obj_idx]['name'],
+                    'status':          res.get('status', '?'),
+                    'solve_ms':        _solve_ms,
+                    'gamma_min':       _vinfo.get('gamma_min'),
+                    'wrench_feasible': bool(_vinfo.get('wrench_feasible', False)),
+                    'ik_thumb_mm':     _vinfo.get('ik_thumb_mm'),
+                    'ik_index_mm':     _vinfo.get('ik_index_mm'),
+                    'n_converged':     _nconv,
+                    'n_seeds':         len(_all),
+                })
+        t = threading.Thread(target=_run, daemon=True, name='cat-recommender')
+        t.start()
+        return t
+
+    def _recommended_inward_normals(obj_idx, p1, p2):
+        """Outward->inward surface normals at p1/p2 for the object's live geom pose,
+        using the planner's shape-aware _geom_normal_np. Returns (n1_in, n2_in)."""
+        o = objects[obj_idx]
+        gid = o['id_geom']
+        gtype = int(model.geom_type[gid])
+        c   = data.geom_xpos[gid].copy()
+        R   = data.geom_xmat[gid].reshape(3, 3).copy()
+        size = model.geom_size[gid]
+        n1_out = _geom_normal_np(p1, gtype, c, R, size)
+        n2_out = _geom_normal_np(p2, gtype, c, R, size)
+        return -n1_out, -n2_out
+
     control_phase  = 'REACH'
+    # contact_aware_teleop: True while the operator is teleoping + the NLP recommends
+    # contacts (pre-lock-in). Lock-in (L) flips this False and hands off to the shared
+    # IK->RRT->GRASP machinery; release (N) flips it back True. Always False otherwise.
+    _teleop_active = _CAT_MODE
     active_idx     = 0
     active_tgt     = 0        # index into targets[]
     tau_ctrl       = np.zeros(model.nv)   # full nv for qfrc_applied
@@ -1303,6 +1518,122 @@ if __name__ == "__main__":
         running = True
         while viewer.is_running() and running:
             step_start = time.time()
+
+            # --- contact_aware_teleop: teleop wrist+fingers, NLP recommends contacts.
+            # Runs ONLY pre-lock-in; after L it falls through to the shared REACH/GRASP
+            # machinery below (like autonomous mode) with recommended contacts. ---
+            if _CAT_MODE and _teleop_active:
+                _dexpilot_ctrl.spin()
+
+                # Drain keys — quit, teleop start, and lock-in.
+                _do_lock_in = False
+                while not keys.empty():
+                    _k = keys.get_nowait()
+                    if _k == 'quit':
+                        running = False
+                    elif _k == 'teleop_start':
+                        _dexpilot_ctrl.start(data)
+                        print("[teleop] tracking started — home pose captured.")
+                    elif _k == 'lock_in':
+                        _do_lock_in = True
+                if not running:
+                    continue
+
+                # Drive wrist (arm IK) + fingers (MediaPipe) kinematically.
+                q_teleop = _dexpilot_ctrl.step(model, data)
+                if q_teleop is not None:
+                    data.qpos[:N_ROBOT] = q_teleop
+                    data.qvel[:N_ROBOT] = 0.0
+                    mj.mj_forward(model, data)
+
+                # Proximity object (min average fingertip->object signed distance).
+                _avg_d = [np.mean([_guarded_geom_dist(_tg, _o['id_geom'])
+                                   for _tg in _ALL_TIP_GIDS]) for _o in objects]
+                _prox_idx = int(np.argmin(_avg_d))
+
+                # Fixed-interval background NLP recommend for the nearest SUPPORTED obj.
+                _supported = objects[_prox_idx]['name'] in _CAT_SUPPORTED
+                _rec_idle  = (_rec_thread is None) or (not _rec_thread.is_alive())
+                if (_supported and _rec_idle
+                        and (time.time() - _rec_last_solve) >= _REC_INTERVAL_S):
+                    _q_snap = np.array([data.qpos[i] for i in _cat_act_idx])
+                    _obj_pos = data.xpos[objects[_prox_idx]['id_body']].copy()
+                    _rec_thread = _fire_recommender(_prox_idx, _q_snap, _obj_pos)
+                    _rec_last_solve = time.time()
+
+                # Show the latest recommendation via the rec1/rec2 markers.
+                _cand = None
+                with _rec_result_lock:
+                    if (_rec_result.get('candidate') is not None
+                            and _rec_result.get('obj_idx') == _prox_idx):
+                        _cand = _rec_result['candidate']
+                        _rec_obj_idx = _prox_idx
+                if _cand is not None:
+                    data.mocap_pos[_rec1_mocap] = _cand['p1']
+                    data.mocap_pos[_rec2_mocap] = _cand['p2']
+                else:
+                    data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
+                    data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
+
+                # Lock-in: snapshot the current recommendation, hand off to IK->RRT.
+                if _do_lock_in:
+                    if _cand is None:
+                        print("[teleop] no recommendation yet for the nearest "
+                              "supported object — hold near a box and wait.")
+                    elif plan_thread is not None:
+                        print("[teleop] still planning — lock-in ignored.")
+                    else:
+                        active_idx = _prox_idx
+                        active_tgt = _prox_idx + 1        # targets[0] is home
+                        _teleop_active = False
+                        data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
+                        data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
+                        q_start = data.qpos[:N_ROBOT].copy()
+                        q_plan_hold = q_start.copy()
+                        _plan_result.clear()
+                        obj_qpos_snap = data.qpos[N_ROBOT:].copy()
+                        with _ghost_markers_lock:
+                            _ghost_markers.clear()
+                        control_phase = 'PLAN'
+                        plan_thread = threading.Thread(
+                            target=_plan_thread_main,
+                            args=(_run_ik_recommended_then_rrt, active_idx,
+                                  objects[active_idx], q_start, obj_qpos_snap, _cand),
+                            daemon=True)
+                        plan_thread.start()
+                        print(f"[teleop] LOCK-IN {objects[active_idx]['name']} — "
+                              f"solving IK + RRT to recommended contacts ...")
+
+                # --- Dashboard streams (same panels as autonomous mode) ---
+                if dash is not None:
+                    _mode = 'Locking in' if not _teleop_active else 'Teleop'
+                    if (_mode, active_tgt) != _dash_last_mode:
+                        dash.push({'type': 'mode', 'mode': _mode,
+                                   'target': objects[_prox_idx]['name']})
+                        _dash_last_mode = (_mode, active_tgt)
+                    if _prox_idx != _dash_last_prox:
+                        dash.push({'type': 'active_obj',
+                                   'name': objects[_prox_idx]['name']})
+                        _dash_last_prox = _prox_idx
+                    if _dash_i % DASH_PUSH_EVERY == 0:
+                        _t = time.time() - _dash_t0
+                        _ogid = objects[_prox_idx]['id_geom']
+                        _dvals = {f: _guarded_geom_dist(_TIP_GEOM_IDS[f], _ogid)
+                                  for f in FINGER_SET}
+                        dash.push({'type': 'dist', 't': _t, 'd': _dvals})
+                        _f_net, _tau_net, _normals, _ = _hand_object_contact_metrics(_prox_idx)
+                        dash.push({'type': 'wrench', 't': _t,
+                                   'f': _f_net.tolist(), 'tau': _tau_net.tolist()})
+                        dash.push({'type': 'normals', 't': _t, 'n': _normals})
+                _dash_i += 1
+
+                # Viz: recommendation markers already set; render one kinematic frame.
+                if viewer.user_scn is not None:
+                    viewer.user_scn.ngeom = 0
+                    _draw_active_marker(viewer.user_scn)
+                viewer.sync()
+                time.sleep(max(0, model.opt.timestep - (time.time() - step_start)))
+                continue
 
             # --- DexPilot teleop mode: bypass the RRT/grasp state machine ---
             if args.mode == 'dexpilot':
@@ -1493,8 +1824,17 @@ if __name__ == "__main__":
                     # Contact geometry in the object body frame (same transform the
                     # GraspController's internal_force_torques uses): col0 of R_OSk is the
                     # inward normal per the scene XML convention.
-                    _p_O   = [R_WO.T @ (data.site_xpos[s] - p_WoO) for s in obj_grasp['id_S']]
-                    _R_in  = [R_WO.T @ data.site_xmat[s].reshape(3, 3) for s in obj_grasp['id_S']]
+                    # contact_aware_teleop stores object-LOCAL recommended frames on
+                    # obj['rec_local']; autonomous mode reads the authored contact sites.
+                    # Gamma is re-solved here on the COMMITTED geometry either way.
+                    _rec_local = obj_grasp.get('rec_local')
+                    _teleop_grasp = _rec_local is not None
+                    if _teleop_grasp:
+                        _p_O   = [p_O.copy() for (p_O, _R_O) in _rec_local]
+                        _R_in  = [R_O.copy() for (_p_O, R_O) in _rec_local]
+                    else:
+                        _p_O   = [R_WO.T @ (data.site_xpos[s] - p_WoO) for s in obj_grasp['id_S']]
+                        _R_in  = [R_WO.T @ data.site_xmat[s].reshape(3, 3) for s in obj_grasp['id_S']]
                     _mu    = [float(model.geom_friction[obj_grasp['id_geom'], 0])] * N_FINGERS
                     _mass  = float(model.body_mass[_bid])
                     # Gravity component per OBJECT-body axis, added to the linear budget.
@@ -1537,15 +1877,37 @@ if __name__ == "__main__":
                     # Internal-force machinery for the Enter-toggled squeeze. Only
                     # internal_force_torques() is used — the joint PD hold stays in the
                     # GRASP branch below, on top of the shared bias comp.
+                    # Teleop: the recommended contacts have no sites, so pass a live
+                    # provider that re-expresses the stored object-LOCAL frames in the
+                    # world each step (tracks the moving object). Autonomous: sites.
+                    if _teleop_grasp:
+                        _rec_local_snap = [(p_O.copy(), R_O.copy())
+                                           for (p_O, R_O) in _rec_local]
+                        _prov_bid = obj_grasp['id_body']
+
+                        def _make_provider(rec_local, bid):
+                            def _provider(d):
+                                p_WoO_l = d.xpos[bid]
+                                R_WO_l  = d.xmat[bid].reshape(3, 3)
+                                return [(p_WoO_l + R_WO_l @ p_O, R_WO_l @ R_O)
+                                        for (p_O, R_O) in rec_local]
+                            return _provider
+
+                        _grasp_provider = _make_provider(_rec_local_snap, _prov_bid)
+                        _grasp_sites    = None
+                    else:
+                        _grasp_provider = None
+                        _grasp_sites    = obj_grasp['id_S']
                     grasp_ctrl = GraspController(
                         model, N_ROBOT,
                         tip_site_ids=id_C,
-                        obj_site_ids=obj_grasp['id_S'],
+                        obj_site_ids=_grasp_sites,
                         obj_body_id=obj_grasp['id_body'],
                         kp=Kp, kd=Kd, gamma=gamma_live,
                         squeeze_pd_scale=SQUEEZE_PD_SCALE,
                         support_weight=True,
-                        pad_offsets=[_PAD_OFFSET[f] for f in FINGER_SET])
+                        pad_offsets=[_PAD_OFFSET[f] for f in FINGER_SET],
+                        obj_contact_provider=_grasp_provider)
                     q_grasp_hold = obj_grasp['q_target'].copy()
                     grasp_ctrl.set_squeeze(False)
                     _push_squeeze(False, gamma_live)
@@ -1574,13 +1936,32 @@ if __name__ == "__main__":
                     grasp_ctrl.set_squeeze(False)
                     _push_squeeze(False, gamma_live)
                     _push_wrench_cone(None, None, None, None)   # clear the cone meshes
-                    q_release      = q_grasp_hold.copy()
-                    q_release[7:]  = Q_BIAS[7:]
-                    traj_waypoints = [q_release]
-                    traj_wp_idx    = 0
-                    traj_wp_step   = 0
-                    control_phase  = 'REACH'
-                    print(f"\r\n[Control] → REACH  (released — opening fingers)")
+                    if _CAT_MODE:
+                        # Teleop: hand control back to the operator (all 23 DOFs are
+                        # teleoped), drop the object, and re-arm the recommender. Clear
+                        # the committed contacts so the next lock-in re-solves fresh.
+                        objects[active_idx].pop('rec_local', None)
+                        _teleop_active = True
+                        active_tgt     = 0
+                        active_idx     = 0
+                        _rec_last_solve = 0.0
+                        with _rec_result_lock:
+                            _rec_result.clear()
+                        control_phase  = 'REACH'
+                        print("\r\n[teleop] released — operator back in control, "
+                              "recommender re-armed.")
+                    else:
+                        # Release: no pregrasp config exists anymore, so open the active
+                        # fingers back to their Q_BIAS posture while the arm stays at the
+                        # (possibly jogged) grasp arm config q_grasp_hold — snapping back
+                        # to the original IK pose would drag the object with it.
+                        q_release      = q_grasp_hold.copy()
+                        q_release[7:]  = Q_BIAS[7:]
+                        traj_waypoints = [q_release]
+                        traj_wp_idx    = 0
+                        traj_wp_step   = 0
+                        control_phase  = 'REACH'
+                        print(f"\r\n[Control] → REACH  (released — opening fingers)")
 
                 elif key == 'ik_vis' and active_tgt > 0 and active_idx in _ik_solved:
                     _ik_vis_mode = {None: 'grasp', 'grasp': None}[_ik_vis_mode]
@@ -1689,6 +2070,16 @@ if __name__ == "__main__":
                     _ghost_markers.clear()
                 _push_squeeze(False, gamma_live)
                 _push_wrench_cone(None, None, None, None)   # clear the cone meshes
+                if _CAT_MODE:
+                    # Return to teleop control and re-arm the recommender.
+                    for _o in objects:
+                        _o.pop('rec_local', None)
+                    _teleop_active  = True
+                    _rec_last_solve = 0.0
+                    with _rec_result_lock:
+                        _rec_result.clear()
+                    data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
+                    data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
                 print("\r\n[Control] RESET — arm home, objects at spawn poses; cached "
                       "IK kept (auto re-solved if stale on next selection)")
 
