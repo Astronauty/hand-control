@@ -1110,8 +1110,11 @@ if __name__ == "__main__":
         # matches the new neutral (Q_BIAS still points at the old forward reach).
         _Q_BIAS_DP = Q_BIAS.copy()
         _Q_BIAS_DP[:7] = _HOME_WRIST_DOWN
+        # debug=False silences the per-frame [retarget] print; hand_tracking=False
+        # holds the fingers OPEN so the hand orientation is easy to read during
+        # orientation calibration (re-enable both for full teleop).
         _dexpilot_ctrl = DexPilotController(model, q_bias=_Q_BIAS_DP,
-            debug=True, eps=0.005, **_cam_kwargs)
+            debug=False, eps=0.005, hand_tracking=False, **_cam_kwargs)
         _dexpilot_ctrl.init_home(data)   # snapshots the wrist-down pose as home
         _dexpilot_ctrl.init_ros()
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")

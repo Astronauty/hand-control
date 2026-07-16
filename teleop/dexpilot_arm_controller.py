@@ -37,6 +37,7 @@ from grasp_control import SpatialIKSolver
 
 _CALIB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "calibration")
+_R_CORRECT_PATH = os.path.join(_CALIB_DIR, "orientation_correction.json")
 
 
 def load_camera_calibration(
@@ -188,7 +189,19 @@ class DexPilotArmController:
         # R_correct was compensating for that broken frame and is no longer valid.
         # Re-measure with teleop/diagnose_frame.py 'c' if a residual board-yaw
         # offset remains, and pass R_align= to set it.
-        self._R_correct = np.eye(3) if R_align is None else np.asarray(R_align, float)
+        # Load a saved orientation correction if present (from a prior multi-pose
+        # calibration), else identity — or an explicit R_align override.
+        if R_align is not None:
+            self._R_correct = np.asarray(R_align, float)
+            self._has_full_correction = True
+        elif os.path.exists(_R_CORRECT_PATH):
+            with open(_R_CORRECT_PATH) as f:
+                self._R_correct = np.array(json.load(f)["R_correct"], float)
+            self._has_full_correction = True
+            print(f"[arm] loaded saved orientation correction from {_R_CORRECT_PATH}")
+        else:
+            self._R_correct = np.eye(3)
+            self._has_full_correction = False
         self._R_cam_robot = R_cam_robot
 
         self._site_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, palm_site)
@@ -345,11 +358,17 @@ class DexPilotArmController:
             # rigidly (verified), this one alignment is correct for ALL later
             # poses — and it avoids the circular "match the moving wrist" problem
             # (the home frame is fixed, not chasing the hand).
-            if self._orient_calib_pending and self._R_site_home is not None:
+            # Skip auto-calib if a full (multi-pose/saved) correction exists —
+            # the single-point press-8 fit would clobber it and reintroduce the
+            # wrong relative rotations.
+            if (self._orient_calib_pending and self._R_site_home is not None
+                    and not self._has_full_correction):
                 self._R_correct = self._R_site_home @ raw.T
                 self._orient_calib_pending = False
                 print("[arm] orientation auto-calibrated at press-8 "
                       "(current hand pose -> robot home wrist).")
+            elif self._orient_calib_pending:
+                self._orient_calib_pending = False  # consumed; keep full correction
             # Store the UNCORRECTED mapping for multi-pose calibration.
             self._last_raw = raw.copy()
             # R_des = R_correct @ (R_mp_to_robot @ palm_R)
@@ -470,10 +489,28 @@ class DexPilotArmController:
         self._R_correct = U @ Vt                                # nearest rotation
         det = float(np.linalg.det(self._R_correct))
         print(f"[arm] SOLVED R_correct from {len(self._calib_pairs)} poses "
-              f"(det={det:+.2f}). Residuals:")
+              f"(det={det:+.2f}). Per-pose residuals (0=perfect, >1=bad):")
+        errs = []
         for i, (raw, site) in enumerate(self._calib_pairs):
             err = float(np.linalg.norm(self._R_correct @ raw - site))
-            print(f"       pose {i+1}: {err:.3f}")
+            errs.append(err)
+            flag = "  <-- BAD, re-capture" if err > 1.0 else ""
+            print(f"       pose {i+1}: {err:.3f}{flag}")
+        mean_err = float(np.mean(errs))
+        if mean_err < 0.3:
+            verdict = "GOOD fit — a single rotation maps hand->wrist."
+        elif mean_err < 0.8:
+            verdict = "ROUGH — re-capture the BAD poses (held more accurately)."
+        else:
+            verdict = ("POOR — no single rotation fits. Likely bad pose-matching, "
+                       "OR the hand->wrist map isn't a single rotation (deeper).")
+        print(f"[arm] mean residual {mean_err:.3f} -> {verdict}")
+        self._has_full_correction = True   # don't let press-8 clobber it
+        # Persist so it loads next launch.
+        with open(_R_CORRECT_PATH, "w") as f:
+            json.dump({"R_correct": self._R_correct.tolist(),
+                       "mean_residual": mean_err}, f, indent=2)
+        print(f"[arm] saved -> {_R_CORRECT_PATH}")
         print(np.array2string(self._R_correct, precision=4))
 
     def clear_calib(self) -> None:

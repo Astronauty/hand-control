@@ -49,12 +49,19 @@ class DexPilotController:
         hand_alpha: float = 0.3,
         debug: bool = False,
         eps: float | None = None,
+        hand_tracking: bool = True,
         **arm_kwargs,
     ) -> None:
         self._n_arm   = n_arm
         self._n_hand  = n_hand
         self._n_robot = n_arm + n_hand
         self._hand_alpha = hand_alpha
+        # When False, the LEAP fingers hold a fixed OPEN pose (q_bias hand joints)
+        # instead of DexPilot retargeting — easier to read the hand orientation
+        # during orientation debugging (fingers don't curl together).
+        self._hand_tracking = hand_tracking
+        self._hand_bias = (q_bias[n_arm:n_arm + n_hand].copy()
+                           if q_bias is not None else np.zeros(n_hand))
 
         arm_bias = q_bias[:n_arm] if q_bias is not None else None
 
@@ -142,13 +149,16 @@ class DexPilotController:
 
         # --- Hand retargeting (16 DOF) ---
         world_lm = np.array(raw[57:120], dtype=float).reshape(21, 3)
-        q_hand   = self._retarg.retarget(world_lm)
-
-        # EMA smoothing on hand joints
-        if self._q_hand_prev is not None:
-            q_hand = (self._hand_alpha * q_hand
-                      + (1.0 - self._hand_alpha) * self._q_hand_prev)
-        self._q_hand_prev = q_hand.copy()
+        if self._hand_tracking:
+            q_hand = self._retarg.retarget(world_lm)
+            # EMA smoothing on hand joints
+            if self._q_hand_prev is not None:
+                q_hand = (self._hand_alpha * q_hand
+                          + (1.0 - self._hand_alpha) * self._q_hand_prev)
+            self._q_hand_prev = q_hand.copy()
+        else:
+            # Hold a fixed OPEN hand (bias pose) — no finger curling.
+            q_hand = self._hand_bias
 
         # --- Arm: position + palm-orientation tracking (7 DOF) ---
         # Use the ROBOT-ALIGNED palm frame so an identical physical hand

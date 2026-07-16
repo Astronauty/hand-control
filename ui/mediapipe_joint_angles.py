@@ -435,6 +435,16 @@ def recalibrate_board(frame, board, detector, K, dist, extr_path):
 
 # --- Visualization ---
 
+def draw_label(image, text, org, scale=0.55, thickness=1):
+    """Draw text with a filled WHITE background box for readability."""
+    (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    x, y = org
+    cv2.rectangle(image, (x - 3, y - th - 4), (x + tw + 3, y + base + 2),
+                  (255, 255, 255), cv2.FILLED)
+    cv2.putText(image, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale,
+                (0, 0, 0), thickness, cv2.LINE_AA)
+
+
 def draw_board_axes(image, K, dist, R_cam_world, t_cam_world, axis_len=0.05):
     """Overlay the FIXED ChArUco board world frame (X=red, Y=green, Z=blue).
 
@@ -738,6 +748,11 @@ def main():
         else:
             print("[INFO] no extrinsics; publishing LEGACY normalised wrist (delta teleop).")
 
+    # Rolling window of the per-axis wrist-vs-board angles, to measure per-axis
+    # NOISE (std). If the palm-NORMAL axis (camera-depth direction) is much
+    # noisier than thumb/fingers, that's the monocular single-camera signature.
+    _ang_hist = deque(maxlen=30)
+
     # ChArUco detector for on-demand board re-calibration (key 'B'). Needs
     # intrinsics; re-solving updates the world frame live without a restart.
     _board = _charuco_det = None
@@ -862,6 +877,45 @@ def main():
                     _pts = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
                     _palm_R = _palm_frame_robot_aligned(_pts[0], _pts[5], _pts[17])
                     draw_palm_frame(annotated, (u_px, v_px), _palm_R)
+
+                    # --- Sanity readout: wrist pose in the BOARD (world) frame ---
+                    # Verify the MediaPipe side is reasonable BEFORE debugging the
+                    # MuJoCo mapping. Only meaningful when calibration is loaded.
+                    if _calib_ok:
+                        # Position (metres) in the board frame — per-axis distances
+                        # from the board origin (already computed as wrist_pos).
+                        _wp = wrist_pos
+                        draw_label(annotated,
+                            f"wrist pos (board m): X={_wp[0]:+.2f} Y={_wp[1]:+.2f} Z={_wp[2]:+.2f}",
+                            (10, fh - 66))
+                        # Orientation: build the palm frame from WORLD landmarks
+                        # (a real 3D frame, in MediaPipe world axes), map it into
+                        # the board frame, and report each axis' angle from the
+                        # board axes (0deg = wrist axis aligned with that board axis).
+                        _wlm = np.array([[lm.x, lm.y, lm.z] for lm in world_lm])
+                        _palm_w = _palm_frame_robot_aligned(_wlm[0], _wlm[5], _wlm[17])
+                        _R_mp_to_board = _R_world_cam @ np.diag([1.0, -1.0, -1.0])
+                        _palm_board = _R_mp_to_board @ _palm_w   # cols in board axes
+                        # Angle of each wrist axis from the SAME-named board axis
+                        # (0=aligned, 90=perpendicular, 180=flipped). No abs, so a
+                        # flipped axis shows as ~180 -> easy to spot.
+                        _ang = [np.degrees(np.arccos(np.clip(_palm_board[i, i], -1, 1)))
+                                for i in range(3)]
+                        draw_label(annotated,
+                            f"wrist ori vs board (deg): N={_ang[0]:4.0f} T={_ang[1]:4.0f} F={_ang[2]:4.0f}",
+                            (10, fh - 44))
+                        # Per-axis NOISE (std over the rolling window). Hold your
+                        # hand STILL and read this: if N (palm-normal, the
+                        # camera-depth axis) is much noisier than T/F, that's the
+                        # monocular single-camera limitation (out-of-plane rotation
+                        # poorly observed) — the likely residual floor.
+                        _ang_hist.append(_ang)
+                        if len(_ang_hist) >= 10:
+                            _s = np.std(np.array(_ang_hist), axis=0)
+                            draw_label(annotated,
+                                f"ori NOISE std (deg): N={_s[0]:4.1f} T={_s[1]:4.1f} F={_s[2]:4.1f}  "
+                                f"(N>>T,F => single-cam depth noise)",
+                                (10, fh - 22))
 
                     # Apply One Euro Filter before publishing.
                     # t is wall-clock seconds — used to adapt the filter's
