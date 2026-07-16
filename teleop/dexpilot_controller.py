@@ -164,8 +164,34 @@ class DexPilotController:
         # Use the ROBOT-ALIGNED palm frame so an identical physical hand
         # orientation maps to an identical robot wrist orientation (no press-8
         # offset). Distinct from the finger-retargeting palm frame above.
+        #
+        # The arm palm frame is built from IMAGE landmarks (raw[120:183]), NOT the
+        # world landmarks used for finger retargeting. The world-landmark depth
+        # flips the palm-NORMAL sign near edge-on poses (verified via the
+        # dual-normal overlay); the image-landmark frame stays stable. Fingers
+        # still use world_lm (they need metric 3D). Falls back to world landmarks
+        # if the publisher didn't send the image block (old message layout).
         cam_wrist      = np.array(raw[0:3], dtype=float)
-        palm_R, _      = self._retarg.human_palm_frame_robot_aligned(world_lm)
+        if len(raw) >= 183:
+            # IMAGE landmarks live in a different BASIS than world landmarks:
+            # image = {x-right, y-DOWN, z-pseudodepth}, world = {x-right, y-UP,
+            # z-toward-cam} (what the downstream R_mp_to_cv=diag([1,-1,-1]) expects).
+            #
+            # DO NOT negate the input coordinates — negating a coordinate and then
+            # taking cross products REFLECTS the frame (det -1), which an SVD
+            # "nearest rotation" then silently repairs by flipping an ARBITRARY
+            # axis, producing an inconsistent single-axis inversion (rotating +Y
+            # showed as -Y in MuJoCo). Instead build the palm frame in the image
+            # basis (already orthonormal — pure cross products + normalisation) and
+            # re-express it in the world basis with a proper-rotation change of
+            # basis C. Image->world is diag([1,-1,-1]) (det +1, the only Y-flip
+            # variant that is a rotation not a reflection).
+            _C            = np.diag([1.0, -1.0, -1.0])   # image basis -> world basis
+            image_lm      = np.array(raw[120:183], dtype=float).reshape(21, 3)
+            palm_R, _     = self._retarg.human_palm_frame_robot_aligned(image_lm)
+            palm_R        = _C @ palm_R
+        else:
+            palm_R, _     = self._retarg.human_palm_frame_robot_aligned(world_lm)
         q_arm          = self._arm.step(cam_wrist, data, palm_R=palm_R)
 
         return np.concatenate([q_arm, q_hand])

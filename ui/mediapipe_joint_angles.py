@@ -318,6 +318,15 @@ _HAND_SPAN_M = 0.09
 # track the left hand instead.
 _TRACK_HANDEDNESS = "Right"
 
+# DISPLAY-ONLY 180deg rotation. When True, the shown window is rotated a
+# half-turn (two 90deg turns) so the on-screen picture matches how your real arm
+# looks to you (camera mounted upside-down / facing you). This is applied ONLY to
+# the final displayed image, AFTER all landmark processing, overlays, and ROS
+# publishing — so it does NOT affect the tracked coordinates or the robot mapping.
+# The hand triad overlays rotate WITH the picture (still aligned to the hand); the
+# text labels also rotate (a cosmetic tradeoff). Set False to disable.
+_DISPLAY_ROTATE_180 = True
+
 # Freeze the monocular depth in ABSOLUTE mode. estimate_wrist_depth() reads the
 # apparent hand SIZE, which shrinks when you ROTATE your wrist (foreshortening) —
 # misread as the hand moving in depth, so rotation caused the target to TRANSLATE.
@@ -435,14 +444,56 @@ def recalibrate_board(frame, board, detector, K, dist, extr_path):
 
 # --- Visualization ---
 
-def draw_label(image, text, org, scale=0.55, thickness=1):
-    """Draw text with a filled WHITE background box for readability."""
-    (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+# Deferred info-labels. When the display is rotated 180deg (_DISPLAY_ROTATE_180),
+# corner text drawn before the rotation would come out upside-down. So draw_label
+# BUFFERS its calls here and they are flushed by flush_labels() AFTER rotation, at
+# rotation-corrected screen positions, keeping the text upright on a flipped image.
+# When rotation is off the buffer is flushed as-is (positions unchanged).
+_deferred_labels: list[tuple] = []
+
+
+def draw_label(image, text, org, scale=0.55, thickness=1,
+               color=(0, 0, 0), font=cv2.FONT_HERSHEY_SIMPLEX, box=True):
+    """Queue a label for upright rendering AFTER any display rotation.
+
+    Buffered rather than drawn immediately so it can be composited after the
+    180deg display flip (see flush_labels). `org` is the position in the UNROTATED
+    image; flush_labels maps it to the rotated frame when needed. Style:
+      box=True  -> white background box, black text (info readouts).
+      box=False -> plain colored text, no box (hand-anchored labels).
+    Works for ANY anchor (corner OR hand-following), since flush_labels remaps the
+    position through the same 180deg transform."""
+    _deferred_labels.append((text, org, scale, thickness, color, font, box))
+
+
+def _render_label(image, text, org, scale, thickness, color, font, box):
+    """Actually draw one label at `org` (optional white box + text)."""
+    (tw, th), base = cv2.getTextSize(text, font, scale, thickness)
     x, y = org
-    cv2.rectangle(image, (x - 3, y - th - 4), (x + tw + 3, y + base + 2),
-                  (255, 255, 255), cv2.FILLED)
-    cv2.putText(image, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale,
-                (0, 0, 0), thickness, cv2.LINE_AA)
+    if box:
+        cv2.rectangle(image, (x - 3, y - th - 4), (x + tw + 3, y + base + 2),
+                      (255, 255, 255), cv2.FILLED)
+    cv2.putText(image, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+
+
+def flush_labels(image, rotated_180: bool):
+    """Render all buffered labels UPRIGHT, then clear the buffer.
+
+    If the image was rotated 180deg, a label anchored at (x, y) in the original
+    frame must move to the mirrored screen position AND stay upright (not
+    mirrored). We remap the anchor to (W-1-x-tw, H-1-y+th) and draw normally — the
+    text glyphs themselves are never rotated, so they read correctly. This holds
+    for any anchor, so hand-following labels track the (now-rotated) hand too."""
+    h, w = image.shape[:2]
+    for text, org, scale, thickness, color, font, box in _deferred_labels:
+        if rotated_180:
+            (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+            x, y = org
+            # Map the anchor so the label lands at the same SCREEN position after a
+            # 180deg flip: (x,y) -> (W-1-x-tw, H-1-y+th). Upright, not mirrored.
+            org = (w - 1 - x - tw, h - 1 - y + th)
+        _render_label(image, text, org, scale, thickness, color, font, box)
+    _deferred_labels.clear()
 
 
 def draw_board_axes(image, K, dist, R_cam_world, t_cam_world, axis_len=0.05):
@@ -465,6 +516,16 @@ def draw_palm_frame(image, wrist_px, palm_R, length_px=40):
       red   = column 0 = palm normal
       green = column 1 = toward thumb
       blue  = column 2 = along fingers
+
+    DEPTH COMPONENT: the (x,y) segment discards each axis' out-of-screen (z)
+    component, which is exactly where the palm-normal flip happens (it points
+    mostly INTO/OUT of the screen). To make the flip visible, draw a dot at each
+    axis tip encoding its z:
+      - dot radius grows with |z| (axis pointing more toward/away from camera),
+      - FILLED  dot = z > 0 (toward camera / out of screen),
+      - HOLLOW  dot = z < 0 (away from camera / into screen).
+    A sign flip of the palm normal therefore shows as the red dot popping
+    between filled and hollow at the instant the MuJoCo triad flips.
     """
     ox, oy = int(wrist_px[0]), int(wrist_px[1])
     colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR: X,Y,Z
@@ -473,6 +534,11 @@ def draw_palm_frame(image, wrist_px, palm_R, length_px=40):
         ex = int(ox + ax[0] * length_px)
         ey = int(oy + ax[1] * length_px)
         cv2.line(image, (ox, oy), (ex, ey), c, 2)
+        # Depth cue at the tip: radius ~ |z|, fill = sign(z).
+        z = float(ax[2])
+        r = int(3 + abs(z) * 8)                 # 3px (in-plane) .. 11px (edge-on)
+        thickness = cv2.FILLED if z > 0 else 2  # filled=out of screen, hollow=into
+        cv2.circle(image, (ex, ey), r, c, thickness)
 
 
 def draw_landmarks(image, hand_landmarks, handedness):
@@ -495,14 +561,19 @@ def draw_landmarks(image, hand_landmarks, handedness):
       mp_drawing_styles.get_default_hand_connections_style())
 
     h, w, _ = image.shape
-    
-    # Draw handedness label
+
+    # Handedness label — DEFERRED so it renders upright after any display
+    # rotation (the hand SKELETON above is drawn immediately and rotates with the
+    # picture; only the text needs to stay readable). box=False keeps the original
+    # plain green DUPLEX style. Its hand-anchored position is remapped by
+    # flush_labels through the same 180deg transform, so it still tracks the hand.
     xs = [lm.x for lm in hand_landmarks]
     ys = [lm.y for lm in hand_landmarks]
-    cv2.putText(
+    draw_label(
         image, handedness,
         (int(min(xs) * w), int(min(ys) * h - MARGIN)),
-        cv2.FONT_HERSHEY_DUPLEX, 0.8, HANDEDNESS_TEXT_COLOR, 1
+        scale=0.8, color=HANDEDNESS_TEXT_COLOR,
+        font=cv2.FONT_HERSHEY_DUPLEX, box=False,
     )
 
 # --- Data Recording ---
@@ -557,7 +628,8 @@ def trigger_calibration():
         print("[USER] Calibration Trigger Sent!")
 
 
-def publish_hand_config(angles, wrist_pose, flexion_angles=None, world_landmarks=None):
+def publish_hand_config(angles, wrist_pose, flexion_angles=None,
+                        world_landmarks=None, image_landmarks=None):
     global joint_angles_pub, ros_node
     if not joint_angles_pub:
         return
@@ -578,9 +650,20 @@ def publish_hand_config(angles, wrist_pose, flexion_angles=None, world_landmarks
         joint_config.extend(flexion_angles)
 
     # Append world landmark positions: 21 landmarks × 3 coords = 63 floats [57:120]
-    # Metric units (metres), wrist approximately at origin.
+    # Metric units (metres), wrist approximately at origin. Used by finger
+    # retargeting (needs metric 3D).
     if world_landmarks is not None:
         joint_config.extend(world_landmarks)
+
+    # Append IMAGE landmark positions: 21 landmarks × 3 coords = 63 floats
+    # [120:183]. Normalised image coords (x,y in [0,1], z = MediaPipe image
+    # pseudo-depth). The arm's palm-frame NORMAL is built from these instead of
+    # the world landmarks because the world-landmark depth flips the palm-normal
+    # sign near edge-on poses, while the image-landmark frame stays stable
+    # (verified via the dual-normal overlay). Requires world_landmarks present so
+    # the [57:120] block keeps the layout fixed.
+    if image_landmarks is not None:
+        joint_config.extend(image_landmarks)
 
     msg.data = joint_config
     joint_angles_pub.publish(msg)
@@ -781,6 +864,9 @@ def main():
         filter_wrist = OneEuroFilterArray(6, freq=30.0, min_cutoff=1.0, beta=0.3)
     filter_flexion  = OneEuroFilterArray(6,  freq=30.0, min_cutoff=1.5, beta=0.2)
     filter_world_lm = OneEuroFilterArray(63, freq=30.0, min_cutoff=1.5, beta=0.2)
+    # Image landmarks feed the arm palm-frame normal (more stable than world LM
+    # near edge-on). Same smoothing profile as the world-landmark filter.
+    filter_image_lm = OneEuroFilterArray(63, freq=30.0, min_cutoff=1.5, beta=0.2)
     last_frame = None
     last_hand_data = None
     show_debug = False  # toggled with 'D' — overlays flexion angles on video
@@ -877,6 +963,35 @@ def main():
                     _pts = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
                     _palm_R = _palm_frame_robot_aligned(_pts[0], _pts[5], _pts[17])
                     draw_palm_frame(annotated, (u_px, v_px), _palm_R)
+                    # Numeric normal-depth readout: watch this cross zero — that
+                    # is where cross(thumb_dir, fingers) degenerates and the
+                    # palm-normal sign flips (the MuJoCo triad flip). |Nz| near 1
+                    # = palm edge-on to the camera (worst case for roll).
+                    draw_label(annotated,
+                        f"palm normal z (img): {float(_palm_R[2, 0]):+.2f}  "
+                        f"(|z|~1 edge-on; sign flip => normal flip)",
+                        (10, fh - 88))
+                    # SECOND normal built from WORLD landmarks — the frame the ARM
+                    # actually consumes (raw[57:120] -> human_palm_frame_robot_aligned).
+                    # The overlay above uses IMAGE landmarks; the arm uses WORLD
+                    # landmarks (a different MediaPipe depth estimate). Draw the
+                    # world-built normal as an extra dot so we can see which one
+                    # flips: if WORLD flips while IMG stays stable => the flip is in
+                    # MediaPipe's world-landmark depth (data; RealSense fixes it),
+                    # NOT the frame construction and NOT the IK. Drawn as a hollow
+                    # magenta ring at the SAME image-plane tip; its FILL encodes the
+                    # world-normal's out-of-screen sign (filled=toward cam).
+                    _wlm2 = np.array([[lm.x, lm.y, lm.z] for lm in world_lm])
+                    _palm_w2 = _palm_frame_robot_aligned(_wlm2[0], _wlm2[5], _wlm2[17])
+                    _wn = _palm_w2[:, 0]                       # world palm normal
+                    _wex = int(u_px + _wn[0] * 40)
+                    _wey = int(v_px + _wn[1] * 40)
+                    _wthick = cv2.FILLED if _wn[2] > 0 else 2
+                    cv2.circle(annotated, (_wex, _wey), 6, (255, 0, 255), _wthick)
+                    draw_label(annotated,
+                        f"palm normal z (WORLD/arm): {float(_wn[2]):+.2f}  "
+                        f"(magenta dot; compare to img red)",
+                        (10, fh - 110))
 
                     # --- Sanity readout: wrist pose in the BOARD (world) frame ---
                     # Verify the MediaPipe side is reasonable BEFORE debugging the
@@ -931,9 +1046,15 @@ def main():
                         [[lm.x, lm.y, lm.z] for lm in world_lm]).flatten()
                     world_flat_f = filter_world_lm(world_flat, t)
 
-                    # Publish to ROS (Euler + flexion + world landmarks)
+                    # IMAGE landmarks (normalised) for the arm palm-frame normal.
+                    image_flat = np.array(
+                        [[lm.x, lm.y, lm.z] for lm in hand_landmarks]).flatten()
+                    image_flat_f = filter_image_lm(image_flat, t)
+
+                    # Publish to ROS (Euler + flexion + world LM + image LM)
                     publish_hand_config(angles, wrist_pose_f,
-                                        flexion_f.tolist(), world_flat_f.tolist())
+                                        flexion_f.tolist(), world_flat_f.tolist(),
+                                        image_flat_f.tolist())
 
                     if show_debug:
                         labels = ["idx_mcp", "idx_pip", "idx_dip",
@@ -957,17 +1078,26 @@ def main():
                     filter_wrist.reset()
                     filter_flexion.reset()
                     filter_world_lm.reset()
+                    filter_image_lm.reset()
 
-                # UI Overlay
+                # UI Overlay — deferred (drawn upright after any display rotation).
                 dbg_label = "[D:ON]" if show_debug else "D:Debug"
                 ui_text = (f"{dbg_label} | SPACE:Snap | Q:Quit"
                            if DEBUG_FLAG else f"{dbg_label} | Q:Quit")
-                cv2.putText(annotated, "In MuJoCo: C -> spread open, C -> pinch to calibrate",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
-                cv2.putText(annotated, ui_text, (10, 52),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+                draw_label(annotated, "In MuJoCo: C -> spread open, C -> pinch to calibrate",
+                           (10, 30))
+                draw_label(annotated, ui_text, (10, 52))
 
-                cv2.imshow(f"Hand Tracking  [cam {camera_index}]", annotated)
+                # Display-only 180deg rotation (see _DISPLAY_ROTATE_180). Rotate a
+                # LOCAL copy right before showing so the tracked data, overlays'
+                # math, and last_frame stay unrotated — this is purely cosmetic.
+                # The HAND landmark/triad overlays rotate WITH the picture (they're
+                # already baked into `annotated`); the info-LABELS are rendered
+                # AFTER rotation by flush_labels so they stay upright and readable.
+                _disp = (cv2.rotate(annotated, cv2.ROTATE_180)
+                         if _DISPLAY_ROTATE_180 else annotated.copy())
+                flush_labels(_disp, _DISPLAY_ROTATE_180)
+                cv2.imshow(f"Hand Tracking  [cam {camera_index}]", _disp)
 
                 # Input Handling
                 key = cv2.waitKey(1) & 0xFF

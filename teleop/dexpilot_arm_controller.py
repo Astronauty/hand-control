@@ -163,6 +163,7 @@ class DexPilotArmController:
         full_orientation: bool = True,
         R_align: np.ndarray | None = None,
         R_cam_robot: np.ndarray | None = _DEFAULT_R_CAM_ROBOT,
+        identity_orientation: bool = False,
     ) -> None:
         self._model       = model
         self._n_arm       = n_arm
@@ -191,7 +192,21 @@ class DexPilotArmController:
         # offset remains, and pass R_align= to set it.
         # Load a saved orientation correction if present (from a prior multi-pose
         # calibration), else identity — or an explicit R_align override.
-        if R_align is not None:
+        #
+        # identity_orientation: force R_correct = I and disable ALL calibration
+        # (press-8 auto-calib AND the saved orientation_correction.json). This is
+        # the DIRECT mapping R_des = R_mp_to_robot @ palm_R — the world->wrist
+        # rotation shown in the MediaPipe overlay becomes the exact target in
+        # MuJoCo, with no offset. Meaningful now that the arm palm frame is built
+        # from the STABLE image landmarks (the saved correction was fit against the
+        # old flip-prone world-landmark frame and is no longer valid).
+        self._identity_orientation = identity_orientation
+        if identity_orientation:
+            self._R_correct = np.eye(3)
+            self._has_full_correction = True   # block press-8 from overwriting I
+            print("[arm] identity orientation: direct hand->wrist mapping, "
+                  "no calibration offset.")
+        elif R_align is not None:
             self._R_correct = np.asarray(R_align, float)
             self._has_full_correction = True
         elif os.path.exists(_R_CORRECT_PATH):

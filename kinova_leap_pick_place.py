@@ -1072,11 +1072,19 @@ if __name__ == "__main__":
             # Only valid when calibration is present (single source of truth).
             _cam_kwargs["absolute"] = True
             _cam_kwargs["abs_scale"] = 1.0
+            # DIRECT hand->wrist orientation: with the arm palm frame now built
+            # from the stable IMAGE landmarks, the world->wrist rotation shown in
+            # the MediaPipe overlay maps 1:1 to the MuJoCo target — no press-8
+            # offset, no stale orientation_correction.json. Set False to re-enable
+            # the press-8 auto-calibration.
+            _cam_kwargs["identity_orientation"] = True
             print(f"[DexPilot] loaded camera calibration: "
                   f"scale_x={_cam_kwargs['scale_x']:.3f} scale_z={_cam_kwargs['scale_z']:.3f} "
-                  f"| ABSOLUTE Z-up positioning + FULL 3-DOF orientation ON (abs_scale=1.0)")
+                  f"| ABSOLUTE Z-up positioning + FULL 3-DOF orientation ON (abs_scale=1.0) "
+                  f"| IDENTITY orientation (direct mapping)")
         except FileNotFoundError:
-            _cam_kwargs = {"R_cam_robot": np.eye(3), "absolute": False}
+            _cam_kwargs = {"R_cam_robot": np.eye(3), "absolute": False,
+                           "identity_orientation": True}
             print("[DexPilot] no camera calibration found — using identity "
                   "R_cam_robot, DELTA positioning. Run calibration/charuco_calibration.py.")
         # Palm-DOWN home for teleop: pinch_site palm NORMAL (+X) points down
