@@ -40,6 +40,38 @@ _CALIB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 _R_CORRECT_PATH = os.path.join(_CALIB_DIR, "orientation_correction.json")
 
 
+_TELEOP_CONFIG_PATH = os.path.join(_CALIB_DIR, "teleop_config.json")
+
+
+def load_teleop_config(path: str | None = None) -> dict:
+    """Load DexPilot teleop tunables (calibration/teleop_config.json).
+
+    Returns a dict of DexPilotController kwargs derived from the config's
+    `position` block: `position_mode`, `abs_scale`, `world_from_board` (3x3 list
+    -> np.ndarray). Missing file or missing keys fall back to sane defaults
+    (relative mode, abs_scale 1.0, identity remap), so teleop still runs without
+    the file. `_comment*` keys are ignored. The caller may override `position_mode`
+    afterwards (e.g. from the --position-mode CLI flag).
+    """
+    path = path or _TELEOP_CONFIG_PATH
+    pos = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            pos = (json.load(f) or {}).get("position", {}) or {}
+        print(f"[teleop] loaded config from {path}")
+    else:
+        print(f"[teleop] no {os.path.basename(path)} — using position defaults "
+              f"(relative, abs_scale=1.0).")
+
+    wfb = pos.get("world_from_board")
+    return {
+        "position_mode":    pos.get("mode", "relative"),
+        "abs_scale":        float(pos.get("abs_scale", 1.0)),
+        "world_from_board": (np.asarray(wfb, float) if wfb is not None
+                             else np.eye(3)),
+    }
+
+
 def load_camera_calibration(
     extrinsics_path: str | None = None,
     intrinsics_path: str | None = None,
@@ -157,7 +189,7 @@ class DexPilotArmController:
         scale_x: float = 0.3,
         scale_z: float = 0.2,
         scale_depth: float = 0.5,
-        absolute: bool = False,
+        position_mode: str = "relative",
         world_from_board: np.ndarray | None = None,
         abs_scale: float = 1.0,
         full_orientation: bool = True,
@@ -172,11 +204,19 @@ class DexPilotArmController:
         self._scale_x     = scale_x
         self._scale_z     = scale_z
         self._scale_depth = scale_depth
-        # Absolute board-anchored positioning (see _camera_to_world). When True,
-        # cam[:3] is a metric wrist position in the ChArUco board frame (published
-        # by ui/mediapipe_joint_angles.py in absolute mode), and motion is mapped
-        # 1:1×abs_scale from the press-8 zero rather than from image deltas.
-        self._absolute   = absolute
+        # Position mode (see _camera_to_world). Both consume cam[:3] = the metric
+        # wrist position in the ChArUco board frame (published in absolute mode):
+        #   "relative": press-8 re-zeroable — robot tracks abs_scale × (board
+        #     displacement from the press-8 board_ref), anchored at _home_site.
+        #   "absolute": true absolute — the board position maps to a FIXED robot
+        #     world position (board origin -> robot BASE origin (0,0,0)), scaled by
+        #     abs_scale. No press-8 re-zero; the workspace is physically pinned.
+        # "legacy" (delta image pixels) remains available for the no-calibration
+        # fallback. abs_scale applies to BOTH relative and absolute.
+        if position_mode not in ("relative", "absolute", "legacy"):
+            raise ValueError(f"position_mode must be relative|absolute|legacy, "
+                             f"got {position_mode!r}")
+        self._position_mode = position_mode
         self._Rwb        = (np.eye(3) if world_from_board is None
                             else np.asarray(world_from_board, float))
         self._abs_scale  = abs_scale
@@ -280,34 +320,43 @@ class DexPilotArmController:
     def _camera_to_world(self, cam: np.ndarray) -> np.ndarray:
         """Map camera-space wrist position to a robot world-frame position target.
 
-        Two modes:
-          * absolute: cam[:3] is a metric wrist position in the ChArUco board
+        Three modes (self._position_mode):
+          * "relative": cam[:3] is a metric wrist position in the ChArUco board
             frame. On the first frame after press-8 we snapshot it as board_ref;
             thereafter the robot tracks the metric board-frame motion (×abs_scale)
-            from _home_site. This aligns the MuJoCo and board frames at press-8 —
-            the robot's current wrist pose ↔ the hand's current board position —
-            then moves absolutely from there.
-          * delta (legacy): cam = [image_x, image_y, depth_m]; motion is relative
-            to the first received frame, mapped through per-axis pixel scales.
+            from _home_site. Re-zeroable at press-8 — the robot's current wrist
+            pose ↔ the hand's current board position — then moves from there.
+          * "absolute": TRUE absolute. cam[:3] (board frame) maps to a FIXED robot
+            world position: board ORIGIN -> robot BASE origin (0,0,0), the whole
+            position scaled by abs_scale. No press-8 anchor, no re-zero — the
+            workspace is physically pinned to the board.
+          * "legacy": cam = [image_x, image_y, depth_m]; motion is relative to the
+            first received frame, mapped through per-axis pixel scales.
+        Position mapping in ALL modes is INDEPENDENT of hand orientation.
         """
         if self._home_site is None:
             raise RuntimeError(
                 "init_home() must be called before DexPilotArmController.step()")
 
-        if self._absolute:
+        if self._position_mode == "relative":
             if self._board_ref is None:
                 self._board_ref = cam[:3].copy()   # hand board-pos at press-8
             delta_board = cam[:3] - self._board_ref
             # Map the board/world-frame displacement into the robot frame by a
             # FIXED world->robot rotation (_Rwb, default identity for board ==
-            # robot world). This must NOT depend on the hand orientation — using
-            # R_board_to_robot (=R_site_home @ palm_R_home^T) here coupled the
-            # translation to how the palm was tilted at press-8, so the same
-            # real-world motion mapped to different robot directions ("bad
-            # real-vs-sim correlation"). Position and orientation are independent.
+            # robot world). Must NOT depend on hand orientation (coupling it made
+            # the same real motion map to different robot directions).
             return self._home_site + self._abs_scale * (self._Rwb @ delta_board)
 
-        # cam = [image_x, image_y, depth_m]; depth from monocular hand-size in
+        if self._position_mode == "absolute":
+            # Board ORIGIN -> robot BASE origin (0,0,0). The full board-frame
+            # position (remapped to robot axes by _Rwb) is scaled by abs_scale.
+            # No _home_site, no _board_ref: the robot wrist goal is a fixed
+            # function of where the hand is over the board. abs_scale>1 amplifies
+            # reach about the board origin.
+            return self._abs_scale * (self._Rwb @ cam[:3])
+
+        # "legacy": cam = [image_x, image_y, depth_m]; depth from monocular hand-size in
         # the publisher (raw[2]). Delta-based like x/y: only motion relative to
         # the startup depth drives robot-Y, so absolute-depth bias doesn't matter.
         if self._cam_home is None:

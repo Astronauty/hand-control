@@ -325,7 +325,7 @@ _TRACK_HANDEDNESS = "Right"
 # publishing — so it does NOT affect the tracked coordinates or the robot mapping.
 # The hand triad overlays rotate WITH the picture (still aligned to the hand); the
 # text labels also rotate (a cosmetic tradeoff). Set False to disable.
-_DISPLAY_ROTATE_180 = True
+_DISPLAY_ROTATE_180 = False
 
 # Freeze the monocular depth in ABSOLUTE mode. estimate_wrist_depth() reads the
 # apparent hand SIZE, which shrinks when you ROTATE your wrist (foreshortening) —
@@ -453,26 +453,28 @@ _deferred_labels: list[tuple] = []
 
 
 def draw_label(image, text, org, scale=0.55, thickness=1,
-               color=(0, 0, 0), font=cv2.FONT_HERSHEY_SIMPLEX, box=True):
+               color=(0, 255, 0), font=cv2.FONT_HERSHEY_SIMPLEX, box=True,
+               box_color=(0, 0, 0)):
     """Queue a label for upright rendering AFTER any display rotation.
 
     Buffered rather than drawn immediately so it can be composited after the
     180deg display flip (see flush_labels). `org` is the position in the UNROTATED
     image; flush_labels maps it to the rotated frame when needed. Style:
-      box=True  -> white background box, black text (info readouts).
+      box=True  -> filled background box (box_color), text (color) — info readouts,
+                   default GREEN text on BLACK box.
       box=False -> plain colored text, no box (hand-anchored labels).
     Works for ANY anchor (corner OR hand-following), since flush_labels remaps the
     position through the same 180deg transform."""
-    _deferred_labels.append((text, org, scale, thickness, color, font, box))
+    _deferred_labels.append((text, org, scale, thickness, color, font, box, box_color))
 
 
-def _render_label(image, text, org, scale, thickness, color, font, box):
-    """Actually draw one label at `org` (optional white box + text)."""
+def _render_label(image, text, org, scale, thickness, color, font, box, box_color):
+    """Actually draw one label at `org` (optional filled box + text)."""
     (tw, th), base = cv2.getTextSize(text, font, scale, thickness)
     x, y = org
     if box:
         cv2.rectangle(image, (x - 3, y - th - 4), (x + tw + 3, y + base + 2),
-                      (255, 255, 255), cv2.FILLED)
+                      box_color, cv2.FILLED)
     cv2.putText(image, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
 
 
@@ -485,14 +487,14 @@ def flush_labels(image, rotated_180: bool):
     text glyphs themselves are never rotated, so they read correctly. This holds
     for any anchor, so hand-following labels track the (now-rotated) hand too."""
     h, w = image.shape[:2]
-    for text, org, scale, thickness, color, font, box in _deferred_labels:
+    for text, org, scale, thickness, color, font, box, box_color in _deferred_labels:
         if rotated_180:
             (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
             x, y = org
             # Map the anchor so the label lands at the same SCREEN position after a
             # 180deg flip: (x,y) -> (W-1-x-tw, H-1-y+th). Upright, not mirrored.
             org = (w - 1 - x - tw, h - 1 - y + th)
-        _render_label(image, text, org, scale, thickness, color, font, box)
+        _render_label(image, text, org, scale, thickness, color, font, box, box_color)
     _deferred_labels.clear()
 
 
@@ -516,16 +518,6 @@ def draw_palm_frame(image, wrist_px, palm_R, length_px=40):
       red   = column 0 = palm normal
       green = column 1 = toward thumb
       blue  = column 2 = along fingers
-
-    DEPTH COMPONENT: the (x,y) segment discards each axis' out-of-screen (z)
-    component, which is exactly where the palm-normal flip happens (it points
-    mostly INTO/OUT of the screen). To make the flip visible, draw a dot at each
-    axis tip encoding its z:
-      - dot radius grows with |z| (axis pointing more toward/away from camera),
-      - FILLED  dot = z > 0 (toward camera / out of screen),
-      - HOLLOW  dot = z < 0 (away from camera / into screen).
-    A sign flip of the palm normal therefore shows as the red dot popping
-    between filled and hollow at the instant the MuJoCo triad flips.
     """
     ox, oy = int(wrist_px[0]), int(wrist_px[1])
     colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # BGR: X,Y,Z
@@ -534,11 +526,6 @@ def draw_palm_frame(image, wrist_px, palm_R, length_px=40):
         ex = int(ox + ax[0] * length_px)
         ey = int(oy + ax[1] * length_px)
         cv2.line(image, (ox, oy), (ex, ey), c, 2)
-        # Depth cue at the tip: radius ~ |z|, fill = sign(z).
-        z = float(ax[2])
-        r = int(3 + abs(z) * 8)                 # 3px (in-plane) .. 11px (edge-on)
-        thickness = cv2.FILLED if z > 0 else 2  # filled=out of screen, hollow=into
-        cv2.circle(image, (ex, ey), r, c, thickness)
 
 
 def draw_landmarks(image, hand_landmarks, handedness):
@@ -831,11 +818,6 @@ def main():
         else:
             print("[INFO] no extrinsics; publishing LEGACY normalised wrist (delta teleop).")
 
-    # Rolling window of the per-axis wrist-vs-board angles, to measure per-axis
-    # NOISE (std). If the palm-NORMAL axis (camera-depth direction) is much
-    # noisier than thumb/fingers, that's the monocular single-camera signature.
-    _ang_hist = deque(maxlen=30)
-
     # ChArUco detector for on-demand board re-calibration (key 'B'). Needs
     # intrinsics; re-solving updates the world frame live without a restart.
     _board = _charuco_det = None
@@ -963,35 +945,6 @@ def main():
                     _pts = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
                     _palm_R = _palm_frame_robot_aligned(_pts[0], _pts[5], _pts[17])
                     draw_palm_frame(annotated, (u_px, v_px), _palm_R)
-                    # Numeric normal-depth readout: watch this cross zero — that
-                    # is where cross(thumb_dir, fingers) degenerates and the
-                    # palm-normal sign flips (the MuJoCo triad flip). |Nz| near 1
-                    # = palm edge-on to the camera (worst case for roll).
-                    draw_label(annotated,
-                        f"palm normal z (img): {float(_palm_R[2, 0]):+.2f}  "
-                        f"(|z|~1 edge-on; sign flip => normal flip)",
-                        (10, fh - 88))
-                    # SECOND normal built from WORLD landmarks — the frame the ARM
-                    # actually consumes (raw[57:120] -> human_palm_frame_robot_aligned).
-                    # The overlay above uses IMAGE landmarks; the arm uses WORLD
-                    # landmarks (a different MediaPipe depth estimate). Draw the
-                    # world-built normal as an extra dot so we can see which one
-                    # flips: if WORLD flips while IMG stays stable => the flip is in
-                    # MediaPipe's world-landmark depth (data; RealSense fixes it),
-                    # NOT the frame construction and NOT the IK. Drawn as a hollow
-                    # magenta ring at the SAME image-plane tip; its FILL encodes the
-                    # world-normal's out-of-screen sign (filled=toward cam).
-                    _wlm2 = np.array([[lm.x, lm.y, lm.z] for lm in world_lm])
-                    _palm_w2 = _palm_frame_robot_aligned(_wlm2[0], _wlm2[5], _wlm2[17])
-                    _wn = _palm_w2[:, 0]                       # world palm normal
-                    _wex = int(u_px + _wn[0] * 40)
-                    _wey = int(v_px + _wn[1] * 40)
-                    _wthick = cv2.FILLED if _wn[2] > 0 else 2
-                    cv2.circle(annotated, (_wex, _wey), 6, (255, 0, 255), _wthick)
-                    draw_label(annotated,
-                        f"palm normal z (WORLD/arm): {float(_wn[2]):+.2f}  "
-                        f"(magenta dot; compare to img red)",
-                        (10, fh - 110))
 
                     # --- Sanity readout: wrist pose in the BOARD (world) frame ---
                     # Verify the MediaPipe side is reasonable BEFORE debugging the
@@ -1011,26 +964,16 @@ def main():
                         _palm_w = _palm_frame_robot_aligned(_wlm[0], _wlm[5], _wlm[17])
                         _R_mp_to_board = _R_world_cam @ np.diag([1.0, -1.0, -1.0])
                         _palm_board = _R_mp_to_board @ _palm_w   # cols in board axes
-                        # Angle of each wrist axis from the SAME-named board axis
-                        # (0=aligned, 90=perpendicular, 180=flipped). No abs, so a
-                        # flipped axis shows as ~180 -> easy to spot.
+                        # Angle of each palm axis from the SAME-named board axis
+                        # (0=aligned, 90=perpendicular, 180=flipped). These are three
+                        # independent per-axis DEVIATIONS (not Euler angles). Labelled
+                        # by the board axis each is measured against: palm normal vs
+                        # board X, thumb vs board Y, fingers vs board Z.
                         _ang = [np.degrees(np.arccos(np.clip(_palm_board[i, i], -1, 1)))
                                 for i in range(3)]
                         draw_label(annotated,
-                            f"wrist ori vs board (deg): N={_ang[0]:4.0f} T={_ang[1]:4.0f} F={_ang[2]:4.0f}",
+                            f"wrist ori vs board (deg): X={_ang[0]:4.0f} Y={_ang[1]:4.0f} Z={_ang[2]:4.0f}",
                             (10, fh - 44))
-                        # Per-axis NOISE (std over the rolling window). Hold your
-                        # hand STILL and read this: if N (palm-normal, the
-                        # camera-depth axis) is much noisier than T/F, that's the
-                        # monocular single-camera limitation (out-of-plane rotation
-                        # poorly observed) — the likely residual floor.
-                        _ang_hist.append(_ang)
-                        if len(_ang_hist) >= 10:
-                            _s = np.std(np.array(_ang_hist), axis=0)
-                            draw_label(annotated,
-                                f"ori NOISE std (deg): N={_s[0]:4.1f} T={_s[1]:4.1f} F={_s[2]:4.1f}  "
-                                f"(N>>T,F => single-cam depth noise)",
-                                (10, fh - 22))
 
                     # Apply One Euro Filter before publishing.
                     # t is wall-clock seconds — used to adapt the filter's
@@ -1084,9 +1027,7 @@ def main():
                 dbg_label = "[D:ON]" if show_debug else "D:Debug"
                 ui_text = (f"{dbg_label} | SPACE:Snap | Q:Quit"
                            if DEBUG_FLAG else f"{dbg_label} | Q:Quit")
-                draw_label(annotated, "In MuJoCo: C -> spread open, C -> pinch to calibrate",
-                           (10, 30))
-                draw_label(annotated, ui_text, (10, 52))
+                draw_label(annotated, ui_text, (10, 30))
 
                 # Display-only 180deg rotation (see _DISPLAY_ROTATE_180). Rotate a
                 # LOCAL copy right before showing so the tracked data, overlays'

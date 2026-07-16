@@ -1,0 +1,11 @@
+{
+  "_comment": "DexPilot teleop tunables. Loaded by teleop.dexpilot_arm_controller.load_teleop_config() and fed to DexPilotController. position.mode is overridden by the --position-mode CLI flag when given.",
+  "position": {
+    "_comment_mode": "relative = press-8 re-zeroable, abs_scale x (board displacement from press-8). absolute = true absolute, board origin -> robot base (0,0,0), whole position x abs_scale. Overridden by --position-mode.",
+    "mode": "relative",
+    "_comment_abs_scale": "Uniform position gain (applies to BOTH relative and absolute). 1.0 = 1:1 metres. >1 amplifies reach.",
+    "abs_scale": 3.0,
+    "_comment_world_from_board": "3x3 rotation remapping board axes -> robot world axes (applied to the position/displacement only). Default identity (board == robot world). Flip a column to invert an axis.",
+    "world_from_board": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+  }
+}

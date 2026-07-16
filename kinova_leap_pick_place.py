@@ -325,6 +325,14 @@ if __name__ == "__main__":
         help="Camera index forwarded to ui/mediapipe_joint_angles.py in dexpilot mode "
              "(default: auto-select — prefers external/USB camera at index ≥1).")
     _arg_parser.add_argument(
+        '--position-mode', choices=['relative', 'absolute'], default=None,
+        help="dexpilot position mapping. relative: press-8 re-zeroable, robot tracks "
+             "abs_scale × (board displacement from press-8). absolute: true absolute, "
+             "hand's board position -> fixed robot position (board origin -> base "
+             "origin), scaled by abs_scale, no re-zero. Default: from "
+             "calibration/teleop_config.json (relative if unset). Other tunables "
+             "(abs_scale, world_from_board) live in that config file.")
+    _arg_parser.add_argument(
         '--seed', type=int, default=None,
         help="RNG seed for object randomization — the same seed reproduces the same "
              "layout (positions and sizes). Default: fresh entropy every run. "
@@ -1055,7 +1063,8 @@ if __name__ == "__main__":
         print(f"[DexPilot] MediaPipe publisher launched (pid {_mediapipe_proc.pid})")
 
         from teleop.dexpilot_controller import DexPilotController
-        from teleop.dexpilot_arm_controller import load_camera_calibration
+        from teleop.dexpilot_arm_controller import (load_camera_calibration,
+                                                    load_teleop_config)
         # Use the measured ChArUco calibration (camera_extrinsics/intrinsics.json)
         # for the camera->robot rotation and pixel->metre scales. Falls back to a
         # bare identity mapping if the calibration files aren't present.
@@ -1067,11 +1076,15 @@ if __name__ == "__main__":
             # orientation disagree and the wrist rotation maps wrong.
             _world_from_board = np.diag([1.0, -1.0, -1.0])
             _cam_kwargs = load_camera_calibration(world_from_board=_world_from_board)
-            # Absolute board-anchored positioning: the publisher sends metric
-            # board-frame wrist coords, and the arm anchors them at press-8.
-            # Only valid when calibration is present (single source of truth).
-            _cam_kwargs["absolute"] = True
-            _cam_kwargs["abs_scale"] = 1.0
+            # Position tunables from calibration/teleop_config.json (mode,
+            # abs_scale, world_from_board). --position-mode CLI overrides the
+            # config's mode when given. The publisher sends metric board-frame
+            # wrist coords (absolute publish mode), which BOTH position modes
+            # consume; only valid when calibration is present.
+            _pos_cfg = load_teleop_config()
+            if args.position_mode is not None:
+                _pos_cfg["position_mode"] = args.position_mode
+            _cam_kwargs.update(_pos_cfg)
             # DIRECT hand->wrist orientation: with the arm palm frame now built
             # from the stable IMAGE landmarks, the world->wrist rotation shown in
             # the MediaPipe overlay maps 1:1 to the MuJoCo target — no press-8
@@ -1080,20 +1093,25 @@ if __name__ == "__main__":
             _cam_kwargs["identity_orientation"] = True
             print(f"[DexPilot] loaded camera calibration: "
                   f"scale_x={_cam_kwargs['scale_x']:.3f} scale_z={_cam_kwargs['scale_z']:.3f} "
-                  f"| ABSOLUTE Z-up positioning + FULL 3-DOF orientation ON (abs_scale=1.0) "
-                  f"| IDENTITY orientation (direct mapping)")
+                  f"| position={_cam_kwargs['position_mode']} abs_scale={_cam_kwargs['abs_scale']:.2f} "
+                  f"| FULL 3-DOF IDENTITY orientation (direct mapping)")
         except FileNotFoundError:
-            _cam_kwargs = {"R_cam_robot": np.eye(3), "absolute": False,
+            _cam_kwargs = {"R_cam_robot": np.eye(3), "position_mode": "legacy",
                            "identity_orientation": True}
             print("[DexPilot] no camera calibration found — using identity "
-                  "R_cam_robot, DELTA positioning. Run calibration/charuco_calibration.py.")
+                  "R_cam_robot, LEGACY delta positioning. Run calibration/charuco_calibration.py.")
         # Palm-DOWN home for teleop: pinch_site palm NORMAL (+X) points down
         # (world -Z) and FINGERS (+Z) point FORWARD (world +X) — palm flat over
         # the table, fingers reaching away. Natural neutral (hold your palm down,
-        # fingers forward, press 8). Solved via IK (pinch_site at ~(0.55,0,0.4)):
-        # normal = world -Z, fingers = world +X; manip ~0.05, within joint limits.
-        _HOME_WRIST_DOWN = np.array([-0.283, 0.509, 3.534, -2.036,
-                                     0.076, 0.955, 2.91])
+        # fingers forward, press 8). Solved via IK for pinch_site at ~(0.55,0,0.15)
+        # — LOWERED from z=0.40 so the sim wrist STARTS near the table: relative
+        # positioning then needs only ~0.15 m of descent, so the operator reaches
+        # the sim table well within real vertical travel at modest abs_scale (the
+        # old 0.40 m start forced high gain / was unreachable). Same orientation
+        # (normal=world -Z, fingers=world +X); ori err 0.1deg, manip ~0.07, limited
+        # joints 2/4/6 within range (margins >=0.5 rad).
+        _HOME_WRIST_DOWN = np.array([-0.217, 1.144, 3.44, -2.011,
+                                     -0.087, 1.541, 2.872])
 
         # Multi-pose orientation calibration: 4 distinct, IK-solved wrist
         # orientations (all reachable, within limits). During calibration (key M)
