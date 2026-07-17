@@ -211,11 +211,12 @@ def make_key_callback(key_queue):
         78:  'release',  # N — (GRASP) open fingers and return to REACH
         76:  'lock_in',  # L — (contact_aware_teleop) lock in the recommended grasp
                         #     contacts and approach them via RRT
-        80:  'rec_vis',  # P — (contact_aware_teleop) hold/preview the recommender's OWN
-                        #     q solution (no collision re-solve) for debugging
-        79:  'rec_ik_vis',  # O — (contact_aware_teleop) preview the collision-aware IK
-                           #     solution to the recommended contacts (runs the lock-in
-                           #     IK without committing to RRT), for A/B against P
+        80:  'rec_vis',  # P — (contact_aware_teleop) preview the recommender's OWN q
+                        #     solution (unconstrained NLP, no collision IK)
+        79:  'rec_ik_recq_vis',  # O — preview the collision-aware IK to the recommended
+                                #     contacts, warm-started from the recommender's q
+        73:  'rec_ik_dls_vis',   # I — same collision-aware IK but warm-started from a
+                                #     fresh DLS solve, to A/B the two warm-starts
         54:  'ik_vis',  # 6 — cycle IK config visualization
         55:  'bspheres', # 7 — toggle IK collision bounding-sphere overlay
         56:  'teleop_start', # 8 — (dexpilot) start/re-zero tracking at current pose
@@ -1042,7 +1043,8 @@ if __name__ == "__main__":
         _run_ik(obj_idx, obj, obj_qpos_snap)
         _run_rrt(q_start, obj['q_target'], obj)
 
-    def _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_seed):
+    def _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_seed,
+                            warmstart='rec_q'):
         """contact_aware_teleop lock-in: like _run_ik but the fingertip targets come
         from the NLP-recommended contacts (rec['p1']=thumb, rec['p2']=index in world)
         instead of the authored contact sites. Stores the recommended contacts as
@@ -1050,10 +1052,14 @@ if __name__ == "__main__":
         then reuses the same DLS->SQP grasp IK to get obj['q_target'].
 
         q_seed is the operator's live teleoped pose at lock-in — the hand is already
-        positioned at a valid, collision-free approach to the object, so we warm-start
-        AND bias the IK from it rather than from Q_BIAS. Seeding from the far-away home
-        pose was leaving the fingertips ~7cm off the recommended contacts because the
-        collision constraints block the tips from wrapping down from that posture."""
+        positioned at a valid, collision-free approach to the object, so we BIAS the IK
+        (posture regularization) from it rather than from Q_BIAS.
+
+        warmstart selects the IK's q_init:
+          'rec_q' — the recommender's own q (already at the contacts, ~cm residual).
+          'dls'   — a fresh DLS solve to the contacts from q_seed.
+        Both share the same q_bias=q_seed; only the initial guess differs. Exposed so
+        the debug previews can A/B the two warm-starts."""
         mj.mj_resetData(model, _ik_data)
         _ik_data.qpos[:N_ROBOT] = q_seed
         _ik_data.qpos[N_ROBOT:] = obj_qpos_snap
@@ -1096,17 +1102,30 @@ if __name__ == "__main__":
         # along each inward normal (same as _run_ik).
         obj['ik_targets'] = [p - _PAD_OFFSET[f] * n
                              for f, p, n in zip(FINGER_SET, p_S_W, inward_S_W)]
-        _t0 = time.time()
-        q_dls_grasp = dls_ik.solve(model, _ik_data, id_C, obj['ik_targets'],
-                                    q_bias=q_seed, null_gain=0.3)
-        dls_ms = (time.time() - _t0) * 1e3
+        # Warm-start (q_init) selection. 'rec_q': the recommender's own q, expanded to
+        # a full-robot pose over q_seed — already at the contacts (~cm residual), a
+        # closer start than a fresh DLS. 'dls': a fresh DLS solve to the contacts.
+        # Falls back to DLS if 'rec_q' is requested but the candidate carries no q.
+        _rec_q = rec.get('q')
+        if warmstart == 'rec_q' and _rec_q is not None:
+            q_warm = np.asarray(q_seed, float).copy()
+            for _i, _idx in enumerate(_cat_act_idx):
+                q_warm[_idx] = _rec_q[_i]
+            dls_ms = 0.0
+            _ws_src = 'recommender-q'
+        else:
+            _t0 = time.time()
+            q_warm = dls_ik.solve(model, _ik_data, id_C, obj['ik_targets'],
+                                  q_bias=q_seed, null_gain=0.3)
+            dls_ms = (time.time() - _t0) * 1e3
+            _ws_src = f'DLS {dls_ms:.0f}ms'
         _t0 = time.time()
         obj['q_target'] = constrained_ik.solve(_ik_data, id_C, obj['ik_targets'],
-                                                q_bias=q_seed, q_init=q_dls_grasp,
+                                                q_bias=q_seed, q_init=q_warm,
                                                 reduced_clearance_geoms=_active_clearance_by_geom,
                                                 inward_dirs=inward_S_W)
         sqp_ms = (time.time() - _t0) * 1e3
-        print(f"\r\n[IK] obj{obj_idx+1} (recommended): grasp DLS {dls_ms:.0f}ms + "
+        print(f"\r\n[IK] obj{obj_idx+1} (recommended): warm-start {_ws_src} + "
               f"SQP {sqp_ms:.0f}ms")
 
         _d_chk = mj.MjData(model)
@@ -1148,22 +1167,26 @@ if __name__ == "__main__":
         _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_start)
         _run_rrt(q_start, obj['q_target'], obj)
 
-    def _fire_preview_ik(obj_idx, obj, q_seed, obj_qpos_snap, rec):
-        """Background: run the collision-aware lock-in IK (WITHOUT RRT / committing) so
-        the O-preview can hold the robot at the collision-aware solution and A/B it
-        against the recommender's own q (P-preview). Populates obj['q_target'] just as
-        lock-in would; the result is a non-committing dry run of the same solve."""
+    def _fire_preview_ik(obj_idx, obj, q_seed, obj_qpos_snap, rec, warmstart, slot):
+        """Background: run the collision-aware lock-in IK (WITHOUT RRT / committing) for
+        one warm-start variant so a preview key can hold the robot at the result. Writes
+        into _rec_ik_result[slot] = {'q','obj_idx','err_mm'}. 'slot' keys the two
+        variants ('rec_q' vs 'dls') so both can be previewed/compared independently."""
         def _run():
             try:
-                _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_seed)
+                _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_seed,
+                                    warmstart=warmstart)
             except Exception:
                 traceback.print_exc()
                 return
             with _rec_ik_lock:
-                _rec_ik_result['q']       = np.asarray(obj['q_target'], float).copy()
-                _rec_ik_result['obj_idx'] = obj_idx
-                _rec_ik_result['err_mm']  = list(obj.get('rec_ik_err_mm', []))
-        t = threading.Thread(target=_run, daemon=True, name='cat-preview-ik')
+                _rec_ik_result[slot] = {
+                    'q':       np.asarray(obj['q_target'], float).copy(),
+                    'obj_idx': obj_idx,
+                    'err_mm':  list(obj.get('rec_ik_err_mm', [])),
+                }
+        t = threading.Thread(target=_run, daemon=True,
+                             name=f'cat-preview-ik-{slot}')
         t.start()
         return t
 
@@ -1203,7 +1226,7 @@ if __name__ == "__main__":
     # the fingers open.
     _teleop_modes   = ('dexpilot', 'contact_aware_teleop')
     _dexpilot_ctrl  = None
-    _retarget_tuner = None
+    _tune_retarget  = False   # dexpilot: consume /hand/retarget_params sliders
     _mediapipe_proc = None
     if args.mode in _teleop_modes:
         # Launch the MediaPipe publisher as a subprocess so its OpenCV window
@@ -1303,14 +1326,13 @@ if __name__ == "__main__":
         _dexpilot_ctrl.init_home(data)   # snapshots the wrist-down pose as home
         _dexpilot_ctrl.init_ros()
 
-        # Live finger-retargeting tuner: OpenCV slider window bound to the
-        # retargeter's tunable constants (BETA/GAMMA/EPS/ETA1/ETA2/S1/S2 gains).
-        # Moving a slider re-shapes the very next retarget() solve; flip SAVE to
-        # persist to calibration/retarget_config.json (auto-loads next launch).
-        # Only bites when fingers are actually tracked (contact_aware_teleop, or
-        # dexpilot with hand_tracking enabled); the window opens regardless.
-        from teleop.retarget_tuner import RetargetTuner
-        _retarget_tuner = RetargetTuner(_dexpilot_ctrl.retargeter)
+        # Live finger-retargeting sliders live ON the MediaPipe camera window
+        # (teleop/retarget_tuner.py::MediaPipeRetargetSliders), publishing the 7
+        # tunable constants (BETA/GAMMA/EPS/ETA1/ETA2/S1/S2 gains) over ROS
+        # (/hand/retarget_params). dexpilot ONLY consumes them and applies them to
+        # the live retargeter (see the per-frame apply_retarget_params() call);
+        # contact_aware_teleop uses the saved constants but isn't the tuning surface.
+        _tune_retarget = (args.mode == 'dexpilot')
 
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")
         print("[DexPilot] Press 8 to start tracking (captures your current wrist "
@@ -1339,9 +1361,10 @@ if __name__ == "__main__":
     _rec_last_solve   = 0.0     # wall-clock of the last solve start
     _rec_obj_idx      = -1      # object the latest recommendation is for
     _rec_vis          = False   # P: hold the robot at the recommender's OWN q (debug)
-    _rec_ik_vis       = False   # O: hold the robot at the collision-aware IK solution
-    _rec_ik_thread    = None    # background thread running the preview collision IK
-    _rec_ik_result    = {}      # {'q': (N_ROBOT,), 'obj_idx': int, 'err_mm': [..]}
+    _rec_ik_mode      = None    # None | 'rec_q' (O) | 'dls' (I): which constrained-IK
+                                #   preview is held (warm-start variant)
+    _rec_ik_thread    = None    # background thread running a preview collision IK
+    _rec_ik_result    = {}      # slot ('rec_q'|'dls') -> {'q','obj_idx','err_mm'}
     _rec_ik_lock      = threading.Lock()
 
     # Objects the NLP recommender supports (box-like first, per the plan). The planner
@@ -1440,8 +1463,9 @@ if __name__ == "__main__":
 
     if _CAT_MODE:
         print("[teleop] Keys: 8=start tracking | L=lock-in & approach | "
-              "P=preview recommender's own q (no collision IK) | "
-              "O=preview collision-aware IK to those contacts | "
+              "P=preview recommender q (unconstrained) | "
+              "O=preview constrained IK (warm=recommender-q) | "
+              "I=preview constrained IK (warm=DLS) | "
               "N=release | Backspace=reset | Q/Esc=quit")
 
     control_phase  = 'REACH'
@@ -1611,12 +1635,15 @@ if __name__ == "__main__":
             # machinery below (like autonomous mode) with recommended contacts. ---
             if _CAT_MODE and _teleop_active:
                 _dexpilot_ctrl.spin()
-                if _retarget_tuner is not None:
-                    _retarget_tuner.apply()   # live-tune finger retargeting
+                if _tune_retarget:
+                    _dexpilot_ctrl.apply_retarget_params()   # live-tune from camera sliders
 
-                # Drain keys — quit, teleop start, and lock-in.
+                # Drain keys — quit, teleop start, lock-in, and the 3 debug previews:
+                #   P  recommender's raw q (unconstrained)
+                #   O  collision-aware IK, warm-started from the recommender's q
+                #   I  collision-aware IK, warm-started from a fresh DLS
                 _do_lock_in = False
-                _fire_rec_ik = False   # set True when O toggles the collision-IK preview on
+                _fire_rec_ik_slot = None   # 'rec_q' | 'dls' when a constrained preview turns on
                 while not keys.empty():
                     _k = keys.get_nowait()
                     if _k == 'quit':
@@ -1629,16 +1656,21 @@ if __name__ == "__main__":
                     elif _k == 'rec_vis':
                         _rec_vis = not _rec_vis
                         if _rec_vis:
-                            _rec_ik_vis = False   # the two previews are mutually exclusive
-                        print(f"[teleop] recommender-q preview "
-                              f"{'ON — holding NLP solution (no collision IK)' if _rec_vis else 'off'}")
-                    elif _k == 'rec_ik_vis':
-                        _rec_ik_vis = not _rec_ik_vis
-                        if _rec_ik_vis:
+                            _rec_ik_mode = None   # previews are mutually exclusive
+                        print(f"[teleop] P: recommender-q preview (unconstrained) "
+                              f"{'ON' if _rec_vis else 'off'}")
+                    elif _k in ('rec_ik_recq_vis', 'rec_ik_dls_vis'):
+                        _slot = 'rec_q' if _k == 'rec_ik_recq_vis' else 'dls'
+                        if _rec_ik_mode == _slot:
+                            _rec_ik_mode = None            # toggle off
+                        else:
+                            _rec_ik_mode = _slot
                             _rec_vis = False
-                            _fire_rec_ik = True   # solve the collision IK for the current cand
-                        print(f"[teleop] collision-aware IK preview "
-                              f"{'ON — solving ...' if _rec_ik_vis else 'off'}")
+                            _fire_rec_ik_slot = _slot      # solve this variant
+                        _lbl = {'rec_q': 'O: collision-IK (warm=recommender-q)',
+                                'dls':   'I: collision-IK (warm=DLS)'}[_slot]
+                        print(f"[teleop] {_lbl} "
+                              f"{'ON — solving ...' if _rec_ik_mode == _slot else 'off'}")
                 if not running:
                     continue
 
@@ -1658,40 +1690,45 @@ if __name__ == "__main__":
                         _cand = _rec_result['candidate']
                         _rec_obj_idx = _prox_idx
 
-                # O-preview: on toggle-on, run the collision-aware lock-in IK for the
-                # current candidate in the background (non-committing). Guarded so it
-                # never races the real plan thread or another preview solve.
-                if (_fire_rec_ik and _cand is not None
-                        and plan_thread is None
-                        and (_rec_ik_thread is None or not _rec_ik_thread.is_alive())):
-                    with _rec_ik_lock:
-                        _rec_ik_result.clear()
-                    _rec_ik_thread = _fire_preview_ik(
-                        _prox_idx, objects[_prox_idx],
-                        data.qpos[:N_ROBOT].copy(), data.qpos[N_ROBOT:].copy(), _cand)
-                elif _fire_rec_ik and _cand is None:
-                    print("[teleop] no recommendation yet — cannot preview collision IK")
-                    _rec_ik_vis = False
+                # Constrained-IK preview (O/I): on toggle-on, run the collision-aware
+                # lock-in IK for the current candidate with the requested warm-start,
+                # in the background (non-committing). Guarded so it never races the real
+                # plan thread or another preview solve.
+                if _fire_rec_ik_slot is not None:
+                    if _cand is None:
+                        print("[teleop] no recommendation yet — cannot preview collision IK")
+                        _rec_ik_mode = None
+                    elif (plan_thread is None
+                            and (_rec_ik_thread is None or not _rec_ik_thread.is_alive())):
+                        with _rec_ik_lock:
+                            _rec_ik_result.pop(_fire_rec_ik_slot, None)
+                        _rec_ik_thread = _fire_preview_ik(
+                            _prox_idx, objects[_prox_idx],
+                            data.qpos[:N_ROBOT].copy(), data.qpos[N_ROBOT:].copy(),
+                            _cand, warmstart=_fire_rec_ik_slot, slot=_fire_rec_ik_slot)
 
-                # Latest collision-aware IK preview result (if solved for this object).
+                # Held constrained-IK result for the active preview mode (if solved for
+                # this object).
                 _rec_ik_q = None
-                with _rec_ik_lock:
-                    if (_rec_ik_result.get('q') is not None
-                            and _rec_ik_result.get('obj_idx') == _prox_idx):
-                        _rec_ik_q = _rec_ik_result['q']
+                if _rec_ik_mode is not None:
+                    with _rec_ik_lock:
+                        _r = _rec_ik_result.get(_rec_ik_mode)
+                        if _r is not None and _r.get('obj_idx') == _prox_idx:
+                            _rec_ik_q = _r['q']
 
                 # Drive the robot. Normally: wrist IK + MediaPipe fingers (kinematic).
-                # Two mutually-exclusive debug previews hold the robot kinematically:
-                #   P (rec_vis)     -> the recommender's OWN q (no collision IK)
-                #   O (rec_ik_vis)  -> the collision-aware lock-in IK to those contacts
-                # A/B them to see the collision-vs-reach gap for the same recommendation.
+                # Three mutually-exclusive debug previews hold the robot kinematically:
+                #   P  -> the recommender's OWN q (unconstrained, no collision IK)
+                #   O  -> collision-aware IK, warm-started from the recommender's q
+                #   I  -> collision-aware IK, warm-started from a fresh DLS
+                # A/B them to see the collision-vs-reach gap and warm-start effect.
                 if _rec_vis and _cand is not None and _cand.get('q') is not None:
                     data.qpos[:N_ROBOT] = Q_BIAS
                     for _i, _idx in enumerate(_cat_act_idx):
                         data.qpos[_idx] = _cand['q'][_i]
                     data.qvel[:N_ROBOT] = 0.0
                     mj.mj_forward(model, data)
-                elif _rec_ik_vis and _rec_ik_q is not None:
+                elif _rec_ik_mode is not None and _rec_ik_q is not None:
                     data.qpos[:N_ROBOT] = _rec_ik_q
                     data.qvel[:N_ROBOT] = 0.0
                     mj.mj_forward(model, data)
@@ -1707,7 +1744,8 @@ if __name__ == "__main__":
                 # Skip while previewing so the held pose isn't fed back as a solve seed.
                 _supported = objects[_prox_idx]['name'] in _CAT_SUPPORTED
                 _rec_idle  = (_rec_thread is None) or (not _rec_thread.is_alive())
-                if (_supported and _rec_idle and not _rec_vis and not _rec_ik_vis
+                if (_supported and _rec_idle and not _rec_vis
+                        and _rec_ik_mode is None
                         and (time.time() - _rec_last_solve) >= _REC_INTERVAL_S):
                     _q_snap = np.array([data.qpos[i] for i in _cat_act_idx])
                     _obj_pos = data.xpos[objects[_prox_idx]['id_body']].copy()
@@ -1733,9 +1771,9 @@ if __name__ == "__main__":
                         # If locking in from a debug preview, the sim is posed at the
                         # held preview (not the operator's hand) — re-drive one teleop
                         # step so the IK seeds from the LIVE pose, not the preview.
-                        if _rec_vis or _rec_ik_vis:
+                        if _rec_vis or _rec_ik_mode is not None:
                             _rec_vis = False
-                            _rec_ik_vis = False
+                            _rec_ik_mode = None
                             _q_live = _dexpilot_ctrl.step(model, data)
                             if _q_live is not None:
                                 data.qpos[:N_ROBOT] = _q_live
@@ -1796,8 +1834,8 @@ if __name__ == "__main__":
             # --- DexPilot teleop mode: bypass the RRT/grasp state machine ---
             if args.mode == 'dexpilot':
                 _dexpilot_ctrl.spin()
-                if _retarget_tuner is not None:
-                    _retarget_tuner.apply()   # live-tune finger retargeting
+                if _tune_retarget:
+                    _dexpilot_ctrl.apply_retarget_params()   # live-tune from camera sliders
                 # Drain key queue — handle quit and teleop start/re-zero
                 while not keys.empty():
                     _k = keys.get_nowait()
@@ -2114,7 +2152,7 @@ if __name__ == "__main__":
                         objects[active_idx].pop('rec_local', None)
                         _teleop_active = True
                         _rec_vis       = False
-                        _rec_ik_vis    = False
+                        _rec_ik_mode   = None
                         active_tgt     = 0
                         active_idx     = 0
                         _rec_last_solve = 0.0
@@ -2251,7 +2289,7 @@ if __name__ == "__main__":
                         _o.pop('rec_local', None)
                     _teleop_active  = True
                     _rec_vis        = False
-                    _rec_ik_vis     = False
+                    _rec_ik_mode    = None
                     _rec_last_solve = 0.0
                     with _rec_result_lock:
                         _rec_result.clear()
@@ -2471,8 +2509,8 @@ if __name__ == "__main__":
     _kb_listener.stop()
     if dash is not None:
         dash.close()
-    if _retarget_tuner is not None:
-        _retarget_tuner.close()
+    # (retargeting sliders live in the MediaPipe subprocess window; it cleans up
+    # its own cv2 windows on exit — no sim-side teardown needed.)
     if _dexpilot_ctrl is not None:
         _dexpilot_ctrl.shutdown()
     if _mediapipe_proc is not None:

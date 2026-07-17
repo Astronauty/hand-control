@@ -202,6 +202,22 @@ class DexPilotController:
         tunable constants (BETA/GAMMA/EPS/ETA1/ETA2/S1_GAIN/S2_GAIN) per frame."""
         return self._retarg
 
+    def apply_retarget_params(self) -> None:
+        """Consume the latest /hand/retarget_params (from the MediaPipe window's
+        sliders) and write the 7 constants onto the live retargeter. A trailing
+        save flag of 1 persists them to retarget_config.json (this process owns
+        the file). No-op when no new message has arrived. Call once per frame,
+        after spin()."""
+        from teleop.retarget_tuner import PARAM_ORDER
+        params = self._ros.consume_retarget_params()
+        if params is None or len(params) < len(PARAM_ORDER):
+            return
+        for name, val in zip(PARAM_ORDER, params):
+            setattr(self._retarg, name, float(val))
+        # save flag is the element right after the 7 params, when present
+        if len(params) > len(PARAM_ORDER) and params[len(PARAM_ORDER)] >= 0.5:
+            self._retarg.save_config()
+
     def target_frame(self):
         """Last IK target pose (pos, R) in world coords — the frame the arm IK
         drives pinch_site toward. Passthrough to the arm controller for viz."""

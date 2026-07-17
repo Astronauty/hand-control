@@ -129,7 +129,14 @@ IPOPT's interior-point method with L-BFGS Hessian approximation. Constraint Jaco
 | `N` | Release and return to teleop control (re-arms the recommender) |
 | `← →` / `↑ ↓` / `PgUp` `PgDn` | Jog the grasped object (x / z / y) after locking in and grasping |
 | `Backspace` | Reset to home and re-arm the recommender |
+| `P` | **Debug preview:** hold the robot at the recommender's own `q` (unconstrained NLP solution, no collision IK) |
+| `O` | **Debug preview:** hold the robot at the collision-aware IK solution, warm-started from the recommender's `q` |
+| `I` | **Debug preview:** same collision-aware IK, warm-started from a fresh DLS solve (A/B the warm-start against `O`) |
 | `Q` / `Esc` | Quit |
+
+The three preview keys (`P` / `O` / `I`) each hold the robot kinematically at one candidate pose for the *same* recommendation, so you can compare where the recommender wants the fingers versus what the collision-aware IK can actually reach, and how the two warm-starts differ. They are mutually exclusive; the recommender pauses re-solving while a preview is held. Lock-in itself uses the `O` variant (collision-aware IK warm-started from the recommender's `q`), and RRT plans to that refined solution.
+
+The **grasp recommender** solves an NLP for two wrench-feasible contact points on the nearest supported object (currently box-shaped objects), visualising them as translucent spheres (green = thumb, cyan = index). Because the recommender's tip-reaching term is soft relative to its wrench/regularisation terms, its raw pose (`P`) does not exactly reach the contacts; the lock-in IK (`O`) refines this under collision constraints. Pair with `--dashboard` for per-solve statistics.
 
 ---
 
