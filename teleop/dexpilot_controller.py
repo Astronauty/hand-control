@@ -196,6 +196,12 @@ class DexPilotController:
 
         return np.concatenate([q_arm, q_hand])
 
+    @property
+    def retargeter(self) -> DexPilotRetargeter:
+        """The finger-retargeting stage — exposed so a live tuner can mutate its
+        tunable constants (BETA/GAMMA/EPS/ETA1/ETA2/S1_GAIN/S2_GAIN) per frame."""
+        return self._retarg
+
     def target_frame(self):
         """Last IK target pose (pos, R) in world coords — the frame the arm IK
         drives pinch_site toward. Passthrough to the arm controller for viz."""

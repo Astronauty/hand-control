@@ -16,20 +16,38 @@ DIP joints on the three primary fingers are constrained to equal their MCP joint
 """
 from __future__ import annotations
 
+import json
+import os
+
 import numpy as np
 import scipy.optimize
 import mujoco as mj
+
+# Tuned retargeting constants persist here (written by the RetargetTuner's save
+# key, loaded on construction). Lives next to the other teleop calibration files.
+_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "calibration", "retarget_config.json",
+)
 
 
 class DexPilotRetargeter:
     """Retargets 21 MediaPipe world landmarks → 16 LEAP hand joint angles."""
 
-    # Paper constants
+    # Paper constants. These are also the fields the live RetargetTuner reads and
+    # writes per frame — every value the retargeting cost consumes is an instance
+    # attribute (never a bare literal in _switching), so a slider can override it.
     BETA  = 1.6       # robot-to-human hand size scale
     GAMMA = 2.5e-3    # regularisation weight (open hand = zero)
     EPS   = 0.03      # proximity threshold [m] — 3 cm
     ETA1  = 1e-4      # S1 target distance: near-contact [m]
     ETA2  = 3e-2      # S2 minimum inter-primary separation [m]
+    S1_GAIN = 200.0   # S1 (pinch) cost weight when a primary tip is near the thumb
+    S2_GAIN = 400.0   # S2 cost weight when both involved primaries are pinching
+
+    # Attribute names the tuner sweeps, in slider order. Kept here so the tuner
+    # and any config file agree on exactly which fields are tunable.
+    TUNABLE = ('BETA', 'GAMMA', 'EPS', 'ETA1', 'ETA2', 'S1_GAIN', 'S2_GAIN')
 
     # MediaPipe landmark indices
     _LM_WRIST   = 0
@@ -60,18 +78,32 @@ class DexPilotRetargeter:
     _DIP_MCP = [(3, 0), (7, 4), (11, 8)]
 
     def __init__(self, model: mj.MjModel, n_arm: int = 7,
-                 debug: bool = False, eps: float | None = None) -> None:
+                 debug: bool = False, eps: float | None = None,
+                 load_config: bool = True) -> None:
         self._model = model
         self._n_arm = n_arm
         self._n_hand = 16
         self.debug = debug   # print S1 pinch distances vs EPS each frame
-        # Proximity threshold override. The paper's 3 cm assumes an open-hand
+
+        # Promote the class-attribute defaults to per-instance fields so the live
+        # tuner (and the eps override / saved config below) mutate only this
+        # instance, never the class.
+        for name in self.TUNABLE:
+            setattr(self, name, getattr(type(self), name))
+
+        # Proximity threshold seed. The paper's 3 cm assumes an open-hand
         # thumb→fingertip separation of ~10 cm; MediaPipe world landmarks
         # compress the thumb toward the palm plane (noisy z), so the open-hand
         # baseline reads ~4-8 cm here. Set eps between your open and pinched
         # clusters (empirically ~1.8-2.0 cm) to avoid false pinches.
         if eps is not None:
             self.EPS = float(eps)
+
+        # Precedence: class defaults -> eps arg (a code-level seed) -> saved
+        # config. A tuned retarget_config.json is the operator's latest word, so
+        # it wins over the hardcoded eps once the tuner has saved one.
+        if load_config:
+            self.load_config()
 
         self._tip_ids = [
             mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, s)
@@ -267,13 +299,13 @@ class DexPilotRetargeter:
 
         if vtype == 's1':
             if d <= self.EPS:
-                return 200.0, self.ETA1
+                return self.S1_GAIN, self.ETA1
             return 1.0, self.BETA * d
 
         # s2: active only when BOTH involved primary fingers are in S1 pinch
         si, sj = hv['s1_dep']
         if d_s1[si] <= self.EPS and d_s1[sj] <= self.EPS:
-            return 400.0, self.ETA2
+            return self.S2_GAIN, self.ETA2
         return 1.0, self.BETA * d
 
     # ------------------------------------------------------------------
@@ -343,3 +375,37 @@ class DexPilotRetargeter:
     def reset(self) -> None:
         """Clear warm-start state (call when hand tracking is lost)."""
         self._q_prev = None
+
+    # ------------------------------------------------------------------
+    # Live-tuning config (see teleop/retarget_tuner.py)
+    # ------------------------------------------------------------------
+
+    def tunables(self) -> dict[str, float]:
+        """Current values of every tunable retargeting constant."""
+        return {name: float(getattr(self, name)) for name in self.TUNABLE}
+
+    def load_config(self, path: str | None = None) -> bool:
+        """Overlay saved tunables from JSON onto this instance.
+
+        Only keys in TUNABLE are applied (unknown keys ignored), so a stale or
+        hand-edited file can't inject arbitrary attributes. Returns True if a file
+        was found and read. Missing file is not an error — defaults stand.
+        """
+        path = path or _CONFIG_PATH
+        if not os.path.exists(path):
+            return False
+        with open(path) as f:
+            cfg = json.load(f) or {}
+        for name in self.TUNABLE:
+            if name in cfg:
+                setattr(self, name, float(cfg[name]))
+        print(f"[retarget] loaded tuned constants from {path}: {self.tunables()}")
+        return True
+
+    def save_config(self, path: str | None = None) -> str:
+        """Write the current tunables to JSON so they auto-load next launch."""
+        path = path or _CONFIG_PATH
+        with open(path, "w") as f:
+            json.dump(self.tunables(), f, indent=2)
+        print(f"[retarget] saved tuned constants -> {path}")
+        return path
