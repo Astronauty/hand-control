@@ -147,10 +147,19 @@ class DexPilotController:
         if raw is None or len(raw) < 120:
             return None
 
-        # --- Hand retargeting (16 DOF) ---
+        # --- Landmark blocks ---
+        # World landmarks (metric): the palm FRAME comes from these (unchanged).
+        # Image landmarks (raw[120:183], present in the extended layout): used as
+        # the fingertip POSITION source for retargeting (isotropy-corrected in the
+        # retargeter) — more stable near edge-on than the world-3D head, which has
+        # a depth-flip ambiguity there. None on the old (world-only) layout.
         world_lm = np.array(raw[57:120], dtype=float).reshape(21, 3)
+        image_lm = (np.array(raw[120:183], dtype=float).reshape(21, 3)
+                    if len(raw) >= 183 else None)
+
+        # --- Hand retargeting (16 DOF) ---
         if self._hand_tracking:
-            q_hand = self._retarg.retarget(world_lm)
+            q_hand = self._retarg.retarget(world_lm, image_lm=image_lm)
             # EMA smoothing on hand joints
             if self._q_hand_prev is not None:
                 q_hand = (self._hand_alpha * q_hand
@@ -165,14 +174,13 @@ class DexPilotController:
         # orientation maps to an identical robot wrist orientation (no press-8
         # offset). Distinct from the finger-retargeting palm frame above.
         #
-        # The arm palm frame is built from IMAGE landmarks (raw[120:183]), NOT the
-        # world landmarks used for finger retargeting. The world-landmark depth
-        # flips the palm-NORMAL sign near edge-on poses (verified via the
-        # dual-normal overlay); the image-landmark frame stays stable. Fingers
-        # still use world_lm (they need metric 3D). Falls back to world landmarks
-        # if the publisher didn't send the image block (old message layout).
+        # The arm palm frame is built from IMAGE landmarks (image_lm above), NOT the
+        # world landmarks. The world-landmark depth flips the palm-NORMAL sign near
+        # edge-on poses (verified via the dual-normal overlay); the image-landmark
+        # frame stays stable. Falls back to world landmarks if the publisher didn't
+        # send the image block (old message layout).
         cam_wrist      = np.array(raw[0:3], dtype=float)
-        if len(raw) >= 183:
+        if image_lm is not None:
             # IMAGE landmarks live in a different BASIS than world landmarks:
             # image = {x-right, y-DOWN, z-pseudodepth}, world = {x-right, y-UP,
             # z-toward-cam} (what the downstream R_mp_to_cv=diag([1,-1,-1]) expects).
@@ -187,7 +195,6 @@ class DexPilotController:
             # basis C. Image->world is diag([1,-1,-1]) (det +1, the only Y-flip
             # variant that is a rotation not a reflection).
             _C            = np.diag([1.0, -1.0, -1.0])   # image basis -> world basis
-            image_lm      = np.array(raw[120:183], dtype=float).reshape(21, 3)
             palm_R, _     = self._retarg.human_palm_frame_robot_aligned(image_lm)
             palm_R        = _C @ palm_R
         else:

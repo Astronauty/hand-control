@@ -224,8 +224,36 @@ class DexPilotRetargeter:
     # Vector lists
     # ------------------------------------------------------------------
 
-    def _human_vectors(self, lm: np.ndarray) -> list[dict]:
+    # Fingertip-source options ----------------------------------------------
+    # Image-landmark fingertips can be more stable near edge-on wrist poses than
+    # world landmarks (the world-3D model head has a depth-flip ambiguity there).
+    # But image coords are ANISOTROPIC: x,y are frame-FRACTIONS on a 4:3 (640x480)
+    # sensor, so image-y is inflated 640/480 vs image-x, and z is pseudodepth in a
+    # model-defined unit. A single scalar EPS can't threshold an anisotropic space
+    # consistently (a pinch triggers at a different gap depending on orientation),
+    # so we apply a per-axis scale S to make image space ISOTROPIC before use, then
+    # map image basis -> world basis with C (so tips compose with the WORLD palm
+    # frame, which is left exactly as-is). EPS/ETA are then just re-tuned numbers.
+    _IMG_ASPECT   = 480.0 / 640.0      # y-scale: undo the 4:3 frame aspect
+    Z_SCALE       = 1.0                # pseudodepth scale vs image-x (empirical; 1:1 for now)
+    _C_IMG_TO_WORLD = np.diag([1.0, -1.0, -1.0])   # image basis -> world basis
+
+    def _tip_scale(self) -> np.ndarray:
+        """Per-axis image->world tip map: C @ diag([1, aspect, Z_SCALE])."""
+        S = np.diag([1.0, self._IMG_ASPECT, float(self.Z_SCALE)])
+        return self._C_IMG_TO_WORLD @ S
+
+    def _human_vectors(self, lm: np.ndarray,
+                       tip_lm: np.ndarray | None = None) -> list[dict]:
         """Compute 10 inter-fingertip vectors in the human palm frame.
+
+        Args:
+          lm:     (21,3) WORLD landmarks. ALWAYS defines the palm FRAME (unchanged).
+          tip_lm: optional (21,3) IMAGE landmarks. When given, fingertip POSITIONS
+                  (and the palm origin) come from these instead of world landmarks,
+                  isotropy-corrected and mapped into world axes by _tip_scale(), so
+                  they compose with the world palm frame. The palm frame itself is
+                  still built from world `lm` — only the tip source changes.
 
         Returns a list of dicts with keys:
           'r'    : ndarray(3) — the vector
@@ -233,11 +261,20 @@ class DexPilotRetargeter:
           For 's1': 'primary' (int 0-2, 0=index)
           For 's2': 's1_dep' ((int, int) — S1 indices that must both be near)
         """
-        R_WP, origin = self.human_palm_frame(lm)
+        # Palm frame: ALWAYS from world landmarks (this handling is unchanged).
+        R_WP, origin_W = self.human_palm_frame(lm)
         R_PW = R_WP.T
 
-        tips_W = lm[self._HUMAN_TIPS]                         # (4,3) world
-        tips   = [R_PW @ (t - origin) for t in tips_W]       # in palm frame
+        if tip_lm is not None:
+            # Isotropy-correct + image->world map, then use image-landmark tips.
+            M = self._tip_scale()
+            origin = M @ tip_lm[self._LM_WRIST]
+            tips_src = [M @ p for p in tip_lm[self._HUMAN_TIPS]]
+        else:
+            origin = origin_W
+            tips_src = [p for p in lm[self._HUMAN_TIPS]]         # (4,3) world
+
+        tips = [R_PW @ (t - origin) for t in tips_src]           # in palm frame
 
         vecs: list[dict] = []
 
@@ -336,17 +373,23 @@ class DexPilotRetargeter:
         self,
         world_lm: np.ndarray,
         q_prev: np.ndarray | None = None,
+        image_lm: np.ndarray | None = None,
     ) -> np.ndarray:
         """Map 21 MediaPipe world landmarks to 16 LEAP hand joint angles.
 
         Args:
             world_lm: (21, 3) array of world landmark positions in metres.
                       MediaPipe convention: wrist ≈ origin, hand facing camera.
+                      ALWAYS used for the palm frame.
             q_prev:   Optional external warm-start (overrides internal state).
+            image_lm: optional (21, 3) IMAGE landmarks. When given, fingertip
+                      POSITIONS come from these (isotropy-corrected — see
+                      _human_vectors) instead of world landmarks; often more stable
+                      near edge-on wrist poses. Re-tune EPS/ETA for the new units.
         Returns:
             q_hand: (16,) LEAP joint angles in radians.
         """
-        human_vecs = self._human_vectors(world_lm)
+        human_vecs = self._human_vectors(world_lm, tip_lm=image_lm)
         d_s1 = [float(np.linalg.norm(human_vecs[4 + i]['r'])) for i in range(3)]
 
         if self.debug:

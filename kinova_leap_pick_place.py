@@ -11,6 +11,7 @@ contacts generically rather than hardcoding 2.
 import argparse
 import numpy as np
 import subprocess
+import os
 import sys
 import time
 import threading
@@ -446,6 +447,11 @@ if __name__ == "__main__":
     # JOG_VEL=0.10 m/s the worst-case rate is ~JOG_VEL/(2*JOG_LAM_MAX)=1.0 rad/s.
     JOG_SING_EPS    = 0.02  # rad·m onset of damping (raise = damp earlier/more conservative)
     JOG_LAM_MAX     = 0.05  # peak damping (raise = gentler but sloppier near singularities)
+    # contact_aware_teleop post-grasp wrist tracking: P-gain from wrist pose error to a
+    # Cartesian velocity command (1/s). The command is then slew-limited to the NCF accel
+    # budget and DLS-mapped to joint rates, so this only sets how briskly the wrist closes
+    # a tracking gap; the budget still caps peak acceleration for the no-slip guarantee.
+    WRIST_TRACK_GAIN = 3.0
 
     # Object definitions: rigid objects only (obj_soft deferred — vertex-level contact,
     # not a rigid grasp-map problem). Each object maps every FINGER_SET finger to the
@@ -813,7 +819,7 @@ if __name__ == "__main__":
     # by construction and gamma covers the true worst case at 1.0x margin. The angular
     # budget is a small cushion for parasitic wrist rotation near singularities (the
     # jog commands zero angular velocity).
-    NCF_ACCEL_BUDGET_XYZ = (0.5, 0.5, 0.5)   # m/s^2   object-frame linear-accel budget
+    NCF_ACCEL_BUDGET_XYZ = (20.0, 20.0, 20.0)   # m/s^2   object-frame linear-accel budget
     NCF_ANG_ACCEL_BUDGET = (1.0, 1.0, 1.0)   # rad/s^2 principal-frame angular-accel budget
 
     # Conservative multiplier on the solved gamma before it drives the squeeze: the LP
@@ -823,7 +829,7 @@ if __name__ == "__main__":
     # hard as the theoretical minimum. Only the value SENT TO THE CONTROLLER is scaled;
     # the wrench-cone viz stays at the raw 1.0x gamma so the drawn cage remains the true
     # feasible boundary the LP computed (the trace then sits well inside it).
-    GAMMA_SAFETY_FACTOR = 20.0
+    GAMMA_SAFETY_FACTOR = 50.0
 
     # Softens Kp/Kd on the active (grasping) finger joints while squeezing, via
     # GraspController.effective_gains(). Without this the full-strength joint PD
@@ -831,7 +837,7 @@ if __name__ == "__main__":
     # harder, the position spring (anchored at the fixed pre-squeeze q_grasp_hold)
     # pulls back proportionally, so measured contact force saturates well below
     # GAMMA/sqrt(2) instead of scaling with it.
-    SQUEEZE_PD_SCALE = 5.0
+    SQUEEZE_PD_SCALE = 20.0
 
     # Ramp the squeeze force 0->GAMMA over this many seconds of sim time after each
     # squeeze-on. The internal force pair only cancels once BOTH contacts exist; at
@@ -1491,7 +1497,31 @@ if __name__ == "__main__":
     gamma_live     = GAMMA_FALLBACK  # per-object squeeze scale solved at that transition
     q_grasp_hold   = None          # GRASP PD target; arm part integrated by arrow-key jog
     _jog_v         = np.zeros(3)   # slew-rate-limited palm velocity command (world x,y,z)
+    # contact_aware_teleop: when True, the GRASP phase carries the object by tracking the
+    # wrist (DexPilot) instead of the arrow-key jog. Armed at the REACH->GRASP transition.
+    _grasp_wrist_track = False
+    _ARM_IK_ITER_SAVE  = 500       # arm IK max_iter to restore after wrist-track carry
+    _jog_w         = np.zeros(3)   # slew-limited angular velocity cmd (wrist tracking)
+    # Wrist-target cache: the DexPilot arm IK solve (step()) is ~ms and the ROS wrist
+    # data arrives at camera rate (~30Hz), so re-solving it every 1ms sim step crushes
+    # real-time. Refresh the cached target on a wall-clock interval; the P-controller
+    # tracks the cached target every step.
+    _wrist_tgt     = None          # cached (p_tgt, R_tgt) for pinch_site
+    _wrist_tgt_t   = 0.0           # wall-clock of last refresh
+    WRIST_TGT_REFRESH_S = 0.033    # ~30 Hz — matches the camera/publisher rate
+    # GRASP-branch per-step timing (opt-in via GRASP_PROFILE): accumulates wall-time of
+    # the wrist-track compute, torque compute, and mj_step, printing a breakdown once/sec.
+    GRASP_PROFILE = os.environ.get('GRASP_PROFILE', '0') == '1'
+    # Debug: WRIST_NO_REFRESH=1 freezes the wrist target after the first refresh (never
+    # calls step()/spin() again). A/B this vs normal to isolate whether the per-refresh
+    # DexPilot step() is the bottleneck: if the sim is smooth with this set but slow
+    # without, the cost is in step(); if slow both ways, it's elsewhere (physics/loop).
+    WRIST_NO_REFRESH = os.environ.get('WRIST_NO_REFRESH', '0') == '1'
+    _gp_acc = {'track': 0.0, 'refresh': 0.0, 'spin': 0.0, 'step_ik': 0.0,
+               'torque': 0.0, 'step': 0.0, 'n': 0}
+    _gp_last = time.time()
     _PALM_BID      = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'leap_palm')
+    _PINCH_SID     = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'pinch_site')
     _ik_vis_mode   = None          # None | 'grasp': freeze physics to show IK config
     _show_bspheres = False         # 7: overlay the IK's per-geom collision bounding spheres
 
@@ -2028,6 +2058,8 @@ if __name__ == "__main__":
                     obj_grasp['p_obj0'] = p_WoO
                     obj_grasp['R_obj0'] = R_WO
                     _jog_v[:] = 0.0    # reset the jog velocity ramp for the new grasp
+                    _jog_w[:] = 0.0
+                    _grasp_wrist_track = False   # (re-armed below for teleop)
 
                     # --- Solve the internal-force scale gamma for THIS grasp geometry ---
                     # Contact geometry in the object body frame (same transform the
@@ -2068,14 +2100,14 @@ if __name__ == "__main__":
                     _gamma = solve_gamma_live(_p_O, _R_in, _mu, _mass,
                                               _accel_box, tuple(_ang_budget), _inertia)
                     if _gamma is None or not np.isfinite(_gamma) or _gamma <= 0.0:
-                        gamma_raw  = GAMMA_FALLBACK      # cone viz uses this too
+                        gamma_raw  = GAMMA_FALLBACK
                         gamma_live = GAMMA_FALLBACK
                         print(f"\r\n[gamma] LP infeasible/degenerate for "
                               f"{obj_grasp['name']} — using fallback {GAMMA_FALLBACK:.0f}")
                     else:
-                        # gamma_raw = the LP's minimum no-slip gamma (drives the cone viz,
-                        # the true feasible boundary). gamma_live = raw * safety factor is
-                        # what actually squeezes.
+                        # gamma_raw = the LP's minimum no-slip gamma (the true feasible
+                        # boundary, reported in the log). gamma_live = raw * safety factor
+                        # is what actually squeezes AND what the wrench cone is drawn at.
                         gamma_raw  = float(_gamma)
                         gamma_live = gamma_raw * GAMMA_SAFETY_FACTOR
                         print(f"\r\n[gamma] {obj_grasp['name']}: solved gamma={gamma_raw:.2f} "
@@ -2118,15 +2150,49 @@ if __name__ == "__main__":
                         pad_offsets=[_PAD_OFFSET[f] for f in FINGER_SET],
                         obj_contact_provider=_grasp_provider)
                     q_grasp_hold = obj_grasp['q_target'].copy()
-                    grasp_ctrl.set_squeeze(False)
-                    _push_squeeze(False, gamma_live)
-                    # Show the feasible wrench set at the RAW (1.0x) gamma — the true
-                    # boundary the LP computed — behind the live trace in the 3D panels.
-                    # The controller squeezes at the safety-scaled gamma_live, so the
-                    # applied wrench sits comfortably inside this cage.
-                    _push_wrench_cone(gamma_raw, _p_O, _R_in, _mu)
+                    # Teleop: apply the squeeze IMMEDIATELY on the first Enter (no need to
+                    # press Enter twice) — the ramp (_squeeze_steps/SQUEEZE_RAMP_S) still
+                    # eases the force in so it's not a shove. Autonomous keeps the explicit
+                    # toggle so you can inspect the pregrasp before committing force.
+                    squeeze_on = bool(_CAT_MODE)
+                    _squeeze_steps = 0
+                    grasp_ctrl.set_squeeze(squeeze_on)
+                    _push_squeeze(squeeze_on, gamma_live)
+                    # Draw the wrench cone at the APPLIED squeeze (gamma_live = raw x
+                    # GAMMA_SAFETY_FACTOR) so the cage reflects the safety multiplier —
+                    # it grows with the factor, making its effect visible as you tune it.
+                    # (The raw 1.0x cone is the minimum feasible boundary; the applied
+                    # cone is GAMMA_SAFETY_FACTOR times larger and the live trace sits
+                    # well inside it.)
+                    _push_wrench_cone(gamma_live, _p_O, _R_in, _mu)
                     print(f"\r\n[Control] → GRASP  ({targets[active_tgt]['label']})  "
                           f"|  Enter: toggle squeeze (gamma={gamma_live:.1f})  |  N: release")
+
+                    # contact_aware_teleop: after grasp, the WRIST follows your hand
+                    # (position + orientation, like the approach) while the fingers and
+                    # squeeze stay frozen. Re-zero DexPilot to the current robot/hand
+                    # pose (== press-8 recalibration) so tracking starts jerk-free. The
+                    # arm PD target (q_grasp_hold[:7]) then slew-tracks the wrist target
+                    # in the GRASP branch below. Autonomous mode keeps the arrow-key jog.
+                    if _CAT_MODE:
+                        _dexpilot_ctrl.start(data)
+                        # Disable finger retargeting (the ~40ms scipy SLSQP solve) for
+                        # the carry: the fingers are frozen at the grasp config, so we
+                        # only need the wrist pose from step().
+                        _dexpilot_ctrl._hand_tracking = False
+                        # Cap the arm IK iterations. The wrist target (position + full
+                        # orientation) often does NOT converge to the 1e-3 tol from the
+                        # grasp arm config, so the DLS burns its full 500-iter cap
+                        # (~38ms) EVERY refresh — the real GRASP-phase stall. 20 DLS iters
+                        # give a smooth setpoint the slew-limiter tracks anyway (~1.5ms
+                        # worst case). Restored on release/reset.
+                        _ARM_IK_ITER_SAVE = _dexpilot_ctrl._arm._ik.max_iter
+                        _dexpilot_ctrl._arm._ik.max_iter = 20
+                        _grasp_wrist_track = True
+                        _wrist_tgt   = None    # force a fresh target on the first step
+                        _wrist_tgt_t = 0.0
+                        print("[teleop] wrist tracking armed — move your hand to carry "
+                              "the object (fingers/squeeze held).")
 
                 elif key == 'enter' and control_phase == 'GRASP':
                     squeeze_on = not squeeze_on
@@ -2145,6 +2211,12 @@ if __name__ == "__main__":
                     grasp_ctrl.set_squeeze(False)
                     _push_squeeze(False, gamma_live)
                     _push_wrench_cone(None, None, None, None)   # clear the cone meshes
+                    _grasp_wrist_track = False
+                    _wrist_tgt = None
+                    _jog_w[:] = 0.0
+                    if _CAT_MODE:
+                        _dexpilot_ctrl._hand_tracking = True   # restore finger retargeting
+                        _dexpilot_ctrl._arm._ik.max_iter = _ARM_IK_ITER_SAVE
                     if _CAT_MODE:
                         # Teleop: hand control back to the operator (all 23 DOFs are
                         # teleoped), drop the object, and re-arm the recommender. Clear
@@ -2276,6 +2348,12 @@ if __name__ == "__main__":
                 gamma_live     = GAMMA_FALLBACK
                 q_grasp_hold   = None
                 _jog_v[:]      = 0.0
+                _jog_w[:]      = 0.0
+                _grasp_wrist_track = False
+                _wrist_tgt     = None
+                if _CAT_MODE and _dexpilot_ctrl is not None:
+                    _dexpilot_ctrl._hand_tracking = True   # restore finger retargeting
+                    _dexpilot_ctrl._arm._ik.max_iter = _ARM_IK_ITER_SAVE
                 _ik_vis_mode   = None
                 tau_ctrl       = np.zeros(model.nv)
                 _last_sim_time = 0.0
@@ -2393,27 +2471,81 @@ if __name__ == "__main__":
                     mj.mj_forward(model, data)
                     _render_kinematic_frame()
                     continue
-                # Slew-rate limit the commanded palm velocity toward the raw arrow-key
-                # target at NCF_ACCEL_BUDGET_XYZ, per world axis. This caps the commanded
-                # palm ACCELERATION at exactly the budget the gamma solve assumed — so
-                # pressing/releasing an arrow ramps 0<->JOG_VEL over ~JOG_VEL/budget
-                # seconds instead of stepping instantly (an unbounded accel that the old
-                # code left the arm inertia + Kp to absorb). The disturbance box is thus
-                # enforced by construction, and gamma covers it at 1.0x margin.
-                _v_target = np.array([_jv_x, _jv_y, _jv_z])
+                # Build a 6-DOF Cartesian velocity command for the wrist, from one of
+                # two sources, then map it to arm joint rates via the SAME singularity-
+                # robust DLS + PD-target integration:
+                #   autonomous  -> arrow-key palm velocity (position only, orient held)
+                #   teleop      -> track the DexPilot wrist target (position+orientation)
+                # Both are slew-limited so the commanded palm ACCELERATION stays within
+                # NCF_ACCEL_BUDGET_XYZ (linear) — the box the gamma squeeze was solved
+                # for — so tracking can lag a fast hand but never exceeds the no-slip
+                # guarantee. The site tracked is pinch_site (teleop) / leap_palm (jog).
+                _t_track0 = time.perf_counter() if GRASP_PROFILE else 0.0
                 _dv_max   = np.array(NCF_ACCEL_BUDGET_XYZ) * model.opt.timestep
-                _jog_v   += np.clip(_v_target - _jog_v, -_dv_max, _dv_max)
+                if _grasp_wrist_track:
+                    # Refresh the wrist TARGET pose (position + full orientation) at camera
+                    # rate only — the arm IK solve inside step() is far too costly to run
+                    # every 1ms sim step. Between refreshes, keep tracking the cached
+                    # target (it's a setpoint, so holding it a few ms is fine).
+                    _now = time.time()
+                    if (_now - _wrist_tgt_t >= WRIST_TGT_REFRESH_S
+                            and not (WRIST_NO_REFRESH and _wrist_tgt is not None)):
+                        _t_ref0 = time.perf_counter() if GRASP_PROFILE else 0.0
+                        _dexpilot_ctrl.spin()
+                        _t_spin = time.perf_counter() if GRASP_PROFILE else 0.0
+                        # step() runs the arm IK for the wrist target. Finger retargeting
+                        # (a ~40ms scipy SLSQP solve) is DISABLED here — the fingers are
+                        # frozen at the grasp config, so we only need the wrist pose. That
+                        # SLSQP was the sole cause of the GRASP-phase stall (~40ms/refresh).
+                        _dexpilot_ctrl.step(model, data)   # updates the internal target frame
+                        _tf = _dexpilot_ctrl.target_frame()
+                        if _tf is not None and _tf[1] is not None:
+                            _wrist_tgt = (np.asarray(_tf[0]).copy(),
+                                          np.asarray(_tf[1]).copy())
+                        _wrist_tgt_t = _now
+                        if GRASP_PROFILE:
+                            _now2 = time.perf_counter()
+                            _gp_acc['refresh'] += _now2 - _t_ref0
+                            _gp_acc['spin'] += _t_spin - _t_ref0
+                            _gp_acc['step_ik'] += _now2 - _t_spin
+                    _p_cur = data.site_xpos[_PINCH_SID]
+                    _R_cur = data.site_xmat[_PINCH_SID].reshape(3, 3)
+                    if _wrist_tgt is not None:
+                        _p_tgt, _R_tgt = _wrist_tgt
+                        # P-control toward the target pose: desired Cartesian velocity =
+                        # gain * pose error. Slew-limited below so accel stays in budget.
+                        _v_lin = WRIST_TRACK_GAIN * (_p_tgt - _p_cur)
+                        _R_err = _R_tgt @ _R_cur.T
+                        _ang   = np.array([_R_err[2, 1] - _R_err[1, 2],
+                                           _R_err[0, 2] - _R_err[2, 0],
+                                           _R_err[1, 0] - _R_err[0, 1]]) * 0.5
+                        _v_ang = WRIST_TRACK_GAIN * _ang
+                    else:
+                        _v_lin = np.zeros(3)
+                        _v_ang = np.zeros(3)
+                    _v_lin = np.clip(_v_lin, -JOG_VEL, JOG_VEL)   # cap peak speed
+                    _jog_v += np.clip(_v_lin - _jog_v, -_dv_max, _dv_max)
+                    _jog_w += np.clip(_v_ang - _jog_w, -_dv_max, _dv_max)
+                    _jac_bid_or_sid = _PINCH_SID
+                    _use_site = True
+                else:
+                    # Arrow-key jog: world-frame palm velocity, orientation held.
+                    _v_target = np.array([_jv_x, _jv_y, _jv_z])
+                    _jog_v   += np.clip(_v_target - _jog_v, -_dv_max, _dv_max)
+                    _jog_w[:] = 0.0
+                    _use_site = False
 
-                # Resolved-rate jog: map the (rate-limited) world-frame palm velocity
-                # [vx, vy, vz] (orientation held) to arm joint rates via 6-DOF DLS on
-                # the live config, and integrate them into the PD target.
                 qdot_jog = np.zeros(7)
-                if np.any(_jog_v):
+                if np.any(_jog_v) or np.any(_jog_w):
                     Jp = np.zeros((3, model.nv))
                     Jr = np.zeros((3, model.nv))
-                    mj.mj_jacBody(model, data, Jp, Jr, _PALM_BID)
+                    if _use_site:
+                        mj.mj_jacSite(model, data, Jp, Jr, _PINCH_SID)
+                    else:
+                        mj.mj_jacBody(model, data, Jp, Jr, _PALM_BID)
                     J6 = np.vstack([Jp[:, :7], Jr[:, :7]])
-                    v6 = np.array([_jog_v[0], _jog_v[1], _jog_v[2], 0.0, 0.0, 0.0])
+                    v6 = np.array([_jog_v[0], _jog_v[1], _jog_v[2],
+                                   _jog_w[0], _jog_w[1], _jog_w[2]])
                     # Singularity-robust DLS: the damping lambda^2 grows as the palm
                     # Jacobian's smallest singular value falls below JOG_SING_EPS,
                     # capping the joint-rate gain at ~1/(2*lambda_max) near singular
@@ -2421,8 +2553,6 @@ if __name__ == "__main__":
                     # lurch the arm off the object (the mechanism that threw the cube:
                     # a runaway qdot_jog written into qvel below drags the fixed-angle
                     # fingers across the object faster than friction can hold it).
-                    # Depth (y) jogs approach the arm's reach limits fastest, so this
-                    # matters most for the new PageUp/PageDown axis.
                     _sigma_min = np.linalg.svd(J6, compute_uv=False)[-1]
                     _lam2 = (0.0 if _sigma_min >= JOG_SING_EPS
                              else (1.0 - (_sigma_min / JOG_SING_EPS) ** 2) * JOG_LAM_MAX ** 2)
@@ -2436,6 +2566,9 @@ if __name__ == "__main__":
                 # rebuilt from a single qacc step), so the target would run away from
                 # the arm — feedforwarding qdot_jog keeps tracking tight and still
                 # pins every DOF's velocity each step.
+                if GRASP_PROFILE:
+                    _gp_acc['track'] += time.perf_counter() - _t_track0
+                _t_tq0 = time.perf_counter() if GRASP_PROFILE else 0.0
                 data.qvel[:N_ROBOT] = 0.0
                 data.qvel[:7] = qdot_jog
                 tau_ctrl = np.zeros(model.nv)
@@ -2457,9 +2590,28 @@ if __name__ == "__main__":
                     tau_ctrl[:N_ROBOT] += grasp_ctrl.slip_correction_torques(data)
                     _squeeze_diag(data)
 
+            if GRASP_PROFILE and control_phase == 'GRASP':
+                _gp_acc['torque'] += time.perf_counter() - _t_tq0
             data.qfrc_applied[:] = tau_ctrl
             data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
+            _t_step0 = time.perf_counter() if GRASP_PROFILE else 0.0
             mj.mj_step(model, data)
+            if GRASP_PROFILE and control_phase == 'GRASP':
+                _gp_acc['step'] += time.perf_counter() - _t_step0
+                _gp_acc['n'] += 1
+                if time.time() - _gp_last >= 1.0:
+                    _n = max(_gp_acc['n'], 1)
+                    print(f"\r\n[grasp-profile] {_gp_acc['n']} steps/s | per-step ms: "
+                          f"track={_gp_acc['track']/_n*1e3:.3f} "
+                          f"(refresh={_gp_acc['refresh']/_n*1e3:.3f}: "
+                          f"spin={_gp_acc['spin']/_n*1e3:.3f} "
+                          f"step_ik={_gp_acc['step_ik']/_n*1e3:.3f}) "
+                          f"torque={_gp_acc['torque']/_n*1e3:.3f} "
+                          f"step={_gp_acc['step']/_n*1e3:.3f} "
+                          f"hand_track={_dexpilot_ctrl._hand_tracking if _dexpilot_ctrl else '?'}")
+                    _gp_acc = {'track': 0.0, 'refresh': 0.0, 'spin': 0.0, 'step_ik': 0.0,
+                               'torque': 0.0, 'step': 0.0, 'n': 0}
+                    _gp_last = time.time()
 
             # Teleop: keep the achieved-contact markers pinned to the object as it
             # moves (jog during GRASP) by re-expressing the stored object-local
