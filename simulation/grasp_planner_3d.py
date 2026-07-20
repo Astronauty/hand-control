@@ -77,7 +77,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 try:
     import importlib as _importlib
-    # _ncf_mod = _importlib.import_module('3D_minimum_NCF_soft')
     _ncf_mod = _importlib.import_module('3D_minimum_NCF')
     min_gamma_for_accel_lp = _ncf_mod.min_gamma_for_accel_lp
     _NCF_AVAILABLE = True
@@ -88,11 +87,9 @@ except Exception as e:
 
 try:
     import casadi as ca
-    from casadi import Callback as _CasadiCallback
     _CASADI_AVAILABLE = True
 except ImportError:
     _CASADI_AVAILABLE = False
-    _CasadiCallback = object
 
 try:
     import mujoco as mj
@@ -119,10 +116,9 @@ if not log.handlers:
     log.addHandler(logging.NullHandler())
 
 if _NCF_AVAILABLE and _CASADI_AVAILABLE and _MJ_AVAILABLE and _CIK_AVAILABLE:
-    print("[grasp_planner_3d] all dependencies available")
+    log.info("all dependencies available")
 else:
-    print("[grasp_planner_3d] WARNING: some dependencies are missing; "
-          "grasp planning will fail if invoked")
+    log.warning("some dependencies are missing; grasp planning will fail if invoked")
 # ─────────────────────────────────────────────────────────────────────────────
 # SQP solver options — copied verbatim from constrained_ik._SQP_SOLVER_OPTS
 # (private name; do not import — copy the dict to avoid coupling)
@@ -297,19 +293,6 @@ def _march_sdf_np(p_start, direction, geom_type, center, mat, size,
     return _project_to_surface_np(p, geom_type, center, mat, size)
 
 
-def _rotate_random_vec(v, angle_rad, rng):
-    """Rotate v by angle_rad about a random axis perpendicular to v (Rodrigues)."""
-    ax = rng.standard_normal(3)
-    ax -= np.dot(ax, v) * v
-    ax_norm = np.linalg.norm(ax)
-    if ax_norm < 1e-12:
-        ax = np.array([1.0, 0.0, 0.0])
-        ax -= np.dot(ax, v) * v
-        ax_norm = np.linalg.norm(ax)
-    ax /= ax_norm + 1e-12
-    return v * np.cos(angle_rad) + np.cross(ax, v) * np.sin(angle_rad)
-
-
 def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
                delta_max=np.deg2rad(25), off_lo=-0.004, off_hi=0.010):
     """
@@ -360,19 +343,8 @@ def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
     }
 
 
-def _reachable_contact(p, n_out, ground_z, r_tip,
-                       n_down_max=-0.5, z_margin=0.002):
-    """
-    Returns False if this contact can't be approached from above the support plane.
-
-    Rejects two cases:
-      - Normal points more than 60° below horizontal (n_out[2] < -0.5): the finger
-        would have to come from underneath the table.
-      - Contact too close to the support surface: the fingertip sphere (radius r_tip)
-        would collide with the table before reaching the contact point.
-    """
-    # if n_out[2] < n_down_max:
-    #     return False
+def _reachable_contact(p, ground_z, r_tip, z_margin=0.002):
+    """Returns False if the contact is too close to the support surface for the fingertip sphere."""
     if p[2] < ground_z + r_tip + z_margin:
         return False
     return True
@@ -518,13 +490,8 @@ def _embed_wrench_cone_ca(opti, p1, p2,
         opti.subject_to(opti.bounded(-_t_bnd, w[0:3], _t_bnd))
         # Force rows: equality with slack (absorbs infeasibility on bad seeds)
         
-        # with slack
         opti.subject_to(w[3:6] == ca.DM(t_f_k) + _s_k)
         slack_list.append(_s_k)
-        
-        # # without slack
-        # opti.subject_to(w[3:6] == ca.DM(t_f_k))
-        
         y1_list.append(_y1_k)
         y2_list.append(_y2_k)
 
@@ -560,7 +527,6 @@ class GraspConfig3D:
 
     # Constraint flags
     joint_limits:      bool  = True   # active joint limit constraints in NLP
-    on_object:         bool  = True   # hard surface constraint when d1/d2 not provided
     wrench_constraint: bool  = True   # embedded LP wrench constraint in NLP
     max_iter:          int   = 120    # per-stage max iterations (Picard loop uses n_normal_relinearize+1 stages)
 
@@ -602,17 +568,6 @@ class GraspConfig3D:
     smooth_sdf: bool  = True
     slsqp_alpha: float = 400.0  # smooth SDF alpha (collision avoidance SDF only)
 
-    # Wrench LP task bounds.
-    # task_tx/ty/tz >= 0.5*hx (half face width) keeps torque inequality feasible
-    # for contacts displaced from face centre (0.03 Nm = full-face coverage for 30mm box).
-    mu:       float = 1.0
-    task_fx:  float = 0.5
-    task_fy:  float = 0.5
-    task_fz:  float = 2.0
-    task_tx:  float = 0.03   # torque bound (box inequality), Nm
-    task_ty:  float = 0.03
-    task_tz:  float = 0.03
-    torque_budget_scale: float = 1.0   # multiply _nlp_tx/ty/tz; set >1 to test torque-tightness
 
     # Acceleration budgets for mass-scaled task wrench computation.
     # Used in solve() to replace fixed task_fx/fy/fz with mass*(accel+gravity),
@@ -817,23 +772,20 @@ class GraspPlanner3D:
         n_obj_dof     = model.nq - n_act
         obj_qpos_snap = data_cb.qpos[n_act:].copy() if n_obj_dof > 0 else None
 
-        # Mass-scaled task wrench for the NLP wrench constraint.
-        # Replaces fixed task_fx/fy/fz so the NLP targets the correct squeeze
-        # capability for the actual object mass: f = mass*(accel+gravity).
+        # Task wrench from object mass/inertia and configured acceleration budgets.
         _bid    = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, cfg.obj_body)
         _mass   = float(model.body_mass[_bid])
-        _inert  = model.body_inertia[_bid]                 # (Ix, Iy, Iz) principal
-        _g_O    = obj_R_np.T @ model.opt.gravity            # gravity in object geom frame
+        _inert  = model.body_inertia[_bid]
+        _g_O    = obj_R_np.T @ model.opt.gravity
         _ab     = cfg.accel_budget_xyz
         _aab    = cfg.ang_accel_budget_xyz
+        _mu     = round(0.8 * float(model.geom_friction[self._obj_gid][0]), 3)
         _nlp_fx = _mass * (_ab[0] + abs(_g_O[0]))
         _nlp_fy = _mass * (_ab[1] + abs(_g_O[1]))
         _nlp_fz = _mass * (_ab[2] + abs(_g_O[2]))
-        # Torques: inertia-scaled, clamped to cfg.task_tx/ty/tz floor so the embedded
-        # LP stays feasible for off-center contacts (needs tx/ty >= 0.5*hx).
-        _nlp_tx = max(float(_inert[0]) * _aab[0], cfg.task_tx) * cfg.torque_budget_scale
-        _nlp_ty = max(float(_inert[1]) * _aab[1], cfg.task_ty) * cfg.torque_budget_scale
-        _nlp_tz = max(float(_inert[2]) * _aab[2], cfg.task_tz) * cfg.torque_budget_scale
+        _nlp_tx = float(_inert[0]) * _aab[0]
+        _nlp_ty = float(_inert[1]) * _aab[1]
+        _nlp_tz = float(_inert[2]) * _aab[2]
 
         obj_center = np.asarray(obj_pos, dtype=float)
         margin     = max(hx, hy, hz)
@@ -960,9 +912,6 @@ class GraspPlanner3D:
             _cost_ik  = 0.5 * (_d1_sq + _d2_sq) / _d_ref**2
             _cost_reg = ca.sumsqr((_q - ca.DM(_q_reg)) / cfg.q_scale) / _n_dof
             _cost = cfg.w_ik * _cost_ik + cfg.w_reg * _cost_reg
-            
-            # Embedded mode: gamma variable added to cost below after _embed_wrench_cone_ca
-            _gamma_lp = None
 
             # ── 1. Joint limits (vectorized) ──────────────────────────────
             if cfg.joint_limits:
@@ -1013,7 +962,7 @@ class GraspPlanner3D:
                 _gamma_lp, _slack_list, _y1_list, _y2_list = _embed_wrench_cone_ca(
                     _opti, _p1, _p2,
                     _R1_param, _R2_param,
-                    obj_center_np, cfg.mu,
+                    obj_center_np, _mu,
                     np.array([_nlp_fx, _nlp_fy, _nlp_fz]),
                     np.array([_nlp_tx, _nlp_ty, _nlp_tz]))
                 _opti.set_initial(_gamma_lp, 1.0)
@@ -1172,7 +1121,6 @@ class GraspPlanner3D:
                 if_evals  = index_cb.eval_count
                 col_evals = col_cb.eval_count if col_cb is not None else 0
                 arm_evals = arm_col_cb.eval_count if arm_col_cb is not None else 0
-                wf_calls  = 0  # embedded mode: no callback
                 _wrench_str = 'embedded' if cfg.wrench_constraint else 'N'
 
                 con_str = (
@@ -1185,7 +1133,7 @@ class GraspPlanner3D:
                     f"{tag}  constraints : {con_str}",
                     f"{tag}  DOF={n_act}  cbs:"
                     f"  thumb={th_evals}  index={if_evals}"
-                    f"  col={col_evals}  arm={arm_evals}  wf_lp={wf_calls}",
+                    f"  col={col_evals}  arm={arm_evals}",
                     f"{tag}  graph_build : {dt_graph*1e3:6.0f} ms",
                     f"{tag}  {'SQP' if cfg.use_slsqp else 'IPOPT'}_solve : {dt_solve*1e3:6.0f} ms",
                     f"{tag}  total_wall  : {dt_total*1e3:6.0f} ms",
@@ -1393,7 +1341,7 @@ class GraspPlanner3D:
             _n1f  = _geom_normal_np(_p1f, geom_type, obj_center_np, obj_R_np, geom_size)
             _n2f  = _geom_normal_np(_p2f, geom_type, obj_center_np, obj_R_np, geom_size)
             _dot12 = float(np.dot(_n1f, _n2f))
-            _sm    = _span_margin(_n1f, _n2f, cfg.mu)
+            _sm    = _span_margin(_n1f, _n2f, _mu)
             self.log.info(
                 f"[solve|final] n1={np.round(_n1f, 3).tolist()}  n2={np.round(_n2f, 3).tolist()}  "
                 f"dot={_dot12:+.3f}  span_margin={_sm:+.4f}rad")
@@ -1477,34 +1425,26 @@ class GraspPlanner3D:
                 _bid_v   = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, cfg.obj_body)
                 _mass_v  = float(model.body_mass[_bid_v])
                 _inert_v = model.body_inertia[_bid_v]
+                _aab_v   = cfg.ang_accel_budget_xyz
+                _mu_v    = round(0.8 * float(model.geom_friction[self._obj_gid][0]), 3)
                 R_WO_v   = data_v.xmat[_bid_v].reshape(3, 3)
                 _g_O_v   = R_WO_v.T @ model.opt.gravity
                 _ab_v    = cfg.accel_budget_xyz
                 _accel_v = tuple(_ab_v[i] + abs(_g_O_v[i]) for i in range(3))
-                # Torque bounds: same formula as NLP (_nlp_tx/ty/tz), converted to
-                # angular acceleration for min_gamma_for_accel_lp.
-                _nlp_tx_v = max(float(_inert_v[0]) * cfg.ang_accel_budget_xyz[0], cfg.task_tx)
-                _nlp_ty_v = max(float(_inert_v[1]) * cfg.ang_accel_budget_xyz[1], cfg.task_ty)
-                _nlp_tz_v = max(float(_inert_v[2]) * cfg.ang_accel_budget_xyz[2], cfg.task_tz)
-                _aab_v = np.array([
-                    _nlp_tx_v / max(float(_inert_v[0]), 1e-12),
-                    _nlp_ty_v / max(float(_inert_v[1]), 1e-12),
-                    _nlp_tz_v / max(float(_inert_v[2]), 1e-12),
-                ])
                 _p1_O_v  = R_WO_v.T @ (p1_np - obj_pos)
                 _p2_O_v  = R_WO_v.T @ (p2_np - obj_pos)
                 R1_O     = R_WO_v.T @ R1
                 R2_O     = R_WO_v.T @ R2
                 gamma_min = min_gamma_for_accel_lp(
                     _mass_v * _accel_v[0], _mass_v * _accel_v[1], _mass_v * _accel_v[2],
-                    _inert_v[0] * _aab_v[0], _inert_v[1] * _aab_v[1], _inert_v[2] * _aab_v[2],
+                    float(_inert_v[0])*_aab_v[0], float(_inert_v[1])*_aab_v[1], float(_inert_v[2])*_aab_v[2],
                     n=2,
                     pos=[_p1_O_v.reshape(3, 1), _p2_O_v.reshape(3, 1)],
                     R=[R1_O, R2_O],
                     ncf=[1.0, 1.0],
                     tan_y=[0.0, 0.0],
                     tan_z=[0.0, 0.0],
-                    mu=[cfg.mu, cfg.mu],
+                    mu=[_mu_v, _mu_v],
                 )
                 wf_feasible = (gamma_min is not None)
                 wf_tag = f'OK(γ_min={gamma_min:.3f})' if wf_feasible else 'INFEASIBLE'
@@ -1619,14 +1559,22 @@ class MultiStartGraspPlanner3D:
             f"(geom types: thumb={int(model.geom_type[_pl._thumb_gid])}  "
             f"index={int(model.geom_type[_pl._index_gid])})")
 
-        # Measure friction from the object geom and set cfg.mu with a 0.8 safety margin.
-        # MuJoCo friction[0] is sliding; effective pair value = sqrt(mu1*mu2) but we
-        # can only read one side here, so apply margin conservatively.
+        # Log friction and torque bounds that will be computed inline at solve time.
         _obj_gid = _pl._obj_gid
         _mu_obj  = float(model.geom_friction[_obj_gid][0])
-        _pl.cfg.mu = round(0.8 * _mu_obj, 3)
+        _mu_init = round(0.8 * _mu_obj, 3)
         _pl.log.info(
-            f"[friction] obj_mu={_mu_obj:.3f}  cfg.mu={_pl.cfg.mu:.3f} (0.8x safety margin)")
+            f"[friction] obj_mu={_mu_obj:.3f}  effective_mu={_mu_init:.3f} (0.8x safety margin)")
+
+        _bid_init   = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, _pl.cfg.obj_body)
+        _inert_init = model.body_inertia[_bid_init]
+        _aab_init   = _pl.cfg.ang_accel_budget_xyz
+        _tx = float(_inert_init[0]) * _aab_init[0]
+        _ty = float(_inert_init[1]) * _aab_init[1]
+        _tz = float(_inert_init[2]) * _aab_init[2]
+        _pl.log.info(
+            f"[task_torque] tx={_tx:.4f}  ty={_ty:.4f}  tz={_tz:.4f} N·m  "
+            f"(I={np.round(_inert_init,6).tolist()}  α={list(_aab_init)})")
 
     def solve(self, q_ref: np.ndarray, obj_pos: np.ndarray,
               max_seeds: int | None = None) -> dict:
@@ -1651,12 +1599,13 @@ class MultiStartGraspPlanner3D:
         _g_O   = obj_R_np.T @ model.opt.gravity
         _ab    = cfg.accel_budget_xyz
         _aab   = cfg.ang_accel_budget_xyz
+        _mu    = round(0.8 * float(model.geom_friction[obj_gid][0]), 3)
         _nlp_fx = _mass * (_ab[0] + abs(_g_O[0]))
         _nlp_fy = _mass * (_ab[1] + abs(_g_O[1]))
         _nlp_fz = _mass * (_ab[2] + abs(_g_O[2]))
-        _nlp_tx = max(float(_inert[0]) * _aab[0], cfg.task_tx) * cfg.torque_budget_scale
-        _nlp_ty = max(float(_inert[1]) * _aab[1], cfg.task_ty) * cfg.torque_budget_scale
-        _nlp_tz = max(float(_inert[2]) * _aab[2], cfg.task_tz) * cfg.torque_budget_scale
+        _nlp_tx = float(_inert[0]) * _aab[0]
+        _nlp_ty = float(_inert[1]) * _aab[1]
+        _nlp_tz = float(_inert[2]) * _aab[2]
 
         bbox_r    = float(np.max(geom_size)) * 2.5
         n_seeds   = max_seeds if max_seeds is not None else cfg.n_seeds
@@ -1679,8 +1628,8 @@ class MultiStartGraspPlanner3D:
                 continue
             # Reachability check — reject contacts below the table or facing downward
             n1_out = -s['n1_in'];  n2_out = -s['n2_in']
-            if (not _reachable_contact(s['p1s'], n1_out, _ground_z, _r_tip_min) or
-                    not _reachable_contact(s['p2s'], n2_out, _ground_z, _r_tip_min)):
+            if (not _reachable_contact(s['p1s'], _ground_z, _r_tip_min) or
+                    not _reachable_contact(s['p2s'], _ground_z, _r_tip_min)):
                 rejected += 1
                 continue
             seeds.append(s)
@@ -1719,7 +1668,7 @@ class MultiStartGraspPlanner3D:
                         ncf=[1.0, 1.0],
                         tan_y=[0.0, 0.0],
                         tan_z=[0.0, 0.0],
-                        mu=[cfg.mu, cfg.mu],
+                        mu=[_mu, _mu],
                     )
                 except Exception as _lp_e:
                     log.debug(f"[seed {i+1}] pre-check LP error: {_lp_e}")
