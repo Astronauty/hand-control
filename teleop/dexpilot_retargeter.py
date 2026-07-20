@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
 import numpy as np
 import scipy.optimize
 import mujoco as mj
 
-# Tuned retargeting constants persist here (written by the RetargetTuner's save
-# key, loaded on construction). Lives next to the other teleop calibration files.
+# Tuned retargeting constants persist here. Edit this file while dexpilot runs and
+# it hot-reloads (poll_config); loaded on construction. Next to the other teleop
+# calibration files.
 _CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "calibration", "retarget_config.json",
@@ -34,9 +36,9 @@ _CONFIG_PATH = os.path.join(
 class DexPilotRetargeter:
     """Retargets 21 MediaPipe world landmarks → 16 LEAP hand joint angles."""
 
-    # Paper constants. These are also the fields the live RetargetTuner reads and
-    # writes per frame — every value the retargeting cost consumes is an instance
-    # attribute (never a bare literal in _switching), so a slider can override it.
+    # Paper constants. Every value the retargeting cost consumes is an instance
+    # attribute (never a bare literal in _switching), so the JSON config can
+    # override any of them and poll_config can hot-reload edits live.
     BETA  = 1.6       # robot-to-human hand size scale
     GAMMA = 2.5e-3    # regularisation weight (open hand = zero)
     EPS   = 0.03      # proximity threshold [m] — 3 cm
@@ -52,6 +54,7 @@ class DexPilotRetargeter:
     # MediaPipe landmark indices
     _LM_WRIST   = 0
     _LM_IDX_MCP = 5   # index finger MCP (defines palm x-axis)
+    _LM_MID_MCP = 9   # middle MCP — far endpoint of the hand-scale reference span
     _LM_PKY_MCP = 17  # pinky MCP (defines palm plane)
     # [index, middle, ring, thumb] fingertip landmark IDs
     _HUMAN_TIPS = [8, 12, 16, 4]
@@ -90,6 +93,8 @@ class DexPilotRetargeter:
         # instance, never the class.
         for name in self.TUNABLE:
             setattr(self, name, getattr(type(self), name))
+
+        self._cfg_mtime: float | None = None   # for poll_config() hot-reload
 
         # Proximity threshold seed. The paper's 3 cm assumes an open-hand
         # thumb→fingertip separation of ~10 cm; MediaPipe world landmarks
@@ -139,6 +144,13 @@ class DexPilotRetargeter:
         self._scratch = mj.MjData(model)
 
         self._q_prev: np.ndarray | None = None
+
+        # Robot-metric hand span for the image-tip normalisation: the robot
+        # palm->middle-fingertip distance at q=0. Rescales the (dimensionless)
+        # hand-size-normalised human tips back into the robot's metre scale so the
+        # BETA*d targets are physically reachable (see _HAND_SCALE / _human_vectors).
+        _rv0 = self._robot_vectors(np.zeros(self._n_hand))
+        self._HAND_SCALE = float(np.linalg.norm(_rv0[1]))   # middle finger palm->tip
 
     # ------------------------------------------------------------------
     # Human palm frame
@@ -235,8 +247,19 @@ class DexPilotRetargeter:
     # map image basis -> world basis with C (so tips compose with the WORLD palm
     # frame, which is left exactly as-is). EPS/ETA are then just re-tuned numbers.
     _IMG_ASPECT   = 480.0 / 640.0      # y-scale: undo the 4:3 frame aspect
-    Z_SCALE       = 1.0                # pseudodepth scale vs image-x (empirical; 1:1 for now)
+    Z_SCALE       = 1.0                # pseudodepth scale vs image-x (see note below)
     _C_IMG_TO_WORLD = np.diag([1.0, -1.0, -1.0])   # image basis -> world basis
+
+    # Hand-scale normalisation (image-tip path) divides fingertip displacements by
+    # the human wrist->mid-MCP span, making them dimensionless HAND-SIZE ratios
+    # (distance-invariant). But the cost compares them against the ROBOT palm->tip
+    # vectors, which are in METRES (~0.12 m) — so the normalised human vectors must
+    # be rescaled back to the robot's metric scale, else f=BETA*d targets land
+    # ~20x beyond the robot's reach and the optimiser bunches every finger toward
+    # the unreachable point (bunching at ALL beta). _HAND_SCALE is that robot-metric
+    # span: it's set to the robot palm->mid-fingertip distance at q=0, so a human
+    # open hand maps to roughly the robot's open geometry and BETA stays ~1.6.
+    _HAND_SCALE   = 0.12               # robot-metric span [m]; overwritten in __init__ from the model
 
     def _tip_scale(self) -> np.ndarray:
         """Per-axis image->world tip map: C @ diag([1, aspect, Z_SCALE])."""
@@ -255,6 +278,16 @@ class DexPilotRetargeter:
                   they compose with the world palm frame. The palm frame itself is
                   still built from world `lm` — only the tip source changes.
 
+                  Image landmarks are PERSPECTIVE-scaled (a projection): the whole
+                  hand shrinks in frame as it recedes, so raw image separations
+                  breathe with camera distance (and image z is wrist-relative, so it
+                  can't compensate). We therefore NORMALISE every image-tip
+                  displacement by the hand's own scale — the wrist->middle-MCP span
+                  in the same scaled space — making all distances HAND-SIZE FRACTIONS,
+                  invariant to how far you are from the camera. Consequence: with
+                  image tips, EPS/ETA1/ETA2 are RATIOS of hand size (~0.1-0.5), not
+                  metres — re-tune them once. The world-tip fallback stays metric.
+
         Returns a list of dicts with keys:
           'r'    : ndarray(3) — the vector
           'type' : 'palm' | 's1' | 's2'
@@ -270,11 +303,20 @@ class DexPilotRetargeter:
             M = self._tip_scale()
             origin = M @ tip_lm[self._LM_WRIST]
             tips_src = [M @ p for p in tip_lm[self._HUMAN_TIPS]]
+            # Hand-scale normalisation: divide displacements by the human
+            # wrist->mid-MCP span (perspective cancels), THEN multiply by the
+            # robot-metric span _HAND_SCALE so the result is back in the robot's
+            # metre scale (comparable to the robot palm->tip vectors the cost
+            # matches). Net: distance-invariant AND metric. Guard a degenerate
+            # span (hand lost) by skipping normalisation.
+            mid_mcp = M @ tip_lm[self._LM_MID_MCP]
+            span = float(np.linalg.norm(mid_mcp - origin))
+            scale = (self._HAND_SCALE / span) if span > 1e-6 else 1.0
+            tips = [R_PW @ ((t - origin) * scale) for t in tips_src]
         else:
             origin = origin_W
             tips_src = [p for p in lm[self._HUMAN_TIPS]]         # (4,3) world
-
-        tips = [R_PW @ (t - origin) for t in tips_src]           # in palm frame
+            tips = [R_PW @ (t - origin) for t in tips_src]       # metric, in palm frame
 
         vecs: list[dict] = []
 
@@ -392,12 +434,6 @@ class DexPilotRetargeter:
         human_vecs = self._human_vectors(world_lm, tip_lm=image_lm)
         d_s1 = [float(np.linalg.norm(human_vecs[4 + i]['r'])) for i in range(3)]
 
-        if self.debug:
-            d_palm = [float(np.linalg.norm(human_vecs[i]['r'])) for i in range(4)]
-            pinch = ['PINCH' if d <= self.EPS else 'open' for d in d_s1]
-            print(f"[retarget] S1 d(if,mf,rf→th)={[round(d,3) for d in d_s1]} "
-                  f"EPS={self.EPS} -> {pinch} | palm→tip={[round(d,3) for d in d_palm]}")
-
         x0 = (q_prev if q_prev is not None
                else (self._q_prev if self._q_prev is not None
                      else np.zeros(self._n_hand)))
@@ -412,15 +448,67 @@ class DexPilotRetargeter:
         )
 
         q = result.x.copy()
+
+        if self.debug:
+            self._print_debug(human_vecs, d_s1, q)
+
         self._q_prev = q
         return q
+
+    def _print_debug(self, human_vecs: list[dict], d_s1: list[float],
+                     q: np.ndarray) -> None:
+        """Render the per-frame retarget readout IN PLACE (static, not scrolling).
+
+        Uses ANSI cursor-up so each frame overwrites the previous block instead of
+        scrolling the terminal. The per-finger PINCH state (S1 d <= EPS) is the
+        AUTHORITATIVE one that actually gates the pinch cost. Falls back to plain
+        scrolling prints if stdout isn't a TTY (piped/logged)."""
+        d_palm = [float(np.linalg.norm(human_vecs[i]['r'])) for i in range(4)]
+        # Per-finger pinch state — the exact d <= EPS decision driving the fingers.
+        pinch = ['PINCH' if d <= self.EPS else 'open ' for d in d_s1]
+        splay = [round(float(q[b + 1]), 2) for b in (0, 4, 8)]        # if,mf,rf rot
+        curl  = [round(float(q[b] + q[b + 2]), 2) for b in (0, 4, 8)]  # mcp+pip
+        # palm->tip target vectors (palm frame: x=along fingers, y=across, z=out).
+        tv = [human_vecs[i]['r'] for i in range(3)]
+
+        lines = [
+            "[retarget] ── live (updates in place) "
+            + "─" * 20,
+            f"  PINCH  if:{pinch[0]}  mf:{pinch[1]}  rf:{pinch[2]}   (EPS={self.EPS:.3f})",
+            f"  S1 d   if,mf,rf→th = {[round(d,3) for d in d_s1]}",
+            f"  palm→tip           = {[round(d,3) for d in d_palm]}",
+            f"  target vecs  if={self._fmt_vec(tv[0])} "
+            f"mf={self._fmt_vec(tv[1])} rf={self._fmt_vec(tv[2])}",
+            f"  joints  splay={splay}  curl(mcp+pip)={curl}  "
+            f"thumb(cmc,mcp)={[round(float(q[12]),2), round(float(q[14]),2)]}",
+        ]
+        n = len(lines)
+        block = "\n".join(lines)
+        if sys.stdout.isatty():
+            # After the first frame, move the cursor up N lines and clear each so the
+            # block redraws in the SAME spot (static display, no scroll).
+            prefix = f"\033[{n}A" if getattr(self, '_dbg_drawn', False) else ""
+            sys.stdout.write(prefix + "\r" + "\033[K"
+                             + ("\n\033[K".join(lines)) + "\n")
+            sys.stdout.flush()
+            self._dbg_drawn = True
+        else:
+            print(block)
+
+    @staticmethod
+    def _fmt_vec(r: np.ndarray) -> str:
+        return f"[{r[0]:+.2f} {r[1]:+.2f} {r[2]:+.2f}]"
 
     def reset(self) -> None:
         """Clear warm-start state (call when hand tracking is lost)."""
         self._q_prev = None
+        # Re-anchor the in-place debug block on the next frame (a fresh print
+        # instead of overwriting stale lines after a tracking gap).
+        self._dbg_drawn = False
 
     # ------------------------------------------------------------------
-    # Live-tuning config (see teleop/retarget_tuner.py)
+    # Live-tuning config: edit calibration/retarget_config.json; poll_config()
+    # hot-reloads it each frame (dexpilot).
     # ------------------------------------------------------------------
 
     def tunables(self) -> dict[str, float]:
@@ -432,18 +520,50 @@ class DexPilotRetargeter:
 
         Only keys in TUNABLE are applied (unknown keys ignored), so a stale or
         hand-edited file can't inject arbitrary attributes. Returns True if a file
-        was found and read. Missing file is not an error — defaults stand.
+        was found and read. Missing file is not an error — defaults stand. A
+        malformed/partially-written file (e.g. mid-edit) is caught and ignored so
+        live editing can't crash the sim.
         """
         path = path or _CONFIG_PATH
         if not os.path.exists(path):
             return False
-        with open(path) as f:
-            cfg = json.load(f) or {}
+        try:
+            with open(path) as f:
+                cfg = json.load(f) or {}
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[retarget] config {path} unreadable ({e}); keeping current values.")
+            return False
         for name in self.TUNABLE:
             if name in cfg:
-                setattr(self, name, float(cfg[name]))
+                try:
+                    setattr(self, name, float(cfg[name]))
+                except (TypeError, ValueError):
+                    pass   # skip a bad single value, keep the rest
+        # Remember the mtime so poll_config() only reloads on actual change.
+        try:
+            self._cfg_mtime = os.path.getmtime(path)
+        except OSError:
+            pass
         print(f"[retarget] loaded tuned constants from {path}: {self.tunables()}")
         return True
+
+    def poll_config(self, path: str | None = None) -> bool:
+        """Hot-reload the tunables from JSON when the file has changed on disk.
+
+        Cheap to call every frame: it only stats the file and reloads when the
+        mtime advances (so you can edit calibration/retarget_config.json in your
+        editor and the live retargeter picks it up on save). Returns True if a
+        reload happened. Missing file resets the watch so a later create reloads.
+        """
+        path = path or _CONFIG_PATH
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            self._cfg_mtime = None   # file gone; re-trigger if it reappears
+            return False
+        if getattr(self, '_cfg_mtime', None) == mtime:
+            return False
+        return self.load_config(path)
 
     def save_config(self, path: str | None = None) -> str:
         """Write the current tunables to JSON so they auto-load next launch."""

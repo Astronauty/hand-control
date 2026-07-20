@@ -9,6 +9,7 @@ used in the grasp is configurable via FINGER_SET (see below) — the controller 
 contacts generically rather than hardcoding 2.
 """
 import argparse
+import json
 import numpy as np
 import subprocess
 import os
@@ -218,6 +219,9 @@ def make_key_callback(key_queue):
                                 #     contacts, warm-started from the recommender's q
         73:  'rec_ik_dls_vis',   # I — same collision-aware IK but warm-started from a
                                 #     fresh DLS solve, to A/B the two warm-starts
+        82:  'record_sample',   # R — (contact_aware_teleop, --record-samples) append the
+                                #     current (pose, object, recommendation) to the tuning
+                                #     dataset for offline IK-weight sweeping
         54:  'ik_vis',  # 6 — cycle IK config visualization
         55:  'bspheres', # 7 — toggle IK collision bounding-sphere overlay
         56:  'teleop_start', # 8 — (dexpilot) start/re-zero tracking at current pose
@@ -370,10 +374,24 @@ if __name__ == "__main__":
              "physics). Disabled by default: hand geoms are moved to contype=2 so "
              "hand↔hand pairs never match, while hand↔object/floor/arm keep colliding.")
     _arg_parser.add_argument(
+        '--physics', action='store_true',
+        help="dexpilot mode: drive the robot with PD torques + gravity comp and hand off "
+             "to mj_step, so the arm/hand PHYSICALLY collide with objects, the floor, and "
+             "(with --hand-self-collision) themselves — they can push/knock things. Default "
+             "is kinematic replay (qpos overwrite; rigid, exact tracking with NO collision "
+             "response — the robot passes through everything), which is best for orientation "
+             "calibration. Calibration holds (M/C/V) stay kinematic even with --physics.")
+    _arg_parser.add_argument(
         '--ik-solver', choices=['sqp', 'ipopt'], default='sqp',
         help="sqp (default): sqpmethod + OSQP + softplus SDF + analytic FK Jacobians — "
              "~3× cheaper per iteration, wins on wall time in most cases  |  "
              "ipopt: IPOPT L-BFGS + finite-difference Jacobians — production baseline.")
+    _arg_parser.add_argument(
+        '--record-samples', metavar='PATH', default=None,
+        help="contact_aware_teleop: append IK-tuning dataset samples to this JSONL file "
+             "when the R key is pressed. Each sample is (q_seed, obj_qpos, object, "
+             "recommender candidate {q,p1,p2}) — everything tune_ik_weights.py needs to "
+             "re-run the recommender->collision-IK gap offline under swept weights.")
     args = _arg_parser.parse_args()
     if args.mode == 'rrt':          # deprecated alias
         args.mode = 'contact_aware_autonomous'
@@ -517,12 +535,21 @@ if __name__ == "__main__":
         'obj_green_box_geom', 'obj_green_cylinder_geom',
         'floor',
     ]
+    # Diagonal posture regularization, split arm (first 7 DOF) vs LEAP hand (next 16).
+    # The posture term is Σ_i w_i (q_i - q_bias_i)²; a per-block weight lets the arm's
+    # redundancy float toward the tip targets (small POSTURE_W_ARM) while the fingers are
+    # held closer to their curled/retargeted bias (larger POSTURE_W_HAND), instead of one
+    # scalar trading tip accuracy against both. Set both equal to recover the old
+    # isotropic behavior. N_ROBOT=23 = 7 arm + 16 LEAP hand joints.
+    POSTURE_W_ARM  = 0.1e-4   # arm joints 1..7: loose, so the null space serves the tips
+    POSTURE_W_HAND = 0.1e-3   # LEAP 16 finger joints: raise to pin fingers near q_bias
+    _posture_w = np.r_[np.full(7, POSTURE_W_ARM), np.full(N_ROBOT - 7, POSTURE_W_HAND)]
     constrained_ik = ConstrainedIKSolver(
         model, N_ROBOT,
         arm_geom_names=_robot_geom_names,
         obj_geom_names=_OBJ_GEOM_NAMES,
         clearance=0.005,
-        posture_weight=0.0005,
+        posture_weight=_posture_w,
         pad_axis=(-1.0, 0.0, 0.0),  # LEAP fingerpad normal in the fingertip-site frame
         # Weight the tip-position task above the posture regularizer: at 1.0 (raw m²)
         # a 15mm tip error costs 2e-4 vs a posture term of ~3e-3, so the solver traded
@@ -533,7 +560,7 @@ if __name__ == "__main__":
         # term drag tips into 20mm+ local minima on sphere/capsule; 1000:1 gives
         # ~0.5-2.5mm tips at <5 deg pads on 4/6 objects).
         # NOTE: _SQP_SOLVER_OPTS' tol_du (1e-2) is calibrated to this cost scale.
-        tip_weight=20.0,
+        tip_weight=100.0,
         orient_weight=1.0,
         max_iter=800,   # DLS warm-start puts us near solution; headroom for the tightened tol
     )
@@ -837,7 +864,7 @@ if __name__ == "__main__":
     # harder, the position spring (anchored at the fixed pre-squeeze q_grasp_hold)
     # pulls back proportionally, so measured contact force saturates well below
     # GAMMA/sqrt(2) instead of scaling with it.
-    SQUEEZE_PD_SCALE = 20.0
+    SQUEEZE_PD_SCALE = 50.0
 
     # Ramp the squeeze force 0->GAMMA over this many seconds of sim time after each
     # squeeze-on. The internal force pair only cancels once BOTH contacts exist; at
@@ -898,6 +925,14 @@ if __name__ == "__main__":
             mj.mj_forward(model, _d)
             positions = [_d.site_xpos[s].copy() for s in _GHOST_SITES]
             markers.append((positions, rgba))
+        # DIAGNOSTIC (recommended-IK path only): the recommender's INTENDED contacts —
+        # where the NLP wanted the tip sites to land (p_S_W). Drawn in magenta so the gap
+        # to the gold ACHIEVED tips above is visible; the delta is exactly what the
+        # collision-constrained IK gave up to stay clearance-feasible. p_S_W is world at
+        # solve time; the object is static during a lock-in solve so this is aligned.
+        if obj.get('p_S_W') is not None and obj.get('rec_local') is not None:
+            markers.append(([np.asarray(p, float).copy() for p in obj['p_S_W']],
+                            np.array([1.0, 0.0, 1.0, 0.9], dtype=np.float32)))
         return markers
 
     _ik_markers_by_obj = [None] * len(objects)
@@ -1113,6 +1148,24 @@ if __name__ == "__main__":
         # closer start than a fresh DLS. 'dls': a fresh DLS solve to the contacts.
         # Falls back to DLS if 'rec_q' is requested but the candidate carries no q.
         _rec_q = rec.get('q')
+        # Recommender's OWN tip error: where the NLP's joint solution lands the tip
+        # SITES relative to its OWN recommended contacts p_S_W. The NLP's w_ik cost
+        # targets the site directly AT the contact (no pad backoff), so measure against
+        # p_S_W, not ik_targets. This is the "low tip error" the user sees reported for
+        # the recommender; the collision-IK error below is measured the same way so the
+        # two are directly comparable and the discrepancy is attributable.
+        obj['rec_nlp_err_mm'] = None
+        if _rec_q is not None:
+            _q_nlp = np.asarray(q_seed, float).copy()
+            for _i, _idx in enumerate(_cat_act_idx):
+                _q_nlp[_idx] = _rec_q[_i]
+            _d_nlp = mj.MjData(model)
+            _d_nlp.qpos[N_ROBOT:] = obj_qpos_snap
+            _d_nlp.qpos[:N_ROBOT] = _q_nlp
+            mj.mj_forward(model, _d_nlp)
+            obj['rec_nlp_err_mm'] = [
+                float(np.linalg.norm(_d_nlp.site_xpos[s] - p) * 1e3)
+                for s, p in zip(id_C, p_S_W)]
         if warmstart == 'rec_q' and _rec_q is not None:
             q_warm = np.asarray(q_seed, float).copy()
             for _i, _idx in enumerate(_cat_act_idx):
@@ -1140,8 +1193,41 @@ if __name__ == "__main__":
         mj.mj_forward(model, _d_chk)
         _errs_mm = [float(np.linalg.norm(_d_chk.site_xpos[s] - t) * 1e3)
                     for s, t in zip(id_C, obj['ik_targets'])]
-        print(f"\r\n[IK] obj{obj_idx+1} (recommended): tip errors = "
-              f"{[f'{e:.1f} mm' for e in _errs_mm]}")
+        # Same site-vs-CONTACT metric the recommender error uses (measured against
+        # p_S_W, not the pad-backed-off ik_targets), so the two numbers are directly
+        # comparable and the gap the collision constraints introduce is visible.
+        _errs_contact_mm = [float(np.linalg.norm(_d_chk.site_xpos[s] - p) * 1e3)
+                            for s, p in zip(id_C, p_S_W)]
+        # Side-by-side attribution (FINGER_SET order = {FINGER_SET}): the discrepancy
+        # between what the NLP reported and what the robot actually reaches is the delta
+        # (collision-constrained IK pulling the tips off the ideal contacts to satisfy
+        # clearance). All measured site->contact (p_S_W) for a like-for-like compare.
+        # Emitted as one multi-line block (each stage on its own line) so the chain reads
+        # cleanly in the console instead of running together with prior output.
+        _nlp_e = obj.get('rec_nlp_err_mm')
+        _nlp_s = (f"{[f'{e:.1f}' for e in _nlp_e]}" if _nlp_e is not None
+                  else "n/a (no rec-q)")
+        _lines = [
+            "",   # leading blank line: separates this block from the SQP-timing line
+            f"[IK] obj{obj_idx+1} tip-error attribution (site->contact, mm), "
+            f"fingers {FINGER_SET}:",
+            f"       recommender NLP q : {_nlp_s}",
+            f"       collision-aware IK: {[f'{e:.1f}' for e in _errs_contact_mm]}",
+        ]
+        if _nlp_e is not None:
+            _delta = [ci - ni for ci, ni in zip(_errs_contact_mm, _nlp_e)]
+            _lines.append(
+                f"       delta (IK - NLP)  : {[f'{d:+.1f}' for d in _delta]}"
+                f"  <- clearance-constraint pull-off")
+        print("\n".join(_lines))
+        obj['rec_ik_contact_err_mm'] = _errs_contact_mm
+        # Push NLP + collision-IK stages to the dashboard's fixed attribution readout.
+        # The RRT-end stage is unknown here (planning/replay hasn't run yet) — it's sent
+        # as a follow-up 'tip_err' from the Enter->GRASP transition, overwriting this row.
+        if dash is not None:
+            dash.push({'type': 'tip_err', 'object': obj['name'],
+                       'fingers': list(FINGER_SET),
+                       'nlp': _nlp_e, 'ik': _errs_contact_mm, 'rrt': None})
 
         # ACHIEVED contact points: where the fingertip SITES actually land at q_target,
         # pushed to the pad surface along each inward normal. These are the contacts the
@@ -1232,7 +1318,7 @@ if __name__ == "__main__":
     # the fingers open.
     _teleop_modes   = ('dexpilot', 'contact_aware_teleop')
     _dexpilot_ctrl  = None
-    _tune_retarget  = False   # dexpilot: consume /hand/retarget_params sliders
+    _tune_retarget  = False   # dexpilot: hot-reload retarget_config.json edits
     _mediapipe_proc = None
     if args.mode in _teleop_modes:
         # Launch the MediaPipe publisher as a subprocess so its OpenCV window
@@ -1319,6 +1405,34 @@ if __name__ == "__main__":
         # matches the new neutral (Q_BIAS still points at the old forward reach).
         _Q_BIAS_DP = Q_BIAS.copy()
         _Q_BIAS_DP[:7] = _HOME_WRIST_DOWN
+        # --physics: persistent PD target the robot is driven toward when no fresh
+        # teleop pose is available (before press-8, or between camera frames), so it
+        # holds the wrist-down home instead of drifting under contact. Refreshed to
+        # each new q_teleop below. Unused in kinematic mode.
+        _dp_target = _Q_BIAS_DP.copy()
+        # --physics gains: the flat Kp[:7]=40 (tuned to HOLD a static grasp) is far
+        # too soft to TRACK a moving hand — the big base joints (I~1.0) get a ~1 Hz
+        # bandwidth and lag badly. Design instead for a uniform ~3 Hz tracking
+        # bandwidth per joint: Kp = I * wn^2 (inertia-scaled), with CRITICAL damping
+        # Kd = 2*I*wn applied via the model's dof_damping (implicit -> unconditionally
+        # stable, no dt limit, so no BADQACC). wn=18 (~3 Hz) keeps peak torque near
+        # the Gen3 actuator limits; higher would clip/oscillate. Computed from the
+        # inertia at the wrist-down home so it matches the teleop operating region.
+        _dp_Kp_arm = np.full(7, 40.0)   # fallback; overwritten just below
+        # Cap on physics substeps per loop iteration (real-time catch-up). Bounds
+        # the work if a single iteration hitches badly, so it can't spiral; ~5 covers
+        # the ~1.7 ms retarget + IK + draw overhead at dt=2 ms with margin.
+        _DP_MAX_SUBSTEPS = 5
+        if args.physics:
+            _Mfull = np.zeros((model.nv, model.nv))
+            mj.mj_fullM(model, _Mfull, data.qM)
+            _I_arm = np.clip(np.diag(_Mfull)[:7], 1e-3, None)   # per-arm-joint inertia
+            _WN = 100.0                                          # rad/s (~3 Hz) target
+            _dp_Kp_arm = _I_arm * _WN**2
+            model.dof_damping[:7] = 2.0 * _I_arm * _WN          # critical, implicit
+            print(f"[dexpilot] --physics: PD-torque drive + mj_step (collisions ON). "
+                  f"arm Kp={np.round(_dp_Kp_arm,0)} (inertia-scaled ~3Hz), "
+                  f"dof_damping={np.round(model.dof_damping[:7],1)} (critical, implicit).")
         # debug=False silences the per-frame [retarget] print. Both teleop modes
         # now run live DexPilot finger retargeting: contact_aware_teleop needs the
         # curling (the MediaPipe joint angles ARE the grasp), and pure dexpilot
@@ -1327,18 +1441,38 @@ if __name__ == "__main__":
         # reading during multi-pose calibration — that convenience is dropped in
         # favour of seeing the retargeting the sliders tune).
         _hand_tracking = True
+        # debug prints the per-frame [retarget] S1 pinch distances (if/mf/rf->th)
+        # vs EPS and the palm->tip distances — the numbers you read to set EPS/ETA
+        # when tuning. On in dexpilot (the tuning mode); off in contact_aware_teleop
+        # so it doesn't spam the grasp path.
+        _retarg_debug = (args.mode == 'dexpilot')
+        # eps seed in METRES (world-landmark fingertips) — open-hand S1 ~0.07-0.11 m,
+        # pinch ~0.01-0.03 m, so ~0.03 sits between the clusters. A saved
+        # calibration/retarget_config.json still wins over this seed.
+        #
+        # Output smoothing (EMA) is a MAJOR lag source. In KINEMATIC mode the EMA is
+        # the only smoothing, so a heavy alpha=0.3 (default) is fine. In --physics
+        # mode the PD + physics ALREADY smooth, so stacking a heavy EMA on top makes
+        # the arm/fingers feel sluggish — use a much CRISPER alpha there (near-raw IK
+        # output) and let the physics do the smoothing. hand_alpha likewise.
+        _dp_arm_alpha  = 0.9 if args.physics else 0.3
+        _dp_hand_alpha = 0.9 if args.physics else 0.3
+        _cam_kwargs.setdefault("alpha", _dp_arm_alpha)
         _dexpilot_ctrl = DexPilotController(model, q_bias=_Q_BIAS_DP,
-            debug=False, eps=0.005, hand_tracking=_hand_tracking, **_cam_kwargs)
+            debug=_retarg_debug, eps=0.03, hand_tracking=_hand_tracking,
+            hand_alpha=_dp_hand_alpha, **_cam_kwargs)
         _dexpilot_ctrl.init_home(data)   # snapshots the wrist-down pose as home
         _dexpilot_ctrl.init_ros()
 
-        # Live finger-retargeting sliders live ON the MediaPipe camera window
-        # (teleop/retarget_tuner.py::MediaPipeRetargetSliders), publishing the 7
-        # tunable constants (BETA/GAMMA/EPS/ETA1/ETA2/S1/S2 gains) over ROS
-        # (/hand/retarget_params). dexpilot ONLY consumes them and applies them to
-        # the live retargeter (see the per-frame apply_retarget_params() call);
-        # contact_aware_teleop uses the saved constants but isn't the tuning surface.
+        # Live finger-retargeting tuning by TEXT ENTRY: edit the 7 constants
+        # (BETA/GAMMA/EPS/ETA1/ETA2/S1/S2 gains) in calibration/retarget_config.json
+        # and save — dexpilot hot-reloads the file onto the live retargeter each
+        # frame (poll_retarget_config, mtime-gated). contact_aware_teleop uses the
+        # saved constants but isn't the live-tuning surface.
         _tune_retarget = (args.mode == 'dexpilot')
+        if _tune_retarget:
+            print("[DexPilot] live tuning: edit calibration/retarget_config.json "
+                  "and save — changes hot-reload onto the retargeter.")
 
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")
         print("[DexPilot] Press 8 to start tracking (captures your current wrist "
@@ -1372,6 +1506,46 @@ if __name__ == "__main__":
     _rec_ik_thread    = None    # background thread running a preview collision IK
     _rec_ik_result    = {}      # slot ('rec_q'|'dls') -> {'q','obj_idx','err_mm'}
     _rec_ik_lock      = threading.Lock()
+
+    # IK-weight tuning dataset recorder (--record-samples). Each R press appends one JSONL
+    # sample capturing everything tune_ik_weights.py needs to re-run the recommender->
+    # collision-IK gap offline: the operator's live pose (IK warm-start/bias), the object
+    # joint state (object pose), and the recommender candidate (q/p1/p2 — weight-invariant,
+    # so it's solved once here, not per tuning iteration).
+    _record_path      = args.record_samples
+    # One-element list so the nested _record_sample mutates the count in place. The
+    # enclosing scope here is the module-level `if __name__` block (not a function), so
+    # `nonlocal` is illegal and rebinding a bare int would need `global`; a container
+    # mutated in place matches the pattern used elsewhere in this file (_rec_result etc.).
+    _n_recorded       = [0]
+    if _record_path is not None:
+        # Count any pre-existing samples so the on-screen counter is cumulative across runs.
+        try:
+            with open(_record_path) as _f:
+                _n_recorded[0] = sum(1 for _line in _f if _line.strip())
+            print(f"[record] appending to {_record_path} "
+                  f"({_n_recorded[0]} existing samples)")
+        except FileNotFoundError:
+            print(f"[record] will create {_record_path} on first R press")
+
+    def _record_sample(q_seed, obj_qpos_snap, obj_idx, cand):
+        """Append one tuning sample as a JSON line. Returns the new cumulative count, or
+        None if there's no usable recommendation (nothing to correlate against)."""
+        if cand is None or cand.get('q') is None:
+            return None
+        sample = {
+            'object':   objects[obj_idx]['name'],
+            'q_seed':   np.asarray(q_seed, float).tolist(),        # (N_ROBOT,)
+            'obj_qpos': np.asarray(obj_qpos_snap, float).tolist(),  # object joints
+            'rec_q':    np.asarray(cand['q'],  float).tolist(),    # actuated-order
+            'rec_p1':   np.asarray(cand['p1'], float).tolist(),    # thumb contact (W)
+            'rec_p2':   np.asarray(cand['p2'], float).tolist(),    # index contact (W)
+            'rec_status': cand.get('status'),
+        }
+        with open(_record_path, 'a') as _f:
+            _f.write(json.dumps(sample) + "\n")
+        _n_recorded[0] += 1
+        return _n_recorded[0]
 
     # Objects the NLP recommender supports (box-like first, per the plan). The planner
     # is shape-aware but validated on boxes; extend this set as other shapes are proven.
@@ -1659,6 +1833,7 @@ if __name__ == "__main__":
         running = True
         while viewer.is_running() and running:
             step_start = time.time()
+            _n_sub = 1   # physics catch-up substeps this iteration (dexpilot --physics)
 
             # --- contact_aware_teleop: teleop wrist+fingers, NLP recommends contacts.
             # Runs ONLY pre-lock-in; after L it falls through to the shared REACH/GRASP
@@ -1666,18 +1841,45 @@ if __name__ == "__main__":
             if _CAT_MODE and _teleop_active:
                 _dexpilot_ctrl.spin()
                 if _tune_retarget:
-                    _dexpilot_ctrl.apply_retarget_params()   # live-tune from camera sliders
+                    _dexpilot_ctrl.poll_retarget_config()  # hot-reload retarget_config.json edits
 
                 # Drain keys — quit, teleop start, lock-in, and the 3 debug previews:
                 #   P  recommender's raw q (unconstrained)
                 #   O  collision-aware IK, warm-started from the recommender's q
                 #   I  collision-aware IK, warm-started from a fresh DLS
                 _do_lock_in = False
+                _do_record  = False        # R: append a tuning sample this frame
                 _fire_rec_ik_slot = None   # 'rec_q' | 'dls' when a constrained preview turns on
                 while not keys.empty():
                     _k = keys.get_nowait()
                     if _k == 'quit':
                         running = False
+                    elif _k == 'record_sample':
+                        _do_record = True
+                    elif _k == 'reset':
+                        # Same Backspace->press-8 flow as dexpilot mode: reset robot +
+                        # objects to home, FREEZE tracking (hold home, don't chase the
+                        # hand), re-anchor home to the reset pose, and clear the live
+                        # recommendation so stale markers/candidates don't linger. You
+                        # then press 8 to re-capture your current hand pose as the offset.
+                        mj.mj_resetData(model, data)
+                        data.qpos[:N_ROBOT] = _Q_BIAS_DP
+                        data.qvel[:N_ROBOT] = 0.0
+                        mj.mj_forward(model, data)
+                        _dexpilot_ctrl.stop()            # freeze — no tracking until press-8
+                        _dexpilot_ctrl.init_home(data)   # re-anchor home to the reset pose
+                        _rec_vis        = False
+                        _rec_ik_mode    = None
+                        _rec_last_solve = 0.0
+                        with _rec_result_lock:
+                            _rec_result.clear()
+                        with _rec_ik_lock:
+                            _rec_ik_result.clear()
+                        data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
+                        data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
+                        _last_sim_time = 0.0
+                        print("[teleop] RESET — robot + objects home, tracking FROZEN. "
+                              "Press 8 to set the offset (capture your current hand pose).")
                     elif _k == 'teleop_start':
                         _dexpilot_ctrl.start(data)
                         print("[teleop] tracking started — home pose captured.")
@@ -1790,6 +1992,26 @@ if __name__ == "__main__":
                     data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
                     data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
 
+                # R: record a tuning sample from the LIVE pose + current recommendation.
+                # data.qpos already reflects this frame's teleop drive, so it's the exact
+                # warm-start/bias the lock-in IK would see. Skipped while a debug preview
+                # holds the robot (the held pose isn't the operator's hand).
+                if _do_record:
+                    if _record_path is None:
+                        print("[record] no --record-samples PATH given; R ignored.")
+                    elif _rec_vis or _rec_ik_mode is not None:
+                        print("[record] a preview is holding the robot — turn it off "
+                              "(P/O/I) so the recorded pose is your live hand.")
+                    else:
+                        _n = _record_sample(data.qpos[:N_ROBOT].copy(),
+                                            data.qpos[N_ROBOT:].copy(), _prox_idx, _cand)
+                        if _n is None:
+                            print("[record] no recommendation for the nearest object yet "
+                                  "— hold near a supported box and wait for markers.")
+                        else:
+                            print(f"[record] sample #{_n} saved "
+                                  f"({objects[_prox_idx]['name']}).")
+
                 # Lock-in: snapshot the current recommendation, hand off to IK->RRT.
                 if _do_lock_in:
                     if _cand is None:
@@ -1865,12 +2087,27 @@ if __name__ == "__main__":
             if args.mode == 'dexpilot':
                 _dexpilot_ctrl.spin()
                 if _tune_retarget:
-                    _dexpilot_ctrl.apply_retarget_params()   # live-tune from camera sliders
+                    _dexpilot_ctrl.poll_retarget_config()  # hot-reload retarget_config.json edits
                 # Drain key queue — handle quit and teleop start/re-zero
                 while not keys.empty():
                     _k = keys.get_nowait()
                     if _k == 'quit':
                         running = False
+                    elif _k == 'reset':
+                        # Reset to the startup state: robot + objects to home, and
+                        # FREEZE tracking (stop chasing the hand) so the robot holds
+                        # the wrist-down home pose. Just like launch, you then press 8
+                        # to re-capture your current hand pose as the offset.
+                        mj.mj_resetData(model, data)
+                        data.qpos[:N_ROBOT] = _Q_BIAS_DP
+                        data.qvel[:N_ROBOT] = 0.0
+                        mj.mj_forward(model, data)
+                        _dexpilot_ctrl.stop()        # freeze — no tracking until press-8
+                        _dexpilot_ctrl.init_home(data)   # re-anchor home to the reset pose
+                        _dp_target = _Q_BIAS_DP.copy()   # physics hold target back to home
+                        _calib_mode = False
+                        print("[dexpilot] RESET — robot + objects home, tracking FROZEN. "
+                              "Press 8 to set the offset (capture your current hand pose).")
                     elif _k == 'teleop_start':
                         # Snapshot current human pose as home and begin tracking.
                         _dexpilot_ctrl.start(data)
@@ -1913,7 +2150,44 @@ if __name__ == "__main__":
                     mj.mj_forward(model, data)
                 else:
                     q_teleop = _dexpilot_ctrl.step(model, data)
-                    if q_teleop is not None:
+                    if args.physics:
+                        # PHYSICS teleop: drive the robot toward the retarget target
+                        # with a SPRING-only torque (Kp) + gravity comp and mj_step,
+                        # so the arm/hand physically collide with objects/floor/self.
+                        # Damping is NOT applied explicitly here: the earlier
+                        # qfrc_applied Kd term violates dt < 2*I/Kd on the low-inertia
+                        # finger DOFs (I~2e-4) at dt=2ms and caused BADQACC resets.
+                        # Instead we rely on the model's implicit dof_damping (added
+                        # for the arm in the --physics setup), which the implicitfast
+                        # integrator handles with NO stability limit. Hold the last
+                        # target (_dp_target, home until the first pose) when no fresh
+                        # teleop pose arrived, so contact can't drift the robot.
+                        if q_teleop is not None:
+                            _dp_target = q_teleop
+                        # REAL-TIME CATCH-UP: the per-iteration work is dominated by
+                        # the retarget SLSQP solve (~1.7 ms) + arm IK + draw + sync,
+                        # which EXCEEDS one timestep (2 ms). Stepping physics once per
+                        # iteration then advances sim slower than wall time -> objects
+                        # fall in slow motion. mj_step is cheap (~0.03 ms), so we take
+                        # as many steps as fit the elapsed wall time (capped, so a hitch
+                        # can't spiral), re-applying the cheap PD torque each substep.
+                        # step() (the expensive IK) still runs ONCE per iteration above;
+                        # the PD tracks the cached _dp_target across the substeps.
+                        _elapsed = time.time() - step_start
+                        _n_sub = int(np.clip(round(_elapsed / model.opt.timestep),
+                                             1, _DP_MAX_SUBSTEPS))
+                        for _ in range(_n_sub):
+                            tau_ctrl[:] = 0.0
+                            # Arm: inertia-scaled Kp (_dp_Kp_arm, ~3 Hz tracking).
+                            # Fingers: shared Kp[7:] (light, they're low-inertia).
+                            _err = _dp_target - data.qpos[:N_ROBOT]
+                            tau_ctrl[:7]        = _dp_Kp_arm * _err[:7]
+                            tau_ctrl[7:N_ROBOT] = Kp[7:] * _err[7:]
+                            data.qfrc_applied[:] = tau_ctrl
+                            data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
+                            mj.mj_step(model, data)
+                    elif q_teleop is not None:
+                        # KINEMATIC replay: overwrite qpos (rigid, no collisions).
                         data.qpos[:N_ROBOT] = q_teleop
                         data.qvel[:N_ROBOT] = 0.0
                         mj.mj_forward(model, data)
@@ -1955,7 +2229,13 @@ if __name__ == "__main__":
                                 data.site_xmat[_psid].reshape(3, 3).copy(),
                                 0.06, 0.004)
                 viewer.sync()
-                time.sleep(max(0, model.opt.timestep - (time.time() - step_start)))
+                # Pace to real time. In --physics we advanced _n_sub timesteps this
+                # iteration, so the wall-clock budget is _n_sub*timestep (else one).
+                # On a fast machine this sleeps the remainder; when the iteration
+                # already overran (the common case — retarget dominates), it's ~0 and
+                # the catch-up substeps keep sim time matched to wall time.
+                _budget = (_n_sub if args.physics else 1) * model.opt.timestep
+                time.sleep(max(0, _budget - (time.time() - step_start)))
                 continue
 
             # --- Proximity "active object" (min average tip→object signed distance) +
@@ -2060,6 +2340,49 @@ if __name__ == "__main__":
                     _jog_v[:] = 0.0    # reset the jog velocity ramp for the new grasp
                     _jog_w[:] = 0.0
                     _grasp_wrist_track = False   # (re-armed below for teleop)
+
+                    # DIAGNOSTIC: RRT-END tip error. Completes the attribution chain
+                    # (recommender NLP -> collision IK -> RRT end). The RRT goal IS
+                    # obj['q_target'], so a planned end pose matches the IK exactly; any
+                    # EXTRA error here is the object drifting during replay (the tips aim
+                    # at where the object WAS). Measured against the recommended contacts
+                    # re-expressed at the object's CURRENT pose (via rec_local, which
+                    # tracks the object) so drift shows up. Compare to the "collision-aware
+                    # IK" line printed at lock-in: if this is larger, the object moved.
+                    _rec_local_dbg = objects[active_idx].get('rec_local')
+                    if _CAT_MODE and _rec_local_dbg is not None:
+                        _if_dbg = {f: i for i, f in enumerate(FINGER_SET)}
+                        _end_err = []
+                        for f in FINGER_SET:
+                            _sid = id_C[_if_dbg[f]]
+                            _pO, _ = _rec_local_dbg[_if_dbg[f]]
+                            _p_contact_now = p_WoO + R_WO @ _pO   # live object pose
+                            _end_err.append(
+                                float(np.linalg.norm(data.site_xpos[_sid]
+                                                     - _p_contact_now) * 1e3))
+                        _ik_ce = objects[active_idx].get('rec_ik_contact_err_mm')
+                        _rrt_lines = [
+                            "",   # leading blank line separates this from prior output
+                            f"[IK] obj{active_idx+1} RRT-END tip errors "
+                            f"(site->contact @ live obj, {FINGER_SET}): "
+                            f"{[f'{e:.1f}' for e in _end_err]} mm",
+                        ]
+                        if _ik_ce is not None:
+                            _drift = [ee - ce for ee, ce in zip(_end_err, _ik_ce)]
+                            _rrt_lines.append(
+                                f"       vs lock-in IK "
+                                f"{[f'{e:.1f}' for e in _ik_ce]} mm  ->  drift "
+                                f"{[f'{d:+.1f}' for d in _drift]} mm "
+                                f"(object moved during replay)")
+                        print("\n".join(_rrt_lines))
+                        # Complete the dashboard's attribution readout with the RRT-end
+                        # stage (overwrites the NLP+IK row pushed at lock-in).
+                        if dash is not None:
+                            dash.push({'type': 'tip_err',
+                                       'object': objects[active_idx]['name'],
+                                       'fingers': list(FINGER_SET),
+                                       'nlp': objects[active_idx].get('rec_nlp_err_mm'),
+                                       'ik':  _ik_ce, 'rrt': _end_err})
 
                     # --- Solve the internal-force scale gamma for THIS grasp geometry ---
                     # Contact geometry in the object body frame (same transform the
@@ -2375,8 +2698,15 @@ if __name__ == "__main__":
                         _rec_ik_result.clear()
                     data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
                     data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
+                    # FREEZE tracking so the robot holds home instead of snapping to the
+                    # hand — like startup, you press 8 to re-capture the offset.
+                    if _dexpilot_ctrl is not None:
+                        _dexpilot_ctrl.stop()
+                        _dexpilot_ctrl.init_home(data)   # re-anchor home to the reset pose
                 print("\r\n[Control] RESET — arm home, objects at spawn poses; cached "
-                      "IK kept (auto re-solved if stale on next selection)")
+                      "IK kept (auto re-solved if stale on next selection)."
+                      + ("  Tracking FROZEN — press 8 to set the offset."
+                         if _CAT_MODE and _dexpilot_ctrl is not None else ""))
 
             # --- Continuous jog: world-frame palm velocity from currently-held arrow
             # keys, consumed by the GRASP branch's resolved-rate target integration.

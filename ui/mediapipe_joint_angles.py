@@ -853,21 +853,10 @@ def main():
     last_hand_data = None
     show_debug = False  # toggled with 'D' — overlays flexion angles on video
 
-    # --- Live finger-retargeting sliders folded INTO this camera window ---
-    # (option 2: one window for camera + hand tuning). Trackbars publish the 7
-    # DexPilot retargeting constants over ROS (/hand/retarget_params); the sim
-    # process applies them to the live retargeter and owns save-to-JSON. Create
-    # the window up front so createTrackbar has a target before the first imshow.
+    # Camera window. (Retargeting constants are now tuned by editing
+    # calibration/retarget_config.json, which the sim hot-reloads — no sliders here.)
     _win_name = f"Hand Tracking  [cam {camera_index}]"
     cv2.namedWindow(_win_name, cv2.WINDOW_NORMAL)
-    _retarget_sliders = None
-    try:
-        # Add repo root to sys.path so `import teleop...` works from ui/.
-        sys.path.insert(0, os.path.dirname(script_dir))
-        from teleop.retarget_tuner import MediaPipeRetargetSliders
-        _retarget_sliders = MediaPipeRetargetSliders(_win_name, ros_node)
-    except Exception as _e:
-        print(f"[INFO] retarget sliders unavailable ({_e}); camera runs without them.")
 
     # Timestamp for MediaPipe (must be monotonically increasing)
     start_time_ms = int(time.time() * 1000)
@@ -1055,10 +1044,6 @@ def main():
                          if _DISPLAY_ROTATE_180 else annotated.copy())
                 flush_labels(_disp, _DISPLAY_ROTATE_180)
                 cv2.imshow(_win_name, _disp)
-
-                # Publish the retargeting-slider values (if the panel loaded).
-                if _retarget_sliders is not None:
-                    _retarget_sliders.publish()
 
                 # Input Handling
                 key = cv2.waitKey(1) & 0xFF

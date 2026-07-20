@@ -602,8 +602,15 @@ class ConstrainedIKSolver:
                      Build this list with build_arm_geom_names() or supply manually.
     obj_geom_names : geom names on scene objects (e.g. ['obj_box_geom', 'obj_cylinder_geom']).
     clearance      : minimum signed distance (m) required between each arm/obj geom pair.
-    posture_weight : weight on ||q - q_bias||² in the cost. Small (0.01–0.1) keeps the
-                     position task dominant while still regularizing the null space.
+    posture_weight : weight on the posture term Σ_i w_i (q_i - q_bias_i)² in the cost.
+                     Small (0.01–0.1) keeps the position task dominant while still
+                     regularizing the null space. A SCALAR applies isotropically to every
+                     DOF (the classic posture_weight·‖q−q_bias‖²). A length-n_robot VECTOR
+                     gives a DIAGONAL weight diag(w) — decompose it into arm and hand
+                     blocks, e.g. np.r_[np.full(7, w_arm), np.full(16, w_hand)], to let the
+                     arm null-space float toward the tip targets (small w_arm) while the
+                     fingers stay pinned near their retargeted pose (large w_hand), or the
+                     reverse. q_bias itself is unchanged — only the per-DOF weight splits.
     tip_weight     : weight on the fingertip position term Σ||site_k(q) - target_k||².
                      The default 1.0 (raw metres²) makes millimetre-scale tip errors
                      numerically tiny next to the posture/orientation regularizers, so
@@ -625,7 +632,14 @@ class ConstrainedIKSolver:
         self._arm_geom_names = list(arm_geom_names)
         self._obj_geom_names = list(obj_geom_names)
         self._clearance      = clearance
-        self._posture_weight = posture_weight
+        # posture_weight may be a scalar (isotropic, applied to every DOF) OR a length-n
+        # vector for a DIAGONAL posture term diag(w) — e.g. w = [w_arm]*7 + [w_hand]*16 to
+        # weight the arm's null-space bias differently from the finger joints. Normalized
+        # to a (n,) vector here so the cost assembly is uniform; a scalar broadcasts and
+        # reproduces the original ‖q−q_bias‖² behavior exactly.
+        self._posture_w_vec  = np.broadcast_to(
+            np.asarray(posture_weight, dtype=float), (n_robot,)).copy()
+        self._posture_weight = posture_weight   # retained for repr/introspection
         self._tip_weight     = tip_weight
         self._max_iter       = max_iter
         self._verbose        = verbose
@@ -785,8 +799,12 @@ class ConstrainedIKSolver:
             cost = cost + self._tip_weight * ca.dot(diff, diff)
 
         if q_bias is not None:
+            # Diagonal posture term dq^T diag(w) dq = Σ_i w_i (q_i - q_bias_i)^2. With a
+            # scalar posture_weight the vector is a constant broadcast, so this reduces to
+            # the original posture_weight * ‖dq‖². A per-DOF vector (arm vs hand blocks)
+            # lets the arm null-space float while the fingers are held, or vice versa.
             dq   = q - ca.DM(q_bias)
-            cost = cost + self._posture_weight * ca.dot(dq, dq)
+            cost = cost + ca.dot(ca.DM(self._posture_w_vec) * dq, dq)
 
         if inward_dirs is not None and self._orient_weight > 0:
             for cb, d_in in zip(axis_cbs, inward_dirs):
@@ -903,7 +921,10 @@ class ConstrainedIKSolver:
 
             if q_bias is not None:
                 dq = np.array(value_fn(q)).flatten() - np.asarray(q_bias)
-                print(f"[{_slabel}]   posture term: {self._posture_weight * float(dq @ dq):.4g}"
+                # Diagonal posture cost Σ w_i dq_i² (matches the solved cost term); with a
+                # scalar weight this equals the old posture_weight·‖dq‖².
+                _posture_cost = float(np.sum(self._posture_w_vec * dq * dq))
+                print(f"[{_slabel}]   posture term: {_posture_cost:.4g}"
                       f"  (||q-q_bias||={float(np.linalg.norm(dq)):.3g} rad)")
 
             if dist_exprs:

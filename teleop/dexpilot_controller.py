@@ -148,18 +148,22 @@ class DexPilotController:
             return None
 
         # --- Landmark blocks ---
-        # World landmarks (metric): the palm FRAME comes from these (unchanged).
-        # Image landmarks (raw[120:183], present in the extended layout): used as
-        # the fingertip POSITION source for retargeting (isotropy-corrected in the
-        # retargeter) — more stable near edge-on than the world-3D head, which has
-        # a depth-flip ambiguity there. None on the old (world-only) layout.
+        # World landmarks (metric, full 3D): fingertip POSITIONS and the palm FRAME
+        # for finger retargeting. Image landmarks (raw[120:183], extended layout):
+        # used ONLY for the ARM palm-orientation below (stable near edge-on).
+        #
+        # NOTE: fingertips deliberately use WORLD, not image, landmarks. Image
+        # landmarks foreshorten finger extension into pseudodepth, which fails when
+        # the fingers point toward/along the camera axis (verified: targets lose
+        # their along-finger component and the optimiser curls the fingers into a
+        # fist). The world 3D head captures that extension correctly.
         world_lm = np.array(raw[57:120], dtype=float).reshape(21, 3)
         image_lm = (np.array(raw[120:183], dtype=float).reshape(21, 3)
                     if len(raw) >= 183 else None)
 
-        # --- Hand retargeting (16 DOF) ---
+        # --- Hand retargeting (16 DOF) — world landmarks (see note above) ---
         if self._hand_tracking:
-            q_hand = self._retarg.retarget(world_lm, image_lm=image_lm)
+            q_hand = self._retarg.retarget(world_lm)
             # EMA smoothing on hand joints
             if self._q_hand_prev is not None:
                 q_hand = (self._hand_alpha * q_hand
@@ -209,21 +213,12 @@ class DexPilotController:
         tunable constants (BETA/GAMMA/EPS/ETA1/ETA2/S1_GAIN/S2_GAIN) per frame."""
         return self._retarg
 
-    def apply_retarget_params(self) -> None:
-        """Consume the latest /hand/retarget_params (from the MediaPipe window's
-        sliders) and write the 7 constants onto the live retargeter. A trailing
-        save flag of 1 persists them to retarget_config.json (this process owns
-        the file). No-op when no new message has arrived. Call once per frame,
-        after spin()."""
-        from teleop.retarget_tuner import PARAM_ORDER
-        params = self._ros.consume_retarget_params()
-        if params is None or len(params) < len(PARAM_ORDER):
-            return
-        for name, val in zip(PARAM_ORDER, params):
-            setattr(self._retarg, name, float(val))
-        # save flag is the element right after the 7 params, when present
-        if len(params) > len(PARAM_ORDER) and params[len(PARAM_ORDER)] >= 0.5:
-            self._retarg.save_config()
+    def poll_retarget_config(self) -> bool:
+        """Hot-reload the retargeting constants from calibration/retarget_config.json
+        when you edit + save it. Cheap (mtime check); call once per frame. Returns
+        True on a reload. This is the text-entry tuning path: edit the JSON in your
+        editor and the live retargeter picks it up."""
+        return self._retarg.poll_config()
 
     def target_frame(self):
         """Last IK target pose (pos, R) in world coords — the frame the arm IK

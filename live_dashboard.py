@@ -31,6 +31,11 @@ Message protocol (plain dicts put on the queue):
         'gamma_min': float|None, 'wrench_feasible': bool,     #   one per completed solve.
         'ik_thumb_mm': float|None, 'ik_index_mm': float|None,
         'n_converged': int, 'n_seeds': int}
+    {'type': 'tip_err',                               # per-stage tip-error attribution
+        'object': str, 'fingers': [str],              #   (contact_aware_teleop lock-in);
+        'nlp': [float]|None,                          #   overwrites a fixed readout.
+        'ik':  [float]|None,                          #   each list is per-finger mm in
+        'rrt': [float]|None}                          #   'fingers' order (None = n/a)
     None                                              # sentinel: quit
 
 Usage from the sim process:
@@ -203,6 +208,47 @@ def _run(queue, fingers, horizon_s, dt_hint):
     grasp_rec_log.setMaximumBlockCount(400)
     grasp_rec_log.setStyleSheet("font-family: monospace; font-size: 11px;")
 
+    # --- (7) tip-error attribution readout (contact_aware_teleop). Fixed panel that
+    # shows the LATEST lock-in's per-stage tip error (recommender NLP -> collision IK ->
+    # RRT end), overwritten each solve rather than scrolling, so the current grasp's
+    # accuracy chain is always visible at a glance. Colours match the viewer markers.
+    tip_err_lbl = QtWidgets.QLabel(
+        "<span style='color:#888'>tip errors: waiting for a lock-in…</span>")
+    tip_err_lbl.setTextFormat(QtCore.Qt.RichText)
+    tip_err_lbl.setStyleSheet("font-family: monospace; font-size: 13px;")
+    tip_err_lbl.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+    tip_err_lbl.setWordWrap(True)
+
+    # --- (8) colour legend: maps viewer marker + dashboard trace colours to meaning so
+    # the magenta/gold spheres and finger traces are self-documenting. Static HTML. ---
+    def _swatch(hexcol):
+        return (f"<span style='color:{hexcol}; font-size:16px;'>&#9632;</span>")
+    _finger_leg = "".join(
+        f"{_swatch('#%02x%02x%02x' % FINGER_COLORS.get(f, (200,200,200)))} {f}&nbsp;&nbsp;"
+        for f in fingers)
+    legend_lbl = QtWidgets.QLabel(
+        "<b>Legend</b><br>"
+        "<u>MuJoCo viewer markers</u><br>"
+        f"{_swatch('#ff00ff')} recommender NLP intended contacts&nbsp;&nbsp;"
+        f"{_swatch('#ffcc00')} achieved fingertip sites (collision IK)<br>"
+        "<u>Tip-error stages</u><br>"
+        f"{_swatch('#55cc88')} recommender NLP&nbsp;&nbsp;"
+        f"{_swatch('#ff9944')} collision-aware IK&nbsp;&nbsp;"
+        f"{_swatch('#ff5555')} RRT end (executed)<br>"
+        f"<u>Finger traces</u><br>{_finger_leg}")
+    legend_lbl.setTextFormat(QtCore.Qt.RichText)
+    legend_lbl.setStyleSheet("font-size: 12px;")
+    legend_lbl.setWordWrap(True)
+
+    tip_box = QtWidgets.QVBoxLayout()
+    tip_box.addWidget(QtWidgets.QLabel("<b>Tip-error attribution (site → contact)</b>"))
+    tip_box.addWidget(tip_err_lbl)
+    tip_box.addSpacing(8)
+    tip_box.addWidget(legend_lbl)
+    tip_box.addStretch(1)
+    tip_widget = QtWidgets.QWidget()
+    tip_widget.setLayout(tip_box)
+
     grid.addWidget(dist_plot,   1, 0)
     grid.addWidget(force_box,   1, 1)
     grid.addWidget(norm_plot,   2, 0)
@@ -211,10 +257,14 @@ def _run(queue, fingers, horizon_s, dt_hint):
     grid.addWidget(QtWidgets.QLabel("<b>Grasp recommender (NLP)</b>"),      3, 1)
     grid.addWidget(plan_log,      4, 0)
     grid.addWidget(grasp_rec_log, 4, 1)
+    grid.addWidget(tip_widget,    1, 2, 4, 1)   # spans the plot rows, right column
     grid.setRowStretch(1, 2)
     grid.setRowStretch(2, 2)
     grid.setRowStretch(4, 1)
-    win.resize(1250, 950)
+    grid.setColumnStretch(0, 3)
+    grid.setColumnStretch(1, 3)
+    grid.setColumnStretch(2, 1)
+    win.resize(1600, 950)
     win.show()
 
     def drain():
@@ -339,6 +389,42 @@ def _run(queue, fingers, horizon_s, dt_hint):
                     f"avg {avg_ms:.0f} ms]",
                 ]
                 grasp_rec_log.appendPlainText("\n".join(lines))
+            elif mt == 'tip_err':
+                # Per-stage tip error for the latest lock-in. Each of nlp/ik/rrt is a
+                # per-finger list (mm) in the order given by 'fingers', or None if that
+                # stage didn't run. Rendered as a fixed, colour-coded table that the
+                # next lock-in overwrites (not a scrolling log).
+                obj    = msg.get('object', '?')
+                order  = msg.get('fingers', fingers)
+                nlp    = msg.get('nlp')
+                ik     = msg.get('ik')
+                rrt    = msg.get('rrt')
+
+                def _fmt(vals, col):
+                    if vals is None:
+                        return "<span style='color:#666'>—</span>"
+                    cells = "  ".join(f"{v:5.1f}" for v in vals)
+                    return f"<span style='color:{col}'>{cells}</span>"
+
+                hdr = "  ".join(f"{f:>5.5s}" for f in order)
+                rows = [
+                    f"<b>{obj}</b> &nbsp; tip error (mm)",
+                    f"<span style='color:#aaa'>finger&nbsp;&nbsp;{hdr}</span>",
+                    f"NLP&nbsp;&nbsp;&nbsp;&nbsp; {_fmt(nlp, '#55cc88')}",
+                    f"colIK&nbsp;&nbsp; {_fmt(ik,  '#ff9944')}",
+                    f"RRTend {_fmt(rrt, '#ff5555')}",
+                ]
+                # Deltas: how much each downstream stage gave up vs the NLP ideal.
+                if nlp is not None and ik is not None:
+                    d = [b - a for a, b in zip(nlp, ik)]
+                    rows.append(f"<span style='color:#999'>Δ IK−NLP&nbsp; "
+                                + "  ".join(f"{v:+5.1f}" for v in d) + "</span>")
+                if ik is not None and rrt is not None:
+                    d = [b - a for a, b in zip(ik, rrt)]
+                    rows.append(f"<span style='color:#999'>Δ RRT−IK&nbsp; "
+                                + "  ".join(f"{v:+5.1f}" for v in d)
+                                + "  (drift)</span>")
+                tip_err_lbl.setText("<br>".join(rows))
         if got_dist:
             x = list(dist_t)
             for f in fingers:
