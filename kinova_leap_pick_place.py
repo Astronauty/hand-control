@@ -856,7 +856,10 @@ if __name__ == "__main__":
     # hard as the theoretical minimum. Only the value SENT TO THE CONTROLLER is scaled;
     # the wrench-cone viz stays at the raw 1.0x gamma so the drawn cage remains the true
     # feasible boundary the LP computed (the trace then sits well inside it).
-    GAMMA_SAFETY_FACTOR = 50.0
+    # GAMMA_SAFETY_FACTOR = 50.0
+    GAMMA_SAFETY_FACTOR = 5.0
+
+
 
     # Softens Kp/Kd on the active (grasping) finger joints while squeezing, via
     # GraspController.effective_gains(). Without this the full-strength joint PD
@@ -864,7 +867,8 @@ if __name__ == "__main__":
     # harder, the position spring (anchored at the fixed pre-squeeze q_grasp_hold)
     # pulls back proportionally, so measured contact force saturates well below
     # GAMMA/sqrt(2) instead of scaling with it.
-    SQUEEZE_PD_SCALE = 50.0
+    # SQUEEZE_PD_SCALE = 50.0
+    SQUEEZE_PD_SCALE = 2.0
 
     # Ramp the squeeze force 0->GAMMA over this many seconds of sim time after each
     # squeeze-on. The internal force pair only cancels once BOTH contacts exist; at
@@ -1883,6 +1887,10 @@ if __name__ == "__main__":
                     elif _k == 'teleop_start':
                         _dexpilot_ctrl.start(data)
                         print("[teleop] tracking started — home pose captured.")
+                    elif _k == 'bspheres':
+                        _show_bspheres = not _show_bspheres
+                        print(f"[teleop] IK collision bounding-sphere overlay "
+                              f"{'ON' if _show_bspheres else 'off'}  (7 to toggle)")
                     elif _k == 'lock_in':
                         _do_lock_in = True
                     elif _k == 'rec_vis':
@@ -2079,6 +2087,7 @@ if __name__ == "__main__":
                 if viewer.user_scn is not None:
                     viewer.user_scn.ngeom = 0
                     _draw_active_marker(viewer.user_scn)
+                    _draw_bspheres(viewer.user_scn)   # 7-toggle: IK collision spheres
                 viewer.sync()
                 time.sleep(max(0, model.opt.timestep - (time.time() - step_start)))
                 continue
