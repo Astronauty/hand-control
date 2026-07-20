@@ -51,13 +51,55 @@ GEN3_XML = 'mujoco_menagerie/kinova_gen3/gen3.xml'
 SCENE_XML = 'models/scene_pick_place.xml'
 N_ROBOT  = 23
 
-# Nominal object parameters (match obj_red_box in scene_pick_place.xml)
+# MuJoCo geom type IDs
+GEOM_TYPE_BOX      = 6
+GEOM_TYPE_SPHERE   = 2
+GEOM_TYPE_CYLINDER = 5
+
+# Legacy single-object nominal params — kept for backward-compat in plot helpers
 NOM_POS  = np.array([0.38, 0.42, 0.040])
 NOM_YAW  = 0.0
 NOM_SIZE = 0.040
 NOM_MU   = 4.0
 
+# One entry per object to test.  nom_size is the characteristic size the sweep
+# returns to after each test case (radius for sphere/cylinder, half-extent for box).
+OBJECT_CONFIGS = [
+    dict(
+        name        = 'obj_red_box',
+        geom        = 'obj_red_box_geom',
+        nom_pos     = np.array([0.38, 0.42, 0.040]),
+        nom_mu      = 4.0,
+        geom_type   = GEOM_TYPE_BOX,
+        nom_size    = 0.040,
+        size_label  = 'Box half-extent (m)',
+        size_values = [0.020, 0.025, 0.030, 0.035, 0.040],
+    ),
+    dict(
+        name        = 'obj_red_sphere',
+        geom        = 'obj_red_sphere_geom',
+        nom_pos     = np.array([0.64, 0.38, 0.028]),
+        nom_mu      = 1.0,
+        geom_type   = GEOM_TYPE_SPHERE,
+        nom_size    = 0.028,
+        size_label  = 'Sphere radius (m)',
+        size_values = [0.018, 0.022, 0.026, 0.028, 0.032],
+    ),
+    dict(
+        name        = 'obj_blue_cylinder',
+        geom        = 'obj_blue_cylinder_geom',
+        nom_pos     = np.array([0.42, 0.58, 0.032]),
+        nom_mu      = 1.0,
+        geom_type   = GEOM_TYPE_CYLINDER,
+        nom_size    = 0.032,
+        size_label  = 'Cylinder radius (m)',  # h_half kept equal to radius
+        size_values = [0.020, 0.024, 0.028, 0.032, 0.036],
+    ),
+]
+
 # ── Sweeps definition ─────────────────────────────────────────────────────────
+# The 'size' entry is a placeholder; get_sweeps_for_obj() replaces it with
+# object-specific values and label at runtime.
 
 SWEEPS = [
     {
@@ -75,7 +117,7 @@ SWEEPS = [
     },
     {
         'name':   'size',
-        'label':  'Box half-extent (m)',
+        'label':  'Size (m)',          # overridden per object
         'values': [0.020, 0.025, 0.030, 0.035, 0.040],
         'fmt':    '{:.3f}',
     },
@@ -110,35 +152,44 @@ def set_object_pose(data, qpos_adr: int, pos: np.ndarray, quat: np.ndarray):
     data.qpos[qpos_adr+3:qpos_adr+7] = quat
 
 
-def set_object_size(model, ms_planner, obj_gid: int, hs: float):
-    """Update geom size in the model AND the cached values in the planner."""
-    model.geom_size[obj_gid] = [hs, hs, hs]
-    p = ms_planner._planner
-    p._obj_hx = hs
-    p._obj_hy = hs
-    p._obj_hz = hs
-    p._obj_size[:] = hs
-    ms_planner._obj_hx = hs
-    ms_planner._obj_hy = hs
-    ms_planner._obj_hz = hs
-    ms_planner._obj_size[:] = hs
+def set_object_size(model, ms_planner, obj_gid: int, size: float):
+    """Update geom size in the model AND the cached planner values — shape-aware."""
+    geom_type = ms_planner._planner._obj_geom_type
+    if geom_type == GEOM_TYPE_SPHERE:
+        r = float(size)
+        gs = np.array([r, 0.0, 0.0])
+        hx, hy, hz = r, 0.0, 0.0
+    elif geom_type == GEOM_TYPE_CYLINDER:
+        r = float(size)
+        gs = np.array([r, r, 0.0])   # keep h_half = radius (aspect ratio 1:1)
+        hx, hy, hz = r, r, 0.0
+    else:   # GEOM_TYPE_BOX or unknown
+        hs = float(size)
+        gs = np.array([hs, hs, hs])
+        hx, hy, hz = hs, hs, hs
+    model.geom_size[obj_gid] = gs
+    for p in (ms_planner._planner, ms_planner):
+        p._obj_hx = hx
+        p._obj_hy = hy
+        p._obj_hz = hz
+        p._obj_size[:] = gs
 
 
-def set_friction(model, ms_planner, obj_gid: int, mu: float):
-    """Update MuJoCo sliding friction AND the planner cfg."""
+def set_friction(model, obj_gid: int, mu: float):
+    """Update MuJoCo sliding friction for the object geom."""
     model.geom_friction[obj_gid, 0] = mu
-    ms_planner._planner.cfg.mu = mu
 
 
-def nominal_params():
-    return dict(pos=NOM_POS.copy(), yaw_deg=NOM_YAW, size=NOM_SIZE, mu=NOM_MU)
+def nominal_params(obj_cfg: dict) -> dict:
+    return dict(pos=obj_cfg['nom_pos'].copy(), yaw_deg=0.0,
+                size=obj_cfg['nom_size'], mu=obj_cfg['nom_mu'])
 
 
-def build_test_case(sweep_name: str, value) -> dict:
-    p = nominal_params()
+def build_test_case(obj_cfg: dict, sweep_name: str, value) -> dict:
+    p = nominal_params(obj_cfg)
     if sweep_name == 'position':
         x, y = value
-        p['pos'] = np.array([x, y, NOM_POS[2]])
+        p['pos'] = np.array([x, y, obj_cfg['nom_pos'][2]])
     elif sweep_name == 'yaw':
         p['yaw_deg'] = value
     elif sweep_name == 'size':
@@ -146,6 +197,17 @@ def build_test_case(sweep_name: str, value) -> dict:
     elif sweep_name == 'mu':
         p['mu'] = value
     return p
+
+
+def get_sweeps_for_obj(obj_cfg: dict) -> list:
+    """Return the 4-sweep list with object-specific size label and values."""
+    return [
+        SWEEPS[0],  # position
+        SWEEPS[1],  # yaw
+        dict(name='size', label=obj_cfg['size_label'],
+             values=obj_cfg['size_values'], fmt='{:.3f}'),
+        SWEEPS[3],  # mu
+    ]
 
 
 # ── Single test run ───────────────────────────────────────────────────────────
@@ -159,7 +221,7 @@ def run_one(model, data, ms_planner, q_bias, qpos_adr, obj_gid,
 
     # Apply test parameters
     set_object_size(model, ms_planner, obj_gid, size)
-    set_friction(model, ms_planner, obj_gid, mu)
+    set_friction(model, obj_gid, mu)
     set_object_pose(data, qpos_adr, pos, yaw_to_quat(yaw_deg))
     mj.mj_forward(model, data)
 
@@ -196,6 +258,7 @@ def run_one(model, data, ms_planner, q_bias, qpos_adr, obj_gid,
         'sdf_p1_mm':       vinfo.get('sdf_p1_mm'),
         'sdf_p2_mm':       vinfo.get('sdf_p2_mm'),
         'gamma_min':       vinfo.get('gamma_min'),
+        'gamma_nlp':       vinfo.get('gamma_nlp'),
         'wrench_feasible': vinfo.get('wrench_feasible', False),
         'n_converged':     sum(1 for r in all_cands
                                if r.get('status') == 'converged'),
@@ -343,8 +406,9 @@ def _fig_position_grid(sweep_rows, out_path):
     plt.close(fig)
 
 
-def _fig_position_contact_scatter(sweep_rows, out_path):
-    """Workspace-level view: box outlines at each tested position + p1/p2 contacts."""
+def _fig_position_contact_scatter(sweep_rows, out_path, nom_size=NOM_SIZE,
+                                   geom_type=GEOM_TYPE_BOX):
+    """Workspace-level view: object outlines at each tested position + p1/p2 contacts."""
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
@@ -357,11 +421,15 @@ def _fig_position_contact_scatter(sweep_rows, out_path):
         converged = r.get('status') == 'converged'
         box_ec = '#27ae60' if converged else '#c0392b'
 
-        # Box outline at this test position
-        hs = NOM_SIZE
-        rect = plt.Rectangle((x - hs, y - hs), 2*hs, 2*hs,
-                              fill=False, edgecolor=box_ec, linewidth=1.2, alpha=0.6)
-        ax.add_patch(rect)
+        hs = nom_size
+        if geom_type in (GEOM_TYPE_SPHERE, GEOM_TYPE_CYLINDER):
+            circ = plt.Circle((x, y), hs, fill=False, edgecolor=box_ec,
+                              linewidth=1.2, alpha=0.6)
+            ax.add_patch(circ)
+        else:
+            rect = plt.Rectangle((x - hs, y - hs), 2*hs, 2*hs,
+                                  fill=False, edgecolor=box_ec, linewidth=1.2, alpha=0.6)
+            ax.add_patch(rect)
 
         if not converged:
             ax.plot(x, y, 'x', color='#c0392b', markersize=10, markeredgewidth=2,
@@ -382,15 +450,16 @@ def _fig_position_contact_scatter(sweep_rows, out_path):
 
     ax.plot(0, 0, 'k^', markersize=13, zorder=8, clip_on=False)
 
+    outline_label = 'Outline (converged)' if geom_type != GEOM_TYPE_BOX else 'Box outline (converged)'
     legend_els = [
         Line2D([0],[0], marker='o', color='w', markerfacecolor='#e74c3c',
                markersize=10, label='p1 — thumb contact'),
         Line2D([0],[0], marker='s', color='w', markerfacecolor='#2980b9',
                markersize=10, label='p2 — index contact'),
         Patch(facecolor='none', edgecolor='#27ae60', linewidth=1.5,
-              label='Box outline (converged)'),
+              label=outline_label),
         Patch(facecolor='none', edgecolor='#c0392b', linewidth=1.5,
-              label='Box outline (failed)'),
+              label=outline_label.replace('converged', 'failed')),
         Line2D([0],[0], marker='^', color='k', markersize=11,
                label='Arm base'),
     ]
@@ -399,8 +468,8 @@ def _fig_position_contact_scatter(sweep_rows, out_path):
     all_xs = [r['sweep_value'][0] for r in sweep_rows]
     all_ys = [r['sweep_value'][1] for r in sweep_rows]
     margin = 0.07
-    ax.set_xlim(min(all_xs) - NOM_SIZE - margin, max(all_xs) + NOM_SIZE + margin)
-    ax.set_ylim(min(all_ys) - NOM_SIZE - margin, max(all_ys) + NOM_SIZE + margin)
+    ax.set_xlim(min(all_xs) - nom_size - margin, max(all_xs) + nom_size + margin)
+    ax.set_ylim(min(all_ys) - nom_size - margin, max(all_ys) + nom_size + margin)
     ax.set_aspect('equal')
     ax.set_xlabel('World X (m)', fontsize=11)
     ax.set_ylabel('World Y (m)', fontsize=11)
@@ -410,18 +479,29 @@ def _fig_position_contact_scatter(sweep_rows, out_path):
     plt.close(fig)
 
 
-def _fig_3d_contact_grid(all_rows, out_path):
+def _fig_3d_contact_grid(all_rows, out_path, obj_cfg=None, sweeps=None):
     """
     2×2 grid of 3D subplots — one per sweep.
-    Each subplot shows the box wireframe in its object-local frame and the
+    Each subplot shows the object wireframe in its object-local frame and the
     thumb (circle) / index (square) contact points transformed into that frame,
     coloured by the sweep parameter.
 
-    Local frame: origin at box centre, axes aligned to box faces.
+    Local frame: origin at object centre, axes aligned to object faces.
     This removes position offsets and yaw rotations so contacts are always
-    expressed as "where on THIS box did the finger land?"
+    expressed as "where on THIS object did the finger land?"
     """
     from itertools import product as _iproduct
+
+    if obj_cfg is None:
+        nom_pos   = NOM_POS
+        nom_size  = NOM_SIZE
+        geom_type = GEOM_TYPE_BOX
+    else:
+        nom_pos   = obj_cfg['nom_pos']
+        nom_size  = obj_cfg['nom_size']
+        geom_type = obj_cfg['geom_type']
+    if sweeps is None:
+        sweeps = SWEEPS
 
     def _box_edges(ax, hx, hy, hz, **kw):
         """Draw 12 wireframe edges of box [-hx..hx, -hy..hy, -hz..hz]."""
@@ -433,25 +513,46 @@ def _fig_3d_contact_grid(all_rows, out_path):
                               [corners[i][1], corners[j][1]],
                               [corners[i][2], corners[j][2]], **kw)
 
+    def _sphere_wireframe(ax, r, **kw):
+        """Draw latitude/longitude lines for a sphere of radius r."""
+        u = np.linspace(0, 2 * np.pi, 30)
+        for lat in np.linspace(-np.pi/2, np.pi/2, 5):
+            rl = r * np.cos(lat)
+            ax.plot3D(rl * np.cos(u), rl * np.sin(u),
+                      r * np.sin(lat) * np.ones_like(u), **kw)
+        v = np.linspace(0, np.pi, 20)
+        for lon in np.linspace(0, 2 * np.pi, 6, endpoint=False):
+            ax.plot3D(r * np.sin(v) * np.cos(lon),
+                      r * np.sin(v) * np.sin(lon),
+                      r * np.cos(v), **kw)
+
+    def _cylinder_wireframe(ax, r, h, **kw):
+        """Draw top/bottom circles and vertical lines for a cylinder."""
+        u = np.linspace(0, 2 * np.pi, 40)
+        for zh in (-h, h):
+            ax.plot3D(r * np.cos(u), r * np.sin(u), zh * np.ones_like(u), **kw)
+        for ang in np.linspace(0, 2 * np.pi, 8, endpoint=False):
+            ax.plot3D([r * np.cos(ang)] * 2, [r * np.sin(ang)] * 2, [-h, h], **kw)
+
     def _row_pose(row):
         """Return (center_world, R_local_to_world) reconstructed from row metadata."""
         sname = row['sweep']
         sv    = row['sweep_value']
         if sname == 'position':
-            center = np.array([sv[0], sv[1], NOM_POS[2]])
+            center  = np.array([sv[0], sv[1], nom_pos[2]])
             yaw_deg = 0.0
         elif sname == 'yaw':
-            center  = NOM_POS.copy()
+            center  = nom_pos.copy()
             yaw_deg = float(sv)
         else:
-            center  = NOM_POS.copy()
+            center  = nom_pos.copy()
             yaw_deg = 0.0
         c, s = np.cos(np.deg2rad(yaw_deg)), np.sin(np.deg2rad(yaw_deg))
         R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
         return center, R
 
     def _row_hs(row):
-        return float(row['sweep_value']) if row['sweep'] == 'size' else NOM_SIZE
+        return float(row['sweep_value']) if row['sweep'] == 'size' else nom_size
 
     fig = plt.figure(figsize=(16, 13))
     fig.suptitle('Contact points in object-local frame — 3D (all sweeps)',
@@ -460,7 +561,7 @@ def _fig_3d_contact_grid(all_rows, out_path):
     cmaps = {'position': 'plasma', 'yaw': 'viridis',
              'size': 'coolwarm', 'mu': 'RdYlGn'}
 
-    for si, sweep in enumerate(SWEEPS):
+    for si, sweep in enumerate(sweeps):
         sname  = sweep['name']
         ax = fig.add_subplot(2, 2, si + 1, projection='3d')
         rows = [r for r in all_rows if r['sweep'] == sname]
@@ -479,13 +580,18 @@ def _fig_3d_contact_grid(all_rows, out_path):
         norm = plt.Normalize(vmin=vmin, vmax=vmax)
         cmap = plt.get_cmap(cmaps.get(sname, 'viridis'))
 
-        # Draw box wireframe(s) — one per unique size, centered at local origin
+        # Draw object wireframe(s) — one per unique size, centered at local origin
+        wf_kw = dict(color='#2c3e50', alpha=0.20, linewidth=0.8, linestyle='--')
         drawn = set()
         for r in rows:
             hs = _row_hs(r)
             if hs not in drawn:
-                _box_edges(ax, hs, hs, hs, color='#2c3e50', alpha=0.20,
-                           linewidth=0.8, linestyle='--')
+                if geom_type == GEOM_TYPE_SPHERE:
+                    _sphere_wireframe(ax, hs, **wf_kw)
+                elif geom_type == GEOM_TYPE_CYLINDER:
+                    _cylinder_wireframe(ax, hs, hs, **wf_kw)
+                else:
+                    _box_edges(ax, hs, hs, hs, **wf_kw)
                 drawn.add(hs)
 
         # Plot contact points transformed to local frame
@@ -495,8 +601,8 @@ def _fig_3d_contact_grid(all_rows, out_path):
             center, R = _row_pose(r)
             col = cmap(norm(sc))
 
-            p1w = np.array([r['p1_x'], r['p1_y'], r.get('p1_z', NOM_POS[2])])
-            p2w = np.array([r['p2_x'], r['p2_y'], r.get('p2_z', NOM_POS[2])])
+            p1w = np.array([r['p1_x'], r['p1_y'], r.get('p1_z', nom_pos[2])])
+            p2w = np.array([r['p2_x'], r['p2_y'], r.get('p2_z', nom_pos[2])])
             p1l = R.T @ (p1w - center)
             p2l = R.T @ (p2w - center)
 
@@ -512,7 +618,7 @@ def _fig_3d_contact_grid(all_rows, out_path):
         cb = fig.colorbar(sm, ax=ax, fraction=0.028, pad=0.10, shrink=0.65)
         cb.set_label(clabel, fontsize=8)
 
-        max_hs = max(_row_hs(r) for r in rows)
+        max_hs = max(_row_hs(r) for r in rows) if rows else nom_size
         lim = max_hs * 1.4
         ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_zlim(-lim, lim)
         ax.set_xlabel('X_local (m)', fontsize=8, labelpad=2)
@@ -527,9 +633,11 @@ def _fig_3d_contact_grid(all_rows, out_path):
     plt.close(fig)
 
 
-def _fig_convergence_bar(all_rows, out_path):
-    sweep_names  = [s['name']  for s in SWEEPS]
-    sweep_labels = [s['label'] for s in SWEEPS]
+def _fig_convergence_bar(all_rows, out_path, sweeps=None):
+    if sweeps is None:
+        sweeps = SWEEPS
+    sweep_names  = [s['name']  for s in sweeps]
+    sweep_labels = [s['label'] for s in sweeps]
 
     conv_rates = []
     for sname in sweep_names:
@@ -556,21 +664,29 @@ def _fig_convergence_bar(all_rows, out_path):
     plt.close(fig)
 
 
-def _fig_contact_scatter(sweep_rows, sweep_meta, nom_size, out_path):
+def _fig_contact_scatter(sweep_rows, sweep_meta, nom_size, out_path,
+                          nom_pos=None, geom_type=GEOM_TYPE_BOX):
     """Top-down (XY) scatter of contact points, colored by parameter value."""
+    if nom_pos is None:
+        nom_pos = NOM_POS
     values = sorted(set(r['sweep_value'] for r in sweep_rows))
     cmap   = CMAP
     norm   = plt.Normalize(vmin=min(values), vmax=max(values))
 
     fig, ax = plt.subplots(figsize=(6, 6))
 
-    # Draw nominal box outline (top-down, centred at nominal XY)
-    bx, by = NOM_POS[0], NOM_POS[1]
+    # Draw nominal object outline (top-down, centred at nominal XY)
+    bx, by = nom_pos[0], nom_pos[1]
     hs = nom_size
-    rect = plt.Rectangle((bx - hs, by - hs), 2*hs, 2*hs,
-                          fill=False, edgecolor='black', linewidth=2,
-                          linestyle='-', label='Nominal box')
-    ax.add_patch(rect)
+    if geom_type in (GEOM_TYPE_SPHERE, GEOM_TYPE_CYLINDER):
+        outline = plt.Circle((bx, by), hs, fill=False, edgecolor='black',
+                             linewidth=2, linestyle='-', label='Nominal outline')
+        ax.add_patch(outline)
+    else:
+        outline = plt.Rectangle((bx - hs, by - hs), 2*hs, 2*hs,
+                                  fill=False, edgecolor='black', linewidth=2,
+                                  linestyle='-', label='Nominal box')
+        ax.add_patch(outline)
 
     for r in sweep_rows:
         c = cmap(norm(r['sweep_value']))
@@ -593,7 +709,7 @@ def _fig_contact_scatter(sweep_rows, sweep_meta, nom_size, out_path):
     p1_patch = mpatches.Patch(color='gray', label='p1 thumb (circle)')
     p2_patch = mpatches.Patch(color='gray', label='p2 index (square)',
                                linestyle='--')
-    ax.legend(handles=[rect, p1_patch, p2_patch], fontsize=8, loc='upper right')
+    ax.legend(handles=[outline, p1_patch, p2_patch], fontsize=8, loc='upper right')
 
     margin = 0.08
     ax.set_xlim(bx - hs - margin, bx + hs + margin)
@@ -619,7 +735,7 @@ def main():
     ap = argparse.ArgumentParser(description='Grasp planner robustness sweep')
     ap.add_argument('--nc',         type=int,   default=6,
                     help='Seeds per solve (default 6)')
-    ap.add_argument('--max-iter',   type=int,   default=150,
+    ap.add_argument('--max-iter',   type=int,   default=50,
                     help='Max IPOPT iterations per seed (default 150)')
     ap.add_argument('--log-prefix', type=str,   default='robustness',
                     help='Log directory prefix (default robustness)')
@@ -646,7 +762,7 @@ def main():
     log.info(f"Output directory: {log_dir}")
     log.info(f"nc={args.nc}  max_iter={args.max_iter}")
 
-    # ── Model + planner ───────────────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────────────
     model = mj.MjModel.from_xml_path(SCENE_XML)
     data  = mj.MjData(model)
     for j in (0, 2, 4, 6):
@@ -655,111 +771,138 @@ def main():
 
     q_bias = make_q_bias()
 
-    obj_body_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'obj_red_box')
-    obj_gid     = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, 'obj_red_box_geom')
-    jnt_id      = model.body_jntadr[obj_body_id]
-    qpos_adr    = int(model.jnt_qposadr[jnt_id])
+    # ── Outer loop: one planner per object shape ──────────────────────────────
+    global_all_rows = []
+    json_store      = []
 
-    grasp_cfg = GraspConfig3D(
-        obj_geom  = 'obj_red_box_geom',
-        obj_body  = 'obj_red_box',
-        max_iter  = args.max_iter,
-    )
-    ms_planner = MultiStartGraspPlanner3D(model, data, grasp_cfg,
-                                          log_dir=str(log_dir))
-    log.info(f"Planner ready — nominal size: "
-             f"hx={ms_planner._obj_hx:.3f} hy={ms_planner._obj_hy:.3f} "
-             f"hz={ms_planner._obj_hz:.3f}")
+    for obj_cfg in OBJECT_CONFIGS:
+        obj_name = obj_cfg['name']
+        obj_geom = obj_cfg['geom']
+        nom_pos  = obj_cfg['nom_pos']
+        nom_size = obj_cfg['nom_size']
+        nom_mu   = obj_cfg['nom_mu']
+        gtype    = obj_cfg['geom_type']
+        gtype_str = {GEOM_TYPE_BOX: 'box', GEOM_TYPE_SPHERE: 'sphere',
+                     GEOM_TYPE_CYLINDER: 'cylinder'}.get(gtype, f'type{gtype}')
 
-    # ── Sweep loop ────────────────────────────────────────────────────────────
-    all_rows   = []
-    json_store = []
+        log.info(f"\n{'#'*70}")
+        log.info(f"OBJECT: {obj_name}  ({gtype_str})  "
+                 f"nom_size={nom_size:.3f}m  nom_mu={nom_mu:.1f}")
+        log.info(f"{'#'*70}")
 
-    for sweep in SWEEPS:
-        sname  = sweep['name']
-        log.info(f"\n{'='*60}")
-        log.info(f"SWEEP: {sweep['label']}")
-        log.info(f"{'='*60}")
+        obj_body_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, obj_name)
+        obj_gid     = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, obj_geom)
+        jnt_id      = model.body_jntadr[obj_body_id]
+        qpos_adr    = int(model.jnt_qposadr[jnt_id])
 
-        sweep_rows = []
-        for val in sweep['values']:
-            tc  = build_test_case(sname, val)
+        grasp_cfg  = GraspConfig3D(obj_geom=obj_geom, obj_body=obj_name,
+                                   max_iter=args.max_iter)
+        ms_planner = MultiStartGraspPlanner3D(model, data, grasp_cfg,
+                                              log_dir=str(log_dir))
+        log.info(f"  Planner ready — "
+                 f"hx={ms_planner._obj_hx:.3f} hy={ms_planner._obj_hy:.3f} "
+                 f"hz={ms_planner._obj_hz:.3f}  geom_type={gtype}")
+
+        # Per-object plot subdirectory
+        obj_plot_dir = log_dir / 'plots' / obj_name
+        obj_plot_dir.mkdir(parents=True, exist_ok=True)
+
+        obj_sweeps  = get_sweeps_for_obj(obj_cfg)
+        obj_all_rows = []
+
+        # ── Sweep loop ────────────────────────────────────────────────────────
+        for sweep in obj_sweeps:
+            sname = sweep['name']
+            log.info(f"\n{'='*60}")
+            log.info(f"[{obj_name}]  SWEEP: {sweep['label']}")
+            log.info(f"{'='*60}")
+
+            sweep_rows = []
+            for val in sweep['values']:
+                tc = build_test_case(obj_cfg, sname, val)
+                if sname == 'position':
+                    tag = '({:.2f},{:.2f})'.format(*val)
+                else:
+                    tag = sweep['fmt'].format(val)
+                log.info(f"  [{sname}={tag}]  pos={np.round(tc['pos'],3)}  "
+                         f"yaw={tc['yaw_deg']:.1f}°  size={tc['size']:.3f}  μ={tc['mu']:.2f}")
+
+                metrics = run_one(
+                    model, data, ms_planner, q_bias, qpos_adr, obj_gid,
+                    pos      = tc['pos'],
+                    yaw_deg  = tc['yaw_deg'],
+                    size     = tc['size'],
+                    mu       = tc['mu'],
+                    nc       = args.nc,
+                    max_iter = args.max_iter,
+                    log      = log,
+                )
+
+                # Restore nominal parameters before the next case
+                set_object_size(model, ms_planner, obj_gid, nom_size)
+                set_friction(model, obj_gid, nom_mu)
+
+                row = {
+                    'object':      obj_name,
+                    'sweep':       sname,
+                    'sweep_label': sweep['label'],
+                    'sweep_value': val,
+                    **metrics,
+                }
+                sweep_rows.append(row)
+                obj_all_rows.append(row)
+                global_all_rows.append(row)
+
+                ik_str = (f"IK=({metrics.get('ik_thumb_mm', float('nan')):.1f},"
+                          f"{metrics.get('ik_index_mm', float('nan')):.1f})mm"
+                          if metrics.get('ik_thumb_mm') is not None else 'IK=N/A')
+                gm_str  = (f"γ={metrics['gamma_min']:.3f}"
+                           if metrics.get('gamma_min') is not None else 'γ=N/A')
+                nlp_str = (f"γ_NLP={metrics['gamma_nlp']:.3f}"
+                           if metrics.get('gamma_nlp') is not None else 'γ_NLP=N/A')
+                log.info(f"    → status={metrics.get('status',-1):12s}  "
+                         f"t={metrics.get('solve_time_ms',0):.0f}ms  "
+                         f"{ik_str}  {nlp_str}  {gm_str}  "
+                         f"WF={'OK' if metrics.get('wrench_feasible') else 'NO'}")
+
+                json_store.append({**row,
+                                   'p1': list(tc.get('pos', [])),
+                                   'p2': None})
+
+            # ── Per-sweep plots ───────────────────────────────────────────────
             if sname == 'position':
-                tag = '({:.2f},{:.2f})'.format(*val)
+                _fig_position_grid(sweep_rows, obj_plot_dir / 'position_grid.png')
+                _fig_position_contact_scatter(
+                    sweep_rows, obj_plot_dir / 'contact_points_position.png',
+                    nom_size=nom_size, geom_type=gtype)
             else:
-                tag = sweep['fmt'].format(val)
-            log.info(f"  [{sname}={tag}]  pos={np.round(tc['pos'],3)}  "
-                     f"yaw={tc['yaw_deg']:.1f}°  size={tc['size']:.3f}  μ={tc['mu']:.2f}")
+                _fig_ik_vs_param(sweep_rows, sweep,
+                                  obj_plot_dir / f'ik_error_{sname}.png')
+                _fig_metric_vs_param(sweep_rows, sweep, 'gamma_min', 'γ_min (NCF scale)',
+                                      obj_plot_dir / f'gamma_{sname}.png', hline=0.0)
+                _fig_solve_time(sweep_rows, sweep,
+                                obj_plot_dir / f'solve_time_{sname}.png')
+                _fig_contact_scatter(sweep_rows, sweep, nom_size,
+                                      obj_plot_dir / f'contact_points_{sname}.png',
+                                      nom_pos=nom_pos, geom_type=gtype)
+            log.info(f"  Plots written for [{obj_name}] sweep '{sname}'")
 
-            metrics = run_one(
-                model, data, ms_planner, q_bias, qpos_adr, obj_gid,
-                pos      = tc['pos'],
-                yaw_deg  = tc['yaw_deg'],
-                size     = tc['size'],
-                mu       = tc['mu'],
-                nc       = args.nc,
-                max_iter = args.max_iter,
-                log      = log,
-            )
+        # ── Per-object summary plots ──────────────────────────────────────────
+        _fig_convergence_bar(obj_all_rows, obj_plot_dir / 'convergence_rate.png',
+                             sweeps=obj_sweeps)
+        _fig_3d_contact_grid(obj_all_rows, obj_plot_dir / 'contact_3d_grid.png',
+                             obj_cfg=obj_cfg, sweeps=obj_sweeps)
+        log.info(f"  Summary plots written for {obj_name}")
 
-            # Restore nominal parameters before the next case
-            set_object_size(model, ms_planner, obj_gid, NOM_SIZE)
-            set_friction(model, ms_planner, obj_gid, NOM_MU)
-
-            row = {
-                'sweep':       sname,
-                'sweep_label': sweep['label'],
-                'sweep_value': val,
-                **metrics,
-            }
-            sweep_rows.append(row)
-            all_rows.append(row)
-
-            ik_str = (f"IK=({metrics.get('ik_thumb_mm', float('nan')):.1f},"
-                      f"{metrics.get('ik_index_mm', float('nan')):.1f})mm"
-                      if metrics.get('ik_thumb_mm') is not None else 'IK=N/A')
-            gm_str = (f"γ={metrics['gamma_min']:.3f}"
-                      if metrics.get('gamma_min') is not None else 'γ=N/A')
-            log.info(f"    → status={metrics.get('status',-1):12s}  "
-                     f"t={metrics.get('solve_time_ms',0):.0f}ms  "
-                     f"{ik_str}  {gm_str}  "
-                     f"WF={'OK' if metrics.get('wrench_feasible') else 'NO'}")
-
-            json_store.append({**row,
-                               'p1': list(tc.get('pos', [])),
-                               'p2': None})
-
-        # ── Per-sweep plots ───────────────────────────────────────────────────
-        pdir = log_dir / 'plots'
-        if sname == 'position':
-            _fig_position_grid(sweep_rows, pdir / 'position_grid.png')
-            _fig_position_contact_scatter(sweep_rows, pdir / 'contact_points_position.png')
-        else:
-            _fig_ik_vs_param(sweep_rows, sweep,
-                              pdir / f'ik_error_{sname}.png')
-            _fig_metric_vs_param(sweep_rows, sweep, 'gamma_min', 'γ_min (NCF scale)',
-                                  pdir / f'gamma_{sname}.png', hline=0.0)
-            _fig_solve_time(sweep_rows, sweep,
-                            pdir / f'solve_time_{sname}.png')
-            _fig_contact_scatter(sweep_rows, sweep, NOM_SIZE,
-                                  pdir / f'contact_points_{sname}.png')
-        log.info(f"  Plots written for sweep '{sname}'")
-
-    # ── Global convergence bar ────────────────────────────────────────────────
-    _fig_convergence_bar(all_rows, log_dir / 'plots' / 'convergence_rate.png')
-
-    # ── 3D contact grid (all sweeps, object-local frame) ─────────────────────
-    _fig_3d_contact_grid(all_rows, log_dir / 'plots' / 'contact_3d_grid.png')
-
-    # ── CSV ───────────────────────────────────────────────────────────────────
-    if all_rows:
+    # ── CSV (all objects combined) ────────────────────────────────────────────
+    if global_all_rows:
         csv_path = log_dir / 'results.csv'
-        fieldnames = list(all_rows[0].keys())
+        fieldnames = list(global_all_rows[0].keys())
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
             w.writeheader()
-            w.writerows(all_rows)
-        log.info(f"\nCSV written: {csv_path}  ({len(all_rows)} rows)")
+            w.writerows(global_all_rows)
+        log.info(f"\nCSV written: {csv_path}  ({len(global_all_rows)} rows)")
 
     # ── JSON ──────────────────────────────────────────────────────────────────
     json_path = log_dir / 'results.json'
@@ -768,26 +911,33 @@ def main():
     log.info(f"JSON written: {json_path}")
 
     # ── Summary table ─────────────────────────────────────────────────────────
-    log.info('\n' + '='*76)
-    log.info(f"{'SWEEP':<12} {'VALUE':>14}  {'STATUS':<14} {'TIME(ms)':>9} "
-             f"{'IK_TH':>7} {'IK_IF':>7} {'γ_MIN':>7} {'WF':>4}")
-    log.info('-'*76)
-    for r in all_rows:
-        ik_t = r.get('ik_thumb_mm')
-        ik_i = r.get('ik_index_mm')
-        gm   = r.get('gamma_min')
-        sv   = r['sweep_value']
+    log.info('\n' + '='*122)
+    log.info(f"{'OBJECT':<20} {'SWEEP':<10} {'VALUE':>12}  {'STATUS':<14} "
+             f"{'t(ms)':>6} {'IK_TH':>7} {'IK_IF':>7} "
+             f"{'GAP_TH':>7} {'GAP_IF':>7} "
+             f"{'SDF_P1':>7} {'SDF_P2':>7} "
+             f"{'γ_NLP':>7} {'γ_MIN':>7} {'WF':>4}")
+    log.info('-'*122)
+    for r in global_all_rows:
+        sv = r['sweep_value']
         sv_str = ('({:.2f},{:.2f})'.format(*sv) if isinstance(sv, (tuple, list))
                   else f'{sv:8.3f}')
+        def _fmt(k):
+            v = r.get(k)
+            return f'{v:7.1f}' if v is not None else '    N/A'
+        def _fmt3(k):
+            v = r.get(k)
+            return f'{v:7.3f}' if v is not None else '    N/A'
         log.info(
-            f"{r['sweep']:<12} {sv_str:>14}  "
-            f"{r.get('status','?'):<14} {r.get('solve_time_ms',0):>9.0f} "
-            f"{ik_t if ik_t is not None else float('nan'):>7.1f} "
-            f"{ik_i if ik_i is not None else float('nan'):>7.1f} "
-            f"{gm if gm is not None else float('nan'):>7.3f} "
+            f"{r.get('object','?'):<20} {r['sweep']:<10} {sv_str:>12}  "
+            f"{r.get('status','?'):<14} {r.get('solve_time_ms',0):>6.0f} "
+            f"{_fmt('ik_thumb_mm')} {_fmt('ik_index_mm')} "
+            f"{_fmt('gap_thumb_mm')} {_fmt('gap_index_mm')} "
+            f"{_fmt('sdf_p1_mm')} {_fmt('sdf_p2_mm')} "
+            f"{_fmt3('gamma_nlp')} {_fmt3('gamma_min')} "
             f"{'Y' if r.get('wrench_feasible') else 'N':>4}"
         )
-    log.info('='*76)
+    log.info('='*122)
     log.info(f"Done. Results in {log_dir}/")
 
 
