@@ -11,8 +11,9 @@ the planner finishes.  No force control; purely a recommender/visualiser.
 
 Controls
 --------
-  Ctrl+1   approach obj_box   → fires grasp planner when wrist within threshold
-  Ctrl+2   approach obj_cylinder (no grasp planner — geometry not supported yet)
+  Ctrl+1   approach obj_red_box       → fires grasp planner
+  Ctrl+2   approach obj_blue_cylinder → fires grasp planner (n_normal_relinearize=2)
+  Ctrl+3   approach obj_red_sphere    → fires grasp planner (n_normal_relinearize=2)
   Ctrl+0   return to home
   Enter    cycle through planner candidates (best → next)
   Q / Esc  quit
@@ -28,6 +29,10 @@ import numpy as np
 import mujoco as mj
 import mujoco.viewer
 from pynput import keyboard as _pynput_kb
+import matplotlib
+matplotlib.use('Agg')   # headless-safe; saves to file without a display
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3D projection)
 
 import os, sys
 from pathlib import Path
@@ -39,7 +44,7 @@ if str(_REPO_ROOT / 'simulation') not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / 'simulation')) 
 
 from grasp_control import SpatialIKSolver
-from grasp_planner_3d import GraspConfig3D, MultiStartGraspPlanner3D
+from grasp_planner_3d import GraspConfig3D, MultiStartGraspPlanner3D, _angle_deg_between
 
 # ── Module-level constants ─────────────────────────────────────────────────────
 
@@ -63,10 +68,139 @@ def make_key_callback(key_queue):
     return _cb
 
 
+# ── 3-D seed / contact visualisation ──────────────────────────────────────────
+
+def _draw_object_wireframe(ax, geom_type, size, pos, mat):
+    """Light-grey wireframe of the grasped object in world frame."""
+    kw = dict(color='#aaaaaa', linewidth=0.7, alpha=0.5)
+    c  = np.asarray(pos, float)
+    R  = np.asarray(mat, float).reshape(3, 3)
+
+    if geom_type == 2:        # SPHERE
+        r = float(size[0])
+        u = np.linspace(0, 2 * np.pi, 24)
+        v = np.linspace(0, np.pi, 13)
+        for vi in v[::3]:
+            xs = r * np.cos(u) * np.sin(vi)
+            ys = r * np.sin(u) * np.sin(vi)
+            zs = np.full_like(u, r * np.cos(vi))
+            pts = R @ np.vstack([xs, ys, zs]) + c[:, None]
+            ax.plot(pts[0], pts[1], pts[2], **kw)
+        for ui in u[::4]:
+            xs2 = r * np.sin(v) * np.cos(ui)
+            ys2 = r * np.sin(v) * np.sin(ui)
+            zs2 = r * np.cos(v)
+            pts = R @ np.vstack([xs2, ys2, zs2]) + c[:, None]
+            ax.plot(pts[0], pts[1], pts[2], **kw)
+
+    elif geom_type == 5:      # CYLINDER  size=(radius, half_height)
+        r, h = float(size[0]), float(size[1])
+        theta = np.linspace(0, 2 * np.pi, 36)
+        for z in (-h, h):
+            xs = r * np.cos(theta); ys = r * np.sin(theta)
+            pts = R @ np.vstack([xs, ys, np.full_like(theta, z)]) + c[:, None]
+            ax.plot(pts[0], pts[1], pts[2], **kw)
+        for t in np.linspace(0, 2 * np.pi, 8, endpoint=False):
+            pts = R @ np.array([[r * np.cos(t), r * np.cos(t)],
+                                 [r * np.sin(t), r * np.sin(t)],
+                                 [-h,             h           ]]) + c[:, None]
+            ax.plot(pts[0], pts[1], pts[2], **kw)
+
+    else:                     # BOX  size=(hx, hy, hz)
+        hx, hy, hz = float(size[0]), float(size[1]), float(size[2])
+        corners = np.array([[sx * hx, sy * hy, sz * hz]
+                             for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)])
+        edges = [(0,1),(2,3),(4,5),(6,7),
+                 (0,2),(1,3),(4,6),(5,7),
+                 (0,4),(1,5),(2,6),(3,7)]
+        for a, b in edges:
+            pts = R @ np.column_stack([corners[a], corners[b]]) + c[:, None]
+            ax.plot(pts[0], pts[1], pts[2], **kw)
+
+
+def _set_equal_axes_3d(ax, center, size):
+    """Cube view volume centred on the object."""
+    r = float(np.max(size)) * 1.8
+    c = np.asarray(center, float)
+    ax.set_xlim(c[0] - r, c[0] + r)
+    ax.set_ylim(c[1] - r, c[1] + r)
+    ax.set_zlim(c[2] - r, c[2] + r)
+
+
+def _plot_grasp_seeds(all_results, obj_geom_type, obj_size, obj_pos, obj_mat,
+                      save_path=None):
+    """
+    Grid of 3-D subplots, one per seed.
+
+    Hollow markers + dashed line = seed (initial) contact pair.
+    Filled markers + solid line  = final contact pair after NLP.
+    Colour encodes convergence: green=converged, orange=best-effort, red=failed.
+    """
+    n     = len(all_results)
+    ncols = min(n, 5)
+    nrows = (n + ncols - 1) // ncols
+    fig   = plt.figure(figsize=(4 * ncols, 4 * nrows))
+    fig.suptitle('Grasp seeds → final contacts', fontsize=11)
+
+    STATUS_COLOR = {
+        'converged':   'tab:green',
+        'best-effort': 'tab:orange',
+        'failed':      'tab:red',
+    }
+
+    for idx, r in enumerate(all_results):
+        ax    = fig.add_subplot(nrows, ncols, idx + 1, projection='3d')
+        color = STATUS_COLOR.get(r.get('status', 'failed'), 'tab:red')
+
+        _draw_object_wireframe(ax, obj_geom_type, obj_size, obj_pos, obj_mat)
+
+        # seed pair (hollow)
+        p1s = r.get('p1_seed')
+        p2s = r.get('p2_seed')
+        if p1s is not None and p2s is not None:
+            ax.scatter(*p1s, marker='o', s=40, facecolors='none',
+                       edgecolors=color, linewidths=1.5, zorder=5)
+            ax.scatter(*p2s, marker='s', s=40, facecolors='none',
+                       edgecolors=color, linewidths=1.5, zorder=5)
+            ax.plot([p1s[0], p2s[0]], [p1s[1], p2s[1]], [p1s[2], p2s[2]],
+                    '--', color=color, linewidth=0.8, alpha=0.5)
+
+        # final contact pair (filled)
+        p1 = r.get('p1')
+        p2 = r.get('p2')
+        if p1 is not None and p2 is not None:
+            ax.scatter(*p1, marker='o', s=60, color=color, zorder=6)
+            ax.scatter(*p2, marker='s', s=60, color=color, zorder=6)
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]],
+                    '-', color=color, linewidth=1.5)
+
+        status = r.get('status', 'failed')
+        cost   = r.get('cost')
+        title  = f"#{idx + 1}  {status}"
+        if cost is not None:
+            title += f"\ncost={cost:.3f}"
+        ax.set_title(title, fontsize=7, color=color)
+        ax.set_xlabel('x', fontsize=5)
+        ax.set_ylabel('y', fontsize=5)
+        ax.set_zlabel('z', fontsize=5)
+        ax.tick_params(labelsize=4)
+        _set_equal_axes_3d(ax, obj_pos, obj_size)
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=120)
+        print(f"[plot] saved → {save_path}")
+    else:
+        fig.savefig('grasp_seeds.png', dpi=120)
+        print("[plot] saved → grasp_seeds.png")
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Grasp recommender test (no RRT, no force ctrl)")
-    ap.add_argument('--nc',       type=int, default=3,
+    ap.add_argument('--ns',       type=int, default=5,
                     help="Grasp-planner seeds per solve (default 3)")
     ap.add_argument('--max-iter', type=int, default=120,
                     help="Max solver iterations per seed (default 120)")
@@ -107,23 +241,36 @@ def main():
     # ── IK + grasp planner ─────────────────────────────────────────────────────
     dls_ik = SpatialIKSolver(n_robot=N_ROBOT)
 
-    grasp_cfg = GraspConfig3D(
-        obj_geom      = 'obj_red_box_geom',
-        obj_body      = 'obj_red_box',
-        max_iter      = args.max_iter,
-    )
-    ms_planner = MultiStartGraspPlanner3D(model, data, grasp_cfg, log_dir=log_dir)
     if log_dir:
         print(f"[log] saving to {log_dir}/")
+
+    def _make_planner(obj_geom, obj_body, n_relinearize=0):
+        cfg = GraspConfig3D(
+            obj_geom              = obj_geom,
+            obj_body              = obj_body,
+            max_iter              = args.max_iter,
+            n_normal_relinearize  = n_relinearize,
+        )
+        return MultiStartGraspPlanner3D(model, data, cfg, log_dir=log_dir)
+
+    planners = {
+        'obj_red_box':       _make_planner('obj_red_box_geom',       'obj_red_box',       n_relinearize=0),
+        'obj_blue_cylinder': _make_planner('obj_blue_cylinder_geom', 'obj_blue_cylinder', n_relinearize=0),
+        'obj_red_sphere':    _make_planner('obj_red_sphere_geom',    'obj_red_sphere',    n_relinearize=0),
+    }
+    ms_planner = planners['obj_red_box']   # default for legacy references
     print(f"[planner] box half-extents: "
           f"hx={ms_planner._obj_hx:.3f}  "
           f"hy={ms_planner._obj_hy:.3f}  "
           f"hz={ms_planner._obj_hz:.3f}")
 
     # ── Precompute approach paths ──────────────────────────────────────────────
+    # (body_name, geom_name, use_planner)
+    # Ctrl+1 = box, Ctrl+2 = cylinder, Ctrl+3 = sphere
     OBJECT_DEFS = [
-        ('obj_red_box',    'obj_red_box_geom',    True),
-        ('obj_red_sphere', 'obj_red_sphere_geom', False),
+        ('obj_red_box',       'obj_red_box_geom',       True),
+        ('obj_blue_cylinder', 'obj_blue_cylinder_geom', True),
+        ('obj_red_sphere',    'obj_red_sphere_geom',    True),
     ]
 
     objects = []
@@ -144,7 +291,7 @@ def main():
         _d.qpos[:N_ROBOT] = Q_BIAS
         mj.mj_forward(model, _d)
 
-        if body_name == 'obj_red_sphere':
+        if body_name in ('obj_red_sphere', 'obj_blue_cylinder'):
             # Task-space straight-line approach: fingertips follow a direct Cartesian
             # path from their home positions to the pregrasp targets.  Joint-space linear
             # interpolation arcs below the target Z; task-space interpolation cannot.
@@ -254,7 +401,7 @@ def main():
     kb = _pynput_kb.Listener(on_press=_on_press, on_release=_on_release)
     kb.start()
 
-    print("\n[Control]  Ctrl+1: obj_red_box  |  Ctrl+2: obj_red_sphere  |  "
+    print("\n[Control]  Ctrl+1: box  |  Ctrl+2: cylinder  |  Ctrl+3: sphere  |  "
           "Ctrl+0: home  |  Enter: next candidate  |  Q/Esc: quit\n")
 
     # ── Helper: select object ──────────────────────────────────────────────────
@@ -290,41 +437,49 @@ def main():
 
     # ── Helper: fire grasp planner in background ───────────────────────────────
     def _fire_planner(obj):
-        q_snap  = np.array([data.qpos[i] for i in ms_planner._planner._act_idx])
+        _plnr   = planners.get(obj['name'], ms_planner)
+        q_snap  = np.array([data.qpos[i] for i in _plnr._planner._act_idx])
         obj_pos = data.xpos[obj['id_body']].copy()
 
         def _run():
             nonlocal candidates, candidate_idx
-            print(f"[planner] solving {args.nc} seeds for {obj['name']} ...")
+            print(f"[planner] solving {args.ns} seeds for {obj['name']} ...")
             t0     = time.monotonic()
-            result = ms_planner.solve(q_snap, obj_pos, max_seeds=args.nc)
+            result = _plnr.solve(q_snap, obj_pos, max_seeds=args.ns)
             dt     = time.monotonic() - t0
             all_r  = result.get('all_results') or [result]
             cands  = [r for r in all_r if r.get('q') is not None]
             cands.sort(key=lambda r: (
                 {'converged': 0, 'best-effort': 1, 'failed': 2}.get(
                     r.get('status', 'failed'), 2),
+                0 if r.get('wrench_ok', True) else 1,
                 r.get('cost') or 1e9))
             n_ok = sum(1 for r in cands if r.get('status') == 'converged')
             print(f"[planner] done in {dt:.1f}s — {n_ok}/{len(cands)} converged")
 
             # ── Verify each candidate ──────────────────────────────────────
-            planner = ms_planner._planner
+            planner = _plnr._planner
             log     = logging.getLogger('verify')
             for i, cand in enumerate(cands):
                 info = planner.verify(cand)
                 if not info:
                     continue
-                _wf = (f"OK γ={info['gamma_min']:.3f}"
-                       if info['wrench_feasible'] else 'INFEASIBLE')
+                _wf      = (f"OK γ={info['gamma_min']:.3f}"
+                            if info['wrench_feasible'] else 'INFEASIBLE')
+                _nlp_str = (f"γ_NLP={info['gamma_nlp']:.3f}"
+                            if info.get('gamma_nlp') is not None else 'γ_NLP=N/A')
+                _n1_delta = _angle_deg_between(cand.get('n1_frozen'), info.get('n1_verify'))
+                _n2_delta = _angle_deg_between(cand.get('n2_frozen'), info.get('n2_verify'))
                 line = (
                     f"[verify {i+1}/{len(cands)}]"
                     f"  status={cand.get('status')}"
+                    f"  wrench_ok={cand.get('wrench_ok')}"
                     f"  IK=({info['ik_thumb_mm']:.2f},{info['ik_index_mm']:.2f})mm"
                     f"  gap=({info['gap_thumb_mm']:+.2f},{info['gap_index_mm']:+.2f},"
                     f"{info['gap_middle_mm']:+.2f},{info['gap_ring_mm']:+.2f})mm"
                     f"  sdf_p=({info['sdf_p1_mm']:.2f},{info['sdf_p2_mm']:.2f})mm"
-                    f"  WF={_wf}"
+                    f"  n_Δ(frozen,verify)=({_n1_delta:.1f}°,{_n2_delta:.1f}°)"
+                    f"  {_nlp_str}  WF={_wf}"
                 )
                 print(line)
                 log.info(line)
@@ -332,6 +487,20 @@ def main():
             candidates    = cands
             candidate_idx = 0
             _show_candidate(0)
+
+            # ── 3-D seed / contact plot ───────────────────────────────
+            try:
+                _gtype = _plnr._obj_geom_type
+                _gsize = _plnr._obj_size
+                _omat  = _plnr._planner.data.geom_xmat[
+                             _plnr._planner._obj_gid].reshape(3, 3).copy()
+                _fname = None
+                if log_dir:
+                    _fname = os.path.join(log_dir, f"seeds_{obj['name']}.png")
+                _plot_grasp_seeds(all_r, _gtype, _gsize, obj_pos, _omat,
+                                  save_path=_fname)
+            except Exception as _pe:
+                print(f"[plot] warning: {_pe}")
 
         t = threading.Thread(target=_run, daemon=True, name='grasp-planner')
         t.start()

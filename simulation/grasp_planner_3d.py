@@ -14,11 +14,15 @@ Seeding (MultiStartGraspPlanner3D)
     Contact frames are frozen from the surface normals at p1s/p2s, not from
     the jittered warm-start.  ~20 seeds per call; no filtering or sorting.
 
-    Pre-check LP: min_gamma_for_accel_lp on (p1s, p2s) before building the NLP.
-    Seeds with γ > 50 are skipped.
+    Pre-check LP: min_gamma_for_accel_lp on (p1s, p2s) before building the NLP,
+    slack-relaxed (cfg.precheck_slack_penalty) so one geometrically-unreachable
+    corner doesn't report the whole seed infeasible. Seeds with γ > 50 are skipped.
 
-    Post-solve filter: results with max_slack > 0.05 N are marked
-    'wrench-infeasible' and ranked below feasible results.
+    Post-solve: wrench_ok = (status == 'converged') AND (max_slack_norm <
+    cfg.slack_tol_abs) — the embedded wrench LP (see below) is slack-relaxed, so
+    solver convergence alone no longer certifies exact wrench feasibility; the
+    slack magnitude must also be negligible. Results are ranked with wrench_ok
+    candidates first.
 
 Decision variables
 ------------------
@@ -27,15 +31,23 @@ Decision variables
     p2       (3,)           index-finger contact point, world frame
     γ        scalar         wrench quality margin (minimized; smaller = better geometry)
     y1_k,y2_k (5,) each    friction-cone mixing weights per contact per load corner k
-    s_k      (3,)  each     force-row slack per load corner k
+    s_k      (6,) each    wrench-balance slack per load corner k (penalized, not minimized to 0)
+
+    Wrench feasibility is enforced as a slack-relaxed equality per load corner k
+    (jointly sign-expanded over torque AND force, in the object body frame),
+    matching min_gamma_for_accel_lp's slack_penalty mode
+    (scripts/3D_minimum_NCF.py) exactly — see _embed_wrench_cone_ca. A single
+    unreachable corner (e.g. near-zero moment arm about one torque axis) no
+    longer makes the whole NLP infeasible; it shows up as nonzero slack on that
+    corner instead, penalized in the cost and checked post-solve via wrench_ok.
 
 Cost (all terms normalized — each ≈ 1 at its reference level, weights are pure priorities)
 ------------------------------------------------------------------------------------------
     w_ik    * 0.5*(‖Δp1‖²+‖Δp2‖²) / d_ref²          d_ref = 5mm
     + w_reg   * ‖(q−q_neutral)/q_scale‖² / n_dof
     + w_gamma * γ / g_ref                              g_ref = ‖task_force‖ N
-    + w_slack * Σ_k ‖s_k‖² / (n_c · s_ref²)          s_ref = 5mN
     + w_y     * Σ_k (‖y1_k‖²+‖y2_k‖²) / (n_c·10·g_ref²)
+    + w_slack * Σ_k ‖s_k / ref6‖² / n_c                 ref6 = per-row [t_ref×3, g_ref×3]
 
     IK target includes fingertip radius offset so the tip sphere surface
     touches the contact point (r_thumb/r_index measured from model geom size).
@@ -44,8 +56,9 @@ Constraints
 -----------
     1. Joint limits    — opti.bounded(lo, q, hi)
     2. Surface contact — linear face-pin (BOX); analytic equality (sphere/cylinder)
-    3. Wrench LP       — embedded: torque rows as box inequality ±[tx,ty,tz];
-                         force rows balanced with per-corner slack s_k
+    3. Wrench LP       — embedded: slack-relaxed equality per corner over the
+                         full [Tx,Ty,Tz,Fx,Fy,Fz] wrench (w + s_k == w_k);
+                         slack penalized in the cost, not hard-bounded to 0
     4. Arm collision   — proximity-pruned softplus SDFs (constrained_ik)
 
 Contact frame convention
@@ -77,7 +90,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 try:
     import importlib as _importlib
-    _ncf_mod = _importlib.import_module('3D_minimum_NCF')
+    _ncf_mod = _importlib.import_module('3D_minimum_NCF_slack')
     min_gamma_for_accel_lp = _ncf_mod.min_gamma_for_accel_lp
     _NCF_AVAILABLE = True
 
@@ -203,6 +216,59 @@ def _build_contact_frame_3d(inward_normal: np.ndarray):
     return n, t1, t2
 
 
+def _symbolic_contact_frame_ca(n_in_sym):
+    """
+    Build right-handed (n_in, t1, t2) contact frame as a CasADi MX expression.
+
+    Mirrors _build_contact_frame_3d but operates on symbolic MX vectors so the
+    frame is part of the NLP's symbolic graph.  CasADi can autodiff through it.
+
+    Parameters
+    ----------
+    n_in_sym : (3,) CasADi MX — inward contact normal (need not be unit-length;
+                normalisation is applied internally).
+
+    Returns
+    -------
+    R : (3,3) CasADi MX  — columns are [n_in, t1, t2]
+    """
+    eps = 1e-12
+    n = n_in_sym / (ca.norm_2(n_in_sym) + eps)
+    # Choose reference that is not parallel to n
+    e0 = ca.DM([1.0, 0.0, 0.0])
+    e1 = ca.DM([0.0, 1.0, 0.0])
+    # Blend: use e1 when |n[0]| >= 0.9, else e0
+    w = ca.fabs(n[0]) - 0.9
+    alpha = 0.5 * (1.0 + ca.tanh(w / 0.01))   # smooth 0→1 as |n[0]| crosses 0.9
+    ref = (1.0 - alpha) * e0 + alpha * e1
+    t1 = ca.cross(n, ref);  t1 = t1 / (ca.norm_2(t1) + eps)
+    t2 = ca.cross(n, t1);   t2 = t2 / (ca.norm_2(t2) + eps)
+    return ca.horzcat(n, t1, t2)                # 3×3 MX
+
+
+def _sym_inward_normal_ca(p, geom_type, center_dm, Rt_dm, size):
+    """
+    Symbolic inward normal at world-frame point p (CasADi MX).
+
+    Supported geom types:
+      2 (SPHERE)   — radial direction
+      5 (CYLINDER) — lateral direction (assumes contact on curved surface)
+    Box normals are piecewise-constant and not differentiable symbolically;
+    use frozen parameters (the default) for geom_type==6.
+    """
+    eps = 1e-12
+    p_loc = Rt_dm @ (p - center_dm)        # object-local frame
+    if geom_type == 2:                      # SPHERE
+        return -p_loc / (ca.norm_2(p_loc) + eps)
+    elif geom_type == 5:                    # CYLINDER (lateral surface)
+        r_xy = ca.sqrt(p_loc[0]**2 + p_loc[1]**2 + eps**2)
+        n_lat_loc = ca.vertcat(-p_loc[0] / r_xy,
+                               -p_loc[1] / r_xy,
+                               ca.DM(0.0))
+        return n_lat_loc
+    raise ValueError(f"symbolic normals not implemented for geom_type={geom_type}")
+
+
 def _geom_sdf_np(point, geom_type: int, center, mat, size) -> float:
     """Shape-agnostic signed distance (numpy). Positive = outside."""
     p = np.asarray(point, float)
@@ -240,6 +306,16 @@ def _geom_normal_np(point, geom_type: int, center, mat, size) -> np.ndarray:
         return R @ n_l
     n = p - c
     return n / (np.linalg.norm(n) + 1e-12)
+
+
+def _angle_deg_between(a, b) -> float:
+    """Angle in degrees between two 3-vectors, or nan if either is None."""
+    if a is None or b is None:
+        return float('nan')
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
+    c = float(np.dot(a, b) / ((np.linalg.norm(a) + 1e-12) * (np.linalg.norm(b) + 1e-12)))
+    return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
 
 
 def _span_margin(n1_out: np.ndarray, n2_out: np.ndarray, mu: float) -> float:
@@ -294,7 +370,7 @@ def _march_sdf_np(p_start, direction, geom_type, center, mat, size,
 
 
 def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
-               delta_max=np.deg2rad(25), off_lo=-0.004, off_hi=0.010):
+               delta_max=np.deg2rad(60), off_lo=-0.004, off_hi=0.010):
     """
     One antipodal seed pair with off-surface jitter.
 
@@ -425,21 +501,48 @@ def _sym_geom_surface_con(opti, p_sym, d, geom_type: int,
 
 def _embed_wrench_cone_ca(opti, p1, p2,
                            R1_param, R2_param,
-                           obj_center_np,
-                           mu, task_f_np, task_t_bound_np):
+                           obj_center_np, obj_R_np,
+                           mu, task_f_np, task_t_np,
+                           use_slack: bool = False):
     """
     Add embedded LP wrench constraints to a CasADi Opti problem.
 
-    R1_param, R2_param : opti.parameter(3,3) — contact frame [n_in | t1 | t2].
-        Computed numerically by caller via _build_contact_frame_3d(-d_lp).
-        Held constant per NLP solve; updated between Picard iterations.
+    Mirrors min_gamma_for_accel_lp (scripts/3D_minimum_NCF.py): a per-corner
+    equality over the full [Tx,Ty,Tz,Fx,Fy,Fz] wrench, jointly sign-expanded
+    over torque and force, evaluated in the object body frame (torque bounds
+    derive from body-frame principal inertia, so the wrench balance must be
+    computed there too).
+
+    use_slack : bool — when False (default), the equality is HARD (w == w_k):
+        a single geometrically-unreachable corner (e.g. exact zero moment arm
+        about one torque axis) makes the whole NLP infeasible, but a converged
+        solve is an exact certificate of wrench feasibility (matches
+        min_gamma_for_accel_lp's default slack_penalty=None behavior).
+        When True, a free per-corner slack variable s_k absorbs any residual
+        (w + s_k == w_k instead of w == w_k), so one unreachable corner can't
+        poison the whole solve — the caller must penalize ‖s_k‖ in the cost
+        and gate wrench_ok on its post-solve magnitude instead of relying on
+        solver convergence alone (matches min_gamma_for_accel_lp's
+        slack_penalty=<float> mode).
+
+    R1_param, R2_param : opti.parameter(3,3) — contact frame [n_in | t1 | t2],
+        in WORLD frame. Computed numerically by caller via
+        _build_contact_frame_3d(-d_lp). Held constant per NLP solve;
+        updated between Picard iterations.
         Eliminates Frisvad singularity at n=[0,0,-1] (top-face inward normal).
 
-    task_f_np       : (3,) force bounds [fx, fy, fz] — sign-expanded to corners.
-    task_t_bound_np : (3,) torque bounds [τx, τy, τz] — shared box inequality.
+    task_f_np : (3,) force magnitudes [fx, fy, fz], object body frame.
+    task_t_np : (3,) torque magnitudes [τx, τy, τz], object body frame.
+        Both sign-expanded jointly into up to 2^6 corners.
 
-    Returns: gamma, slack_list, y1_list, y2_list
-        slack_list : list of (3,) MX slack variables (one per corner, on force rows)
+    Returns: gamma, y1_list, y2_list, corners, s_list
+        corners : list of (6,) [τx,τy,τz,fx,fy,fz] wrenches, one per entry of
+            y1_list/y2_list/s_list, in matching order — lets a caller warm-start
+            each corner's y from an external per-corner LP solve.
+        s_list  : list of opti.variable(6), per-corner wrench slack, when
+            use_slack=True — inspect post-solve (opti.value / opti.debug.value)
+            to judge how much of the solve relied on slack rather than exact
+            wrench resistance. Empty list when use_slack=False.
     """
     import itertools
 
@@ -455,47 +558,55 @@ def _embed_wrench_cone_ca(opti, p1, p2,
     forces1 = [R1_param @ ca.DM(v) for v in verts_c]
     forces2 = [R2_param @ ca.DM(v) for v in verts_c]
     obj_c   = ca.DM(obj_center_np)
+    R_ow    = ca.DM(obj_R_np.T)   # world → object body-frame rotation
 
     def _wrench_sum(p, forces, y):
-        w = ca.MX.zeros(6)
+        w   = ca.MX.zeros(6)
+        p_O = R_ow @ (p - obj_c)
         for j, f_j in enumerate(forces):
-            w += y[j] * ca.vertcat(ca.cross(p - obj_c, f_j), f_j)
+            f_O = R_ow @ f_j
+            w += y[j] * ca.vertcat(ca.cross(p_O, f_O), f_O)
         return w
 
-    # Corner expansion on force components only
-    nz_idx = np.where(np.abs(task_f_np) > 1e-10)[0]
+    # Joint corner expansion over torque AND force together — matches
+    # min_gamma_for_accel_lp's `corners` set (3D_minimum_NCF.py:320-330).
+    task6  = np.concatenate([task_t_np, task_f_np])
+    nz_idx = np.where(np.abs(task6) > 1e-10)[0]
     seen, corners = set(), []
     for signs in itertools.product([-1, 1], repeat=len(nz_idx)):
-        t_k = task_f_np.copy()
+        w_k = task6.copy()
         for i, idx in enumerate(nz_idx):
-            t_k[idx] *= signs[i]
-        key = tuple(np.round(t_k, 12))
+            w_k[idx] *= signs[i]
+        key = tuple(np.round(w_k, 12))
         if key not in seen:
-            seen.add(key); corners.append(t_k)
+            seen.add(key); corners.append(w_k)
     if not corners:
-        corners = [task_f_np.copy()]
+        corners = [task6.copy()]
 
-    _t_bnd = ca.DM(task_t_bound_np)
-    slack_list, y1_list, y2_list = [], [], []
-    for t_f_k in corners:
+    y1_list, y2_list, s_list = [], [], []
+    for w_k in corners:
         _y1_k = opti.variable(nverts)
         _y2_k = opti.variable(nverts)
-        _s_k  = opti.variable(3)           # slack on force-row balance
         opti.subject_to(_y1_k >= 0)
         opti.subject_to(_y2_k >= 0)
         opti.subject_to(ca.sum1(_y1_k) <= _gamma)
         opti.subject_to(ca.sum1(_y2_k) <= _gamma)
         w = _wrench_sum(p1, forces1, _y1_k) + _wrench_sum(p2, forces2, _y2_k)
-        # Torque rows: box inequality (same bound for all corners)
-        opti.subject_to(opti.bounded(-_t_bnd, w[0:3], _t_bnd))
-        # Force rows: equality with slack (absorbs infeasibility on bad seeds)
-        
-        opti.subject_to(w[3:6] == ca.DM(t_f_k) + _s_k)
-        slack_list.append(_s_k)
+        if use_slack:
+            # Slack-relaxed equality across all 6 rows — mirrors
+            # min_gamma_for_accel_lp's slack_penalty mode. Always feasible;
+            # caller must penalize/gate on ‖s_k‖.
+            _s_k = opti.variable(6)   # free per-corner wrench slack (penalized in caller's cost)
+            opti.subject_to(w + _s_k == ca.DM(w_k))
+            s_list.append(_s_k)
+        else:
+            # Hard equality across all 6 rows — matches min_gamma_for_accel_lp's
+            # default (slack_penalty=None) exactly.
+            opti.subject_to(w == ca.DM(w_k))
         y1_list.append(_y1_k)
         y2_list.append(_y2_k)
 
-    return _gamma, slack_list, y1_list, y2_list
+    return _gamma, y1_list, y2_list, corners, s_list
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -507,16 +618,26 @@ class GraspConfig3D:
     """Configuration for the 3D grasp planner (Kinova Gen3 + LEAP hand)."""
 
     # Cost weights — dimensionless priorities (each term normalized to ≈1 at its reference)
-    # d_ref=5mm, g_ref=task_load_N, s_ref=5mN, y_ref=g_ref
+    # d_ref=5mm, g_ref=task_load_N, y_ref=g_ref
     w_ik:     float = 0.80   # reachability — dominant until IK < 5mm
     w_reg:    float = 0.06   # posture tie-breaker
     w_gamma:  float = 0.10   # grasp quality (was 0.1, now normalized by task load)
     w_y:      float = 0.04   # min-norm force distribution tie-breaker
-    
-    w_slack:  float = 10.00   # wrench feasibility — never lose to a preference term
+    # penalty on embedded wrench-cone slack (per-corner ‖s_k‖²). None (default)
+    # => hard-equality NLP, no slack variables at all (pre-slack behavior).
+    # Set to a float (e.g. 1e4) to opt into the slack-relaxed formulation.
+    w_slack:  float | None = None
 
-    
     q_scale:  float = 1.0
+
+    # Wrench-cone slack tolerances (see _embed_wrench_cone_ca / min_gamma_for_accel_lp
+    # slack_penalty mode). A converged NLP no longer certifies exact wrench
+    # resistance by itself — wrench_ok additionally requires max_slack_norm below
+    # these thresholds. Absolute units: N for force rows, N*m for torque rows.
+    slack_tol_abs:          float = 1e-3   # gates NLP result's wrench_ok
+    verify_slack_penalty:   float = 1e3    # slack_penalty passed to verify()'s diagnostic LP
+    verify_slack_tol:       float = 1e-3   # gates verify()'s wf_tag OK vs SLACK
+    precheck_slack_penalty: float = 1e3    # slack_penalty passed to the seed-loop pre-check LP
 
     # Fingertip mesh effective radius (site centroid to contact surface distance).
     # Measured from model geom at init (MultiStartGraspPlanner3D.__init__).
@@ -559,12 +680,21 @@ class GraspConfig3D:
     # n_normal_relinearize can be zero for box, search stays within the seed faces
     # n_normal_relinearize = 2 for curved surfaces, since normals genuinely rotate there
     n_seeds:             int  = 10    # seed pairs per multi-start (each from _seed_pair)
-    n_normal_relinearize: int  = 2
+    n_normal_relinearize: int  = 0
     verbose_profile:      bool = False
 
     # Solver — use_slsqp=True  → SQP+OSQP (default; linear face-pin + wrench constraints exact)
     #           use_slsqp=False → IPOPT (interior-point; use for non-box geometries)
     use_slsqp:  bool  = False
+    # symbolic_normals: build the wrench contact frame as a CasADi MX expression
+    # of p1/p2 rather than a frozen parameter.  The frame is then re-evaluated at
+    # every NLP function call (eval_f / eval_grad_f), making the contact frame
+    # genuinely dynamic within the solve.  Supported for sphere and cylinder only
+    # (box face normals are piecewise-constant and require frozen parameters).
+    # This causes L-BFGS to accumulate curvature pairs (s_k, y_k) that are
+    # inconsistent across iterations because ∇f changes not just due to x movement
+    # but also due to the frame rotating with x — demonstrably harder to solve.
+    symbolic_normals: bool = True
     smooth_sdf: bool  = True
     slsqp_alpha: float = 400.0  # smooth SDF alpha (collision avoidance SDF only)
 
@@ -733,7 +863,11 @@ class GraspPlanner3D:
               p1_init: np.ndarray | None = None,
               p2_init: np.ndarray | None = None,
               d1:      np.ndarray | None = None,
-              d2:      np.ndarray | None = None) -> dict:
+              d2:      np.ndarray | None = None,
+              iter_callback=None,
+              update_normals_in_callback: bool = False,
+              gamma_init: float | None = None,
+              y_by_corner_init: dict | None = None) -> dict:
         """
         Run 3D grasp optimisation (synchronous / blocking).
 
@@ -745,6 +879,15 @@ class GraspPlanner3D:
         p2_init : (3,)  optional index contact seed.
         d1, d2  : face-direction unit vectors (from MultiStart seeds).
                   When provided, pins p1/p2 to the corresponding geom face.
+        gamma_init       : optional γ from the caller's pre-solver LP check
+                            (min_gamma_for_accel_lp), used to warm-start the
+                            embedded wrench-cone LP's γ variable instead of 1.0.
+        y_by_corner_init : optional {corner_tuple: y*} dict from the same LP
+                            check (return_y=True), used to warm-start the
+                            per-corner cone coefficients y1/y2 instead of a
+                            uniform 1/5 split. Keyed by rounded
+                            (Tx,Ty,Tz,Fx,Fy,Fz) corner wrench, matching the
+                            corners generated in _embed_wrench_cone_ca.
 
         Returns
         -------
@@ -807,6 +950,7 @@ class GraspPlanner3D:
             [p1_seed, p2_seed],
             q_bias=q_ref, null_gain=0.3)
         mj.mj_kinematics(self.model, self._dls_data)
+        
         # DLS target is the contact point; IK error is ‖site − (p + r·n_out)‖.
         _d1_ws = (np.asarray(d1, float) if d1 is not None
                   else _geom_normal_np(p1_seed, geom_type, obj_center_np, obj_R_np, geom_size))
@@ -843,7 +987,9 @@ class GraspPlanner3D:
                        d1_lp: np.ndarray | None = None,
                        d2_lp: np.ndarray | None = None,
                        max_iter_override: int | None = None,
-                       stage_label: str = '') -> dict:
+                       stage_label: str = '',
+                       iter_callback=None,
+                       update_normals_in_callback: bool = False) -> dict:
 
             _t_stage_start = time.perf_counter()
             _uid = id(q_ws)
@@ -946,51 +1092,92 @@ class GraspPlanner3D:
 
             # ── 3. Wrench feasibility (embedded LP) ───────────────────────
             _gamma_lp    = None
-            _slack_list  = []
+            _y1_list     = []
+            _y2_list     = []
+            _s_list      = []
+            _R1_param    = None   # hoisted so _opti_cb closure can see them
+            _R2_param    = None
+            _n1_in       = None   # frozen contact normals actually used this stage
+            _n2_in       = None
             if cfg.wrench_constraint:
-                # Contact frames as 3×3 parameter — computed numerically, no Frisvad singularity.
-                # Held constant per solve; updated between Picard iterations by outer loop.
-                _n1_in = -(d1_lp if d1_lp is not None else
-                            _geom_normal_np(p1_ws, geom_type, obj_center_np, obj_R_np, geom_size))
-                _n2_in = -(d2_lp if d2_lp is not None else
-                            _geom_normal_np(p2_ws, geom_type, obj_center_np, obj_R_np, geom_size))
-                _R1_param = _opti.parameter(3, 3)
-                _R2_param = _opti.parameter(3, 3)
-                _opti.set_value(_R1_param, np.column_stack(_build_contact_frame_3d(_n1_in)))
-                _opti.set_value(_R2_param, np.column_stack(_build_contact_frame_3d(_n2_in)))
+                use_sym_normals = (cfg.symbolic_normals and
+                                   geom_type in (2, 5))  # sphere / cylinder only
+                if use_sym_normals:
+                    # Contact frame built as a CasADi MX expression of _p1/_p2.
+                    # CasADi re-evaluates this at every eval_f / eval_grad_f call,
+                    # so the frame tracks the current contact position throughout
+                    # the solve.  L-BFGS sees inconsistent curvature pairs because
+                    # ∇f changes both from x movement AND frame rotation.
+                    _c_dm  = ca.DM(obj_center_np)
+                    _Rt_dm = ca.DM(obj_R_np.T)
+                    _n1_in_sym = _sym_inward_normal_ca(_p1, geom_type, _c_dm, _Rt_dm, geom_size)
+                    _n2_in_sym = _sym_inward_normal_ca(_p2, geom_type, _c_dm, _Rt_dm, geom_size)
+                    _R1_expr = _symbolic_contact_frame_ca(_n1_in_sym)
+                    _R2_expr = _symbolic_contact_frame_ca(_n2_in_sym)
+                else:
+                    # Default: contact frames as 3×3 parameter — frozen per NLP solve,
+                    # updated between Picard iterations by the outer loop.
+                    _n1_in = -(d1_lp if d1_lp is not None else
+                                _geom_normal_np(p1_ws, geom_type, obj_center_np, obj_R_np, geom_size))
+                    _n2_in = -(d2_lp if d2_lp is not None else
+                                _geom_normal_np(p2_ws, geom_type, obj_center_np, obj_R_np, geom_size))
+                    _R1_param = _opti.parameter(3, 3)
+                    _R2_param = _opti.parameter(3, 3)
+                    _opti.set_value(_R1_param, np.column_stack(_build_contact_frame_3d(_n1_in)))
+                    _opti.set_value(_R2_param, np.column_stack(_build_contact_frame_3d(_n2_in)))
+                    _R1_expr = _R1_param
+                    _R2_expr = _R2_param
 
-                _gamma_lp, _slack_list, _y1_list, _y2_list = _embed_wrench_cone_ca(
+                _gamma_lp, _y1_list, _y2_list, _corners, _s_list = _embed_wrench_cone_ca(
                     _opti, _p1, _p2,
-                    _R1_param, _R2_param,
-                    obj_center_np, _mu,
+                    _R1_expr, _R2_expr,
+                    obj_center_np, obj_R_np, _mu,
                     np.array([_nlp_fx, _nlp_fy, _nlp_fz]),
-                    np.array([_nlp_tx, _nlp_ty, _nlp_tz]))
-                _opti.set_initial(_gamma_lp, 1.0)
+                    np.array([_nlp_tx, _nlp_ty, _nlp_tz]),
+                    use_slack=(cfg.w_slack is not None))
+                # Warm-start γ and the per-corner cone y's from the caller's
+                # pre-solver LP check (min_gamma_for_accel_lp) when available,
+                # falling back to a naive uniform init otherwise.
+                _opti.set_initial(_gamma_lp,
+                                   float(gamma_init) if gamma_init is not None else 1.0)
                 _y_init = np.ones(5) / 5.0
-                for _y1_k, _y2_k, _s_k in zip(_y1_list, _y2_list, _slack_list):
-                    _opti.set_initial(_y1_k, _y_init)
-                    _opti.set_initial(_y2_k, _y_init)
-                    _opti.set_initial(_s_k, np.zeros(3))
+                for _w_k, _y1_k, _y2_k in zip(_corners, _y1_list, _y2_list):
+                    _y_star = (y_by_corner_init.get(tuple(np.round(_w_k, 9)))
+                               if y_by_corner_init is not None else None)
+                    if _y_star is not None:
+                        _opti.set_initial(_y1_k, _y_star[:5])
+                        _opti.set_initial(_y2_k, _y_star[5:])
+                    else:
+                        _opti.set_initial(_y1_k, _y_init)
+                        _opti.set_initial(_y2_k, _y_init)
 
-            # Finalize cost (gamma + slack penalty + y regularizer — all normalized)
+            # Finalize cost (gamma + y regularizer + wrench-cone slack — all normalized)
             # Sentinel zero expressions let the log helper always evaluate all terms.
             _cost_gamma = ca.DM(0.0)
-            _cost_slack = ca.DM(0.0)
             _cost_y     = ca.DM(0.0)
+            _cost_slack = ca.DM(0.0)
             if _gamma_lp is not None:
                 _g_ref  = float(np.linalg.norm([_nlp_fx, _nlp_fy, _nlp_fz]))  # N task load
-                _s_ref  = 0.005                                                  # N acceptable slack
+                _t_ref  = float(np.linalg.norm([_nlp_tx, _nlp_ty, _nlp_tz]))  # N*m task load
                 _y_ref  = _g_ref                                                 # N force scale
-                _n_c    = max(len(_slack_list), 1)
+                _n_c    = max(len(_y1_list), 1)
                 _n_y    = _n_c * 10                                              # 5 verts × 2 contacts per corner
                 _cost_gamma = _gamma_lp / max(_g_ref, 1e-6)
-                _cost_slack = sum(ca.sumsqr(sk) for sk in _slack_list) / (_n_c * _s_ref**2)
                 _cost_y     = sum(ca.sumsqr(y1k) + ca.sumsqr(y2k)
                                   for y1k, y2k in zip(_y1_list, _y2_list)) / (_n_y * _y_ref**2)
-                _opti.minimize(_cost
-                             + cfg.w_gamma * _cost_gamma
-                             + cfg.w_slack * _cost_slack
-                             + cfg.w_y     * _cost_y)
+                _opti_cost = (_cost
+                              + cfg.w_gamma * _cost_gamma
+                              + cfg.w_y     * _cost_y)
+                if cfg.w_slack is not None and _s_list:
+                    # Per-row normalization: rows 0-2 are torque (N*m), rows 3-5
+                    # are force (N) — mixed units, so each needs its own
+                    # reference scale before summing squares (same pattern as
+                    # _g_ref elsewhere).
+                    _ref6 = ca.DM([max(_t_ref, 1e-6)] * 3 + [max(_g_ref, 1e-6)] * 3)
+                    _cost_slack = (sum(ca.sumsqr(s_k / _ref6) for s_k in _s_list)
+                                   / max(len(_s_list), 1))
+                    _opti_cost = _opti_cost + cfg.w_slack * _cost_slack
+                _opti.minimize(_opti_cost)
             else:
                 _opti.minimize(_cost)
 
@@ -1078,8 +1265,8 @@ class GraspPlanner3D:
                 ('Jik',        _cost_ik),
                 ('Jreg',       _cost_reg),
                 ('Jgam',       _cost_gamma),
-                ('Jslk',       _cost_slack),
                 ('Jy',         _cost_y),
+                ('Jslack',     _cost_slack),
             ]
             if self.log_dir:
                 if include_surface:
@@ -1093,9 +1280,14 @@ class GraspPlanner3D:
                         ('col_rf', _sdf(_tr) - _d_min),
                     ]
 
-            # Per-iteration logger (logging only — no parameter updates here;
-            # updating opti parameters inside the callback corrupts the L-BFGS
-            # curvature pairs and causes numerical divergence).
+            # Per-iteration logger.  Parameter updates are intentionally absent:
+            # calling opti.set_value() here corrupts the L-BFGS curvature pairs
+            # and causes numerical divergence.  The iter_callback receives a
+            # read-only snapshot of current contact positions and their actual
+            # surface normals for diagnostic / visualisation purposes only.
+            _d1_frozen = d1_lp if d1_lp is not None else np.zeros(3)
+            _d2_frozen = d2_lp if d2_lp is not None else np.zeros(3)
+
             def _opti_cb(i):
                 if _log_exprs:
                     parts = [f"i={i:3d}"]
@@ -1106,6 +1298,47 @@ class GraspPlanner3D:
                         except Exception:
                             parts.append(f"{_lbl}=?")
                     self.log.debug(_log_tag + "  ".join(parts))
+                if iter_callback is not None or update_normals_in_callback:
+                    try:
+                        _p1v = np.asarray(_opti.debug.value(_p1), float).flatten()
+                        _p2v = np.asarray(_opti.debug.value(_p2), float).flatten()
+                        _n1a = _geom_normal_np(_p1v, geom_type,
+                                               obj_center_np, obj_R_np, geom_size)
+                        _n2a = _geom_normal_np(_p2v, geom_type,
+                                               obj_center_np, obj_R_np, geom_size)
+                        _cos1 = float(np.clip(np.dot(_d1_frozen, _n1a), -1.0, 1.0))
+                        _cos2 = float(np.clip(np.dot(_d2_frozen, _n2a), -1.0, 1.0))
+                        _mismatch = max(np.degrees(np.arccos(_cos1)),
+                                        np.degrees(np.arccos(_cos2)))
+                        if update_normals_in_callback and _R1_param is not None:
+                            # Deliberately update the wrench-frame parameters mid-solve.
+                            # This re-linearizes the contact frame every SQP/IPOPT
+                            # iteration, which corrupts the L-BFGS curvature pairs
+                            # (y = ∇f_new − ∇f_old is inconsistent when f changed
+                            # between iterates due to the parameter shift).
+                            _new_R1 = np.column_stack(
+                                _build_contact_frame_3d(-_n1a))
+                            _new_R2 = np.column_stack(
+                                _build_contact_frame_3d(-_n2a))
+                            _opti.set_value(_R1_param, _new_R1)
+                            _opti.set_value(_R2_param, _new_R2)
+                            _d1_frozen[:] = _n1a
+                            _d2_frozen[:] = _n2a
+                        if iter_callback is not None:
+                            iter_callback({
+                                'iter':         i,
+                                'stage':        stage_label,
+                                'p1':           _p1v,
+                                'p2':           _p2v,
+                                'n1_actual':    _n1a,
+                                'n2_actual':    _n2a,
+                                'n1_frozen':    _d1_frozen.copy(),
+                                'n2_frozen':    _d2_frozen.copy(),
+                                'mismatch_deg': _mismatch,
+                                'cost':         float(_opti.debug.value(_opti.f)),
+                            })
+                    except Exception:
+                        pass
 
             _opti.callback(_opti_cb)
 
@@ -1161,15 +1394,16 @@ class GraspPlanner3D:
                     try:    return float(val_fn(expr))
                     except: return float('nan')
                 ik   = _v(_cost_ik);   reg  = _v(_cost_reg)
-                gam  = _v(_cost_gamma); slk = _v(_cost_slack); y = _v(_cost_y)
+                gam  = _v(_cost_gamma); y = _v(_cost_y); slack = _v(_cost_slack)
                 f    = _v(_opti.f)
+                _w_slack_disp = cfg.w_slack if cfg.w_slack is not None else 0.0
                 return (
                     f"f={f:.4f}  "
                     f"ik={cfg.w_ik*ik:.4f}({ik:.3f})  "
                     f"reg={cfg.w_reg*reg:.4f}({reg:.3f})  "
                     f"γ={cfg.w_gamma*gam:.4f}({gam:.3f})  "
-                    f"slk={cfg.w_slack*slk:.4f}({slk:.3f})  "
-                    f"y={cfg.w_y*y:.4f}({y:.3f})"
+                    f"y={cfg.w_y*y:.4f}({y:.3f})  "
+                    f"slack={_w_slack_disp*slack:.4f}({slack:.3f})"
                 )
 
             def _torque_diagnostic(val_fn) -> str:
@@ -1198,22 +1432,6 @@ class GraspPlanner3D:
                 except Exception as _te:
                     return f"torque_diag_err={_te}"
 
-            def _max_slack(val_fn):
-                if not _slack_list:
-                    return 0.0
-                try:
-                    return float(max(np.max(np.abs(val_fn(sk))) for sk in _slack_list))
-                except Exception:
-                    return float('nan')
-
-            def _slack_vectors(val_fn):
-                result = []
-                for sk in _slack_list:
-                    try:
-                        result.append(np.asarray(val_fn(sk)).flatten().tolist())
-                    except Exception:
-                        result.append([float('nan'), float('nan'), float('nan')])
-                return result
 
             try:
                 _sol = _opti.solve()
@@ -1230,8 +1448,12 @@ class GraspPlanner3D:
                     'iterations': _sol.stats()['iter_count'],
                     'status':     'converged',
                     'gamma_nlp':     float(_sol.value(_gamma_lp)) if _gamma_lp is not None else None,
-                    'max_slack':     _max_slack(_sol.value),
-                    'slack_vectors': _slack_vectors(_sol.value),
+                    'slack_norms':   ([float(np.linalg.norm(_sol.value(sk))) for sk in _s_list]
+                                       if _s_list else None),
+                    'max_slack_norm': (float(max(np.linalg.norm(_sol.value(sk)) for sk in _s_list))
+                                        if _s_list else None),
+                    'n1_frozen':     _n1_in.tolist() if _n1_in is not None else None,
+                    'n2_frozen':     _n2_in.tolist() if _n2_in is not None else None,
                 }
             except Exception as _e:
                 self.log.warning(f"GraspPlanner3D._run_stage({stage_label}): {_e}")
@@ -1251,15 +1473,18 @@ class GraspPlanner3D:
                         'iterations': (_st or {}).get('iter_count'),
                         'status':     'best-effort',
                         'gamma_nlp':     float(_opti.debug.value(_gamma_lp)) if _gamma_lp is not None else None,
-                        'max_slack':     _max_slack(_opti.debug.value),
-                        'slack_vectors': _slack_vectors(_opti.debug.value),
+                        'slack_norms':   ([float(np.linalg.norm(_opti.debug.value(sk))) for sk in _s_list]
+                                           if _s_list else None),
+                        'max_slack_norm': (float(max(np.linalg.norm(_opti.debug.value(sk)) for sk in _s_list))
+                                            if _s_list else None),
+                        'n1_frozen':     _n1_in.tolist() if _n1_in is not None else None,
+                        'n2_frozen':     _n2_in.tolist() if _n2_in is not None else None,
                     }
                 except Exception as _e2:
                     self.log.error(f"GraspPlanner3D debug extraction: {_e2}")
                     return {'success': False, 'q': None, 'p1': None, 'p2': None,
                             'cost': None, 'iterations': None, 'status': 'failed',
-                            'gamma_nlp': None, 'max_slack': float('nan'),
-                            'slack_vectors': []}
+                            'gamma_nlp': None, 'slack_norms': None, 'max_slack_norm': None}
 
         # ── Run optimisation ─────────────────────────────────────────────────
         # Outer re-linearisation loop.  Contact normals are frozen per NLP solve
@@ -1281,7 +1506,9 @@ class GraspPlanner3D:
                              d1_lp=_d1_lp,
                              d2_lp=_d2_lp,
                              max_iter_override=cfg.max_iter,
-                             stage_label=f'S{_ri+1}')
+                             stage_label=f'S{_ri+1}',
+                             iter_callback=iter_callback,
+                             update_normals_in_callback=update_normals_in_callback)
             # Keep the cheapest stage result — relinearization has no descent guarantee.
             if (res.get('cost') is not None and
                     (not _best_res or res['cost'] < _best_res.get('cost', float('inf')))):
@@ -1310,8 +1537,7 @@ class GraspPlanner3D:
 
             self.log.info(
                 f"[relinearize S{_ri+1}→S{_ri+2}] "
-                f"dp={_dp*1e3:.2f}mm  mismatch={_mismatch_deg:.1f}°  "
-                f"max_slack={res.get('max_slack', float('nan')):.3e}")
+                f"dp={_dp*1e3:.2f}mm  mismatch={_mismatch_deg:.1f}°")
 
             if _dp < _tol_p_m and _mismatch_deg < _tol_deg:
                 self.log.info(
@@ -1345,10 +1571,8 @@ class GraspPlanner3D:
             self.log.info(
                 f"[solve|final] n1={np.round(_n1f, 3).tolist()}  n2={np.round(_n2f, 3).tolist()}  "
                 f"dot={_dot12:+.3f}  span_margin={_sm:+.4f}rad")
-            _svecs = res.get('slack_vectors', [])
-            if _svecs:
-                self.log.info(
-                    f"[solve|slack] per_corner={[[round(x, 4) for x in sv] for sv in _svecs]}")
+            res['n1_final'] = _n1f.tolist()
+            res['n2_final'] = _n2f.tolist()
             res['span_margin_final'] = _sm
         return res
 
@@ -1402,10 +1626,12 @@ class GraspPlanner3D:
         s4 = _sdf3(data_v.geom_xpos[self._ring_gid])
 
         # Wrench feasibility (post-solve LP for debugging/analysis)
-        cfg         = self.cfg
-        gamma_min   = None
-        wf_feasible = False
-        wf_tag      = 'SKIP'
+        cfg            = self.cfg
+        gamma_min      = None
+        max_slack_norm = None
+        wf_feasible    = False
+        wf_tag         = 'SKIP'
+        n1_out = n2_out = None
         try:
             if (_NCF_AVAILABLE
                     and result.get('p1') is not None
@@ -1435,7 +1661,7 @@ class GraspPlanner3D:
                 _p2_O_v  = R_WO_v.T @ (p2_np - obj_pos)
                 R1_O     = R_WO_v.T @ R1
                 R2_O     = R_WO_v.T @ R2
-                gamma_min = min_gamma_for_accel_lp(
+                gamma_min, max_slack_norm = min_gamma_for_accel_lp(
                     _mass_v * _accel_v[0], _mass_v * _accel_v[1], _mass_v * _accel_v[2],
                     float(_inert_v[0])*_aab_v[0], float(_inert_v[1])*_aab_v[1], float(_inert_v[2])*_aab_v[2],
                     n=2,
@@ -1445,9 +1671,17 @@ class GraspPlanner3D:
                     tan_y=[0.0, 0.0],
                     tan_z=[0.0, 0.0],
                     mu=[_mu_v, _mu_v],
+                    slack_penalty=cfg.verify_slack_penalty,
                 )
                 wf_feasible = (gamma_min is not None)
-                wf_tag = f'OK(γ_min={gamma_min:.3f})' if wf_feasible else 'INFEASIBLE'
+                _slack_bad = (max_slack_norm is not None
+                              and max_slack_norm > cfg.verify_slack_tol)
+                if _slack_bad:
+                    wf_tag = f'SLACK(γ_min={gamma_min:.3f}, slack={max_slack_norm:.4f})'
+                elif wf_feasible:
+                    wf_tag = f'OK(γ_min={gamma_min:.3f})'
+                else:
+                    wf_tag = 'INFEASIBLE'
         except Exception as _e:
             wf_tag = f'ERROR: {_e}'
 
@@ -1468,7 +1702,10 @@ class GraspPlanner3D:
             'sdf_ring_tip_mm':      s4   * 1000,
             'wrench_feasible':      wf_feasible,
             'gamma_min':            gamma_min,
+            'max_slack_norm':       max_slack_norm,
             'gamma_nlp':            result.get('gamma_nlp'),
+            'n1_verify':            n1_out.tolist() if n1_out is not None else None,
+            'n2_verify':            n2_out.tolist() if n2_out is not None else None,
         }
         self.log.info(
             f"[verify3d] IK=({ik_t*1e3:.2f},{ik_i*1e3:.2f})mm "
@@ -1618,14 +1855,16 @@ class MultiStartGraspPlanner3D:
         _r_tip_min = min(cfg.r_thumb, cfg.r_index)  # conservative: unknown which tip goes where
 
         _t0 = time.perf_counter()
+
+        # sample seeds for solver
         seeds, attempts, rejected = [], 0, 0
         while len(seeds) < n_seeds and attempts < max_attempts:
             attempts += 1
             s = _seed_pair(geom_type, geom_size, c, obj_R_np, bbox_r, self._rng)
-            # Hemisphere check — n1 and n2 must point into opposing hemispheres
-            if float(np.dot(s['n1_in'], s['n2_in'])) >= 0:
-                rejected += 1
-                continue
+            # # Hemisphere check — n1 and n2 must point into opposing hemispheres
+            # if float(np.dot(s['n1_in'], s['n2_in'])) >= 0:
+            #     rejected += 1
+            #     continue
             # Reachability check — reject contacts below the table or facing downward
             n1_out = -s['n1_in'];  n2_out = -s['n2_in']
             if (not _reachable_contact(s['p1s'], _ground_z, _r_tip_min) or
@@ -1647,8 +1886,11 @@ class MultiStartGraspPlanner3D:
             if dash is not None:
                 dash.push({'type': 'active', 'label': f'grasp3d seed {i+1}/{n_seeds}'})
 
-            # ── Pre-check LP on surface footprints ────────────────────────────
+            # ── Pre-check LP on surface footprints (slack-relaxed — see
+            #    cfg.precheck_slack_penalty) ───────────────────────────────────
             g_pre = None
+            y_by_corner_pre = None
+            max_slack_pre = None
             if _NCF_AVAILABLE and min_gamma_for_accel_lp is not None:
                 try:
                     _, t1_1, t2_1 = _build_contact_frame_3d(seed['n1_in'])
@@ -1659,7 +1901,7 @@ class MultiStartGraspPlanner3D:
                     p2s_O = obj_R_np.T @ (seed['p2s'] - obj_center_np)
                     R1_O  = obj_R_np.T @ R1
                     R2_O  = obj_R_np.T @ R2
-                    g_pre = min_gamma_for_accel_lp(
+                    g_pre, y_by_corner_pre, max_slack_pre, _ = min_gamma_for_accel_lp(
                         _nlp_fx, _nlp_fy, _nlp_fz,
                         _nlp_tx, _nlp_ty, _nlp_tz,
                         n=2,
@@ -1669,22 +1911,31 @@ class MultiStartGraspPlanner3D:
                         tan_y=[0.0, 0.0],
                         tan_z=[0.0, 0.0],
                         mu=[_mu, _mu],
+                        return_y=True,
+                        slack_penalty=cfg.precheck_slack_penalty,
                     )
+                    log.debug(f"[seed {i+1}] pre-check LP γ={g_pre:.3f} "
+                              f"slack={max_slack_pre:.4f}")
                 except Exception as _lp_e:
                     log.debug(f"[seed {i+1}] pre-check LP error: {_lp_e}")
 
+            # Remove seeds that are obviously infeasible (γ > 500, or the pre-check
+            # relies heavily on slack to reach a finite γ) to avoid wasting time on
+            # NLP solves.
             g_pre_str = f'{g_pre:.2f}' if g_pre is not None else 'N/A'
-            if g_pre is not None and g_pre > 50.0:
+            if g_pre is not None and g_pre > 500.0:
                 log.debug(
-                    f"[seed {i+1}/{n_seeds}] pre-check γ={g_pre:.1f} > 50 — skip")
+                    f"[seed {i+1}/{n_seeds}] pre-check γ={g_pre:.1f} > 500 — skip")
                 continue
 
-            # ── Run NLP ───────────────────────────────────────────────────────
+            # ── Run NLP (warm-started from the pre-check LP's γ and cone y's) ──
             r = self._planner.solve(q_ref, obj_pos,
                                     p1_init=seed['p1'],
                                     p2_init=seed['p2'],
                                     d1=-seed['n1_in'],   # outward normal
-                                    d2=-seed['n2_in'])
+                                    d2=-seed['n2_in'],
+                                    gamma_init=g_pre,
+                                    y_by_corner_init=y_by_corner_pre)
 
             # ── Post-solve diagnostics ────────────────────────────────────────
             sdf_p1 = sdf_p2 = float('nan')
@@ -1707,18 +1958,30 @@ class MultiStartGraspPlanner3D:
                     ik_if = float(np.linalg.norm(
                         self._fk_data.site_xpos[self._planner._index_sid] - _tgt2)) * 1e3
 
-                # Post-solve filter: large slack means force rows unresolvable
-                if r.get('max_slack', float('inf')) > 0.05:
-                    r['status'] = 'wrench-infeasible'
+                # The embedded LP is a slack-relaxed, corner-coupled equality
+                # (matches verify()'s min_gamma_for_accel_lp slack_penalty mode) —
+                # solver convergence alone no longer certifies exact wrench
+                # feasibility, since a corner's slack can absorb an unresolved
+                # residual. wrench_ok additionally requires that residual be
+                # negligible (cfg.slack_tol_abs).
+                _max_slack = r.get('max_slack_norm')
+                _slack_ok  = (_max_slack is None) or (_max_slack < cfg.slack_tol_abs)
+                r['wrench_ok'] = (r.get('status') == 'converged') and _slack_ok
 
             o1, o2 = seed['offsets']
+            _n1_ang_sf = _angle_deg_between(seed.get('n1_in'), r.get('n1_frozen'))
+            _n1_ang_ff = _angle_deg_between(r.get('n1_frozen'), r.get('n1_final'))
+            _n2_ang_sf = _angle_deg_between(seed.get('n2_in'), r.get('n2_frozen'))
+            _n2_ang_ff = _angle_deg_between(r.get('n2_frozen'), r.get('n2_final'))
             log.info(
                 f"[seed {i+1}/{n_seeds}] "
                 f"o=({o1*1e3:+.1f},{o2*1e3:+.1f})mm δ={seed['delta_deg']:.0f}° "
                 f"γ_pre={g_pre_str} γ_nlp={r.get('gamma_nlp') or float('nan'):.3f} "
-                f"slack={r.get('max_slack', float('nan')):.3f}N "
+                f"wrench_ok={r.get('wrench_ok')} "
                 f"sdf=({sdf_p1*1e3:.2f},{sdf_p2*1e3:.2f})mm "
                 f"IK=({ik_th:.1f},{ik_if:.1f})mm "
+                f"n1(seed→frozen→final)={_n1_ang_sf:.1f}°/{_n1_ang_ff:.1f}° "
+                f"n2(seed→frozen→final)={_n2_ang_sf:.1f}°/{_n2_ang_ff:.1f}° "
                 f"iters={r.get('iterations', '?')} → {r.get('status', '?')}")
 
             r['p1_seed']  = seed['p1s'].copy()
@@ -1731,10 +1994,34 @@ class MultiStartGraspPlanner3D:
                     'cost': None, 'status': 'failed', 'all_results': []}
 
         def _rank(r):
-            ok  = r.get('p1') is not None and r.get('status') != 'wrench-infeasible'
+            ok = (r.get('p1') is not None
+                  and r.get('status') != 'failed'
+                  and r.get('wrench_ok', True))
             return (0 if ok else 1, r.get('cost') or 1e9)
 
         results.sort(key=_rank)
         best = results[0]
         best['all_results'] = results
+
+        # ── Summary: seed vs. final contact-normal divergence for the best result ──
+        _best_seed = best.get('seed_meta') or {}
+        _n1_seed, _n1_final = _best_seed.get('n1_in'), best.get('n1_final')
+        _n2_seed, _n2_final = _best_seed.get('n2_in'), best.get('n2_final')
+        _n1_div = _angle_deg_between(_n1_seed, _n1_final)
+        _n2_div = _angle_deg_between(_n2_seed, _n2_final)
+        best['n1_seed']      = _n1_seed
+        best['n2_seed']      = _n2_seed
+        best['n1_divergence_deg'] = _n1_div
+        best['n2_divergence_deg'] = _n2_div
+        log.info(
+            f"[summary] best seed idx={results.index(best)+1}/{len(results)} "
+            f"n1(seed→final)={np.round(_n1_seed, 3).tolist() if _n1_seed is not None else None}"
+            f"→{np.round(_n1_final, 3).tolist() if _n1_final is not None else None} "
+            f"Δ={_n1_div:.1f}° "
+            f"n2(seed→final)={np.round(_n2_seed, 3).tolist() if _n2_seed is not None else None}"
+            f"→{np.round(_n2_final, 3).tolist() if _n2_final is not None else None} "
+            f"Δ={_n2_div:.1f}° "
+            f"γ_nlp={best.get('gamma_nlp') or float('nan'):.3f} "
+            f"status={best.get('status', '?')}")
+
         return best
