@@ -108,6 +108,12 @@ class DexPilotController:
         """True once tracking has been started (via start())."""
         return self._active
 
+    @property
+    def raw_msg(self) -> list | None:
+        """Latest raw /hand/joint_angles payload (or None). Exposed so callers can
+        visualise the world landmarks (raw[57:120]) without reaching into ._ros."""
+        return self._ros.raw_msg
+
     def start(self, data: mj.MjData) -> None:
         """(Re)zero tracking to the robot's current pose and enable tracking.
 

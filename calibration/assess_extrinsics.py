@@ -90,10 +90,16 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--camera", type=int, required=True)
+    p.add_argument("--name", default=None,
+                   help="Per-camera name for multi-camera rigs. Loads "
+                        "camera_intrinsics_<name>.json and (on save) writes "
+                        "camera_extrinsics_<name>.json — the same files the fusion "
+                        "node and hand_landmark_node use. Omit for single-camera. "
+                        "Explicit --intrinsics/--out override this.")
     p.add_argument("--square-mm", type=float, required=True,
                    help="MEASURED printed square size in mm")
-    p.add_argument("--intrinsics", default=DEFAULT_INTRINSICS)
-    p.add_argument("--out", default=DEFAULT_EXTRINSICS)
+    p.add_argument("--intrinsics", default=None)
+    p.add_argument("--out", default=None)
     # Default 640x480 to match a typical intrinsics calibration resolution;
     # override to whatever resolution camera_intrinsics.json was captured at.
     p.add_argument("--width", type=int, default=640)
@@ -101,6 +107,17 @@ def main() -> None:
     p.add_argument("--window", type=int, default=30,
                    help="rolling window (frames) for jitter stats")
     args = p.parse_args()
+
+    # Resolve per-camera calibration paths from --name (explicit paths win).
+    def _named(default_path, name):
+        if not name:
+            return default_path
+        root, ext = os.path.splitext(default_path)
+        return f"{root}_{name}{ext}"
+    if args.intrinsics is None:
+        args.intrinsics = _named(DEFAULT_INTRINSICS, args.name)
+    if args.out is None:
+        args.out = _named(DEFAULT_EXTRINSICS, args.name)
 
     square_m = args.square_mm / 1000.0
     board, aruco_dict = _make_board(square_m)

@@ -392,6 +392,21 @@ if __name__ == "__main__":
              "when the R key is pressed. Each sample is (q_seed, obj_qpos, object, "
              "recommender candidate {q,p1,p2}) — everything tune_ik_weights.py needs to "
              "re-run the recommender->collision-IK gap offline under swept weights.")
+    _arg_parser.add_argument(
+        '--no-mediapipe', '--external-hand', dest='no_mediapipe',
+        action='store_true',
+        help="dexpilot / contact_aware_teleop: do NOT spawn the built-in single-camera "
+             "publisher (ui/mediapipe_joint_angles.py). Use when an EXTERNAL process "
+             "already publishes /hand/joint_angles — e.g. teleop/run_multicam.py — so "
+             "the teleop app only subscribes. Avoids two publishers racing on the same "
+             "topic (interleaved single-cam + fused poses).")
+    _arg_parser.add_argument(
+        '--skeleton-view', action='store_true',
+        help="dexpilot / contact_aware_teleop: open a separate orbitable 3D window "
+             "showing the hand skeleton from the WORLD landmarks in /hand/joint_angles "
+             "(raw[57:120]) — the same fused skeleton run_multicam.py --show draws, so "
+             "you can watch the multi-camera fusion while teleoping. No camera-preview "
+             "grid (those images aren't in the joint_angles message).")
     args = _arg_parser.parse_args()
     if args.mode == 'rrt':          # deprecated alias
         args.mode = 'contact_aware_autonomous'
@@ -1328,12 +1343,19 @@ if __name__ == "__main__":
         # Launch the MediaPipe publisher as a subprocess so its OpenCV window
         # appears alongside the MuJoCo viewer. The subprocess inherits the
         # current environment (CYCLONEDDS_URI, ROS sourcing, venv Python).
-        _mp_cmd = [sys.executable,
-                   'ui/mediapipe_joint_angles.py']
-        if args.camera is not None:
-            _mp_cmd += ['--camera', str(args.camera)]
-        _mediapipe_proc = subprocess.Popen(_mp_cmd)
-        print(f"[DexPilot] MediaPipe publisher launched (pid {_mediapipe_proc.pid})")
+        # --no-mediapipe/--external-hand skips this so an external publisher
+        # (e.g. teleop/run_multicam.py) can be the SOLE source on
+        # /hand/joint_angles — two publishers on one topic interleave poses.
+        if args.no_mediapipe:
+            print("[DexPilot] --no-mediapipe: single-cam publisher NOT started; "
+                  "subscribing to an external /hand/joint_angles publisher.")
+        else:
+            _mp_cmd = [sys.executable,
+                       'ui/mediapipe_joint_angles.py']
+            if args.camera is not None:
+                _mp_cmd += ['--camera', str(args.camera)]
+            _mediapipe_proc = subprocess.Popen(_mp_cmd)
+            print(f"[DexPilot] MediaPipe publisher launched (pid {_mediapipe_proc.pid})")
 
         from teleop.dexpilot_controller import DexPilotController
         from teleop.dexpilot_arm_controller import (load_camera_calibration,
@@ -1364,6 +1386,20 @@ if __name__ == "__main__":
             # offset, no stale orientation_correction.json. Set False to re-enable
             # the press-8 auto-calibration.
             _cam_kwargs["identity_orientation"] = True
+            # MULTICAM (--no-mediapipe): the fused palm_R is already in the SHARED
+            # WORLD frame (triangulated), not a single camera's MediaPipe frame. So
+            # the single-cam R_cam_robot (= that one camera's R_world_cam, ~103.7°
+            # of rotation) must NOT be applied — it re-rotates an already-world palm
+            # and flips the wrist orientation. The orientation chain in step() is
+            #   R_des = R_correct @ R_cam_robot @ R_mp_to_cv @ palm_R,
+            # with R_correct=I (identity_orientation) and R_mp_to_cv=diag([1,-1,-1]).
+            # Choosing R_cam_robot = diag([1,-1,-1]) makes R_cam_robot@R_mp_to_cv = I,
+            # so R_des = palm_R maps the fused world palm DIRECTLY to the robot. The
+            # single-cam path keeps the measured R_cam_robot (unchanged below).
+            if args.no_mediapipe:
+                _cam_kwargs["R_cam_robot"] = np.diag([1.0, -1.0, -1.0])
+                print("[DexPilot] multicam: R_cam_robot neutralized (fused palm is "
+                      "already world-frame) — direct world->robot orientation.")
             print(f"[DexPilot] loaded camera calibration: "
                   f"scale_x={_cam_kwargs['scale_x']:.3f} scale_z={_cam_kwargs['scale_z']:.3f} "
                   f"| position={_cam_kwargs['position_mode']} abs_scale={_cam_kwargs['abs_scale']:.2f} "
@@ -1481,6 +1517,45 @@ if __name__ == "__main__":
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")
         print("[DexPilot] Press 8 to start tracking (captures your current wrist "
               "orientation as the robot's home). Q/Esc: quit")
+
+    # --- Optional fused-skeleton viewer (dexpilot / contact_aware_teleop) ---
+    # Reuses teleop/skeleton_viewer.SkeletonViewer, fed the 21 WORLD landmarks that
+    # already ride in every /hand/joint_angles message (raw[57:120]) — the SAME points
+    # the multicam fusion node draws. So this shows the fused skeleton with zero extra
+    # ROS wiring; it just visualises what's already reaching the retargeter. Camera
+    # positions can't be drawn here (calib lives in the fusion node, not the message),
+    # and the camera-preview grid needs the /hand/cam_*/preview topics — use
+    # run_multicam.py --show for those. Drawn once per frame from both teleop branches.
+    _skel_viewer = None
+    if args.skeleton_view and args.mode in _teleop_modes:
+        sys.path.insert(0, __file__.rsplit('/', 1)[0] + '/teleop')
+        from skeleton_viewer import SkeletonViewer   # noqa: E402
+        _skel_viewer = SkeletonViewer(name="teleop hand skeleton")
+        print("[teleop] skeleton view on — orbit with mouse, r reset, z flip up.")
+
+    def _draw_skeleton():
+        """Feed the latest ABSOLUTE world-frame hand skeleton to the viewer.
+
+        The /hand/joint_angles world-landmark block (raw[57:120]) is WRIST-RELATIVE
+        (world_lm = pts - pts[wrist] in the fusion node), so drawing it alone pins
+        the wrist at the origin — the hand articulates but never translates, which
+        is NOT what the fusion node's own viewer shows. Re-add the absolute wrist
+        position (raw[0:3], the triangulated wrist in the shared world frame) to
+        recover the true world pose the multicam viewer draws. Draws empty until a
+        hand is tracked; no-op if the viewer isn't enabled."""
+        if _skel_viewer is None:
+            return
+        raw = _dexpilot_ctrl.raw_msg
+        pts = None
+        n_lm = 0
+        if raw is not None and len(raw) >= 120:
+            wrist_rel = np.asarray(raw[57:120], float).reshape(21, 3)
+            wrist_abs = np.asarray(raw[0:3], float)      # absolute wrist (world frame)
+            pts = wrist_rel + wrist_abs                  # wrist-relative -> absolute
+            n_lm = 21
+        _skel_viewer.show(pts, f"world landmarks: {n_lm}/21  "
+                               f"wrist=({raw[0]:+.2f},{raw[1]:+.2f},{raw[2]:+.2f})m"
+                               if pts is not None else "waiting for hand…")
 
     # --- contact_aware_teleop: NLP grasp recommender machinery ---
     # A per-object MultiStartGraspPlanner3D (built lazily, box-like first) continuously
@@ -1844,6 +1919,7 @@ if __name__ == "__main__":
             # machinery below (like autonomous mode) with recommended contacts. ---
             if _CAT_MODE and _teleop_active:
                 _dexpilot_ctrl.spin()
+                _draw_skeleton()   # fused-hand overlay (no-op unless --skeleton-view)
                 if _tune_retarget:
                     _dexpilot_ctrl.poll_retarget_config()  # hot-reload retarget_config.json edits
 
@@ -2095,6 +2171,7 @@ if __name__ == "__main__":
             # --- DexPilot teleop mode: bypass the RRT/grasp state machine ---
             if args.mode == 'dexpilot':
                 _dexpilot_ctrl.spin()
+                _draw_skeleton()   # fused-hand overlay (no-op unless --skeleton-view)
                 if _tune_retarget:
                     _dexpilot_ctrl.poll_retarget_config()  # hot-reload retarget_config.json edits
                 # Drain key queue — handle quit and teleop start/re-zero
@@ -3004,6 +3081,8 @@ if __name__ == "__main__":
     # its own cv2 windows on exit — no sim-side teardown needed.)
     if _dexpilot_ctrl is not None:
         _dexpilot_ctrl.shutdown()
+    if _skel_viewer is not None:
+        _skel_viewer.close()
     if _mediapipe_proc is not None:
         _mediapipe_proc.terminate()
         _mediapipe_proc.wait()

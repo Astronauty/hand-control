@@ -167,7 +167,11 @@ python internal_force_control.py
 
 ## Camera calibration (ChArUco board)
 
-Generate a printable ChArUco calibration board PNG (5×7 squares, 35 mm nominal, sized for letter paper):
+Calibration produces, per camera, the intrinsics (`camera_matrix`, `dist_coeffs`) and the extrinsic pose (`R_cam_world`, `t_cam_world`) that place the camera in a fixed **world frame** anchored to the board. Single-camera teleop uses these for metric wrist positioning; multi-camera triangulation uses them to fuse views (see [`teleop/MULTICAM.md`](teleop/MULTICAM.md)).
+
+### Board setup
+
+Generate a printable ChArUco board PNG (5×7 squares, 35 mm nominal, sized for letter paper):
 
 ```bash
 python calibration/charuco_calibration.py generate
@@ -175,15 +179,49 @@ python calibration/charuco_calibration.py generate
 
 Writes `calibration/board.png` (~7.2 × 9.9 in at 300 DPI). Options: `--square-mm` (nominal square size, default 35), `--dpi` (default 300), `--out`.
 
-Printing:
-1. Print at **100% / Actual size** — never "fit to page", which silently rescales and invalidates the metric calibration. Note the raw PNG has no DPI metadata, so viewers that assume 96 DPI will size it wrong; if your viewer misbehaves, place the image on a letter-size 300 DPI canvas first or print from an application that lets you set the scale explicitly.
+1. Print at **100% / Actual size** — never "fit to page", which silently rescales and invalidates the metric calibration. The raw PNG has no DPI metadata, so viewers that assume 96 DPI size it wrong; if your viewer misbehaves, place the image on a letter-size 300 DPI canvas first or print from an application that lets you set the scale explicitly.
 2. Glue or tape the print completely flat to something rigid (foam board, clipboard).
-3. Measure one black square edge with calipers — printers drift a few percent — and pass the **measured** value as `--square-mm` to the calibration steps:
+3. Measure one black square edge with calipers — printers drift a few percent — and pass the **measured** value as `--square-mm` to every step below.
+
+### Single camera
 
 ```bash
 python calibration/charuco_calibration.py intrinsics --camera 1 --square-mm 34.8
 python calibration/charuco_calibration.py extrinsics --camera 1 --square-mm 34.8
 ```
+
+`intrinsics`: wave the board across the frame; **SPACE** captures a view (collect 12+ at varied angle/tilt/distance), **C** calibrates. Aim for RMS < 1.0 px. `extrinsics`: fix the board at the desired world origin facing the camera; **SPACE** averages `--n-avg` frames and solves. Writes `calibration/camera_intrinsics.json` and `camera_extrinsics.json`.
+
+### Multiple cameras (triangulation rig)
+
+Each camera gets its own named calibration files (`camera_intrinsics_<name>.json`, `camera_extrinsics_<name>.json`). Two rules make triangulation valid:
+
+- **Same board pose for all extrinsics.** Every camera's extrinsic must be solved against the *same* fixed board placement — that shared pose is what puts all cameras in one world frame (no stereo calibration needed). Do not move the board between cameras.
+- **Calibrate at the capture resolution.** Intrinsics are only valid at the resolution they were estimated at. Use `--max-res` (opens the camera at its highest supported mode) consistently for calibration *and* at run time, or pin an explicit `--width/--height`. The fusion node hard-errors on a resolution mismatch.
+
+**1. Intrinsics — per camera** (independent of board placement):
+
+```bash
+python calibration/charuco_calibration.py intrinsics --camera 0 --name c0 --square-mm 34.8 --max-res
+python calibration/charuco_calibration.py intrinsics --camera 2 --name c1 --square-mm 34.8 --max-res
+```
+
+**2. Extrinsics — all cameras in one command** (board fixed for the whole run):
+
+```bash
+python calibration/charuco_calibration.py extrinsics-all \
+    --cam c0:0 --cam c1:2 --square-mm 34.8 --max-res
+```
+
+This walks through each `--cam <name>:<index>` in turn. Per camera: **SPACE** solves and saves, **S** skips, **Q** stops the walkthrough. Add more cameras (e.g. `--cam rs:4`) by appending to the list. (The single-camera `extrinsics --camera <idx> --name <name>` still works to redo just one.)
+
+**3. Validate.** Launch the pipeline and watch the fusion node's health log — median reprojection error should be a few px; it warns above ~8 px, which flags a moved board, a resolution mismatch, or a bad intrinsic:
+
+```bash
+python teleop/run_multicam.py --cam c0:0 --cam c1:2 --max-res --show-fused
+```
+
+See [`teleop/MULTICAM.md`](teleop/MULTICAM.md) for the full multi-camera pipeline (per-camera resolution, the combined viewer, and running teleop against the fused output).
 
 ---
 
@@ -195,12 +233,15 @@ python ui/mediapipe_joint_angles.py --camera 1    # specify camera index
 python ui/mediapipe_joint_angles.py --list-cameras
 ```
 
-Publishes to `/hand/joint_angles` (`Float32MultiArray`, 120 floats):
+Publishes to `/hand/joint_angles` (`Float32MultiArray`, 183 floats):
 
 | Slice | Content |
 |---|---|
-| `[0:3]` | Wrist position (camera space) |
-| `[3:6]` | Wrist Euler angles |
+| `[0:3]` | Wrist position (board/world metres in absolute mode, or image x,y + monocular depth in legacy mode) |
+| `[3:6]` | Wrist Euler angles (palm frame, ZYX degrees) |
 | `[6:51]` | 15-joint Euler angles |
 | `[51:57]` | 6 inter-segment flexion angles (degrees) |
-| `[57:120]` | 21 MediaPipe world landmark positions — 63 floats, (x,y,z) per landmark in metres |
+| `[57:120]` | 21 MediaPipe **world** landmark positions — 63 floats, (x,y,z) per landmark in metres |
+| `[120:183]` | 21 MediaPipe **image** landmark positions — 63 floats, (x,y,z) per landmark; normalised image coords (x,y ∈ [0,1], z = MediaPipe pseudo-depth). Drives the arm palm-frame normal (more stable near edge-on wrist poses than world-landmark depth) |
+
+The multi-camera fusion node ([`teleop/hand_fusion_node.py`](teleop/hand_fusion_node.py)) publishes the **same 183-float message** — the triangulated 3D skeleton fills both the world- and image-landmark blocks — so all downstream teleop is identical whether the source is the single-camera publisher or the fused rig.
