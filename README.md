@@ -60,15 +60,20 @@ Requires a sourced ROS 2 environment (see [ROS 2 setup](#ros-2-setup) below).
 
 **Start tracking:** the robot holds its home pose until you press **`8`**. Hold your hand at a comfortable neutral orientation and press `8` — that instant is captured as home, so the robot's wrist orientation is treated as matching yours, and it then follows your movement and rotation relative to that pose. `Q`/`Esc` quits.
 
-**Multi-camera (fused) input.** Both teleop modes take their hand pose from `/hand/joint_angles`, which by default the built-in single-camera publisher supplies. Pass `--multicam` to instead auto-launch the [multi-camera pipeline](teleop/MULTICAM.md) (triangulated, occlusion-robust) as a child process — no separate terminal:
+**Multi-camera (fused) input.** Both teleop modes take their hand pose from `/hand/joint_angles`, which by default the built-in single-camera publisher supplies. Pass `--multicam-auto` (or `--multicam` with explicit specs) to instead auto-launch the [multi-camera pipeline](teleop/MULTICAM.md) (triangulated, occlusion-robust) as a child process — no separate terminal:
 
 ```bash
+# hands-off: discover + match all calibrated cameras by hardware id
+python kinova_leap_pick_place.py --mode dexpilot \
+    --multicam-auto --skeleton-view --camera-views
+
+# or name each camera explicitly
 python kinova_leap_pick_place.py --mode dexpilot \
     --multicam c0:0 --multicam c1:2 --multicam rs:8 --multicam-realsense rs \
     --skeleton-view --camera-views
 ```
 
-Per-camera resolution is read from `camera_intrinsics_<name>.json`, so a bare `NAME:INDEX` is enough. Add `--recalibrate-extrinsics` to re-solve each camera's board pose interactively before teleop starts. See [CLI flags](#cli-flags) and [`teleop/MULTICAM.md`](teleop/MULTICAM.md).
+`--multicam-auto` finds every calibrated camera currently plugged in (RealSense auto-flagged) — no indices or names to pass. With explicit `--multicam`, per-camera resolution is read from `camera_intrinsics_<name>.json`, so a bare `NAME:INDEX` is enough. Add `--recalibrate-extrinsics` to re-solve each camera's board pose interactively before teleop starts. See [CLI flags](#cli-flags) and [`teleop/MULTICAM.md`](teleop/MULTICAM.md).
 
 ---
 
@@ -83,7 +88,8 @@ Per-camera resolution is read from `camera_intrinsics_<name>.json`, so a bare `N
 | `--seed N` | none | RNG seed for object randomization — the same seed reproduces the same layout (positions and sizes). Default: fresh entropy every run. Ignored with `--no-randomize`. |
 | `--no-randomize` | off | Skip object randomization entirely: objects keep the positions, sizes, and colors authored in `models/scene_pick_place.xml`. |
 | `--camera N` | auto | *(teleop modes only)* Camera index forwarded to the built-in single-camera MediaPipe publisher. Defaults to auto-select (prefers external/USB camera at index ≥ 1). Run `python ui/mediapipe_joint_angles.py --list-cameras` to see available indices. |
-| `--multicam NAME:INDEX[:WxH]` | none | *(teleop modes)* Auto-launch the [multi-camera pipeline](teleop/MULTICAM.md) (`teleop/run_multicam.py`) as a child process instead of the single-camera publisher, so `/hand/joint_angles` comes from the **fused** cameras. Repeat per camera (≥ 2), e.g. `--multicam c0:0 --multicam c1:2`. Implies `--no-mediapipe`. Resolution is read from each camera's `camera_intrinsics_<name>.json` when `:WxH` is omitted. |
+| `--multicam-auto` | off | *(teleop modes)* Hands-off multi-camera: discover connected cameras and match each to its calibration by hardware id — no specs needed. Uses every calibrated camera currently plugged in (≥ 2); RealSense auto-flagged. Equivalent to `run_multicam.py --auto`. Mutually exclusive with `--multicam`. |
+| `--multicam NAME:INDEX[:WxH]` | none | *(teleop modes)* Auto-launch the [multi-camera pipeline](teleop/MULTICAM.md) (`teleop/run_multicam.py`) as a child process instead of the single-camera publisher, so `/hand/joint_angles` comes from the **fused** cameras. Repeat per camera (≥ 2), e.g. `--multicam c0:0 --multicam c1:2`. Implies `--no-mediapipe`. Resolution is read from each camera's `camera_intrinsics_<name>.json` when `:WxH` is omitted. Prefer `--multicam-auto` unless you need explicit indices. |
 | `--multicam-realsense NAME` | none | *(with `--multicam`)* Mark a camera as an Intel RealSense — its node captures the COLOR stream via `pyrealsense2` (the `:INDEX` is then ignored; the SDK picks the device). Default 640×480 @ 30 fps (the D435I's 1080p color is only 8 fps). Repeatable. |
 | `--multicam-max-res` | off | *(with `--multicam`)* Open each camera at its highest supported resolution (forwards `--max-res`). Prefer omitting it — resolutions come from the intrinsics files automatically. |
 | `--recalibrate-extrinsics` | off | *(with `--multicam`)* Run the interactive extrinsics solve for each camera **before** teleop starts (fix the ChArUco board at the world origin, press **SPACE** per camera). Reuses each camera's calibrated resolution. Default reuses the saved extrinsics. |
@@ -99,9 +105,8 @@ python kinova_leap_pick_place.py --viz-only --dashboard
 python kinova_leap_pick_place.py --ik-solver ipopt
 python kinova_leap_pick_place.py --seed 42          # reproducible object layout
 
-# multi-camera (fused) teleop — resolutions auto-read from intrinsics:
-python kinova_leap_pick_place.py --mode dexpilot \
-    --multicam c0:0 --multicam c1:2 --multicam rs:8 --multicam-realsense rs \
+# multi-camera (fused) teleop — hands-off: discover + match calibrated cameras:
+python kinova_leap_pick_place.py --mode dexpilot --multicam-auto \
     --skeleton-view --camera-views
 ```
 
