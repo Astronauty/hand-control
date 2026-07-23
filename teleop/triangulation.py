@@ -129,12 +129,59 @@ def triangulate_point(cams: list[CameraModel],
     return X[:3] / X[3]
 
 
+def _reproj_px(cam: CameraModel, uv, X) -> float:
+    """Reprojection error [px] of world point X in one view."""
+    x = cam.P @ np.append(X, 1.0)
+    if abs(x[2]) < 1e-12:
+        return float("inf")
+    return float(np.linalg.norm(x[:2] / x[2] - np.asarray(uv, float)))
+
+
+def _triangulate_consensus(sub_cams, sub_uv, sub_w, reject_px):
+    """Triangulate one landmark, rejecting a single outlier VIEW by reprojection
+    consensus when >= 3 views are available.
+
+    MediaPipe hand landmarks carry no usable visibility (occluded fingertips are
+    hallucinated with full confidence), so the visibility gate can't drop them.
+    Instead: triangulate from all views, and if the worst view's reprojection
+    exceeds reject_px AND leaving it out lowers the max reprojection of the rest,
+    drop that view and re-triangulate. One outlier per landmark — enough for the
+    "third camera has this fingertip occluded" case; the two agreeing cameras win.
+
+    Returns (X, dropped_index_or_None) or (None, None).
+    """
+    X = triangulate_point(sub_cams, sub_uv, sub_w)
+    if X is None:
+        return None, None
+    n = len(sub_cams)
+    if n < 3 or reject_px <= 0.0:
+        return X, None
+    errs = [_reproj_px(c, uv, X) for c, uv in zip(sub_cams, sub_uv)]
+    worst = int(np.argmax(errs))
+    if errs[worst] <= reject_px:
+        return X, None                      # all views agree — keep the full fit
+    # Re-triangulate without the worst view and confirm it actually helps: the
+    # remaining views' max reprojection must drop clearly, else the "outlier" was
+    # just noise and dropping it would throw away a good observation.
+    keep = [i for i in range(n) if i != worst]
+    X2 = triangulate_point([sub_cams[i] for i in keep],
+                           [sub_uv[i] for i in keep],
+                           [sub_w[i] for i in keep])
+    if X2 is None:
+        return X, None
+    max_after = max(_reproj_px(sub_cams[i], sub_uv[i], X2) for i in keep)
+    if max_after < errs[worst] * 0.5:
+        return X2, worst
+    return X, None
+
+
 def triangulate_landmarks(cams: list[CameraModel],
                           uv_per_cam: list[np.ndarray | None],
                           vis_per_cam: list[np.ndarray | None] | None = None,
                           n_landmarks: int = 21,
                           vis_thresh: float = 0.3,
-                          min_views: int = 2) -> tuple[np.ndarray, np.ndarray]:
+                          min_views: int = 2,
+                          reject_px: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
     """Triangulate all N landmarks across all cameras.
 
     Args:
@@ -148,20 +195,28 @@ def triangulate_landmarks(cams: list[CameraModel],
         vis_thresh:  a view is used for a landmark only if its visibility exceeds
                      this (drops occluded/hallucinated points from the fit).
         min_views:   minimum usable views to accept a landmark.
+        reject_px:   if > 0 and a landmark has >= 3 views, reject a single outlier
+                     view per landmark by reprojection consensus (drops an
+                     occluded/hallucinated fingertip that one camera got wrong,
+                     which MediaPipe visibility does NOT flag). 0 disables.
     Returns:
         pts:  (n_landmarks, 3) world points; rows for un-triangulated landmarks
               are NaN.
         ok:   (n_landmarks,) bool — True where the landmark was triangulated.
+        dropped: (n_landmarks,) index of the CAMERA rejected for that landmark
+                 (into `cams`), or -1 if none. Diagnostic — lets the caller log
+                 which fingertips had a view rejected.
     """
     if vis_per_cam is None:
         vis_per_cam = [None] * len(cams)
 
     pts = np.full((n_landmarks, 3), np.nan)
     ok = np.zeros(n_landmarks, bool)
+    dropped = np.full(n_landmarks, -1, int)
 
     for j in range(n_landmarks):
-        sub_cams, sub_uv, sub_w = [], [], []
-        for cam, uv, vis in zip(cams, uv_per_cam, vis_per_cam):
+        sub_cams, sub_uv, sub_w, sub_idx = [], [], [], []
+        for ci, (cam, uv, vis) in enumerate(zip(cams, uv_per_cam, vis_per_cam)):
             if uv is None:
                 continue
             w = 1.0 if vis is None else float(vis[j])
@@ -170,13 +225,16 @@ def triangulate_landmarks(cams: list[CameraModel],
             sub_cams.append(cam)
             sub_uv.append(uv[j])
             sub_w.append(w)
+            sub_idx.append(ci)
         if len(sub_cams) < min_views:
             continue
-        X = triangulate_point(sub_cams, sub_uv, sub_w)
+        X, drop_local = _triangulate_consensus(sub_cams, sub_uv, sub_w, reject_px)
         if X is not None:
             pts[j] = X
             ok[j] = True
-    return pts, ok
+            if drop_local is not None:
+                dropped[j] = sub_idx[drop_local]
+    return pts, ok, dropped
 
 
 def reprojection_errors(cams: list[CameraModel],
@@ -214,3 +272,40 @@ def reprojection_errors(cams: list[CameraModel],
         if per_view:
             errs[j] = float(np.mean(per_view))
     return errs
+
+
+def per_camera_reproj(cams: list[CameraModel],
+                      uv_per_cam: list[np.ndarray | None],
+                      pts: np.ndarray) -> list[float]:
+    """Median reprojection error [px] of each camera against the triangulation.
+
+    Unlike reprojection_errors (which averages OVER cameras per landmark), this
+    keeps cameras separate so a single mis-calibrated view can be identified and
+    dropped. A camera whose pose disagrees with the shared world frame reprojects
+    the (correctly triangulated) points far from where it actually saw them, so
+    its own median error spikes while the consistent cameras stay low.
+
+    Args:
+        cams:       list of CameraModel.
+        uv_per_cam: per-camera (n,2) UNDISTORTED pixels (or None), same as fed to
+                    triangulate_landmarks.
+        pts:        (n,3) triangulated world points (NaN rows allowed).
+    Returns:
+        list of length len(cams): median px error for each camera, NaN for a
+        camera with no detection this frame or no reprojectable landmark.
+    """
+    out = []
+    for cam, uv in zip(cams, uv_per_cam):
+        if uv is None:
+            out.append(float("nan"))
+            continue
+        per_lm = []
+        for j in range(pts.shape[0]):
+            if not np.all(np.isfinite(pts[j])):
+                continue
+            x = cam.P @ np.append(pts[j], 1.0)
+            if abs(x[2]) < 1e-12:
+                continue
+            per_lm.append(np.linalg.norm(x[:2] / x[2] - uv[j]))
+        out.append(float(np.median(per_lm)) if per_lm else float("nan"))
+    return out

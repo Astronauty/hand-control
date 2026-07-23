@@ -11,7 +11,9 @@ contacts generically rather than hardcoding 2.
 import argparse
 import json
 import numpy as np
+import cv2   # camera-feed grid (--camera-views) + post-recalibration GUI reset
 import subprocess
+import signal
 import os
 import sys
 import time
@@ -393,6 +395,36 @@ if __name__ == "__main__":
              "recommender candidate {q,p1,p2}) — everything tune_ik_weights.py needs to "
              "re-run the recommender->collision-IK gap offline under swept weights.")
     _arg_parser.add_argument(
+        '--multicam', action='append', metavar='NAME:INDEX[:WxH]', default=None,
+        help="dexpilot / contact_aware_teleop: auto-launch the multi-camera "
+             "hand-tracking pipeline (teleop/run_multicam.py) as a child process "
+             "instead of the single-camera publisher, so /hand/joint_angles comes "
+             "from the FUSED cameras. Repeat per camera (>=2), e.g. --multicam c0:0 "
+             "--multicam c1:2. Implies --no-mediapipe (external publisher). Each "
+             "NAME needs camera_intrinsics_<name>.json + camera_extrinsics_<name>.json "
+             "in calibration/.")
+    _arg_parser.add_argument(
+        '--multicam-realsense', action='append', default=[], metavar='NAME',
+        help="With --multicam: mark a camera NAME as an Intel RealSense (captures the "
+             "COLOR stream via pyrealsense2). Its --multicam :INDEX is ignored (SDK "
+             "selects the device); :WxH (or 640x480 default) sets the color size. "
+             "The D435I's 1080p color is only 8fps, so default 640x480 @30fps. "
+             "Repeatable. Forwards --realsense NAME to run_multicam.py.")
+    _arg_parser.add_argument(
+        '--multicam-max-res', action='store_true',
+        help="With --multicam: open each camera at its HIGHEST supported resolution "
+             "(forwards --max-res to run_multicam.py). Use this when your per-camera "
+             "intrinsics were calibrated at max res. Otherwise cameras open at 640x480 "
+             "and their intrinsics MUST match that — set a per-camera :WxH in --multicam "
+             "(e.g. --multicam c0:0:1920x1080) to match each camera's calibrated size.")
+    _arg_parser.add_argument(
+        '--recalibrate-extrinsics', action='store_true',
+        help="With --multicam: run the INTERACTIVE extrinsics-all walkthrough "
+             "(calibration/charuco_calibration.py) BEFORE launching — fix the "
+             "ChArUco board at the world origin and press SPACE per camera to "
+             "re-solve each camera_extrinsics_<name>.json. Default reuses the saved "
+             "extrinsics. Requires per-camera intrinsics to already exist.")
+    _arg_parser.add_argument(
         '--no-mediapipe', '--external-hand', dest='no_mediapipe',
         action='store_true',
         help="dexpilot / contact_aware_teleop: do NOT spawn the built-in single-camera "
@@ -400,6 +432,12 @@ if __name__ == "__main__":
              "already publishes /hand/joint_angles — e.g. teleop/run_multicam.py — so "
              "the teleop app only subscribes. Avoids two publishers racing on the same "
              "topic (interleaved single-cam + fused poses).")
+    _arg_parser.add_argument(
+        '--camera-views', action='store_true',
+        help="dexpilot / contact_aware_teleop with --multicam: open a window tiling "
+             "each camera's live feed + landmark overlay (same as run_multicam.py "
+             "--show-fused's camera grid), by subscribing to /hand/cam_<name>/preview. "
+             "Camera names come from --multicam.")
     _arg_parser.add_argument(
         '--skeleton-view', action='store_true',
         help="dexpilot / contact_aware_teleop: open a separate orbitable 3D window "
@@ -410,6 +448,18 @@ if __name__ == "__main__":
     args = _arg_parser.parse_args()
     if args.mode == 'rrt':          # deprecated alias
         args.mode = 'contact_aware_autonomous'
+    if args.multicam:
+        # The fused pipeline is the sole /hand/joint_angles publisher, so never
+        # also spawn the single-cam one (two publishers interleave poses).
+        args.no_mediapipe = True
+        if len(args.multicam) < 2:
+            _arg_parser.error("--multicam needs at least 2 cameras for triangulation "
+                              "(e.g. --multicam c0:0 --multicam c1:2)")
+    elif args.recalibrate_extrinsics:
+        _arg_parser.error("--recalibrate-extrinsics requires --multicam")
+    if args.camera_views and not args.multicam:
+        _arg_parser.error("--camera-views requires --multicam (it needs the camera "
+                          "names to subscribe to /hand/cam_<name>/preview)")
 
     model = mj.MjModel.from_xml_path('models/scene_pick_place.xml')
     data  = mj.MjData(model)
@@ -1346,7 +1396,90 @@ if __name__ == "__main__":
         # --no-mediapipe/--external-hand skips this so an external publisher
         # (e.g. teleop/run_multicam.py) can be the SOLE source on
         # /hand/joint_angles — two publishers on one topic interleave poses.
-        if args.no_mediapipe:
+        # --multicam auto-launches that fused pipeline here as a child process.
+        if args.multicam:
+            _here = __file__.rsplit('/', 1)[0]
+            # Optional interactive extrinsics recalibration FIRST (blocking): the
+            # board must be fixed at the world origin and SPACE pressed per camera.
+            # Reuses charuco_calibration.py extrinsics-all; --cam takes NAME:INDEX
+            # (strip any :WxH resolution suffix the pipeline spec may carry).
+            if args.recalibrate_extrinsics:
+                # Solve extrinsics per-camera (the single 'extrinsics' subcommand),
+                # NOT extrinsics-all: each camera must open at the SIZE ITS OWN
+                # intrinsics were calibrated at, and cameras here differ (e.g. c0
+                # 1920x1080, c1 1280x960, rs 1280x720). extrinsics-all only takes a
+                # global --max-res / --width-height, which can't serve mixed sizes
+                # (and --max-res over-shoots the RealSense to 1080p). Per-camera we
+                # forward each spec's :WxH (or --max-res when a spec has none). The
+                # board must stay FIXED across all of these solves for one world frame.
+                print("[DexPilot] --recalibrate-extrinsics: solving each camera's "
+                      "extrinsic in turn — KEEP THE BOARD FIXED at the world origin "
+                      "for ALL cameras (that shared pose is the common frame). SPACE "
+                      "to solve each, S to skip, Q to stop. Teleop starts after.")
+                _cal = _here + '/calibration/charuco_calibration.py'
+                sys.path.insert(0, _here + '/teleop')
+                from run_multicam import _intrinsics_res  # noqa: E402
+                _rs_names = set(args.multicam_realsense)
+                for _spec in args.multicam:
+                    _p = _spec.split(':')
+                    _nm, _idx = _p[0], _p[1]
+                    _is_rs = _nm in _rs_names
+                    _ex = [sys.executable, _cal, 'extrinsics',
+                           '--camera', _idx, '--name', _nm]
+                    # A RealSense MUST be captured via pyrealsense2 (same path the
+                    # pipeline uses), NOT cv2 — forward --realsense so the solve sees
+                    # the identical color stream its intrinsics were read from. cv2
+                    # here would open a different stream (or fail on the D435I) and
+                    # the pose wouldn't match runtime pixels.
+                    if _is_rs:
+                        _ex += ['--realsense']
+                    # Open at this camera's calibrated size so the solve matches its
+                    # intrinsics: explicit :WxH > intrinsics image_size > --max-res.
+                    # (--max-res is skipped for a RealSense: its capture size is fixed
+                    # at the pyrealsense2 stream, and 1080p color is only 8 fps.)
+                    _res = None
+                    if len(_p) >= 3 and _p[2]:                 # explicit :WxH
+                        _res = tuple(int(v) for v in _p[2].lower().split('x'))
+                    else:
+                        _res = _intrinsics_res(_nm)
+                    if _res is not None:
+                        _ex += ['--width', str(_res[0]), '--height', str(_res[1])]
+                    elif args.multicam_max_res and not _is_rs:
+                        _ex += ['--max-res']
+                    print(f"[DexPilot]   extrinsic for '{_nm}' (index {_idx})…")
+                    _rc = subprocess.call(_ex)
+                    if _rc != 0:
+                        print(f"[DexPilot]   '{_nm}' extrinsic exited {_rc}; keeping "
+                              f"its existing extrinsic on disk.")
+                # The calibration subprocesses ran their own cv2 (Qt5) HighGUI
+                # windows on this same $DISPLAY. Reset the parent's cv2 GUI state to
+                # a clean slate before we later create the skeleton / camera-feed
+                # windows, so a stale Qt window registry left by the child can't make
+                # them fail to map / vanish. Pump waitKey so Qt processes the destroy.
+                try:
+                    cv2.destroyAllWindows()
+                    for _ in range(5):
+                        cv2.waitKey(1)
+                except Exception:
+                    pass
+            # Launch the fused pipeline as ONE supervised child (run_multicam owns
+            # the landmark + fusion subprocesses). We only hold this one handle and
+            # terminate it on exit; if it dies, the subscriber simply goes quiet.
+            _mc_cmd = [sys.executable, _here + '/teleop/run_multicam.py']
+            for _spec in args.multicam:
+                _mc_cmd += ['--cam', _spec]
+            for _rs_name in args.multicam_realsense:
+                _mc_cmd += ['--realsense', _rs_name]
+            # Resolution: a per-camera :WxH in the spec wins; else --max-res opens
+            # each at its highest size; else run_multicam falls back to 640x480 (which
+            # must then match each camera's calibrated intrinsics, or the fusion node
+            # rejects the projection as invalid).
+            if args.multicam_max_res:
+                _mc_cmd += ['--max-res']
+            _mediapipe_proc = subprocess.Popen(_mc_cmd)
+            print(f"[DexPilot] multicam pipeline launched (pid {_mediapipe_proc.pid}): "
+                  f"{len(args.multicam)} cameras -> /hand/joint_angles.")
+        elif args.no_mediapipe:
             print("[DexPilot] --no-mediapipe: single-cam publisher NOT started; "
                   "subscribing to an external /hand/joint_angles publisher.")
         else:
@@ -1556,6 +1689,65 @@ if __name__ == "__main__":
         _skel_viewer.show(pts, f"world landmarks: {n_lm}/21  "
                                f"wrist=({raw[0]:+.2f},{raw[1]:+.2f},{raw[2]:+.2f})m"
                                if pts is not None else "waiting for hand…")
+
+    # --- Optional per-camera feed grid (dexpilot / contact_aware_teleop --multicam) ---
+    # Mirrors run_multicam.py --show-fused's CAMERA GRID window: each camera's live
+    # frame + landmark overlay, tiled. The landmark nodes already publish a throttled
+    # JPEG preview to /hand/cam_<name>/preview (independent of --show), so we just
+    # subscribe here on our OWN small rclpy node (kept separate from the shared
+    # DexPilot subscriber) and decode into a CameraGridWindow. Camera names come from
+    # the --multicam specs (strip :INDEX[:WxH]). Drawn once per frame like _draw_skeleton.
+    _cam_grid       = None
+    _cam_grid_node  = None
+    _cam_previews   = {}      # name -> latest decoded BGR frame
+    if args.camera_views and args.multicam and args.mode in _teleop_modes:
+        import rclpy as _rclpy                             # noqa: E402
+        from rclpy.node import Node as _RclNode            # noqa: E402
+        from sensor_msgs.msg import CompressedImage as _CompressedImage  # noqa: E402
+        sys.path.insert(0, __file__.rsplit('/', 1)[0] + '/teleop')
+        from skeleton_viewer import CameraGridWindow       # noqa: E402
+        _cam_names = [s.split(':')[0] for s in args.multicam]
+        # rclpy is already init()'d by the DexPilot ROSInterface; just add a node.
+        _cam_grid_node = _RclNode("teleop_camera_grid")
+
+        def _mk_preview_cb(_nm):
+            def _cb(msg):
+                buf = np.frombuffer(bytes(msg.data), np.uint8)
+                img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                if img is not None:
+                    _cam_previews[_nm] = img
+            return _cb
+
+        for _nm in _cam_names:
+            _cam_grid_node.create_subscription(
+                _CompressedImage, f"/hand/cam_{_nm}/preview", _mk_preview_cb(_nm), 2)
+        _cam_grid = CameraGridWindow(_cam_names, name="teleop camera feeds")
+        print(f"[teleop] camera feeds on — tiling {_cam_names} "
+              f"from /hand/cam_<name>/preview.")
+
+    def _draw_camera_views():
+        """Spin the preview subscriptions and tile the latest per-camera frames.
+        No-op unless --camera-views is on. Mirrors the fusion node's camera grid."""
+        if _cam_grid is None:
+            return
+        import rclpy as _rclpy
+        _rclpy.spin_once(_cam_grid_node, timeout_sec=0.0)   # drain pending previews
+        _cam_grid.show(_cam_previews)
+
+    _pipeline_dead_warned = [False]
+
+    def _check_pipeline_alive():
+        """Warn ONCE if the --multicam pipeline child has exited, so a dead pipeline
+        (e.g. a camera failed to open) shows a clear message instead of the app just
+        freezing with no hand data arriving. No-op unless we launched a pipeline."""
+        if _mediapipe_proc is None or not args.multicam:
+            return
+        if _mediapipe_proc.poll() is not None and not _pipeline_dead_warned[0]:
+            _pipeline_dead_warned[0] = True
+            print(f"[teleop] WARNING: multicam pipeline (pid {_mediapipe_proc.pid}) "
+                  f"exited (code {_mediapipe_proc.returncode}). No /hand/joint_angles "
+                  f"will arrive — the robot will hold still. Check the pipeline log "
+                  f"above for the failing camera, then relaunch.")
 
     # --- contact_aware_teleop: NLP grasp recommender machinery ---
     # A per-object MultiStartGraspPlanner3D (built lazily, box-like first) continuously
@@ -1920,6 +2112,8 @@ if __name__ == "__main__":
             if _CAT_MODE and _teleop_active:
                 _dexpilot_ctrl.spin()
                 _draw_skeleton()   # fused-hand overlay (no-op unless --skeleton-view)
+                _draw_camera_views()   # per-camera feed grid (no-op unless --camera-views)
+                _check_pipeline_alive()  # warn if the multicam child died
                 if _tune_retarget:
                     _dexpilot_ctrl.poll_retarget_config()  # hot-reload retarget_config.json edits
 
@@ -2172,8 +2366,11 @@ if __name__ == "__main__":
             if args.mode == 'dexpilot':
                 _dexpilot_ctrl.spin()
                 _draw_skeleton()   # fused-hand overlay (no-op unless --skeleton-view)
+                _draw_camera_views()   # per-camera feed grid (no-op unless --camera-views)
+                _check_pipeline_alive()  # warn if the multicam child died
                 if _tune_retarget:
                     _dexpilot_ctrl.poll_retarget_config()  # hot-reload retarget_config.json edits
+                _dp_reset_frame = False   # set by a 'reset' key: skip physics this frame
                 # Drain key queue — handle quit and teleop start/re-zero
                 while not keys.empty():
                     _k = keys.get_nowait()
@@ -2186,8 +2383,17 @@ if __name__ == "__main__":
                         # to re-capture your current hand pose as the offset.
                         mj.mj_resetData(model, data)
                         data.qpos[:N_ROBOT] = _Q_BIAS_DP
-                        data.qvel[:N_ROBOT] = 0.0
+                        # Zero EVERY DOF's velocity/accel/applied-force (not just the
+                        # robot's): teleporting the arm home while objects snap to their
+                        # spawn poses can leave a penetration that the next mj_step would
+                        # resolve into object velocity — the objects then fly off the
+                        # pick area. _dp_reset_frame skips physics for this frame so the
+                        # scene settles at rest before stepping resumes.
+                        data.qvel[:]         = 0.0
+                        data.qacc[:]         = 0.0
+                        data.qfrc_applied[:] = 0.0
                         mj.mj_forward(model, data)
+                        _dp_reset_frame = True
                         _dexpilot_ctrl.stop()        # freeze — no tracking until press-8
                         _dexpilot_ctrl.init_home(data)   # re-anchor home to the reset pose
                         _dp_target = _Q_BIAS_DP.copy()   # physics hold target back to home
@@ -2233,6 +2439,11 @@ if __name__ == "__main__":
                     # but discard its qpos output.
                     _dexpilot_ctrl.step(model, data)
                     data.qpos[:7] = _CALIB_POSES[_calib_idx]
+                    mj.mj_forward(model, data)
+                elif _dp_reset_frame:
+                    # Reset just teleported the scene; render it at rest without a
+                    # physics step so no teleport-penetration impulse spins up the
+                    # objects. Tracking is already frozen (init_home above).
                     mj.mj_forward(model, data)
                 else:
                     q_teleop = _dexpilot_ctrl.step(model, data)
@@ -2745,6 +2956,16 @@ if __name__ == "__main__":
                     _plan_discard = True   # in-flight IK/RRT started pre-reset: drop it
                 mj.mj_resetData(model, data)
                 data.qpos[:N_ROBOT] = Q_BIAS   # arm/hand home (qpos0 zero = straight up)
+                # mj_resetData zeros qvel, but writing the arm to Q_BIAS while the
+                # objects snap back to their (possibly gripper-overlapping) spawn poses
+                # sets up a penetration that the NEXT mj_step resolves with a large
+                # contact impulse — the objects pick up velocity and fly off the pick
+                # area. Zero every DOF's velocity and clear any leftover applied force,
+                # then skip physics for this frame (render-only) so the reset scene
+                # settles at rest before stepping resumes.
+                data.qvel[:]         = 0.0
+                data.qacc[:]         = 0.0
+                data.qfrc_applied[:] = 0.0
                 mj.mj_forward(model, data)
                 control_phase  = 'REACH'
                 active_tgt     = 0
@@ -2793,6 +3014,12 @@ if __name__ == "__main__":
                       "IK kept (auto re-solved if stale on next selection)."
                       + ("  Tracking FROZEN — press 8 to set the offset."
                          if _CAT_MODE and _dexpilot_ctrl is not None else ""))
+                # Render this frame WITHOUT mj_step: stepping now would resolve any
+                # residual arm/object penetration from the teleport with a contact
+                # impulse, re-injecting the very velocity mj_resetData just cleared.
+                # Next iteration steps from a settled, zero-velocity rest state.
+                _render_kinematic_frame()
+                continue
 
             # --- Continuous jog: world-frame palm velocity from currently-held arrow
             # keys, consumed by the GRASP branch's resolved-rate target integration.
@@ -3083,6 +3310,25 @@ if __name__ == "__main__":
         _dexpilot_ctrl.shutdown()
     if _skel_viewer is not None:
         _skel_viewer.close()
+    if _cam_grid is not None:
+        _cam_grid.close()
+    if _cam_grid_node is not None:
+        try:
+            _cam_grid_node.destroy_node()
+        except Exception:
+            pass
     if _mediapipe_proc is not None:
-        _mediapipe_proc.terminate()
-        _mediapipe_proc.wait()
+        # run_multicam.py (the --multicam child) supervises its own landmark +
+        # fusion subprocesses and tears them down on SIGINT; SIGTERM would orphan
+        # them. The single-cam publisher handles SIGTERM fine. Send SIGINT for the
+        # pipeline, then wait (with a grace fallback to terminate).
+        if args.multicam:
+            _mediapipe_proc.send_signal(signal.SIGINT)
+            try:
+                _mediapipe_proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                _mediapipe_proc.terminate()
+                _mediapipe_proc.wait()
+        else:
+            _mediapipe_proc.terminate()
+            _mediapipe_proc.wait()

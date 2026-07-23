@@ -70,6 +70,116 @@ _TRACK_HANDEDNESS = "Right"   # matches ui/mediapipe_joint_angles.py
 N_LM = 21
 
 
+class _RealSenseCapture:
+    """cv2.VideoCapture-compatible shim over an Intel RealSense COLOR stream.
+
+    RealSense color can't be reliably opened at the desired resolution through bare
+    V4L2/cv2.VideoCapture (multiple /dev/video nodes, stateful ioctls), so we drive
+    it via pyrealsense2 instead. Exposes just the cv2.VideoCapture surface the node
+    uses — isOpened(), read(), get(CAP_PROP_FRAME_WIDTH/HEIGHT), set() (no-op after
+    construction), release() — so the capture loop, reopen, and preview code stay
+    unchanged.
+
+    Streams color at (width x height @ fps) in BGR (matching cv2's BGR convention),
+    so downstream MediaPipe/preview code needs no format change. Default 640x480@30
+    matches the USB webcams' framerate for clean fusion sync (the D435I's 1080p
+    color caps at 8 fps — too slow for teleop).
+    """
+
+    def __init__(self, width: int = 640, height: int = 480, fps: int | None = None,
+                 retries: int = 8, retry_delay: float = 0.5):
+        import pyrealsense2 as rs
+        self._rs = rs
+        # fps is RESOLUTION-DEPENDENT on the D435I: 640x480 does 30, but 1280x720
+        # tops out at 15 and 1920x1080 at 8 — a hardcoded 30 makes start() raise
+        # "Couldn't resolve requests" forever at those sizes. Query the device for
+        # the highest bgr8 fps this exact WxH offers and use that (unless the caller
+        # pinned one). No supported bgr8 mode at this size -> clear error.
+        if fps is None:
+            fps = self._best_fps(rs, width, height)
+            if fps is None:
+                raise RuntimeError(
+                    f"RealSense has no bgr8 color mode at {width}x{height}. Pick a "
+                    f"supported size (e.g. 640x480, 1280x720, 1920x1080) and "
+                    f"calibrate its intrinsics at that size.")
+        self._w, self._h, self._fps = width, height, fps
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        # start() also raises "Couldn't resolve requests" TRANSIENTLY while a prior
+        # process is still releasing the device (RealSense handles don't free
+        # instantly — a crashed/Ctrl-C'd run leaves it busy for a moment). Retry
+        # with backoff so a mid-release device doesn't kill the whole pipeline.
+        last_exc = None
+        for _attempt in range(max(1, retries)):
+            self._pipe = rs.pipeline()
+            try:
+                self._profile = self._pipe.start(cfg)
+                self._opened = True
+                print(f"[RealSense] color {width}x{height}@{fps} bgr8 started.")
+                return
+            except RuntimeError as e:
+                last_exc = e
+                time.sleep(retry_delay)
+        raise RuntimeError(
+            f"RealSense color {width}x{height}@{fps} start failed after "
+            f"{retries} tries ({retry_delay}s apart): {last_exc}. Is the device "
+            f"still held by another process? (check: fuser /dev/video*)")
+
+    @staticmethod
+    def _best_fps(rs, width: int, height: int) -> int | None:
+        """Highest bgr8 color fps the device offers at exactly (width, height),
+        or None if this size has no bgr8 color mode."""
+        best = None
+        try:
+            for d in rs.context().query_devices():
+                for s in d.query_sensors():
+                    for p in s.get_stream_profiles():
+                        if p.stream_type() != rs.stream.color:
+                            continue
+                        if p.format() != rs.format.bgr8:
+                            continue
+                        vp = p.as_video_stream_profile()
+                        if vp.width() == width and vp.height() == height:
+                            best = max(best or 0, p.fps())
+        except Exception:
+            return None
+        return best
+
+    def isOpened(self) -> bool:
+        return self._opened
+
+    def read(self):
+        """Return (ok, frame_bgr) like cv2.VideoCapture.read()."""
+        try:
+            frames = self._pipe.wait_for_frames(2000)   # ms timeout
+            color = frames.get_color_frame()
+            if not color:
+                return False, None
+            return True, np.asanyarray(color.get_data())
+        except Exception:
+            return False, None
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self._w)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self._h)
+        return 0.0
+
+    def set(self, *_a, **_k):
+        # Resolution is fixed at construction (the enabled stream); ignore cv2-style
+        # set() calls so the shared open/reopen code path is a no-op here.
+        return True
+
+    def release(self):
+        if self._opened:
+            try:
+                self._pipe.stop()
+            except Exception:
+                pass
+            self._opened = False
+
+
 def _load_extrinsic(name: str):
     """Load this camera's K, dist, and world->cam pose for the axis overlay.
 
@@ -143,10 +253,12 @@ class HandLandmarkNode(Node):
 
     def __init__(self, camera: int, name: str, width: int, height: int,
                  show: bool, max_res: bool = False,
-                 preview_w: int = 640, preview_hz: float = 15.0):
+                 preview_w: int = 640, preview_hz: float = 15.0,
+                 realsense: bool = False):
         super().__init__(f"hand_landmark_{name}")
         self._name = name
         self._show = show
+        self._realsense = realsense
         self._pub = self.create_publisher(
             Float32MultiArray, f"/hand/cam_{name}/landmarks", 10)
 
@@ -165,16 +277,35 @@ class HandLandmarkNode(Node):
         if not os.path.exists(_MODEL_PATH):
             raise FileNotFoundError(f"hand_landmarker.task not found at {_MODEL_PATH}")
 
-        self._cap = cv2.VideoCapture(camera)
-        if not self._cap.isOpened():
-            raise RuntimeError(f"could not open camera index {camera}")
+        if realsense:
+            # RealSense COLOR via pyrealsense2 (see _RealSenseCapture). --camera is
+            # ignored (the SDK picks the device); resolution comes from --width/height
+            # (--max-res N/A — RS 1080p is only 8 fps). fps=None -> pick the highest
+            # the device offers at that size (640x480:30, 1280x720:15, 1080p:8).
+            self._cap = _RealSenseCapture(width or 640, height or 480, fps=None)
+        else:
+            self._cap = cv2.VideoCapture(camera)
+            if not self._cap.isOpened():
+                raise RuntimeError(f"could not open camera index {camera}")
 
-        if max_res:
-            width, height = self._request_max_res()
-        if width:
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        if height:
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            if max_res:
+                width, height = self._request_max_res()
+            elif width and height:
+                # Set MJPG BEFORE the explicit size: many webcams expose their
+                # higher modes (e.g. 1920x1080) ONLY under MJPG, and a raw request
+                # silently clamps to a low mode like 640x480 (the c0 bug: intrinsics
+                # 1080p but the stream fell back to 480p). --max-res already does
+                # this in _request_max_res; mirror it for the explicit path. Harmless
+                # for cameras whose requested mode is available raw.
+                try:
+                    self._cap.set(cv2.CAP_PROP_FOURCC,
+                                  cv2.VideoWriter_fourcc(*"MJPG"))
+                except Exception:
+                    pass
+            if width:
+                self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            if height:
+                self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
         # Remember open params so the capture loop can REOPEN the camera on a USB
         # dropout instead of exiting (a clean exit tore the whole pipeline down).
@@ -281,6 +412,14 @@ class HandLandmarkNode(Node):
             self._cap.release()
         except Exception:
             pass
+        if self._realsense:
+            # Rebuild the RealSense pipeline at the same resolution (SDK reopen).
+            try:
+                self._cap = _RealSenseCapture(self._cap_w or 640,
+                                              self._cap_h or 480, fps=None)
+            except Exception:
+                return False
+            return self._cap.isOpened()
         self._cap = cv2.VideoCapture(self._camera_idx)
         if not self._cap.isOpened():
             return False
@@ -518,6 +657,13 @@ def main():
                     help="Open the camera at its HIGHEST supported resolution "
                          "(probed live). Overrides --width/--height. Remember to "
                          "calibrate this camera's intrinsics at the SAME size.")
+    ap.add_argument("--realsense", action="store_true",
+                    help="Capture from an Intel RealSense COLOR stream via "
+                         "pyrealsense2 instead of cv2.VideoCapture (--camera is then "
+                         "ignored; the SDK selects the device). Streams --width x "
+                         "--height @ 30fps in BGR. Default 640x480 — the D435I's "
+                         "1080p color is only 8fps, too slow for teleop. Calibrate "
+                         "this camera's intrinsics at the SAME size.")
     ap.add_argument("--show", action="store_true",
                     help="Show a debug window with detected landmarks.")
     ap.add_argument("--preview-w", type=int, default=640,
@@ -530,7 +676,8 @@ def main():
     rclpy.init()
     node = HandLandmarkNode(args.camera, args.name, args.width, args.height,
                             args.show, max_res=args.max_res,
-                            preview_w=args.preview_w, preview_hz=args.preview_hz)
+                            preview_w=args.preview_w, preview_hz=args.preview_hz,
+                            realsense=args.realsense)
     try:
         node.spin_capture()
     except KeyboardInterrupt:

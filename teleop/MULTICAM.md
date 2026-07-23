@@ -68,6 +68,50 @@ Use a fixed `--width/--height` instead of `--max-res` if you want a specific siz
 > looks fine per-camera. The fusion node **hard-errors** on a size mismatch, and
 > `--max-res` on both the calibration tool and `run_multicam` keeps them aligned.
 
+### RealSense cameras (D435I etc.)
+
+A RealSense is a **special case for both rules above**: the pipeline captures its
+COLOR stream through **pyrealsense2** (not cv2/V4L2), and the D435I color at
+640×480 is what `--multicam-realsense`/`run_multicam --realsense` opens by
+default. So its calibration must use the *same* capture path and size, or you get
+exactly the "hundreds of px, unfixable by re-doing extrinsics" failure.
+
+1. **Intrinsics.** Two options:
+
+   **(a) SDK factory values (fast, no session):**
+   ```bash
+   python calibration/realsense_intrinsics.py --name rs           # 640x480 (pipeline default)
+   ```
+   Queries pyrealsense2 for the color stream's intrinsics at the exact pipeline
+   size and writes `camera_intrinsics_rs.json`. **Caveat:** the D435I's factory
+   color intrinsics report **zero distortion**. If fused landmarks drift/warp
+   near the FRAME EDGES, that's real uncorrected radial lens distortion the zeros
+   don't model — board-calibrate instead:
+
+   **(b) Board calibration (recovers real k1,k2,p1,p2,k3):**
+   ```bash
+   python calibration/charuco_calibration.py intrinsics \
+       --camera 8 --name rs --realsense --square-mm <measured>
+   # --realsense defaults to 640x480 and captures via pyrealsense2 (same stream
+   # as the pipeline). Fill the frame EDGES/CORNERS with the board across views —
+   # that's what pins down the edge distortion. C = calibrate, aim for RMS < 0.5 px.
+   ```
+
+2. **Extrinsics — capture the RealSense via pyrealsense2 too**, by naming it in
+   `--realsense`. RealSense cameras then use `--rs-width/--rs-height` (default
+   640×480), while webcams keep `--width/--height`:
+   ```bash
+   python calibration/charuco_calibration.py extrinsics-all \
+       --cam c0:0 --cam c1:2 --cam rs:8 --realsense rs \
+       --square-mm <measured>
+   ```
+   (The single-camera form takes a bare `--realsense` flag:
+   `extrinsics --camera 8 --name rs --realsense --width 640 --height 480`.)
+
+> Changing intrinsics **invalidates the old extrinsics** (they were solved on top
+> of the old K) — always re-run extrinsics for that camera after re-doing its
+> intrinsics.
+
 This writes `calibration/camera_intrinsics_<name>.json` and
 `camera_extrinsics_<name>.json`. Do **not** move the board between cameras'
 extrinsics steps — they must all reference the same physical pose.
@@ -80,21 +124,35 @@ extrinsics steps — they must all reference the same physical pose.
 > - **Cross-camera (the real check):** launch the pipeline (step 2) and watch the
 >   fusion node's median reprojection-error log — it warns above ~8 px. This is
 >   the true shared-frame validation.
+>
+> **Auto-reject of a bad view:** the fusion node scores each participating camera
+> by its own median reprojection error against the triangulation and, if the
+> worst breaches `--reproj-gate` (default 40 px) while enough views remain to
+> keep `--min-views`, drops that camera and re-triangulates without it. So a 3rd
+> camera whose extrinsics landed in the wrong board frame no longer drags the
+> fused skeleton off — the health log shows `reject[<name>:N]` and the reported
+> reproj drops back to the clean two-view value. Set `--reproj-gate 0` to disable
+> (e.g. while diagnosing the calibration itself). This is a safety net, not a
+> fix: re-solve that camera's extrinsics so it can rejoin the solve.
 
 ## 2. Launch the pipeline
 
 ```bash
-# every camera at its highest resolution (match how you calibrated)
-python teleop/run_multicam.py --cam c0:0 --cam c1:2 --max-res
+# resolutions auto-read from each camera's intrinsics — no :WxH needed
+python teleop/run_multicam.py --cam c0:0 --cam c1:2
 
-# explicit per-camera resolution: name:index:WxH (must match that cam's intrinsics)
+# explicit per-camera resolution: name:index:WxH (overrides the intrinsics size)
 python teleop/run_multicam.py --cam c0:0:1920x1080 --cam c1:2:1280x960
 
-# fixed same size for all, with per-camera debug windows
-python teleop/run_multicam.py --cam c0:0 --cam c1:2 --width 640 --height 480 --show
+# force each camera to its highest mode, with per-camera debug windows
+python teleop/run_multicam.py --cam c0:0 --cam c1:2 --max-res --show
 ```
 
-Resolution precedence per camera: explicit `:WxH` → `--max-res` → `--width/--height`.
+Resolution precedence per camera:
+**explicit `:WxH` → `camera_intrinsics_<name>.json` `image_size` → `--max-res` →
+`--width/--height`.** Because the calibrated size is stored in the intrinsics file,
+a bare `NAME:INDEX` streams at exactly the resolution it was calibrated at — no
+`:WxH` on the CLI, and no separate rig-config file to keep in sync.
 `--list-cameras` on the old publisher (`python ui/mediapipe_joint_angles.py
 --list-cameras`) still lists OpenCV indices.
 
@@ -126,21 +184,55 @@ python teleop/run_multicam.py --cam c0:0 --cam c1:2 --max-res --show --show-fuse
   close-up debugging. Not needed for normal use — everything is in the combined
   `--show-fused` window.
 
-The RealSense participates as a **plain RGB camera** in v1 (its depth is ignored
-for now — a phase-2 add-on). Give it any name, e.g. `rs`, calibrate it like the
-others, and pass `--cam rs:<idx>`.
+### Intel RealSense
+
+The RealSense participates as an **RGB camera** (its depth is not used yet — a
+phase-2 add-on). Its color stream can't be opened reliably at higher resolutions
+through bare OpenCV/V4L2, so it's captured via **`pyrealsense2`** instead. Mark it
+with `--realsense <name>`:
+
+```bash
+python teleop/run_multicam.py --cam c0:0 --cam c1:2 --cam rs:8 --realsense rs
+```
+
+- The `:INDEX` for a `--realsense` camera is **ignored** — the SDK selects the
+  device (single-RealSense rigs need nothing more).
+- The D435I's 1080p color runs at only **8 fps** (too slow for teleop), so a
+  RealSense defaults to **640×480 @ 30 fps** (matching the webcams' framerate for
+  clean fusion sync). Calibrate its intrinsics at the size you'll stream.
+- Note the `:INDEX` still matters for the **calibration tool** (which uses OpenCV):
+  point `intrinsics`/`extrinsics --camera <idx>` at the RealSense **color** V4L2
+  node (find it with `v4l2-ctl --list-devices`; it's the one that reads a normal
+  3-channel frame, not depth/IR).
 
 ## 3. Run teleop as usual
 
 The fusion node publishes `/hand/joint_angles`, so your existing teleop is
-untouched:
+untouched. Two ways to wire it up:
+
+**A. Let the teleop app launch the pipeline** (`--multicam`, recommended — one
+command, no separate terminal):
 
 ```bash
-python kinova_leap_pick_place.py        # or whatever launches DexPilotController
+python kinova_leap_pick_place.py --mode dexpilot \
+    --multicam c0:0 --multicam c1:2 --multicam rs:8 --multicam-realsense rs \
+    --skeleton-view --camera-views
 ```
 
-Do **not** also run `ui/mediapipe_joint_angles.py` at the same time — both
-publish to the same topic. Use one publisher OR the multi-camera pipeline.
+Resolutions come from the intrinsics files. `--multicam` implies `--no-mediapipe`
+(so the single-cam publisher isn't also started). Add `--recalibrate-extrinsics`
+to re-solve each camera's board pose interactively before teleop starts.
+
+**B. Run the pipeline separately**, then the teleop app pointed at it:
+
+```bash
+python teleop/run_multicam.py --cam c0:0 --cam c1:2      # terminal 1
+python kinova_leap_pick_place.py --mode dexpilot --no-mediapipe   # terminal 2
+```
+
+Do **not** also run `ui/mediapipe_joint_angles.py` (or omit `--no-mediapipe` in
+option B) at the same time — two publishers on `/hand/joint_angles` interleave
+poses. Use exactly one hand-pose source.
 
 ## Tuning
 

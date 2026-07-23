@@ -60,6 +60,16 @@ Requires a sourced ROS 2 environment (see [ROS 2 setup](#ros-2-setup) below).
 
 **Start tracking:** the robot holds its home pose until you press **`8`**. Hold your hand at a comfortable neutral orientation and press `8` — that instant is captured as home, so the robot's wrist orientation is treated as matching yours, and it then follows your movement and rotation relative to that pose. `Q`/`Esc` quits.
 
+**Multi-camera (fused) input.** Both teleop modes take their hand pose from `/hand/joint_angles`, which by default the built-in single-camera publisher supplies. Pass `--multicam` to instead auto-launch the [multi-camera pipeline](teleop/MULTICAM.md) (triangulated, occlusion-robust) as a child process — no separate terminal:
+
+```bash
+python kinova_leap_pick_place.py --mode dexpilot \
+    --multicam c0:0 --multicam c1:2 --multicam rs:8 --multicam-realsense rs \
+    --skeleton-view --camera-views
+```
+
+Per-camera resolution is read from `camera_intrinsics_<name>.json`, so a bare `NAME:INDEX` is enough. Add `--recalibrate-extrinsics` to re-solve each camera's board pose interactively before teleop starts. See [CLI flags](#cli-flags) and [`teleop/MULTICAM.md`](teleop/MULTICAM.md).
+
 ---
 
 ### CLI flags
@@ -72,7 +82,14 @@ Requires a sourced ROS 2 environment (see [ROS 2 setup](#ros-2-setup) below).
 | `--viz-only` | off | Debug mode: disables arm/hand collision physics and never calls `mj_step`. REACH and GRASP phases hold their IK solution kinematically so you can inspect the IK/RRT result without dynamics interference. |
 | `--seed N` | none | RNG seed for object randomization — the same seed reproduces the same layout (positions and sizes). Default: fresh entropy every run. Ignored with `--no-randomize`. |
 | `--no-randomize` | off | Skip object randomization entirely: objects keep the positions, sizes, and colors authored in `models/scene_pick_place.xml`. |
-| `--camera N` | auto | *(teleop modes only)* Camera index forwarded to the MediaPipe publisher. Defaults to auto-select (prefers external/USB camera at index ≥ 1). Run `python ui/mediapipe_joint_angles.py --list-cameras` to see available indices. |
+| `--camera N` | auto | *(teleop modes only)* Camera index forwarded to the built-in single-camera MediaPipe publisher. Defaults to auto-select (prefers external/USB camera at index ≥ 1). Run `python ui/mediapipe_joint_angles.py --list-cameras` to see available indices. |
+| `--multicam NAME:INDEX[:WxH]` | none | *(teleop modes)* Auto-launch the [multi-camera pipeline](teleop/MULTICAM.md) (`teleop/run_multicam.py`) as a child process instead of the single-camera publisher, so `/hand/joint_angles` comes from the **fused** cameras. Repeat per camera (≥ 2), e.g. `--multicam c0:0 --multicam c1:2`. Implies `--no-mediapipe`. Resolution is read from each camera's `camera_intrinsics_<name>.json` when `:WxH` is omitted. |
+| `--multicam-realsense NAME` | none | *(with `--multicam`)* Mark a camera as an Intel RealSense — its node captures the COLOR stream via `pyrealsense2` (the `:INDEX` is then ignored; the SDK picks the device). Default 640×480 @ 30 fps (the D435I's 1080p color is only 8 fps). Repeatable. |
+| `--multicam-max-res` | off | *(with `--multicam`)* Open each camera at its highest supported resolution (forwards `--max-res`). Prefer omitting it — resolutions come from the intrinsics files automatically. |
+| `--recalibrate-extrinsics` | off | *(with `--multicam`)* Run the interactive extrinsics solve for each camera **before** teleop starts (fix the ChArUco board at the world origin, press **SPACE** per camera). Reuses each camera's calibrated resolution. Default reuses the saved extrinsics. |
+| `--camera-views` | off | *(with `--multicam`)* Tile each camera's live feed + landmark overlay in a window (subscribes to `/hand/cam_<name>/preview`), like `run_multicam.py --show-fused`'s camera grid. |
+| `--skeleton-view` | off | *(teleop modes)* Open a separate orbitable 3D window of the fused hand skeleton (from the world landmarks in `/hand/joint_angles`). |
+| `--no-mediapipe` / `--external-hand` | off | *(teleop modes)* Do **not** spawn the built-in single-camera publisher — for when an external process already publishes `/hand/joint_angles`. Implied by `--multicam`. |
 
 Flags can be combined, e.g.:
 ```bash
@@ -81,6 +98,11 @@ python kinova_leap_pick_place.py --mode dexpilot --camera 1
 python kinova_leap_pick_place.py --viz-only --dashboard
 python kinova_leap_pick_place.py --ik-solver ipopt
 python kinova_leap_pick_place.py --seed 42          # reproducible object layout
+
+# multi-camera (fused) teleop — resolutions auto-read from intrinsics:
+python kinova_leap_pick_place.py --mode dexpilot \
+    --multicam c0:0 --multicam c1:2 --multicam rs:8 --multicam-realsense rs \
+    --skeleton-view --camera-views
 ```
 
 ---
@@ -197,7 +219,7 @@ python calibration/charuco_calibration.py extrinsics --camera 1 --square-mm 34.8
 Each camera gets its own named calibration files (`camera_intrinsics_<name>.json`, `camera_extrinsics_<name>.json`). Two rules make triangulation valid:
 
 - **Same board pose for all extrinsics.** Every camera's extrinsic must be solved against the *same* fixed board placement — that shared pose is what puts all cameras in one world frame (no stereo calibration needed). Do not move the board between cameras.
-- **Calibrate at the capture resolution.** Intrinsics are only valid at the resolution they were estimated at. Use `--max-res` (opens the camera at its highest supported mode) consistently for calibration *and* at run time, or pin an explicit `--width/--height`. The fusion node hard-errors on a resolution mismatch.
+- **Calibrate at the capture resolution.** Intrinsics are only valid at the resolution they were estimated at. Each camera's calibrated size is stored in its `camera_intrinsics_<name>.json` (`image_size`), and both `run_multicam.py` and the `--multicam` launch **read it back automatically** — so a camera streams at its calibrated resolution with no `:WxH` on the CLI. The fusion node hard-errors on a resolution mismatch.
 
 **1. Intrinsics — per camera** (independent of board placement):
 
@@ -218,10 +240,19 @@ This walks through each `--cam <name>:<index>` in turn. Per camera: **SPACE** so
 **3. Validate.** Launch the pipeline and watch the fusion node's health log — median reprojection error should be a few px; it warns above ~8 px, which flags a moved board, a resolution mismatch, or a bad intrinsic:
 
 ```bash
-python teleop/run_multicam.py --cam c0:0 --cam c1:2 --max-res --show-fused
+python teleop/run_multicam.py --cam c0:0 --cam c1:2 --show-fused
 ```
 
-See [`teleop/MULTICAM.md`](teleop/MULTICAM.md) for the full multi-camera pipeline (per-camera resolution, the combined viewer, and running teleop against the fused output).
+**4. Run teleop against the fused output.** Either launch `run_multicam.py` in one terminal and the teleop app in another, or let the app spawn the pipeline itself with `--multicam` (see [CLI flags](#cli-flags)):
+
+```bash
+python kinova_leap_pick_place.py --mode dexpilot \
+    --multicam c0:0 --multicam c1:2 --skeleton-view --camera-views
+```
+
+**Intel RealSense** participates as a plain RGB camera. Its color stream needs `pyrealsense2` (bundled in the env) rather than bare OpenCV — pass `--multicam-realsense <name>` (in the app) or `--realsense <name>` (in `run_multicam.py`) to capture the color stream via the SDK. The `:INDEX` is then ignored (the SDK selects the device). The D435I's 1080p color runs at only 8 fps, so it defaults to 640×480 @ 30 fps; calibrate its intrinsics at the size you'll stream.
+
+See [`teleop/MULTICAM.md`](teleop/MULTICAM.md) for the full multi-camera pipeline (per-camera resolution, the combined viewer, RealSense capture, and running teleop against the fused output).
 
 ---
 

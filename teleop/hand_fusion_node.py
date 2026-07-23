@@ -41,7 +41,7 @@ from sensor_msgs.msg import CompressedImage
 import cv2
 
 from triangulation import (CameraModel, triangulate_landmarks,
-                           reprojection_errors)
+                           reprojection_errors, per_camera_reproj)
 from hand_message import (WORLD_FROM_BOARD, get_euler_angles,
                           get_flexion_angles, get_wrist_orientation_euler,
                           build_message)
@@ -147,13 +147,29 @@ def _load_camera(name: str) -> CameraModel:
 
 class HandFusionNode(Node):
     def __init__(self, names: list[str], sync_window: float, vis_thresh: float,
-                 min_views: int, reproj_warn: float, show: bool = False):
+                 min_views: int, reproj_warn: float, reproj_gate: float,
+                 reject_px: float = 0.0, show: bool = False):
         super().__init__("hand_fusion")
         self._names = names
         self._sync_window = sync_window
         self._vis_thresh = vis_thresh
         self._min_views = min_views
         self._reproj_warn = reproj_warn
+        # A view whose median reprojection error exceeds this is dropped from the
+        # solve and the frame re-triangulated without it (as long as min_views
+        # still holds) — a mis-calibrated 3rd camera can't drag the fused
+        # skeleton off. 0 disables the gate. Rejections are counted per camera
+        # and surfaced in the health log.
+        self._reproj_gate = reproj_gate
+        self._reject_count = {n: 0 for n in names}
+        # PER-LANDMARK outlier rejection: when a landmark has >= 3 views and one
+        # view's reprojection exceeds this, that single view is dropped for that
+        # landmark only (re-triangulated from the consensus views). Fixes an
+        # occluded fingertip that ONE camera hallucinates — MediaPipe visibility
+        # doesn't flag it, so geometry has to. 0 disables. Distinct from
+        # reproj_gate (which drops a whole mis-CALIBRATED camera).
+        self._reject_px = reject_px
+        self._lmreject_count = {n: 0 for n in names}
 
         # Optional 3D viewer of the fused skeleton. Created on the MAIN thread in
         # main() (all HighGUI + waitKey must stay off the ROS executor thread, or
@@ -212,6 +228,14 @@ class HandFusionNode(Node):
         # the health log to report each camera's effective fps.
         self._rx_count = {n: 0 for n in names}
         self._rx_since = time.time()
+        # Per-camera ADMIT diagnostics: how often each camera's frame was fresh
+        # enough to JOIN the fused solve vs skipped as stale. A slow camera can
+        # arrive (high _rx_count) yet still miss the fuse window — this measures
+        # that directly. _fuse_attempts counts frames where the fuse ran; admit/
+        # stale sum to it per camera. Reported in the health log as admit%.
+        self._fuse_attempts = 0
+        self._admit_count = {n: 0 for n in names}
+        self._stale_count = {n: 0 for n in names}
         self.get_logger().info(
             f"[fusion] {len(names)} cameras {names}; publishing /hand/joint_angles "
             f"(sync window {sync_window*1e3:.0f} ms, min_views {min_views}).")
@@ -298,17 +322,20 @@ class HandFusionNode(Node):
         idx = {cam.name: i for i, cam in enumerate(self._cams)}
         admitted_ts = []
         n_fresh = 0
+        self._fuse_attempts += 1
         for cam in self._cams:
             entry = self._latest.get(cam.name)
             if entry is None or not entry[3]:
                 continue                     # no frame yet / not detecting
             stamp, uv, vis, _ = entry
             if now - stamp > stale:
+                self._stale_count[cam.name] += 1   # arrived, but too old to fuse
                 continue                     # this camera's frame is genuinely old
             i = idx[cam.name]
             uv_per_cam[i] = cam.undistort_pixels(uv)
             vis_per_cam[i] = vis
             admitted_ts.append(stamp)
+            self._admit_count[cam.name] += 1
             n_fresh += 1
         if len(admitted_ts) >= 2:
             self._last_span = max(admitted_ts) - min(admitted_ts)
@@ -408,10 +435,45 @@ class HandFusionNode(Node):
                 self._last_wait_log = now
             return None, msg
 
-        pts, ok = triangulate_landmarks(
+        pts, ok, dropped = triangulate_landmarks(
             self._cams, uv_per_cam, vis_per_cam,
             n_landmarks=N_LM, vis_thresh=self._vis_thresh,
-            min_views=self._min_views)
+            min_views=self._min_views, reject_px=self._reject_px)
+
+        # --- Auto-reject a mis-calibrated view -------------------------------
+        # Score each participating camera by its own median reprojection error
+        # against the triangulation. If the worst exceeds the gate AND enough
+        # views survive to keep min_views, drop it and re-triangulate WITHOUT
+        # it. One pass (single worst offender) is enough for the observed
+        # failure — a 3rd camera whose extrinsics don't match the shared board
+        # frame reprojects at hundreds of px while the two consistent views sit
+        # at a few px, so it stands out unambiguously.
+        n_used = n_fresh
+        if self._reproj_gate > 0.0 and ok.any():
+            present = [i for i, uv in enumerate(uv_per_cam) if uv is not None]
+            if len(present) > self._min_views:
+                per_cam = per_camera_reproj(self._cams, uv_per_cam, pts)
+                worst = max(present, key=lambda i: (per_cam[i]
+                            if np.isfinite(per_cam[i]) else -1.0))
+                if np.isfinite(per_cam[worst]) and per_cam[worst] > self._reproj_gate:
+                    self._reject_count[self._cams[worst].name] += 1
+                    uv_per_cam = list(uv_per_cam)
+                    vis_per_cam = list(vis_per_cam)
+                    uv_per_cam[worst] = None
+                    vis_per_cam[worst] = None
+                    n_used -= 1
+                    pts, ok, dropped = triangulate_landmarks(
+                        self._cams, uv_per_cam, vis_per_cam,
+                        n_landmarks=N_LM, vis_thresh=self._vis_thresh,
+                        min_views=self._min_views, reject_px=self._reject_px)
+        n_fresh = n_used
+
+        # Per-landmark view rejection diagnostics: count how many landmarks had an
+        # occluded view dropped this window, per camera (surfaced in the health
+        # log as lmreject[name:N]). A fingertip that one camera occludes shows up
+        # here without dragging the fused point.
+        for _ci in dropped[dropped >= 0]:
+            self._lmreject_count[self._cams[int(_ci)].name] += 1
 
         # Require the landmarks the downstream math depends on: wrist + the two
         # MCPs that define the palm frame, plus the fingertips for pinch. If the
@@ -486,8 +548,33 @@ class HandFusionNode(Node):
             dt = max(1e-3, t - self._rx_since)
             fps = {n: self._rx_count[n] / dt for n in self._rx_count}
             fps_str = " ".join(f"{n}:{fps[n]:.0f}" for n in self._rx_count)
+            # ADMIT rate: of the fuse attempts this window, how often each camera was
+            # fresh enough to be included. A camera with high fps but LOW admit% is
+            # arriving but consistently too old to join the fuse (the "slow camera
+            # hurting combining" case) — raise --sync-window or speed that camera up.
+            _att = max(1, self._fuse_attempts)
+            admit_str = " ".join(
+                f"{n}:{100.0 * self._admit_count[n] / _att:.0f}%"
+                for n in self._rx_count)
+            # Views the reproj gate dropped this window. A camera with a nonzero
+            # count is the one whose calibration disagrees with the shared frame.
+            _rej_total = sum(self._reject_count.values())
+            reject_str = (" reject[" + " ".join(
+                f"{n}:{self._reject_count[n]}" for n in self._rx_count
+                if self._reject_count[n]) + "]") if _rej_total else ""
+            # Per-landmark (fingertip) view rejections this window — a camera with
+            # a nonzero count keeps occluding some landmarks that the others see.
+            _lmrej_total = sum(self._lmreject_count.values())
+            lmreject_str = (" lmreject[" + " ".join(
+                f"{n}:{self._lmreject_count[n]}" for n in self._rx_count
+                if self._lmreject_count[n]) + "]") if _lmrej_total else ""
             for n in self._rx_count:
                 self._rx_count[n] = 0
+                self._admit_count[n] = 0
+                self._stale_count[n] = 0
+                self._reject_count[n] = 0
+                self._lmreject_count[n] = 0
+            self._fuse_attempts = 0
             self._rx_since = t
             if med > self._reproj_warn:
                 cause = ("desync? tighten --sync-window" if span_ms > 8.0
@@ -502,7 +589,7 @@ class HandFusionNode(Node):
             self.get_logger().info(
                 f"[fusion] {n_fresh} views, {int(ok.sum())}/{N_LM} LM, "
                 f"reproj med {med:.1f}px max {mx:.1f}px, span {span_ms:.0f}ms, "
-                f"fps[{fps_str}]{flag}")
+                f"fps[{fps_str}] admit[{admit_str}]{reject_str}{lmreject_str}{flag}")
             self._last_ok_log = t
             self._view_info = (f"{n_fresh} views  {int(ok.sum())}/{N_LM} LM  "
                                f"reproj {med:.1f}px")
@@ -545,6 +632,20 @@ def main():
                     help="Minimum simultaneous views to triangulate a landmark.")
     ap.add_argument("--reproj-warn", type=float, default=8.0,
                     help="Median reprojection error [px] above which to warn.")
+    ap.add_argument("--reproj-gate", type=float, default=40.0,
+                    help="Per-view median reprojection error [px] above which a "
+                         "camera is DROPPED from the solve and the frame "
+                         "re-triangulated without it (only when enough views "
+                         "remain to keep --min-views). 0 disables. Default 40 px "
+                         "sits well above healthy sync jitter (a few px) but far "
+                         "below a mis-calibrated view (hundreds of px).")
+    ap.add_argument("--reject-px", type=float, default=8.0,
+                    help="PER-LANDMARK outlier rejection: when a landmark has >= 3 "
+                         "views and one view's reprojection exceeds this [px], drop "
+                         "that single view for that landmark and re-triangulate from "
+                         "the rest. Fixes an occluded fingertip that ONE camera "
+                         "hallucinates (MediaPipe visibility doesn't flag it). 0 "
+                         "disables. Needs >= 3 cameras to do anything. Default 8 px.")
     ap.add_argument("--show", action="store_true",
                     help="Open a 3D viewer of the fused skeleton on a black window "
                          "(orbit with the mouse; shows the world-frame axes).")
@@ -555,7 +656,8 @@ def main():
 
     rclpy.init()
     node = HandFusionNode(args.cameras, args.sync_window, args.vis_thresh,
-                          args.min_views, args.reproj_warn, show=args.show)
+                          args.min_views, args.reproj_warn, args.reproj_gate,
+                          reject_px=args.reject_px, show=args.show)
 
     if not node.wants_viewer():
         # Headless: plain spin on this thread.

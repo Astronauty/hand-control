@@ -45,6 +45,18 @@ DEFAULT_BOARD_PNG = os.path.join(_HERE, "board.png")
 DEFAULT_INTRINSICS = os.path.join(_HERE, "camera_intrinsics.json")
 DEFAULT_EXTRINSICS = os.path.join(_HERE, "camera_extrinsics.json")
 
+# Extrinsic-solve stability: reject an averaged board pose whose per-frame
+# translation scatter exceeds this — a jiggly board (hand-held, vibrating mount)
+# bakes a noisy pose into the extrinsic. ~3 mm passes a genuinely-fixed board but
+# flags a shaking one. Overridable via --pose-std-mm.
+_POSE_STD_TOL_M = 0.003
+
+# cornerSubPix refinement for ChArUco corners — raw detector corners jitter
+# frame-to-frame; sub-pixel refinement is the single biggest reduction in that
+# jitter (and in the drawn-axis wobble you see during the solve).
+_SUBPIX_WIN = (5, 5)
+_SUBPIX_CRIT = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
+
 
 def _named(default_path: str, name: str | None) -> str:
     """Insert a camera name before the extension for per-camera calibration files.
@@ -154,8 +166,98 @@ def _request_max_res(cap: cv2.VideoCapture) -> None:
     print(f"[camera] max-res -> {best[0]}x{best[1]}")
 
 
+class _RealSenseCapture:
+    """cv2.VideoCapture-compatible shim over a RealSense COLOR stream.
+
+    MUST match how the teleop pipeline captures the RealSense
+    (teleop/hand_landmark_node.py::_RealSenseCapture): pyrealsense2 color at a
+    fixed WxH in bgr8. Calibrating extrinsics through bare cv2.VideoCapture would
+    open a DIFFERENT stream (or fail — the D435I color isn't reliably openable
+    via V4L2), so the resulting pose would not match the pixels fusion receives.
+    Exposes just the read()/get()/release()/isOpened() surface _open_camera's
+    callers use.
+    """
+
+    def __init__(self, width: int, height: int, fps: int | None = None):
+        import pyrealsense2 as rs
+        self._rs = rs
+        if fps is None:
+            fps = self._best_fps(rs, width, height)
+            if fps is None:
+                sys.exit(f"ERROR: RealSense has no bgr8 color mode at "
+                         f"{width}x{height}. Use a supported size (e.g. 640x480, "
+                         f"1280x720) and calibrate intrinsics at that same size.")
+        self._w, self._h = width, height
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        self._pipe = rs.pipeline()
+        try:
+            self._pipe.start(cfg)
+        except Exception as e:
+            sys.exit(f"ERROR: could not start RealSense color at "
+                     f"{width}x{height}@{fps} ({e}). Is the device held by "
+                     f"another process? (check: fuser /dev/video*)")
+        self._opened = True
+        print(f"[camera] RealSense color {width}x{height}@{fps} bgr8 started — "
+              f"extrinsics will be valid ONLY at this size.")
+
+    @staticmethod
+    def _best_fps(rs, width: int, height: int):
+        best = None
+        try:
+            for d in rs.context().query_devices():
+                for s in d.query_sensors():
+                    for p in s.get_stream_profiles():
+                        if p.stream_type() != rs.stream.color:
+                            continue
+                        if p.format() != rs.format.bgr8:
+                            continue
+                        vp = p.as_video_stream_profile()
+                        if vp.width() == width and vp.height() == height:
+                            best = max(best or 0, p.fps())
+        except Exception:
+            return None
+        return best
+
+    def isOpened(self):
+        return self._opened
+
+    def read(self):
+        try:
+            frames = self._pipe.wait_for_frames(2000)
+            color = frames.get_color_frame()
+            if not color:
+                return False, None
+            return True, np.asanyarray(color.get_data())
+        except Exception:
+            return False, None
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self._w)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self._h)
+        return 0.0
+
+    def set(self, *_a, **_k):
+        return True   # resolution fixed at construction
+
+    def release(self):
+        if self._opened:
+            try:
+                self._pipe.stop()
+            except Exception:
+                pass
+            self._opened = False
+
+
 def _open_camera(index: int, width: int, height: int,
-                 max_res: bool = False) -> cv2.VideoCapture:
+                 max_res: bool = False, realsense: bool = False):
+    if realsense:
+        # RealSense: pyrealsense2 color at a FIXED size (max_res N/A — RS 1080p
+        # color is 8 fps). Default 640x480 to match the pipeline unless the
+        # caller overrode width/height. --camera index is ignored (SDK picks it).
+        return _RealSenseCapture(width or 640, height or 480, fps=None)
     cap = cv2.VideoCapture(index)
     if not cap.isOpened():
         sys.exit(f"ERROR: could not open camera index {index}. "
@@ -209,7 +311,17 @@ def cmd_intrinsics(args: argparse.Namespace) -> None:
     board, aruco_dict = _make_board(square_m)
     _, charuco_detector = _make_detectors(board, aruco_dict)
 
-    cap = _open_camera(args.camera, args.width, args.height, args.max_res)
+    _rs = getattr(args, "realsense", False)
+    _w, _h, _mx = args.width, args.height, args.max_res
+    if _rs:
+        # A RealSense's capture size is the pyrealsense2 stream size, and 1080p
+        # color is only 8 fps. If the user didn't override the (webcam-oriented)
+        # 1280x720 defaults, fall back to the pipeline's 640x480 so the intrinsics
+        # match what teleop actually streams. --max-res is meaningless here.
+        if (_w, _h) == (1280, 720):
+            _w, _h = 640, 480
+        _mx = False
+    cap = _open_camera(args.camera, _w, _h, _mx, _rs)
     win = "intrinsics — SPACE capture, C calibrate, Q quit"
     _make_window(win)
     print("[intrinsics] SPACE = capture a view, C = calibrate, Q = quit.")
@@ -253,14 +365,51 @@ def cmd_intrinsics(args: argparse.Namespace) -> None:
             if len(all_corners) < args.min_views:
                 print(f"[intrinsics] need >= {args.min_views} views, have {len(all_corners)}.")
                 continue
-            _run_intrinsics_calib(board, all_corners, all_ids, image_size, args.out)
+            _run_intrinsics_calib(board, all_corners, all_ids, image_size,
+                                  args.out, fix_k3=getattr(args, "fix_k3", False))
             break
 
     cap.release()
     cv2.destroyAllWindows()
 
 
-def _run_intrinsics_calib(board, all_corners, all_ids, image_size, out_path) -> None:
+def _radial_factor(dist, r):
+    """OpenCV radial distortion factor 1 + k1 r^2 + k2 r^4 + k3 r^6 at radius r."""
+    k1, k2 = float(dist[0]), float(dist[1])
+    k3 = float(dist[4]) if len(dist) >= 5 else 0.0
+    r2 = r * r
+    return 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+
+
+def _warn_if_distortion_overfit(dist) -> None:
+    """Flag a non-monotonic / diverging radial model — the tell-tale of an
+    overfit high-order term (usually k3) from insufficient frame-edge coverage.
+
+    A healthy lens model's radial factor is monotonic out to the corner
+    (r ~ 0.6-0.7 in normalised units). If it turns over or swings > ~10%, the
+    correction bends the WRONG way at the edges, so triangulated points near the
+    frame border smear — exactly the failure this guard exists to catch. We warn
+    (not error) so an intentional strong-distortion calibration still saves.
+    """
+    rs = np.linspace(0.0, 0.7, 15)
+    fac = np.array([_radial_factor(dist, r) for r in rs])
+    swing = float(fac.max() - fac.min())
+    # A well-behaved low/moderate-distortion model stays within a few % of 1.0
+    # across the frame. Only flag genuine divergence: a large overall swing, or
+    # the correction turning over enough to drop below 0.95 at the corner. (A
+    # sub-1% ripple from float noise is NOT overfitting — don't warn on it.)
+    if swing > 0.06 or fac[-1] < 0.95:
+        print("[intrinsics] *** WARNING: distortion model looks OVERFIT ***")
+        print(f"[intrinsics]   radial factor swings {swing*100:.1f}% over the frame "
+              f"(corner={fac[-1]:.3f}); k3={float(dist[4]) if len(dist)>=5 else 0:.3f}")
+        print("[intrinsics]   This bends the correction the wrong way at the EDGES "
+              "(fused points near the border will smear).")
+        print("[intrinsics]   Re-run with --fix-k3 (pins the 6th-order term to 0), "
+              "or capture more views with the board pushed into the CORNERS.")
+
+
+def _run_intrinsics_calib(board, all_corners, all_ids, image_size, out_path,
+                          fix_k3: bool = False) -> None:
     # Build object/image point correspondences per view from the board model,
     # then calibrate with the generic cv2.calibrateCamera (stable across the
     # 4.x aruco API churn around calibrateCameraCharuco).
@@ -276,13 +425,20 @@ def _run_intrinsics_calib(board, all_corners, all_ids, image_size, out_path) -> 
     if len(obj_points) < 3:
         sys.exit("[intrinsics] not enough valid views after matching; recapture.")
 
+    # CALIB_FIX_K3 pins the unstable 6th-order radial term to 0. For a
+    # low-distortion lens (RealSense color, most webcams) k3 is near zero and
+    # only overfits without dense corner coverage — fixing it yields a stable,
+    # monotonic model that behaves at the frame edges.
+    flags = cv2.CALIB_FIX_K3 if fix_k3 else 0
     rms, camera_matrix, dist_coeffs, _, _ = cv2.calibrateCamera(
-        obj_points, img_points, image_size, None, None)
+        obj_points, img_points, image_size, None, None, flags=flags)
 
     print(f"[intrinsics] RMS reprojection error: {rms:.4f} px "
-          f"({'good' if rms < 1.0 else 'high — recapture with more/varied views'})")
+          f"({'good' if rms < 1.0 else 'high — recapture with more/varied views'})"
+          + ("  [k3 fixed to 0]" if fix_k3 else ""))
     print(f"[intrinsics] camera_matrix=\n{camera_matrix}")
     print(f"[intrinsics] dist_coeffs={dist_coeffs.ravel()}")
+    _warn_if_distortion_overfit(dist_coeffs.ravel())
 
     data = {
         "image_size": list(image_size),
@@ -300,7 +456,9 @@ def _run_intrinsics_calib(board, all_corners, all_ids, image_size, out_path) -> 
 # ----------------------------------------------------------------------------
 def _solve_one_extrinsic(camera: int, intrinsics_path: str, out_path: str,
                          square_mm: float, n_avg: int, width: int, height: int,
-                         max_res: bool, title: str = "") -> bool:
+                         max_res: bool, title: str = "",
+                         realsense: bool = False,
+                         std_tol_m: float = _POSE_STD_TOL_M) -> bool:
     """Interactive extrinsic solve for ONE camera against the fixed board.
 
     Opens the camera, shows the live board detection + world axes, and on SPACE
@@ -320,7 +478,7 @@ def _solve_one_extrinsic(camera: int, intrinsics_path: str, out_path: str,
     board, aruco_dict = _make_board(square_m)
     _, charuco_detector = _make_detectors(board, aruco_dict)
 
-    cap = _open_camera(camera, width, height, max_res)
+    cap = _open_camera(camera, width, height, max_res, realsense)
     win = f"extrinsics {title} — SPACE solve, S skip, Q quit".strip()
     _make_window(win)
     print(f"[extrinsics] {title} Fix the board at the WORLD ORIGIN, facing the camera.")
@@ -339,10 +497,13 @@ def _solve_one_extrinsic(camera: int, intrinsics_path: str, out_path: str,
         vis = frame.copy()
         n_det = 0 if charuco_ids is None else len(charuco_ids)
         if n_det >= 6:
-            obj_pts, img_pts = board.matchImagePoints(charuco_corners, charuco_ids)
-            ok_pnp, rvec, tvec = cv2.solvePnP(obj_pts, img_pts,
-                                              camera_matrix, dist_coeffs)
-            if ok_pnp:
+            # Same refined SQPNP solve the SAVE path uses, so the drawn axes match
+            # what gets averaged/stored (and jitter far less than the old default
+            # iterative solvePnP on raw corners).
+            sol = _solve_board_pose(gray, charuco_corners, charuco_ids, board,
+                                    camera_matrix, dist_coeffs)
+            if sol is not None:
+                rvec, tvec = sol
                 cv2.drawFrameAxes(vis, camera_matrix, dist_coeffs,
                                   rvec, tvec, square_m * 2)
         label = f"{title}  corners: {n_det}  (need >=6; SPACE solve, S skip, Q quit)"
@@ -359,9 +520,10 @@ def _solve_one_extrinsic(camera: int, intrinsics_path: str, out_path: str,
             break
         if key == ord(' '):
             pose = _average_pose(cap, charuco_detector, board,
-                                 camera_matrix, dist_coeffs, n_avg)
+                                 camera_matrix, dist_coeffs, n_avg, std_tol_m)
             if pose is None:
-                print("[extrinsics] board not stably detected; hold steady and retry.")
+                # _average_pose already printed the specific reason (too few
+                # solves, or unstable/jiggling). Stay in the loop to retry.
                 continue
             _report_and_save_extrinsics(pose, out_path)
             solved = True
@@ -375,9 +537,29 @@ def _solve_one_extrinsic(camera: int, intrinsics_path: str, out_path: str,
 
 
 def cmd_extrinsics(args: argparse.Namespace) -> None:
+    # The extrinsic MUST be solved at the resolution this camera's intrinsics were
+    # calibrated at (K is only valid there). The intrinsics file's image_size is
+    # the source of truth, so auto-adopt it unless the user overrode --width/height
+    # or asked for --max-res — otherwise a camera calibrated at, e.g., 1280x960
+    # would be silently opened at the 1280x720 default and solved against a
+    # mis-scaled K. (--realsense uses its own default via _open_camera.)
+    w, h = args.width, args.height
+    if not args.max_res and not args.realsense and (w, h) == (1280, 720):
+        try:
+            import json
+            sz = json.load(open(args.intrinsics)).get("image_size")
+            if sz:
+                w, h = int(sz[0]), int(sz[1])
+                if (w, h) != (1280, 720):
+                    print(f"[extrinsics] using calibrated resolution {w}x{h} from "
+                          f"{os.path.basename(args.intrinsics)} (pass --width/--height "
+                          f"to override).")
+        except Exception:
+            pass
     _solve_one_extrinsic(args.camera, args.intrinsics, args.out,
-                         args.square_mm, args.n_avg, args.width, args.height,
-                         args.max_res)
+                         args.square_mm, args.n_avg, w, h,
+                         args.max_res, realsense=args.realsense,
+                         std_tol_m=args.pose_std_mm / 1000.0)
 
 
 def cmd_extrinsics_all(args: argparse.Namespace) -> None:
@@ -390,8 +572,9 @@ def cmd_extrinsics_all(args: argparse.Namespace) -> None:
     to stop the walkthrough.
     """
     cams = args.cam
+    rs_names = set(args.realsense)
     print(f"[extrinsics-all] {len(cams)} cameras: "
-          f"{', '.join(f'{n}:{i}' for n, i in cams)}")
+          f"{', '.join(f'{n}:{i}' + ('(rs)' if n in rs_names else '') for n, i in cams)}")
     print("[extrinsics-all] KEEP THE BOARD FIXED at the world origin for the WHOLE "
           "run — that shared pose is what puts all cameras in one frame.")
     done, skipped = [], []
@@ -400,9 +583,18 @@ def cmd_extrinsics_all(args: argparse.Namespace) -> None:
             intr = _named(DEFAULT_INTRINSICS, name)
             out = _named(DEFAULT_EXTRINSICS, name)
             title = f"[{k}/{len(cams)}] {name}"
-            print(f"\n[extrinsics-all] ==== {title} (camera index {idx}) ====")
+            is_rs = name in rs_names
+            # A RealSense captures via pyrealsense2 at its own (intrinsics-matched)
+            # size; webcams use the shared --width/height. Both MUST equal the size
+            # each camera's intrinsics were calibrated at, or the solved pose is
+            # invalid (mis-scaled K).
+            w = args.rs_width if is_rs else args.width
+            h = args.rs_height if is_rs else args.height
+            print(f"\n[extrinsics-all] ==== {title} "
+                  f"({'RealSense color' if is_rs else f'camera index {idx}'}) ====")
             ok = _solve_one_extrinsic(idx, intr, out, args.square_mm, args.n_avg,
-                                      args.width, args.height, args.max_res, title)
+                                      w, h, args.max_res, title, realsense=is_rs,
+                                      std_tol_m=args.pose_std_mm / 1000.0)
             (done if ok else skipped).append(name)
     except KeyboardInterrupt:
         print("\n[extrinsics-all] stopped early (Q).")
@@ -414,12 +606,31 @@ def cmd_extrinsics_all(args: argparse.Namespace) -> None:
               "(same board pose). Validate with the fusion node's reproj log.")
 
 
-def _average_pose(cap, charuco_detector, board, camera_matrix, dist_coeffs, n_avg):
+# Reject a solve whose per-frame translation scatter exceeds this — a jiggly
+
+def _solve_board_pose(gray, cc, ci, board, K, dist):
+    """One refined board-pose solve. Refines the ChArUco corners to sub-pixel and
+    uses SQPNP (stable on the near-planar board, unlike the default iterative
+    solver which can flip to a mirror pose). Returns (rvec, tvec) or None."""
+    cc = cv2.cornerSubPix(gray, cc.astype(np.float32), _SUBPIX_WIN, (-1, -1),
+                          _SUBPIX_CRIT)
+    obj_pts, img_pts = board.matchImagePoints(cc, ci)
+    if obj_pts is None or len(obj_pts) < 6:
+        return None
+    ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist,
+                                  flags=cv2.SOLVEPNP_SQPNP)
+    return (rvec, tvec) if ok else None
+
+
+def _average_pose(cap, charuco_detector, board, camera_matrix, dist_coeffs, n_avg,
+                  std_tol_m: float = _POSE_STD_TOL_M):
     """Average board pose over n_avg frames to reduce single-frame PnP jitter.
 
-    Returns (R_cam_board 3x3, t_cam_board 3) or None if too few solves.
-    Translation is averaged directly; rotation via mean of rvecs (small-angle
-    spread over a few static frames makes this adequate).
+    Returns (R_cam_board 3x3, t_cam_board 3), or None if too few solves OR the
+    per-frame scatter is too large (a jiggly board — hold it steadier and retry).
+    Corners are refined to sub-pixel and solved with SQPNP; translation is
+    averaged directly, rotation via mean of rvecs (valid for the small spread of
+    a static board — a large spread trips the stability gate below).
     """
     tvecs: list[np.ndarray] = []
     rvecs: list[np.ndarray] = []
@@ -433,20 +644,34 @@ def _average_pose(cap, charuco_detector, board, camera_matrix, dist_coeffs, n_av
         cc, ci, _, _ = charuco_detector.detectBoard(gray)
         if ci is None or len(ci) < 6:
             continue
-        obj_pts, img_pts = board.matchImagePoints(cc, ci)
-        ok_pnp, rvec, tvec = cv2.solvePnP(obj_pts, img_pts,
-                                          camera_matrix, dist_coeffs)
-        if ok_pnp:
+        sol = _solve_board_pose(gray, cc, ci, board, camera_matrix, dist_coeffs)
+        if sol is not None:
+            rvec, tvec = sol
             rvecs.append(rvec.ravel())
             tvecs.append(tvec.ravel())
 
     if len(tvecs) < max(3, n_avg // 3):
+        print(f"[extrinsics] only {len(tvecs)}/{n_avg} valid solves — board not "
+              f"reliably detected; reposition and retry.")
+        return None
+    t_std = np.std(tvecs, axis=0)
+    r_std = np.std(rvecs, axis=0)
+    print(f"[extrinsics] averaged {len(tvecs)}/{n_avg} valid frames; "
+          f"tvec std = {np.round(t_std*1000, 2)} mm, "
+          f"rvec std = {np.round(np.degrees(r_std), 3)} deg")
+    # Stability gate: a fixed board should solve to well under a mm of scatter.
+    # High scatter = the board (or camera) is moving, or PnP is flipping between
+    # poses — either way the averaged pose is unreliable. Refuse to save it.
+    if float(np.linalg.norm(t_std)) > std_tol_m:
+        print(f"[extrinsics] *** UNSTABLE: pose scatter {np.linalg.norm(t_std)*1000:.1f} mm "
+              f"> {std_tol_m*1000:.1f} mm tolerance ***")
+        print("[extrinsics]   The board or camera is JIGGLING. Fix the board rigidly "
+              "(clamp it), steady the camera, and re-press SPACE. Loosen the gate "
+              "with --pose-std-mm only if you understand the accuracy cost.")
         return None
     t_mean = np.mean(tvecs, axis=0)
     r_mean = np.mean(rvecs, axis=0)
     R_mean, _ = cv2.Rodrigues(r_mean)
-    print(f"[extrinsics] averaged {len(tvecs)}/{n_avg} valid frames; "
-          f"tvec std = {np.std(tvecs, axis=0)} m")
     return R_mean, t_mean
 
 
@@ -513,6 +738,19 @@ def main() -> None:
                    help="Calibrate at the camera's HIGHEST supported resolution "
                         "(matches run_multicam --max-res). Overrides --width/height. "
                         "The camera MUST then run the pipeline at this same size.")
+    i.add_argument("--realsense", action="store_true",
+                   help="Capture via pyrealsense2 COLOR (Intel RealSense) instead "
+                        "of cv2 — the same stream the teleop pipeline uses. Solves "
+                        "REAL distortion coeffs (the SDK's factory color intrinsics "
+                        "report zero distortion, which leaves visible edge/radial "
+                        "error). --camera index is ignored; set --width/--height to "
+                        "the pipeline size (default 640x480).")
+    i.add_argument("--fix-k3", action="store_true",
+                   help="Pin the 6th-order radial distortion term k3 to 0 "
+                        "(CALIB_FIX_K3). Use for low-distortion lenses (RealSense "
+                        "color, most webcams) where k3 overfits without dense corner "
+                        "coverage and makes the correction diverge at the frame "
+                        "edges — the tool warns when it detects this.")
     i.set_defaults(func=cmd_intrinsics)
 
     e = sub.add_parser("extrinsics", help="solve fixed-board camera->world pose")
@@ -535,6 +773,16 @@ def main() -> None:
     e.add_argument("--max-res", action="store_true",
                    help="Open the camera at its HIGHEST supported resolution. Use "
                         "the SAME setting as the intrinsics step for this camera.")
+    e.add_argument("--realsense", action="store_true",
+                   help="Capture via pyrealsense2 COLOR (Intel RealSense) instead "
+                        "of cv2.VideoCapture — the same path the teleop pipeline "
+                        "uses. --camera index is ignored; use --width/--height to "
+                        "match this camera's intrinsics size (default 640x480).")
+    e.add_argument("--pose-std-mm", type=float, default=_POSE_STD_TOL_M * 1000.0,
+                   help="Reject a solve whose averaged board-pose scatter exceeds "
+                        "this (mm) — guards against a jiggling board/camera. "
+                        f"Default {_POSE_STD_TOL_M*1000:.0f} mm. Raise only if you "
+                        "accept the accuracy cost.")
     e.set_defaults(func=cmd_extrinsics)
 
     ea = sub.add_parser(
@@ -554,6 +802,21 @@ def main() -> None:
     ea.add_argument("--max-res", action="store_true",
                     help="Open each camera at its HIGHEST supported resolution "
                          "(match how you ran intrinsics for these cameras).")
+    ea.add_argument("--realsense", action="append", default=[], metavar="NAME",
+                    help="Mark a --cam NAME as an Intel RealSense: capture its "
+                         "COLOR via pyrealsense2 (same path as the teleop "
+                         "pipeline), NOT cv2. Repeatable. RealSense cameras use "
+                         "--rs-width/--rs-height (default 640x480) instead of "
+                         "--width/--height, to match their intrinsics.")
+    ea.add_argument("--rs-width", type=int, default=640,
+                    help="Color width for --realsense cameras (default 640; must "
+                         "equal their intrinsics' image_size width).")
+    ea.add_argument("--rs-height", type=int, default=480,
+                    help="Color height for --realsense cameras (default 480).")
+    ea.add_argument("--pose-std-mm", type=float, default=_POSE_STD_TOL_M * 1000.0,
+                    help="Reject a solve whose averaged board-pose scatter exceeds "
+                         "this (mm) — guards against a jiggling board/camera. "
+                         f"Default {_POSE_STD_TOL_M*1000:.0f} mm.")
     ea.set_defaults(func=cmd_extrinsics_all)
 
     args = p.parse_args()

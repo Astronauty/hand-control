@@ -68,6 +68,23 @@ def _parse_cam(spec: str) -> tuple[str, int, tuple[int, int] | None]:
     return name, idx, res
 
 
+def _intrinsics_res(name: str) -> tuple[int, int] | None:
+    """Calibrated (W, H) from camera_intrinsics_<name>.json, or None if absent.
+
+    The intrinsics file's image_size IS the resolution this camera must stream at
+    (the fusion node rejects a mismatch), so it's the single source of truth — no
+    separate rig-config file needed. Used to fill a --cam spec that omits :WxH."""
+    import json
+    p = os.path.join(_CALIB_DIR, f"camera_intrinsics_{name}.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        sz = json.load(open(p)).get("image_size")
+        return (int(sz[0]), int(sz[1])) if sz else None
+    except Exception:
+        return None
+
+
 def _check_calibration(names: list[str]) -> None:
     """Warn (don't fail) if a camera's per-name calibration is missing.
 
@@ -94,6 +111,12 @@ def main():
                     help="Camera name:OpenCV-index, optional :WxH resolution. "
                          "Repeat for each camera (>=2). Cameras may run at "
                          "DIFFERENT resolutions (each uses its own intrinsics).")
+    ap.add_argument("--realsense", action="append", default=[], metavar="NAME",
+                    help="Mark a camera NAME as an Intel RealSense: its landmark node "
+                         "captures the COLOR stream via pyrealsense2 (--realsense flag) "
+                         "instead of cv2.VideoCapture. The :INDEX in --cam is ignored "
+                         "for that camera (SDK selects the device); its :WxH (or the "
+                         "640x480 default) sets the color resolution. Repeatable.")
     ap.add_argument("--max-res", action="store_true",
                     help="Open EVERY camera at its highest supported resolution "
                          "(unless that camera specified an explicit :WxH). Best "
@@ -119,6 +142,13 @@ def main():
     ap.add_argument("--sync-window", type=float, default=0.033)
     ap.add_argument("--vis-thresh", type=float, default=0.3)
     ap.add_argument("--min-views", type=int, default=2)
+    ap.add_argument("--reproj-gate", type=float, default=40.0,
+                    help="Per-view median reproj [px] above which a camera is "
+                         "dropped from the solve (0 disables). See fusion node.")
+    ap.add_argument("--reject-px", type=float, default=8.0,
+                    help="Per-LANDMARK outlier reproj [px]: drop one view for a "
+                         "single landmark (e.g. an occluded fingertip) when >= 3 "
+                         "views disagree (0 disables). See fusion node.")
     args = ap.parse_args()
 
     if len(args.cam) < 2:
@@ -137,11 +167,27 @@ def main():
 
     try:
         # One landmark node per camera. Resolution precedence per camera:
-        #   explicit :WxH  >  --max-res  >  global --width/--height fallback.
+        #   explicit :WxH  >  camera_intrinsics_<name>.json image_size  >
+        #   --max-res  >  global --width/--height fallback.
+        # The intrinsics-derived size means a bare NAME:INDEX spec streams at the
+        # calibrated resolution automatically — no per-camera :WxH needed on the CLI.
+        _rs_names = set(args.realsense)
         for name, idx, res in args.cam:
             argv = [_LANDMARK, "--camera", str(idx), "--name", name]
-            if res is not None:
-                argv += ["--width", str(res[0]), "--height", str(res[1])]
+            _is_rs = name in _rs_names
+            # Resolve the effective (W, H): explicit spec wins, else calibrated size.
+            _res = res if res is not None else _intrinsics_res(name)
+            if _res is not None:
+                _src = "spec" if res is not None else "intrinsics"
+                print(f"[run] camera '{name}' -> {_res[0]}x{_res[1]} (from {_src})")
+            if _is_rs:
+                # RealSense: SDK capture, --max-res N/A (1080p is 8fps). Resolution
+                # from :WxH / intrinsics, else the 640x480 default (webcam framerate).
+                argv += ["--realsense"]
+                _rw, _rh = _res if _res is not None else (640, 480)
+                argv += ["--width", str(_rw), "--height", str(_rh)]
+            elif _res is not None:
+                argv += ["--width", str(_res[0]), "--height", str(_res[1])]
             elif args.max_res:
                 argv += ["--max-res"]
             else:
@@ -157,7 +203,9 @@ def main():
         fusion_argv = [_FUSION, "--cameras", *names,
                        "--sync-window", str(args.sync_window),
                        "--vis-thresh", str(args.vis_thresh),
-                       "--min-views", str(args.min_views)]
+                       "--min-views", str(args.min_views),
+                       "--reproj-gate", str(args.reproj_gate),
+                       "--reject-px", str(args.reject_px)]
         if args.show_fused:
             fusion_argv.append("--show")
         spawn(fusion_argv, "fusion node")
