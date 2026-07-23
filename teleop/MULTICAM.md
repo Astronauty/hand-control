@@ -138,7 +138,10 @@ extrinsics steps — they must all reference the same physical pose.
 ## 2. Launch the pipeline
 
 ```bash
-# index auto-resolved by hardware id; resolution auto-read from intrinsics
+# fully automatic: discover connected cameras + match to calibration by id
+python teleop/run_multicam.py --auto --show-fused
+
+# name each camera; index auto-resolved by hardware id, resolution from intrinsics
 python teleop/run_multicam.py --cam c0 --cam c1
 
 # explicit index (verified against the calibrated hardware id — warns on mismatch)
@@ -155,8 +158,12 @@ python teleop/run_multicam.py --cam c0 --cam c1 --max-res --show
 stamped with the camera's hardware id (USB `vendor:product:serial`, or the
 RealSense SDK serial) in `camera_intrinsics_<name>.json`. So:
 
-- `--cam <name>` with **no index** auto-finds that camera on whatever port it's
-  plugged into — indices shuffle between sessions, the identity doesn't.
+- `--auto` **discovers all connected cameras and matches each to its calibration
+  by id** — no `--cam` at all. It uses every calibrated camera currently plugged
+  in (RealSense auto-flagged for SDK capture), reports which are matched, and
+  notes any calibrated-but-absent ones. Needs ≥2 matches.
+- `--cam <name>` with **no index** auto-finds that one camera on whatever port
+  it's plugged into — indices shuffle between sessions, the identity doesn't.
 - `--cam <name>:<index>` still works, but the index is **verified** against the
   stored id; if the camera at that index is a *different* device, you get a loud
   warning instead of silently applying the wrong intrinsic.

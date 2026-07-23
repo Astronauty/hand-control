@@ -306,31 +306,40 @@ def _make_window(name: str) -> None:
 # ----------------------------------------------------------------------------
 # intrinsics
 # ----------------------------------------------------------------------------
-def cmd_intrinsics(args: argparse.Namespace) -> None:
-    square_m = args.square_mm / 1000.0
+def _intrinsics_capture_loop(camera: int, out_path: str, square_mm: float,
+                             min_views: int, width: int, height: int,
+                             max_res: bool, realsense: bool, fix_k3: bool,
+                             title: str = "") -> bool:
+    """Interactive intrinsics capture+solve for ONE camera. Returns True if a
+    calibration was written, False if the user quit/skipped. Shared by the single
+    `intrinsics` command and the `intrinsics-all` auto-discovery walkthrough.
+
+    Q quits the WHOLE run (raises KeyboardInterrupt); S skips this camera.
+    """
+    square_m = square_mm / 1000.0
     board, aruco_dict = _make_board(square_m)
     _, charuco_detector = _make_detectors(board, aruco_dict)
 
-    _rs = getattr(args, "realsense", False)
-    _w, _h, _mx = args.width, args.height, args.max_res
-    if _rs:
-        # A RealSense's capture size is the pyrealsense2 stream size, and 1080p
-        # color is only 8 fps. If the user didn't override the (webcam-oriented)
-        # 1280x720 defaults, fall back to the pipeline's 640x480 so the intrinsics
-        # match what teleop actually streams. --max-res is meaningless here.
+    _w, _h, _mx = width, height, max_res
+    if realsense:
+        # RealSense capture is the pyrealsense2 stream size; 1080p color is 8 fps.
+        # Fall back to the pipeline's 640x480 unless overridden. --max-res N/A.
         if (_w, _h) == (1280, 720):
             _w, _h = 640, 480
         _mx = False
-    cap = _open_camera(args.camera, _w, _h, _mx, _rs)
-    win = "intrinsics — SPACE capture, C calibrate, Q quit"
+    cap = _open_camera(camera, _w, _h, _mx, realsense)
+    win = f"intrinsics {title} — SPACE capture, C solve, S skip, Q quit".strip()
     _make_window(win)
-    print("[intrinsics] SPACE = capture a view, C = calibrate, Q = quit.")
-    print(f"[intrinsics] Collect {args.min_views}+ views: vary angle, tilt, distance.")
-    print("[intrinsics] Fill the frame edges/corners across the set for good distortion.")
+    print(f"[intrinsics] {title} SPACE = capture a view, C = calibrate, "
+          f"S = skip, Q = quit.")
+    print(f"[intrinsics] Collect {min_views}+ views: vary angle, tilt, distance; "
+          f"fill the frame EDGES/CORNERS for good distortion.")
 
     all_corners: list[np.ndarray] = []
     all_ids: list[np.ndarray] = []
     image_size: tuple[int, int] | None = None
+    solved = False
+    quit_all = False
 
     while True:
         ok, frame = cap.read()
@@ -346,15 +355,19 @@ def cmd_intrinsics(args: argparse.Namespace) -> None:
         n_det = 0 if charuco_ids is None else len(charuco_ids)
         if n_det > 0:
             cv2.aruco.drawDetectedCornersCharuco(vis, charuco_corners, charuco_ids)
-        cv2.putText(vis, f"views: {len(all_corners)}  corners now: {n_det}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(vis, f"{title}  views: {len(all_corners)}  corners: {n_det}"
+                    "  (SPACE cap, C solve, S skip, Q quit)",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.imshow(win, vis)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
+            quit_all = True
+            break
+        if key == ord('s'):
+            print(f"[intrinsics] {title} skipped.")
             break
         if key == ord(' '):
-            # Need a decent number of corners for a useful view.
             if n_det >= 6:
                 all_corners.append(charuco_corners)
                 all_ids.append(charuco_ids)
@@ -362,17 +375,92 @@ def cmd_intrinsics(args: argparse.Namespace) -> None:
             else:
                 print(f"[intrinsics] too few corners ({n_det}); reposition board.")
         if key == ord('c'):
-            if len(all_corners) < args.min_views:
-                print(f"[intrinsics] need >= {args.min_views} views, have {len(all_corners)}.")
+            if len(all_corners) < min_views:
+                print(f"[intrinsics] need >= {min_views} views, have {len(all_corners)}.")
                 continue
-            hw_id = _camera_hardware_id(args.camera, _rs)
+            hw_id = _camera_hardware_id(camera, realsense)
             _run_intrinsics_calib(board, all_corners, all_ids, image_size,
-                                  args.out, fix_k3=getattr(args, "fix_k3", False),
-                                  hardware_id=hw_id)
+                                  out_path, fix_k3=fix_k3, hardware_id=hw_id)
+            solved = True
             break
 
     cap.release()
+    cv2.destroyWindow(win)
+    if quit_all:
+        raise KeyboardInterrupt
+    return solved
+
+
+def cmd_intrinsics(args: argparse.Namespace) -> None:
+    try:
+        _intrinsics_capture_loop(
+            args.camera, args.out, args.square_mm, args.min_views,
+            args.width, args.height, args.max_res,
+            getattr(args, "realsense", False), getattr(args, "fix_k3", False))
+    except KeyboardInterrupt:
+        pass
     cv2.destroyAllWindows()
+
+
+def cmd_intrinsics_all(args: argparse.Namespace) -> None:
+    """Auto-discover all connected cameras and calibrate each one's intrinsics.
+
+    Names are assigned automatically: RealSense -> 'rs', others -> c0, c1, ... in
+    discovery order. Because each intrinsic is stamped with the camera's HARDWARE
+    ID, the auto-assigned name is just a label — at launch, `--cam c0` (no index)
+    re-binds to the correct physical camera by id regardless of enumeration order.
+    """
+    try:
+        from camera_identity import discover_cameras
+    except Exception as e:
+        sys.exit(f"[intrinsics-all] camera discovery unavailable: {e}")
+
+    cams = discover_cameras()
+    if not cams:
+        sys.exit("[intrinsics-all] no color cameras discovered. Are they plugged "
+                 "in? (RealSense color needs pyrealsense2 for capture, but is "
+                 "still discovered as a UVC color node.)")
+
+    # Assign names: RealSense -> rs / rs2 / ...; others -> c0, c1, ...
+    n_rs, n_web = 0, 0
+    for c in cams:
+        if c["is_realsense"]:
+            c["name"] = "rs" if n_rs == 0 else f"rs{n_rs}"
+            n_rs += 1
+        else:
+            c["name"] = f"c{n_web}"
+            n_web += 1
+
+    print(f"[intrinsics-all] discovered {len(cams)} camera(s):")
+    for c in cams:
+        print(f"    {c['name']:>4}  index {c['index']}  {c['label']!r}"
+              f"  id={c['id']}" + ("  [RealSense]" if c["is_realsense"] else ""))
+    print("[intrinsics-all] calibrating each in turn "
+          "(SPACE capture, C solve, S skip, Q quit).")
+
+    done, skipped = [], []
+    try:
+        for k, c in enumerate(cams, 1):
+            out = _named(DEFAULT_INTRINSICS, c["name"])
+            title = f"[{k}/{len(cams)}] {c['name']}"
+            print(f"\n[intrinsics-all] ==== {title} (index {c['index']}"
+                  f"{', RealSense' if c['is_realsense'] else ''}) ====")
+            ok = _intrinsics_capture_loop(
+                c["index"], out, args.square_mm, args.min_views,
+                args.width, args.height, args.max_res, c["is_realsense"],
+                args.fix_k3, title)
+            (done if ok else skipped).append(c["name"])
+    except KeyboardInterrupt:
+        print("\n[intrinsics-all] stopped early (Q).")
+    cv2.destroyAllWindows()
+    print(f"\n[intrinsics-all] done: {done or '(none)'}"
+          f"   skipped: {skipped or '(none)'}")
+    if done:
+        print("[intrinsics-all] NEXT: solve extrinsics against a FIXED board:")
+        print("[intrinsics-all]   python calibration/charuco_calibration.py "
+              "extrinsics-all " + " ".join(
+                  f"--cam {c['name']}:{c['index']}" for c in cams
+                  if c['name'] in done) + " --square-mm <measured>")
 
 
 def _camera_hardware_id(index: int, realsense: bool) -> str | None:
@@ -595,8 +683,24 @@ def cmd_extrinsics_all(args: argparse.Namespace) -> None:
     camera_extrinsics_<name>.json. Press SPACE to solve a camera, S to skip it, Q
     to stop the walkthrough.
     """
-    cams = args.cam
-    rs_names = set(args.realsense)
+    if getattr(args, "auto", False):
+        if args.cam:
+            sys.exit("[extrinsics-all] --auto and --cam are mutually exclusive.")
+        try:
+            from camera_identity import match_calibrated_cameras
+        except Exception as e:
+            sys.exit(f"[extrinsics-all] --auto unavailable: {e}")
+        cams, auto_rs = match_calibrated_cameras(_HERE)
+        rs_names = set(args.realsense) | set(auto_rs)
+        if len(cams) < 2:
+            sys.exit(f"[extrinsics-all] --auto found only {len(cams)} calibrated "
+                     f"camera(s) plugged in; need >= 2. Run intrinsics-all first, "
+                     f"or plug the cameras in.")
+    elif not args.cam:
+        sys.exit("[extrinsics-all] pass --cam per camera, or --auto to discover.")
+    else:
+        cams = args.cam
+        rs_names = set(args.realsense)
     print(f"[extrinsics-all] {len(cams)} cameras: "
           f"{', '.join(f'{n}:{i}' + ('(rs)' if n in rs_names else '') for n, i in cams)}")
     print("[extrinsics-all] KEEP THE BOARD FIXED at the world origin for the WHOLE "
@@ -831,6 +935,21 @@ def main() -> None:
                         "edges — the tool warns when it detects this.")
     i.set_defaults(func=cmd_intrinsics)
 
+    ia = sub.add_parser(
+        "intrinsics-all",
+        help="auto-discover ALL connected cameras and calibrate each one's "
+             "intrinsics (names auto-assigned c0/c1/rs; ids stamped)")
+    ia.add_argument("--square-mm", type=float, default=DEFAULT_SQUARE_MM,
+                    help="MEASURED printed square size in mm")
+    ia.add_argument("--min-views", type=int, default=12)
+    ia.add_argument("--width", type=int, default=1280)
+    ia.add_argument("--height", type=int, default=720)
+    ia.add_argument("--max-res", action="store_true",
+                    help="Calibrate each webcam at its highest supported resolution.")
+    ia.add_argument("--fix-k3", action="store_true",
+                    help="Pin k3=0 for all cameras (low-distortion lenses).")
+    ia.set_defaults(func=cmd_intrinsics_all)
+
     e = sub.add_parser("extrinsics", help="solve fixed-board camera->world pose")
     e.add_argument("--camera", type=int, required=True)
     e.add_argument("--name", default=None,
@@ -866,12 +985,18 @@ def main() -> None:
     ea = sub.add_parser(
         "extrinsics-all",
         help="calibrate EVERY camera's extrinsics in one walkthrough (one board)")
-    ea.add_argument("--cam", action="append", type=_parse_cam_spec, required=True,
+    ea.add_argument("--auto", action="store_true",
+                    help="Auto-discover connected cameras and match each to its "
+                         "camera_intrinsics_<name>.json by hardware id — no --cam "
+                         "needed. RealSense auto-flagged. (Same discovery as "
+                         "run_multicam --auto.) Keep the board FIXED for the run.")
+    ea.add_argument("--cam", action="append", type=_parse_cam_spec, default=None,
                     metavar="NAME:INDEX",
                     help="Camera name:OpenCV-index. Repeat per camera, e.g. "
                          "--cam c0:0 --cam c1:2 --cam rs:4. Uses each camera's "
                          "camera_intrinsics_<name>.json; writes "
-                         "camera_extrinsics_<name>.json. Keep the board FIXED.")
+                         "camera_extrinsics_<name>.json. Omit and pass --auto to "
+                         "discover automatically. Keep the board FIXED.")
     ea.add_argument("--square-mm", type=float, default=DEFAULT_SQUARE_MM,
                     help="MEASURED printed square size in mm")
     ea.add_argument("--n-avg", type=int, default=30)

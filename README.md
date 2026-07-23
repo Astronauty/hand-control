@@ -230,7 +230,15 @@ python calibration/camera_identity.py                    # index -> hardware id 
 
 Pick a stable `<name>` for each physical camera (e.g. `c0`, `c1`, `rs`) and note its current index. A RealSense exposes several `/dev/video*` nodes; only the **color** one is usable for tracking (`camera_identity.py` labels it; on Linux it is typically the highest-numbered readable node).
 
-**1. Intrinsics — per camera** (independent of board placement; `--max-res` opens each at its highest mode):
+**1. Intrinsics.** Easiest is **auto-discovery** — one command finds every connected color camera, auto-names them (`c0`, `c1`, … and `rs` for a RealSense), and walks through calibrating each:
+
+```bash
+python calibration/charuco_calibration.py intrinsics-all --square-mm 34.8 --max-res
+```
+
+Per camera: **SPACE** captures a view (12+ at varied angle/tilt/distance, fill the edges), **C** solves, **S** skips, **Q** quits. It prints the `extrinsics-all` command to run next. Because each intrinsic is stamped with the camera's hardware id, the auto-assigned names are just labels — the *identity* is what binds them at launch (so enumeration order doesn't matter later).
+
+Or calibrate cameras individually (independent of board placement; `--max-res` opens each at its highest mode):
 
 ```bash
 python calibration/charuco_calibration.py intrinsics --camera 0 --name c0 --square-mm 34.8 --max-res
@@ -239,19 +247,21 @@ python calibration/charuco_calibration.py intrinsics --camera 2 --name c1 --squa
 
 Each run also **stamps the camera's hardware id** (USB `vendor:product:serial`, or RealSense SDK serial) into the intrinsics file — see *Camera identity* below.
 
-**2. Extrinsics — all cameras in one command** (board fixed for the whole run):
+**2. Extrinsics — all cameras in one command** (board fixed for the whole run). Fix the board at the world origin, then `--auto` discovers every calibrated camera and walks through each:
 
 ```bash
-python calibration/charuco_calibration.py extrinsics-all \
-    --cam c0:0 --cam c1:2 --square-mm 34.8 --max-res
+python calibration/charuco_calibration.py extrinsics-all --auto --square-mm 34.8
+# or name them explicitly:
+# ... extrinsics-all --cam c0:0 --cam c1:2 --cam rs:8 --square-mm 34.8
 ```
 
-This walks through each `--cam <name>:<index>` in turn. Per camera: **SPACE** solves and saves, **S** skips, **Q** stops the walkthrough. Add more cameras (e.g. `--cam rs:8`) by appending to the list. (The single-camera `extrinsics --camera <idx> --name <name>` still works to redo just one.)
+Per camera: **SPACE** solves and saves, **S** skips, **Q** stops the walkthrough. `--auto` uses the same discovery + hardware-id matching as `run_multicam --auto`, so it needs each camera's stamped intrinsics from step 1. (The single-camera `extrinsics --camera <idx> --name <name>` still works to redo just one.)
 
 **3. Validate.** Launch the pipeline and watch the fusion node's health log — median reprojection error should be a few px; it warns above ~8 px, which flags a moved board, a resolution mismatch, or a bad intrinsic:
 
 ```bash
-python teleop/run_multicam.py --cam c0 --cam c1 --show-fused
+python teleop/run_multicam.py --auto --show-fused     # discover + match by id
+# or name them: python teleop/run_multicam.py --cam c0 --cam c1 --show-fused
 ```
 
 **4. Run teleop against the fused output.** Either launch `run_multicam.py` in one terminal and the teleop app in another, or let the app spawn the pipeline itself with `--multicam` (see [CLI flags](#cli-flags)):
@@ -263,11 +273,14 @@ python kinova_leap_pick_place.py --mode dexpilot \
 
 #### Camera identity (index-free launch)
 
-Because intrinsics are a property of the lens+sensor — not the USB port — calibration stamps each camera's hardware id into its intrinsics file. At launch you can then **omit the index** and the camera is auto-found on whatever port it's plugged into:
+Because intrinsics are a property of the lens+sensor — not the USB port — calibration stamps each camera's hardware id into its intrinsics file. At launch you can then discover everything automatically, or name cameras and omit indices:
 
 ```bash
+python teleop/run_multicam.py --auto                   # discover + match all by id
 python teleop/run_multicam.py --cam c0 --cam c1        # indices auto-resolved by id
 ```
+
+`--auto` uses every calibrated camera currently plugged in (matched by id), flags any RealSense for SDK capture, and reports which are matched vs. calibrated-but-absent.
 
 Passing an explicit index (`--cam c0:0`) still works and is *verified* against the stored id — a mismatch warns rather than silently applying the wrong intrinsic. Moving a camera to a different port never requires recalibration. (A RealSense still needs an explicit index — its color-stream index isn't derivable from the serial alone — but that index is verified against the serial.) If you ever have intrinsics that predate this stamping, add the id without recalibrating:
 

@@ -150,6 +150,27 @@ def _intrinsics_res(name: str) -> tuple[int, int] | None:
         return None
 
 
+def _auto_discover_cams():
+    """Discover connected cameras and match each to a calibration by hardware id.
+
+    Returns (cam_specs, realsense_names) with cam_specs as the [(name, index, res)]
+    list the --cam parser produces (res=None -> filled from intrinsics later), so
+    the rest of main() is unchanged. Uses the shared matcher in camera_identity so
+    this is IDENTICAL to `extrinsics-all --auto`.
+    """
+    sys.path.insert(0, _CALIB_DIR)
+    try:
+        from camera_identity import match_calibrated_cameras, calibrated_hardware_ids
+    except Exception as e:
+        sys.exit(f"[run] --auto unavailable (camera_identity import failed): {e}")
+    if not calibrated_hardware_ids(_CALIB_DIR):
+        sys.exit("[run] --auto: no calibrated cameras with a stored hardware_id. "
+                 "Run: python calibration/charuco_calibration.py intrinsics-all")
+    specs2, rs_names = match_calibrated_cameras(_CALIB_DIR)
+    specs = [(name, idx, None) for name, idx in specs2]
+    return specs, rs_names
+
+
 def _check_calibration(names: list[str]) -> None:
     """Warn (don't fail) if a camera's per-name calibration is missing.
 
@@ -171,11 +192,16 @@ def main():
     ap = argparse.ArgumentParser(
         description="Launch multi-camera hand-tracking pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--cam", action="append", type=_parse_cam, required=True,
-                    metavar="NAME:INDEX[:WxH]",
-                    help="Camera name:OpenCV-index, optional :WxH resolution. "
-                         "Repeat for each camera (>=2). Cameras may run at "
-                         "DIFFERENT resolutions (each uses its own intrinsics).")
+    ap.add_argument("--auto", action="store_true",
+                    help="Auto-discover connected cameras and match each to its "
+                         "calibration by hardware id (no --cam needed). Uses every "
+                         "camera that has a calibrated camera_intrinsics_<name>.json "
+                         "with a matching hardware_id currently plugged in.")
+    ap.add_argument("--cam", action="append", type=_parse_cam, default=None,
+                    metavar="NAME[:INDEX][:WxH]",
+                    help="Camera name, optional :index (auto-resolved by hardware "
+                         "id if omitted), optional :WxH. Repeat per camera (>=2). "
+                         "Omit entirely and pass --auto to discover automatically.")
     ap.add_argument("--realsense", action="append", default=[], metavar="NAME",
                     help="Mark a camera NAME as an Intel RealSense: its landmark node "
                          "captures the COLOR stream via pyrealsense2 (--realsense flag) "
@@ -215,6 +241,19 @@ def main():
                          "single landmark (e.g. an occluded fingertip) when >= 3 "
                          "views disagree (0 disables). See fusion node.")
     args = ap.parse_args()
+
+    if args.auto:
+        if args.cam:
+            ap.error("--auto and --cam are mutually exclusive")
+        args.cam, auto_rs = _auto_discover_cams()
+        # RealSense cameras discovered by --auto need the SDK capture path.
+        args.realsense = list(dict.fromkeys(list(args.realsense) + auto_rs))
+        if len(args.cam) < 2:
+            sys.exit(f"[run] --auto found only {len(args.cam)} calibrated "
+                     f"camera(s) plugged in; need >= 2. Calibrate more "
+                     f"(intrinsics-all) or plug them in.")
+    elif not args.cam:
+        ap.error("pass --cam per camera, or --auto to discover automatically")
 
     if len(args.cam) < 2:
         ap.error("need at least 2 --cam entries for triangulation")

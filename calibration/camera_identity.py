@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import glob
+import json
 
 
 def _read(path: str) -> str | None:
@@ -148,10 +149,120 @@ def find_index_by_identity(target_id: str,
     return None
 
 
+def _is_color_frame(frame) -> bool:
+    """Heuristic: a real COLOR frame has channel means that differ (B!=G!=R).
+
+    Depth is single-plane; IR is 3-plane but gray (equal channel means). A tiny
+    tolerance rejects gray/IR while accepting even a dim color scene."""
+    if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+        return False
+    b, g, r = frame[:, :, 0].mean(), frame[:, :, 1].mean(), frame[:, :, 2].mean()
+    return (max(b, g, r) - min(b, g, r)) > 3.0
+
+
+def discover_cameras(max_index: int = 12, warmup: int = 8) -> list[dict]:
+    """Auto-discover usable COLOR cameras, one entry per PHYSICAL device.
+
+    Opens each /dev/video* node, keeps only those returning a color frame, and
+    dedups by hardware id (a multi-node device — e.g. a RealSense exposing
+    color+IR+depth — collapses to a single physical camera). Returns a list of
+    dicts (sorted by index) with keys:
+        index    OpenCV index of the color stream
+        id       hardware identity string (or None)
+        label    human product label
+        is_realsense  True if it looks like an Intel RealSense
+    Requires cv2; identity via sysfs (Linux). Best-effort — skips anything that
+    won't open or read.
+    """
+    import cv2
+    rs_id = _first_realsense_identity()
+    seen_ids: set = set()
+    out: list[dict] = []
+    for idx in _list_video_indices(max_index):
+        cap = cv2.VideoCapture(idx)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        frame = None
+        for _ in range(warmup):
+            ok, fr = cap.read()
+            if ok and fr is not None:
+                frame = fr
+        cap.release()
+        if not _is_color_frame(frame):
+            continue                       # depth/IR/metadata node
+        hw = identity_for_index(idx)
+        label = label_for_index(idx)
+        is_rs = bool(label and "realsense" in label.lower()) or (
+            hw is not None and rs_id is not None)
+        # Dedup by hardware id: multiple color-ish nodes of one device -> keep the
+        # first (lowest index). Devices with no id can't be deduped -> keep each.
+        key = hw or f"__noid_{idx}"
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
+        out.append({"index": idx, "id": hw, "label": label,
+                    "is_realsense": is_rs})
+    return out
+
+
+def calibrated_hardware_ids(calib_dir: str) -> dict:
+    """Map name -> hardware_id for every camera_intrinsics_<name>.json that has
+    one. Only these participate in identity matching."""
+    import glob
+    out = {}
+    for p in glob.glob(os.path.join(calib_dir, "camera_intrinsics_*.json")):
+        name = os.path.basename(p)[len("camera_intrinsics_"):-len(".json")]
+        try:
+            hw = json.load(open(p)).get("hardware_id")
+        except Exception:
+            hw = None
+        if hw:
+            out[name] = hw
+    return out
+
+
+def match_calibrated_cameras(calib_dir: str, verbose: bool = True):
+    """Discover connected cameras and match each to a calibration by hardware id.
+
+    Returns (specs, realsense_names) where specs is [(name, index)] for every
+    calibrated camera currently plugged in (matched by id), and realsense_names
+    lists which of those are RealSense. Shared by run_multicam --auto and
+    extrinsics-all --auto so their discovery is identical. `verbose` prints a
+    per-camera match/skip report and the calibrated-but-absent set.
+    """
+    calibrated = calibrated_hardware_ids(calib_dir)   # name -> hw_id
+    if not calibrated:
+        return [], []
+    by_id = {hw: name for name, hw in calibrated.items()}
+    specs, rs_names, matched = [], [], []
+    for cam in discover_cameras():
+        name = by_id.get(cam["id"]) if cam["id"] else None
+        if name is None:
+            if verbose:
+                print(f"[match] camera at index {cam['index']} ({cam['label']!r}, "
+                      f"id={cam['id']}) has no matching calibration — skipping.")
+            continue
+        specs.append((name, cam["index"]))
+        if cam["is_realsense"]:
+            rs_names.append(name)
+        matched.append(f"{name}@{cam['index']}")
+    if verbose:
+        print(f"[match] matched {len(specs)} camera(s): {', '.join(matched) or '(none)'}")
+        absent = set(calibrated) - {n for n, _ in specs}
+        if absent:
+            print(f"[match] calibrated but not plugged in: {sorted(absent)}")
+    return specs, rs_names
+
+
 if __name__ == "__main__":
-    # Quick manual check: print identity of every video node.
+    # Quick manual check: print identity of every video node, then discovery.
     for idx in _list_video_indices():
         print(f"video{idx}: id={identity_for_index(idx)}  "
               f"label={label_for_index(idx)!r}")
     rs_id = _first_realsense_identity()
     print(f"realsense: {rs_id or '(none / pyrealsense2 not installed)'}")
+    print("\ndiscovered color cameras:")
+    for c in discover_cameras():
+        print(f"  index {c['index']}  {c['label']!r}  id={c['id']}  "
+              f"{'[RealSense]' if c['is_realsense'] else ''}")
