@@ -216,17 +216,28 @@ python calibration/charuco_calibration.py extrinsics --camera 1 --square-mm 34.8
 
 ### Multiple cameras (triangulation rig)
 
-Each camera gets its own named calibration files (`camera_intrinsics_<name>.json`, `camera_extrinsics_<name>.json`). Two rules make triangulation valid:
+Setting up a rig on a new machine from scratch. Each camera gets its own named calibration files (`camera_intrinsics_<name>.json`, `camera_extrinsics_<name>.json`). Two rules make triangulation valid:
 
 - **Same board pose for all extrinsics.** Every camera's extrinsic must be solved against the *same* fixed board placement — that shared pose is what puts all cameras in one world frame (no stereo calibration needed). Do not move the board between cameras.
-- **Calibrate at the capture resolution.** Intrinsics are only valid at the resolution they were estimated at. Each camera's calibrated size is stored in its `camera_intrinsics_<name>.json` (`image_size`), and both `run_multicam.py` and the `--multicam` launch **read it back automatically** — so a camera streams at its calibrated resolution with no `:WxH` on the CLI. The fusion node hard-errors on a resolution mismatch.
+- **Calibrate at the capture resolution.** Intrinsics are only valid at the resolution they were estimated at. Each camera's calibrated size is stored in its `camera_intrinsics_<name>.json` (`image_size`), which `run_multicam.py` and the `--multicam` launch **read back automatically** — so a camera streams at its calibrated resolution with no `:WxH` on the CLI. The fusion node hard-errors on a resolution mismatch.
 
-**1. Intrinsics — per camera** (independent of board placement):
+**0. Find your camera indices.** OpenCV indices are assigned by USB enumeration and differ per machine/session:
+
+```bash
+python ui/mediapipe_joint_angles.py --list-cameras       # lists openable indices
+python calibration/camera_identity.py                    # index -> hardware id + model label
+```
+
+Pick a stable `<name>` for each physical camera (e.g. `c0`, `c1`, `rs`) and note its current index. A RealSense exposes several `/dev/video*` nodes; only the **color** one is usable for tracking (`camera_identity.py` labels it; on Linux it is typically the highest-numbered readable node).
+
+**1. Intrinsics — per camera** (independent of board placement; `--max-res` opens each at its highest mode):
 
 ```bash
 python calibration/charuco_calibration.py intrinsics --camera 0 --name c0 --square-mm 34.8 --max-res
 python calibration/charuco_calibration.py intrinsics --camera 2 --name c1 --square-mm 34.8 --max-res
 ```
+
+Each run also **stamps the camera's hardware id** (USB `vendor:product:serial`, or RealSense SDK serial) into the intrinsics file — see *Camera identity* below.
 
 **2. Extrinsics — all cameras in one command** (board fixed for the whole run):
 
@@ -235,24 +246,48 @@ python calibration/charuco_calibration.py extrinsics-all \
     --cam c0:0 --cam c1:2 --square-mm 34.8 --max-res
 ```
 
-This walks through each `--cam <name>:<index>` in turn. Per camera: **SPACE** solves and saves, **S** skips, **Q** stops the walkthrough. Add more cameras (e.g. `--cam rs:4`) by appending to the list. (The single-camera `extrinsics --camera <idx> --name <name>` still works to redo just one.)
+This walks through each `--cam <name>:<index>` in turn. Per camera: **SPACE** solves and saves, **S** skips, **Q** stops the walkthrough. Add more cameras (e.g. `--cam rs:8`) by appending to the list. (The single-camera `extrinsics --camera <idx> --name <name>` still works to redo just one.)
 
 **3. Validate.** Launch the pipeline and watch the fusion node's health log — median reprojection error should be a few px; it warns above ~8 px, which flags a moved board, a resolution mismatch, or a bad intrinsic:
 
 ```bash
-python teleop/run_multicam.py --cam c0:0 --cam c1:2 --show-fused
+python teleop/run_multicam.py --cam c0 --cam c1 --show-fused
 ```
 
 **4. Run teleop against the fused output.** Either launch `run_multicam.py` in one terminal and the teleop app in another, or let the app spawn the pipeline itself with `--multicam` (see [CLI flags](#cli-flags)):
 
 ```bash
 python kinova_leap_pick_place.py --mode dexpilot \
-    --multicam c0:0 --multicam c1:2 --skeleton-view --camera-views
+    --multicam c0 --multicam c1 --skeleton-view --camera-views
 ```
 
-**Intel RealSense** participates as a plain RGB camera. Its color stream needs `pyrealsense2` (bundled in the env) rather than bare OpenCV — pass `--multicam-realsense <name>` (in the app) or `--realsense <name>` (in `run_multicam.py`) to capture the color stream via the SDK. The `:INDEX` is then ignored (the SDK selects the device). The D435I's 1080p color runs at only 8 fps, so it defaults to 640×480 @ 30 fps; calibrate its intrinsics at the size you'll stream.
+#### Camera identity (index-free launch)
 
-See [`teleop/MULTICAM.md`](teleop/MULTICAM.md) for the full multi-camera pipeline (per-camera resolution, the combined viewer, RealSense capture, and running teleop against the fused output).
+Because intrinsics are a property of the lens+sensor — not the USB port — calibration stamps each camera's hardware id into its intrinsics file. At launch you can then **omit the index** and the camera is auto-found on whatever port it's plugged into:
+
+```bash
+python teleop/run_multicam.py --cam c0 --cam c1        # indices auto-resolved by id
+```
+
+Passing an explicit index (`--cam c0:0`) still works and is *verified* against the stored id — a mismatch warns rather than silently applying the wrong intrinsic. Moving a camera to a different port never requires recalibration. (A RealSense still needs an explicit index — its color-stream index isn't derivable from the serial alone — but that index is verified against the serial.) If you ever have intrinsics that predate this stamping, add the id without recalibrating:
+
+```bash
+python calibration/charuco_calibration.py stamp-id --camera 0 --name c0
+python calibration/charuco_calibration.py stamp-id --camera 8 --name rs --realsense
+```
+
+#### Intel RealSense
+
+A RealSense participates as a plain RGB camera, but its color stream is captured through `pyrealsense2` (bundled in the env) rather than bare OpenCV. Pass `--multicam-realsense <name>` (in the app) or `--realsense <name>` (in `run_multicam.py`), and use `--realsense` on the calibration commands so they capture the same stream:
+
+```bash
+python calibration/charuco_calibration.py intrinsics --camera 8 --name rs --realsense --square-mm 34.8
+python calibration/charuco_calibration.py extrinsics-all --cam c0:0 --cam c1:2 --cam rs:8 --realsense rs --square-mm 34.8
+```
+
+The D435I's 1080p color runs at only 8 fps, so RealSense capture defaults to 640×480 @ 30 fps — calibrate its intrinsics at the size you'll stream. (Factory SDK intrinsics report zero distortion; if fused landmarks warp near the frame edges, board-calibrate to recover the real coefficients.)
+
+See [`teleop/MULTICAM.md`](teleop/MULTICAM.md) for the full multi-camera pipeline (per-camera resolution, the combined viewer, RealSense specifics, calibration validation, and the reprojection auto-reject safety net).
 
 ---
 

@@ -36,27 +36,31 @@ _FUSION = os.path.join(_HERE, "hand_fusion_node.py")
 _CALIB_DIR = os.path.join(os.path.dirname(_HERE), "calibration")
 
 
-def _parse_cam(spec: str) -> tuple[str, int, tuple[int, int] | None]:
-    """Parse a --cam <name>:<index>[:<W>x<H>] spec.
+def _parse_cam(spec: str) -> tuple[str, int | None, tuple[int, int] | None]:
+    """Parse a --cam <name>[:<index>][:<W>x<H>] spec.
 
-    Optional per-camera resolution lets each camera run at its own native size
-    (triangulation does NOT require a shared resolution — each camera's intrinsics
-    encode its own). Examples:
-        c0:0            -> (c0, 0, None)     use default / --max-res
+    The INDEX is now OPTIONAL: omit it and the camera is auto-resolved by the
+    hardware id stored in camera_intrinsics_<name>.json — plug it into any port
+    and it's found. When given, the index is used but VERIFIED against that stored
+    id (a mismatch warns, so you never silently apply the wrong intrinsic).
+
+    Optional per-camera resolution lets each camera run at its own native size.
+    Examples:
+        c0              -> (c0, None, None)       auto-resolve index by hardware id
+        c0:0            -> (c0, 0, None)          index 0 (verified against hw id)
         c1:2:1280x960   -> (c1, 2, (1280,960))
-    The resolution here MUST match that camera's calibrated intrinsics size.
+        rs::640x480     -> (rs, None, (640,480))  auto index, explicit resolution
     """
     parts = spec.split(":")
-    if len(parts) < 2:
-        raise argparse.ArgumentTypeError(
-            f"--cam expects <name>:<index>[:<W>x<H>], got {spec!r}")
     name = parts[0]
     if not name:
         raise argparse.ArgumentTypeError(f"empty camera name in {spec!r}")
-    try:
-        idx = int(parts[1])
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"index must be an int in {spec!r}")
+    idx = None
+    if len(parts) >= 2 and parts[1] != "":
+        try:
+            idx = int(parts[1])
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"index must be an int in {spec!r}")
     res = None
     if len(parts) >= 3 and parts[2]:
         try:
@@ -66,6 +70,67 @@ def _parse_cam(spec: str) -> tuple[str, int, tuple[int, int] | None]:
             raise argparse.ArgumentTypeError(
                 f"resolution must be <W>x<H> in {spec!r}")
     return name, idx, res
+
+
+def _stored_hardware_id(name: str) -> str | None:
+    """hardware_id recorded in camera_intrinsics_<name>.json, or None."""
+    import json
+    p = os.path.join(_CALIB_DIR, f"camera_intrinsics_{name}.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        return json.load(open(p)).get("hardware_id")
+    except Exception:
+        return None
+
+
+def _resolve_index(name: str, idx: int | None) -> int:
+    """Resolve the OpenCV index for a camera, using its stored hardware id.
+
+    - idx given: keep it, but WARN if the camera currently at that index doesn't
+      match the hardware id stored at calibration (wrong camera on this port).
+    - idx omitted: find the index whose camera matches the stored hardware id;
+      error out with guidance if it can't be found.
+    RealSense ids (rs:<serial>) can't be mapped to a color index from sysfs alone,
+    so those still need an explicit index (verified only if resolvable).
+    """
+    stored = _stored_hardware_id(name)
+    try:
+        sys.path.insert(0, _CALIB_DIR)
+        from camera_identity import (identity_for_index, find_index_by_identity,
+                                      label_for_index)
+    except Exception:
+        # Identity helper unavailable -> fall back to the given index verbatim.
+        if idx is None:
+            raise SystemExit(f"[run] camera '{name}': no index given and hardware "
+                             f"identity is unavailable on this platform. Pass "
+                             f"--cam {name}:<index>.")
+        return idx
+
+    if idx is not None:
+        if stored and not stored.startswith("rs:"):
+            cur = identity_for_index(idx)
+            if cur and cur != stored:
+                print(f"[run] *** WARNING: camera '{name}' index {idx} is {cur} "
+                      f"but its calibration was for {stored}. You may be applying "
+                      f"the WRONG intrinsic. Omit the index to auto-find "
+                      f"'{name}', or re-calibrate. ***")
+        return idx
+
+    # No index: auto-resolve by hardware id.
+    if not stored:
+        raise SystemExit(
+            f"[run] camera '{name}': no index given and no hardware_id in "
+            f"camera_intrinsics_{name}.json (calibrated before identity binding). "
+            f"Pass --cam {name}:<index>, or re-run intrinsics to stamp its id.")
+    found = find_index_by_identity(stored)
+    if found is None:
+        raise SystemExit(
+            f"[run] camera '{name}' ({stored}) not found on any port. Is it "
+            f"plugged in? For a RealSense, pass an explicit --cam {name}:<index>.")
+    print(f"[run] camera '{name}' auto-resolved to index {found} "
+          f"({label_for_index(found)}) by hardware id {stored}.")
+    return found
 
 
 def _intrinsics_res(name: str) -> tuple[int, int] | None:
@@ -173,6 +238,9 @@ def main():
         # calibrated resolution automatically — no per-camera :WxH needed on the CLI.
         _rs_names = set(args.realsense)
         for name, idx, res in args.cam:
+            # Resolve/verify the OpenCV index by the camera's stored hardware id,
+            # so a re-plugged camera is found on any port and a wrong index warns.
+            idx = _resolve_index(name, idx)
             argv = [_LANDMARK, "--camera", str(idx), "--name", name]
             _is_rs = name in _rs_names
             # Resolve the effective (W, H): explicit spec wins, else calibrated size.

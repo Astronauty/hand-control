@@ -107,6 +107,13 @@ def main() -> None:
     try:
         color_stream = profile.get_stream(rs.stream.color)
         intr = color_stream.as_video_stream_profile().get_intrinsics()
+        # Serial number -> stable hardware id, so the pipeline auto-loads this
+        # intrinsic for this exact RealSense whatever port/index it lands on.
+        try:
+            serial = profile.get_device().get_info(rs.camera_info.serial_number)
+            hardware_id = f"rs:{serial}" if serial else None
+        except Exception:
+            hardware_id = None
     finally:
         pipe.stop()
 
@@ -134,6 +141,9 @@ def main() -> None:
         "camera_matrix": camera_matrix,
         "dist_coeffs": dist_coeffs,
     }
+    if hardware_id:
+        data["hardware_id"] = hardware_id
+        print(f"[rs-intrinsics] hardware id: {hardware_id}")
     with open(out_path, "w") as f:
         json.dump(data, f, indent=2)
 

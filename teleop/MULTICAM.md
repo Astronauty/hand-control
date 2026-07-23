@@ -138,23 +138,50 @@ extrinsics steps — they must all reference the same physical pose.
 ## 2. Launch the pipeline
 
 ```bash
-# resolutions auto-read from each camera's intrinsics — no :WxH needed
+# index auto-resolved by hardware id; resolution auto-read from intrinsics
+python teleop/run_multicam.py --cam c0 --cam c1
+
+# explicit index (verified against the calibrated hardware id — warns on mismatch)
 python teleop/run_multicam.py --cam c0:0 --cam c1:2
 
 # explicit per-camera resolution: name:index:WxH (overrides the intrinsics size)
 python teleop/run_multicam.py --cam c0:0:1920x1080 --cam c1:2:1280x960
 
 # force each camera to its highest mode, with per-camera debug windows
-python teleop/run_multicam.py --cam c0:0 --cam c1:2 --max-res --show
+python teleop/run_multicam.py --cam c0 --cam c1 --max-res --show
 ```
+
+**Camera identity (no more index bookkeeping).** Each intrinsic calibration is
+stamped with the camera's hardware id (USB `vendor:product:serial`, or the
+RealSense SDK serial) in `camera_intrinsics_<name>.json`. So:
+
+- `--cam <name>` with **no index** auto-finds that camera on whatever port it's
+  plugged into — indices shuffle between sessions, the identity doesn't.
+- `--cam <name>:<index>` still works, but the index is **verified** against the
+  stored id; if the camera at that index is a *different* device, you get a loud
+  warning instead of silently applying the wrong intrinsic.
+- The intrinsic is a property of the lens+sensor, so **you never re-calibrate a
+  camera just because it moved ports.** (RealSense: pass an explicit index —
+  its color-stream index isn't resolvable from the serial alone.)
+- Intrinsics calibrated *before* this feature have no stored id. Stamp it onto
+  the existing file **without recalibrating** (the intrinsic values don't change):
+  ```bash
+  # webcam currently at index 0 -> stamp its id into camera_intrinsics_c0.json
+  python calibration/charuco_calibration.py stamp-id --camera 0 --name c0
+  # RealSense (uses the SDK serial)
+  python calibration/charuco_calibration.py stamp-id --camera 8 --name rs --realsense
+  ```
+  It cross-checks that the camera's current stream size matches the file's
+  calibrated `image_size` before stamping (guards against stamping the wrong
+  camera); `--no-verify-size` overrides.
 
 Resolution precedence per camera:
 **explicit `:WxH` → `camera_intrinsics_<name>.json` `image_size` → `--max-res` →
-`--width/--height`.** Because the calibrated size is stored in the intrinsics file,
-a bare `NAME:INDEX` streams at exactly the resolution it was calibrated at — no
-`:WxH` on the CLI, and no separate rig-config file to keep in sync.
-`--list-cameras` on the old publisher (`python ui/mediapipe_joint_angles.py
---list-cameras`) still lists OpenCV indices.
+`--width/--height`.** The calibrated size lives in the intrinsics file, so a bare
+`NAME` streams at exactly the resolution it was calibrated at — no `:WxH` on the
+CLI, no separate rig-config to keep in sync. `--list-cameras` on the old
+publisher (`python ui/mediapipe_joint_angles.py --list-cameras`) still lists
+OpenCV indices.
 
 ### Visualization
 

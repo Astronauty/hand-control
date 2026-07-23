@@ -365,12 +365,31 @@ def cmd_intrinsics(args: argparse.Namespace) -> None:
             if len(all_corners) < args.min_views:
                 print(f"[intrinsics] need >= {args.min_views} views, have {len(all_corners)}.")
                 continue
+            hw_id = _camera_hardware_id(args.camera, _rs)
             _run_intrinsics_calib(board, all_corners, all_ids, image_size,
-                                  args.out, fix_k3=getattr(args, "fix_k3", False))
+                                  args.out, fix_k3=getattr(args, "fix_k3", False),
+                                  hardware_id=hw_id)
             break
 
     cap.release()
     cv2.destroyAllWindows()
+
+
+def _camera_hardware_id(index: int, realsense: bool) -> str | None:
+    """Stable hardware identity of the camera being calibrated, for the JSON.
+
+    Best-effort: returns None if identity can't be read (import guarded so the
+    calibration tool still runs on platforms without the identity helper)."""
+    try:
+        from camera_identity import identity_for_index, label_for_index
+    except Exception:
+        return None
+    hw = identity_for_index(index, realsense=realsense)
+    if hw:
+        print(f"[intrinsics] camera hardware id: {hw}  ({label_for_index(index)})")
+    else:
+        print("[intrinsics] hardware id unavailable (index-only binding).")
+    return hw
 
 
 def _radial_factor(dist, r):
@@ -409,7 +428,7 @@ def _warn_if_distortion_overfit(dist) -> None:
 
 
 def _run_intrinsics_calib(board, all_corners, all_ids, image_size, out_path,
-                          fix_k3: bool = False) -> None:
+                          fix_k3: bool = False, hardware_id: str | None = None) -> None:
     # Build object/image point correspondences per view from the board model,
     # then calibrate with the generic cv2.calibrateCamera (stable across the
     # 4.x aruco API churn around calibrateCameraCharuco).
@@ -446,6 +465,11 @@ def _run_intrinsics_calib(board, all_corners, all_ids, image_size, out_path,
         "camera_matrix": camera_matrix.tolist(),
         "dist_coeffs": dist_coeffs.ravel().tolist(),
     }
+    # Hardware identity binds this intrinsic to the physical camera (not a port or
+    # OpenCV index), so the pipeline can auto-load it whatever port the camera
+    # lands on, and warn if an index maps to a different camera. Omitted if unknown.
+    if hardware_id:
+        data["hardware_id"] = hardware_id
     with open(out_path, "w") as f:
         json.dump(data, f, indent=2)
     print(f"[intrinsics] wrote {out_path}")
@@ -604,6 +628,60 @@ def cmd_extrinsics_all(args: argparse.Namespace) -> None:
     if done:
         print("[extrinsics-all] All solved cameras now share ONE world frame "
               "(same board pose). Validate with the fusion node's reproj log.")
+
+
+def cmd_stamp_id(args: argparse.Namespace) -> None:
+    """Write the hardware id into an EXISTING intrinsics file — no recalibration.
+
+    The intrinsic values (camera_matrix, dist_coeffs) are a property of the
+    lens+sensor and don't change; this only records which physical camera they
+    belong to, so run_multicam can auto-resolve the camera by identity on any
+    port. Reads the id from the camera currently at --camera (pass --realsense for
+    a RealSense so the SDK serial is used). Verifies the file's calibrated
+    image_size matches the camera's current stream before stamping.
+    """
+    path = _named(DEFAULT_INTRINSICS, args.name)
+    if not os.path.exists(path):
+        sys.exit(f"[stamp-id] no intrinsics file at {path}. Calibrate first.")
+    with open(path) as f:
+        data = json.load(f)
+
+    try:
+        from camera_identity import identity_for_index, label_for_index
+    except Exception as e:
+        sys.exit(f"[stamp-id] camera_identity unavailable: {e}")
+
+    hw = identity_for_index(args.camera, realsense=args.realsense)
+    if not hw:
+        sys.exit(f"[stamp-id] could not read a hardware id for camera "
+                 f"{args.camera}. On a RealSense pass --realsense; otherwise this "
+                 f"platform may not expose USB identity via sysfs.")
+
+    # Sanity: confirm the camera at this index streams the size the file was
+    # calibrated at, so we don't stamp an id onto a mismatched-resolution file.
+    want = data.get("image_size")
+    if want and not args.no_verify_size:
+        _rs = args.realsense
+        _w, _h = (int(want[0]), int(want[1]))
+        cap = _open_camera(args.camera, _w, _h, False, _rs)
+        ok, frame = cap.read()
+        cap.release()
+        if ok and frame is not None:
+            gw, gh = frame.shape[1], frame.shape[0]
+            if (gw, gh) != (_w, _h):
+                print(f"[stamp-id] *** WARNING: camera {args.camera} streams "
+                      f"{gw}x{gh} but {os.path.basename(path)} was calibrated at "
+                      f"{_w}x{_h}. This may be the WRONG camera for this file. "
+                      f"Re-run with --no-verify-size to stamp anyway. ***")
+                sys.exit(1)
+
+    prev = data.get("hardware_id")
+    data["hardware_id"] = hw
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    label = label_for_index(args.camera)
+    print(f"[stamp-id] {os.path.basename(path)}: hardware_id = {hw}  ({label})"
+          + (f"   (was {prev})" if prev else ""))
 
 
 # Reject a solve whose per-frame translation scatter exceeds this — a jiggly
@@ -818,6 +896,20 @@ def main() -> None:
                          "this (mm) — guards against a jiggling board/camera. "
                          f"Default {_POSE_STD_TOL_M*1000:.0f} mm.")
     ea.set_defaults(func=cmd_extrinsics_all)
+
+    s = sub.add_parser(
+        "stamp-id",
+        help="record the hardware id into an existing intrinsics file "
+             "(no recalibration) so run_multicam can auto-resolve the camera")
+    s.add_argument("--camera", type=int, required=True,
+                   help="OpenCV index the physical camera is currently on.")
+    s.add_argument("--name", required=True,
+                   help="Camera name; stamps camera_intrinsics_<name>.json.")
+    s.add_argument("--realsense", action="store_true",
+                   help="Use the RealSense SDK serial (rs:<serial>) as the id.")
+    s.add_argument("--no-verify-size", action="store_true",
+                   help="Skip the resolution cross-check before stamping.")
+    s.set_defaults(func=cmd_stamp_id)
 
     args = p.parse_args()
     # Resolve per-camera paths from --name (explicit --out/--intrinsics win).
