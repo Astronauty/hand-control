@@ -404,6 +404,13 @@ if __name__ == "__main__":
              "NAME needs camera_intrinsics_<name>.json + camera_extrinsics_<name>.json "
              "in calibration/.")
     _arg_parser.add_argument(
+        '--multicam-auto', action='store_true',
+        help="Hands-off multi-camera: discover connected cameras and match each to "
+             "its calibration by hardware id (no --multicam specs needed). "
+             "Equivalent to run_multicam.py --auto. Uses every calibrated camera "
+             "currently plugged in (>=2); RealSense auto-flagged. Mutually exclusive "
+             "with --multicam.")
+    _arg_parser.add_argument(
         '--multicam-realsense', action='append', default=[], metavar='NAME',
         help="With --multicam: mark a camera NAME as an Intel RealSense (captures the "
              "COLOR stream via pyrealsense2). Its --multicam :INDEX is ignored (SDK "
@@ -448,6 +455,37 @@ if __name__ == "__main__":
     args = _arg_parser.parse_args()
     if args.mode == 'rrt':          # deprecated alias
         args.mode = 'contact_aware_autonomous'
+    if args.multicam and args.multicam_auto:
+        _arg_parser.error("--multicam and --multicam-auto are mutually exclusive")
+    if args.multicam_auto:
+        # Discover + match calibrated cameras by hardware id, and synthesise the
+        # equivalent --multicam / --multicam-realsense lists so ALL downstream code
+        # (name extraction, camera-views subscriptions, the run_multicam command)
+        # works unchanged. The child pipeline is launched with --auto (below), but
+        # the app still needs the resolved NAMES here.
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         'calibration'))
+        try:
+            from camera_identity import (match_calibrated_cameras,
+                                         calibrated_hardware_ids)
+        except Exception as _e:
+            _arg_parser.error(f"--multicam-auto unavailable (camera discovery): {_e}")
+        _calib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'calibration')
+        if not calibrated_hardware_ids(_calib_dir):
+            _arg_parser.error("--multicam-auto: no calibrated cameras with a stored "
+                              "hardware id. Run: python calibration/"
+                              "charuco_calibration.py intrinsics-all")
+        _specs, _rs = match_calibrated_cameras(_calib_dir)
+        if len(_specs) < 2:
+            _arg_parser.error(f"--multicam-auto found only {len(_specs)} calibrated "
+                              f"camera(s) plugged in; need >= 2.")
+        args.multicam = [f"{_nm}:{_idx}" for _nm, _idx in _specs]
+        args.multicam_realsense = list(dict.fromkeys(
+            list(args.multicam_realsense) + _rs))
+        print(f"[multicam-auto] using {len(args.multicam)} cameras: "
+              f"{', '.join(args.multicam)}")
     if args.multicam:
         # The fused pipeline is the sole /hand/joint_angles publisher, so never
         # also spawn the single-cam one (two publishers interleave poses).

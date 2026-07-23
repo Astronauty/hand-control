@@ -264,9 +264,14 @@ python teleop/run_multicam.py --auto --show-fused     # discover + match by id
 # or name them: python teleop/run_multicam.py --cam c0 --cam c1 --show-fused
 ```
 
-**4. Run teleop against the fused output.** Either launch `run_multicam.py` in one terminal and the teleop app in another, or let the app spawn the pipeline itself with `--multicam` (see [CLI flags](#cli-flags)):
+**4. Run teleop against the fused output.** Either launch `run_multicam.py` in one terminal and the teleop app in another, or let the app spawn the pipeline itself. `--multicam-auto` discovers and matches every calibrated camera by hardware id — fully hands-off:
 
 ```bash
+# hands-off: discover + match all calibrated cameras
+python kinova_leap_pick_place.py --mode dexpilot \
+    --multicam-auto --skeleton-view --camera-views
+
+# or name them explicitly
 python kinova_leap_pick_place.py --mode dexpilot \
     --multicam c0 --multicam c1 --skeleton-view --camera-views
 ```
