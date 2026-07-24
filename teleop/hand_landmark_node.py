@@ -432,6 +432,8 @@ class HandLandmarkNode(Node):
     def spin_capture(self) -> None:
         """Blocking capture+detect+publish loop (this node owns its camera)."""
         fail_streak = 0
+        frozen_streak = 0
+        last_sample = None
         # Loop on rclpy.ok() only — a closed camera is treated as a transient
         # dropout to recover from, NOT a reason to exit (exiting cleanly tore the
         # whole pipeline down via the supervisor).
@@ -460,6 +462,30 @@ class HandLandmarkNode(Node):
             if fail_streak:
                 self.get_logger().info(f"[{self._name}] camera recovered.")
                 fail_streak = 0
+
+            # A wedged UVC driver can keep re-serving the SAME buffered frame
+            # forever with ok=True — no read ever fails, so the fail_streak path
+            # above never fires, but the feed is dead (this is exactly what a
+            # "process is busy but the picture never moves" report looks like).
+            # Cheap sparse-pixel fingerprint (tiny slice, not a full-frame hash —
+            # negligible next to the MediaPipe inference already running every
+            # frame) catches a byte-identical repeat; treat it like a read
+            # failure and reuse the same reopen recovery.
+            sample = frame[::37, ::41].tobytes()
+            if last_sample is not None and sample == last_sample:
+                frozen_streak += 1
+                if frozen_streak in (30, 150) or frozen_streak % 300 == 0:
+                    self.get_logger().warn(
+                        f"[{self._name}] camera frame FROZEN (identical for "
+                        f"{frozen_streak} reads) — reopening.")
+                    self._reopen_camera()
+                    last_sample = None
+                time.sleep(0.005)
+                continue
+            if frozen_streak:
+                self.get_logger().info(f"[{self._name}] camera unfroze.")
+                frozen_streak = 0
+            last_sample = sample
 
             # MediaPipe VIDEO mode REQUIRES strictly increasing timestamps. Wall
             # ms can repeat within a millisecond (fast cameras) -> detect_for_video

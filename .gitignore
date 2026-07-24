@@ -1,4 +1,6 @@
 hand_snapshots/*
+logs/*
+MUJOCO_LOG.TXT
 simulation/logs/*
 simulation/results/*
 simulation/wip_debug_scripts/*

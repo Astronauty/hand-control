@@ -1,7 +1,7 @@
 """ChArUco camera calibration for the DexPilot teleop pipeline.
 
 One printed ChArUco board does the whole job:
-  1. `generate`   — render a letter-size board PNG to print at 100 % scale.
+  1. `generate`   — render an A3-size board PNG to print at 100 % scale.
   2. `intrinsics` — wave the board around to solve the camera matrix + distortion.
   3. `extrinsics` — fix the board where you want world origin; solve T_cam_world.
 
@@ -14,10 +14,11 @@ the project's camera env ships opencv-contrib-python==4.11.
 
 Typical flow (fixed camera):
     python calibration/charuco_calibration.py generate
+    # or: generate --paper letter (smaller squares, same 5x7 grid, fits a normal printer)
     # print board.png at 100%, glue flat, MEASURE a square with calipers
-    python calibration/charuco_calibration.py intrinsics --camera 1 --square-mm 35.0
+    python calibration/charuco_calibration.py intrinsics --camera 1 --square-mm 50.0
     # fix board at desired world origin, facing camera
-    python calibration/charuco_calibration.py extrinsics --camera 1 --square-mm 35.0
+    python calibration/charuco_calibration.py extrinsics --camera 1 --square-mm 50.0
 """
 from __future__ import annotations
 
@@ -25,18 +26,19 @@ import argparse
 import json
 import os
 import sys
+import time
 
 import cv2
 import numpy as np
 
 # ----------------------------------------------------------------------------
 # Board definition — shared by all three subcommands so IDs/geometry match.
-# 5x7 squares at 35 mm fits letter (8.5x11") with margin and stays resolvable
-# at ~1 m. Marker length is 0.75 of the square (standard ChArUco ratio).
+# 5x7 squares at 50 mm (current printed board) stays resolvable at ~1 m.
+# Marker length is 0.75 of the square (standard ChArUco ratio).
 # ----------------------------------------------------------------------------
 SQUARES_X = 5
 SQUARES_Y = 7
-DEFAULT_SQUARE_MM = 35.0
+DEFAULT_SQUARE_MM = 50.0
 MARKER_RATIO = 0.75
 ARUCO_DICT = cv2.aruco.DICT_5X5_100
 
@@ -44,6 +46,16 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BOARD_PNG = os.path.join(_HERE, "board.png")
 DEFAULT_INTRINSICS = os.path.join(_HERE, "camera_intrinsics.json")
 DEFAULT_EXTRINSICS = os.path.join(_HERE, "camera_extrinsics.json")
+
+# Paper sizes (mm, portrait) for `generate --paper`. --square-mm still wins if
+# passed explicitly; otherwise the square size is the largest that fits the
+# SQUARES_X x SQUARES_Y grid on this sheet with PAPER_MARGIN_MM to spare.
+PAPER_SIZES_MM = {
+    "letter": (215.9, 279.4),
+    "a4": (210.0, 297.0),
+    "a3": (297.0, 420.0),
+}
+PAPER_MARGIN_MM = 10.0
 
 # Extrinsic-solve stability: reject an averaged board pose whose per-frame
 # translation scatter exceeds this — a jiggly board (hand-held, vibrating mount)
@@ -110,6 +122,23 @@ def _make_board(square_len_m: float) -> tuple:
 # generate
 # ----------------------------------------------------------------------------
 def cmd_generate(args: argparse.Namespace) -> None:
+    if args.out is None:
+        args.out = (DEFAULT_BOARD_PNG if not args.paper or args.paper == "a3"
+                    else os.path.join(_HERE, f"board_{args.paper}.png"))
+
+    square_mm = args.square_mm
+    if args.paper and square_mm is None:
+        paper_w, paper_h = PAPER_SIZES_MM[args.paper]
+        usable_w = paper_w - 2 * PAPER_MARGIN_MM
+        usable_h = paper_h - 2 * PAPER_MARGIN_MM
+        square_mm = min(usable_w / SQUARES_X, usable_h / SQUARES_Y)
+        print(f"[generate] --paper {args.paper}: sizing square to "
+              f"{square_mm:.2f} mm to fill {paper_w:.0f}x{paper_h:.0f} mm sheet "
+              f"({PAPER_MARGIN_MM:.0f} mm margin).")
+    elif square_mm is None:
+        square_mm = DEFAULT_SQUARE_MM
+    args.square_mm = square_mm
+
     # Geometry is scale-free for the printed image; use nominal mm for sizing.
     square_m = args.square_mm / 1000.0
     board, _ = _make_board(square_m)
@@ -258,7 +287,12 @@ def _open_camera(index: int, width: int, height: int,
         # color is 8 fps). Default 640x480 to match the pipeline unless the
         # caller overrode width/height. --camera index is ignored (SDK picks it).
         return _RealSenseCapture(width or 640, height or 480, fps=None)
-    cap = cv2.VideoCapture(index)
+    # Force the V4L2 backend explicitly (Linux) — the default lets OpenCV
+    # cascade through other backends (e.g. its bundled Orbbec/obsensor probe)
+    # after V4L2 fails, which is slow (extra ioctl round-trips) and prints a
+    # spurious "obsensor ... Camera index out of range" error unrelated to
+    # this rig (no Orbbec hardware here).
+    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
     if not cap.isOpened():
         sys.exit(f"ERROR: could not open camera index {index}. "
                  f"Check the index used by ui/mediapipe_joint_angles.py --list-cameras.")
@@ -277,10 +311,59 @@ def _open_camera(index: int, width: int, height: int,
 
 
 def _make_detectors(board, aruco_dict):
-    """Create ArUco + ChArUco detectors (OpenCV 4.7+ API)."""
+    """Create ArUco + ChArUco detectors (OpenCV 4.7+ API).
+
+    Tuned (vs. cv2 defaults) for markers that are small in-frame or seen at an
+    oblique angle — e.g. a board held far/tilted enough back to stay in view of
+    several cameras at once. minMarkerPerimeterRate and polygonalApproxAccuracyRate
+    are the two expensive ones: loosening either lets far more candidate shapes
+    survive the cheap initial filter and reach the costly per-candidate decode
+    step, so both are nudged rather than maxed out (~2x detectBoard() cost for
+    a small additional nudge is not worth it; that call runs every preview frame
+    in the live capture loop, so overly aggressive values here show up as visible
+    lag, not just slower calibration solves):
+      - minMarkerPerimeterRate 0.03 -> 0.02: don't discard small/far markers.
+      - adaptiveThreshWinSize 3..23 step 10 -> 3..35 step 8: wider multi-scale
+        search catches marker edges the coarse default steps skip over, without
+        scanning as many levels as a finer step would.
+      - perspectiveRemovePixelPerCell 4 -> 8: upsample more when unwarping each
+        marker cell before bit-sampling, which helps decode a marker that only
+        covers a small patch of the source image. Cheap — no per-candidate-count
+        blowup, just a bigger fixed-size warp per candidate.
+      - errorCorrectionRate 0.6 -> 0.8: tolerate more bit errors when matching
+        a noisy/small marker against the dictionary. Cheap.
+      - minOtsuStdDev 5.0 -> 3.0: don't reject low-contrast (small/far, or dim)
+        marker regions during binarization. Cheap.
+      - polygonalApproxAccuracyRate 0.03 -> 0.08: accept a less-precisely-square
+        contour as a marker candidate — a marker seen at a grazing/oblique angle
+        (camera close to the board's own plane) projects to a heavily
+        foreshortened quad, and JPEG/blur noise on its edges makes the strict
+        default reject it before bit-decoding is ever attempted. Cheap — unlike
+        minMarkerPerimeterRate this doesn't blow up candidate count in practice
+        (verified: same detectBoard() cost as the stricter 0.045 on real rig
+        frames), so it's fine to lean on this one harder than the perimeter rate.
+      - maxErroneousBitsInBorderRate 0.35 -> 0.5: tolerate noisier border bits,
+        which perspective interpolation introduces more of at oblique angles.
+        Cheap.
+    CharucoParameters.minMarkers 2 -> 1: interpolate a ChArUco corner from just
+    ONE neighboring detected marker instead of requiring two — at range or at
+    an oblique angle, often only one of a corner's neighboring markers decodes.
+    """
     aruco_params = cv2.aruco.DetectorParameters()
+    aruco_params.minMarkerPerimeterRate = 0.02
+    aruco_params.adaptiveThreshWinSizeMin = 3
+    aruco_params.adaptiveThreshWinSizeMax = 35
+    aruco_params.adaptiveThreshWinSizeStep = 8
+    aruco_params.perspectiveRemovePixelPerCell = 8
+    aruco_params.errorCorrectionRate = 0.8
+    aruco_params.minOtsuStdDev = 3.0
+    aruco_params.polygonalApproxAccuracyRate = 0.08
+    aruco_params.maxErroneousBitsInBorderRate = 0.5
+    aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
-    charuco_detector = cv2.aruco.CharucoDetector(board)
+    charuco_params = cv2.aruco.CharucoParameters()
+    charuco_params.minMarkers = 1
+    charuco_detector = cv2.aruco.CharucoDetector(board, charuco_params, aruco_params)
     return aruco_detector, charuco_detector
 
 
@@ -405,13 +488,16 @@ def cmd_intrinsics(args: argparse.Namespace) -> None:
 def cmd_intrinsics_all(args: argparse.Namespace) -> None:
     """Auto-discover all connected cameras and calibrate each one's intrinsics.
 
-    Names are assigned automatically: RealSense -> 'rs', others -> c0, c1, ... in
-    discovery order. Because each intrinsic is stamped with the camera's HARDWARE
-    ID, the auto-assigned name is just a label — at launch, `--cam c0` (no index)
-    re-binds to the correct physical camera by id regardless of enumeration order.
+    Naming is STABLE across reruns: a camera whose hardware id already has a
+    camera_intrinsics_<name>.json on disk keeps that same name (so re-running
+    this after replugging cameras in a different USB order, or to redo just
+    one camera, doesn't silently reassign c0/c1/c2 to different physical
+    cameras and desync the extrinsics/fusion files that reference them by
+    name). Only cameras with NO prior calibration on record get a fresh name:
+    RealSense -> 'rs'/'rs2'/..., others -> the lowest unused c<N>.
     """
     try:
-        from camera_identity import discover_cameras
+        from camera_identity import discover_cameras, calibrated_hardware_ids
     except Exception as e:
         sys.exit(f"[intrinsics-all] camera discovery unavailable: {e}")
 
@@ -421,40 +507,71 @@ def cmd_intrinsics_all(args: argparse.Namespace) -> None:
                  "in? (RealSense color needs pyrealsense2 for capture, but is "
                  "still discovered as a UVC color node.)")
 
-    # Assign names: RealSense -> rs / rs2 / ...; others -> c0, c1, ...
-    n_rs, n_web = 0, 0
+    # Reuse existing names by hardware id; only assign fresh ones for cameras
+    # with no prior calibration file on record.
+    existing = calibrated_hardware_ids(_HERE)              # name -> hw_id
+    by_id = {hw: name for name, hw in existing.items()}    # hw_id -> name
+    used_names = set(existing)
+
+    def _next_free(prefix: str, n: list) -> str:
+        while True:
+            cand = prefix if n[0] == 0 else f"{prefix}{n[0]}"
+            n[0] += 1
+            if cand not in used_names:
+                return cand
+
+    rs_n, web_n = [0], [0]
     for c in cams:
-        if c["is_realsense"]:
-            c["name"] = "rs" if n_rs == 0 else f"rs{n_rs}"
-            n_rs += 1
+        reused = by_id.get(c["id"]) if c["id"] else None
+        if reused:
+            c["name"] = reused
+            c["reused"] = True
+        elif c["is_realsense"]:
+            c["name"] = _next_free("rs", rs_n)
+            used_names.add(c["name"])
         else:
-            c["name"] = f"c{n_web}"
-            n_web += 1
+            c["name"] = _next_free("c", web_n)
+            used_names.add(c["name"])
 
     print(f"[intrinsics-all] discovered {len(cams)} camera(s):")
     for c in cams:
+        tag = "  [RealSense]" if c["is_realsense"] else ""
+        tag += "  (reusing existing name)" if c.get("reused") else "  (new)"
         print(f"    {c['name']:>4}  index {c['index']}  {c['label']!r}"
-              f"  id={c['id']}" + ("  [RealSense]" if c["is_realsense"] else ""))
+              f"  id={c['id']}{tag}")
     print("[intrinsics-all] calibrating each in turn "
           "(SPACE capture, C solve, S skip, Q quit).")
 
-    done, skipped = [], []
+    done, skipped, failed = [], [], []
     try:
         for k, c in enumerate(cams, 1):
             out = _named(DEFAULT_INTRINSICS, c["name"])
             title = f"[{k}/{len(cams)}] {c['name']}"
             print(f"\n[intrinsics-all] ==== {title} (index {c['index']}"
                   f"{', RealSense' if c['is_realsense'] else ''}) ====")
-            ok = _intrinsics_capture_loop(
-                c["index"], out, args.square_mm, args.min_views,
-                args.width, args.height, args.max_res, c["is_realsense"],
-                args.fix_k3, title)
-            (done if ok else skipped).append(c["name"])
+            try:
+                ok = _intrinsics_capture_loop(
+                    c["index"], out, args.square_mm, args.min_views,
+                    args.width, args.height, args.max_res, c["is_realsense"],
+                    args.fix_k3, title)
+                (done if ok else skipped).append(c["name"])
+            except SystemExit as e:
+                # A per-camera failure (bad open, too few valid views, etc.)
+                # calls sys.exit(), which — uncaught — would silently kill this
+                # WHOLE multi-camera walkthrough and abandon every camera still
+                # left in `cams`, without writing anything for them either.
+                # Treat it the same as pressing 'S': log why, move on to the
+                # next camera. Only 'Q' (KeyboardInterrupt, below) should stop
+                # the whole batch.
+                print(f"[intrinsics-all] {title} FAILED: {e} — skipping this "
+                      f"camera, continuing with the rest.")
+                failed.append(c["name"])
     except KeyboardInterrupt:
         print("\n[intrinsics-all] stopped early (Q).")
     cv2.destroyAllWindows()
     print(f"\n[intrinsics-all] done: {done or '(none)'}"
-          f"   skipped: {skipped or '(none)'}")
+          f"   skipped: {skipped or '(none)'}"
+          f"   failed: {failed or '(none)'}")
     if done:
         print("[intrinsics-all] NEXT: solve extrinsics against a FIXED board:")
         print("[intrinsics-all]   python calibration/charuco_calibration.py "
@@ -599,15 +716,68 @@ def _solve_one_extrinsic(camera: int, intrinsics_path: str, out_path: str,
 
     solved = False
     quit_all = False
+    stall_since = None
+    warned_stall = False
+    perf_read_ms: list[float] = []
+    perf_detect_ms: list[float] = []
+    perf_last_report = time.time()
     while True:
+        t_read0 = time.time()
         ok, frame = cap.read()
+        perf_read_ms.append((time.time() - t_read0) * 1000.0)
         if not ok:
+            # A camera can wedge mid-session (USB glitch, driver hiccup) and
+            # start returning ok=False on every read — without this, the loop
+            # spins silently forever and the window just looks frozen with no
+            # indication why. Surface it, then bail out with a clear error
+            # instead of hanging indefinitely.
+            now = time.time()
+            if stall_since is None:
+                stall_since = now
+            elif not warned_stall and now - stall_since > 3.0:
+                print(f"[extrinsics] {title} camera {camera} stopped returning "
+                      f"frames — still retrying...")
+                warned_stall = True
+            elif now - stall_since > 15.0:
+                sys.exit(f"[extrinsics] {title} camera {camera} produced no frames "
+                         f"for 15s — likely disconnected or wedged. Check the "
+                         f"cable/port and re-run.")
             continue
+        stall_since = None
+        warned_stall = False
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        t_det0 = time.time()
         charuco_corners, charuco_ids, _, _ = charuco_detector.detectBoard(gray)
+        perf_detect_ms.append((time.time() - t_det0) * 1000.0)
+
+        # Lightweight perf readout every ~2s — read() vs detectBoard() vs actual
+        # achieved FPS, so a "laggy feed" report has concrete numbers to point
+        # at (slow USB reads vs slow detection vs something outside this loop,
+        # e.g. imshow/window compositing) instead of needing to be reproduced
+        # blind after the fact.
+        now = time.time()
+        if now - perf_last_report > 2.0 and perf_read_ms:
+            # perf_read_ms grows on every read ATTEMPT (success or failure);
+            # perf_detect_ms only on successful ones that reached detectBoard —
+            # the two are NOT the same length whenever reads are failing (e.g. a
+            # stalling/timing-out camera), so they must be indexed independently.
+            n_read = len(perf_read_ms)
+            n_det = len(perf_detect_ms)
+            fps = n_read / (now - perf_last_report)
+            read_stats = (f"{sorted(perf_read_ms)[n_read//2]:.0f}/"
+                         f"{max(perf_read_ms):.0f}")
+            det_stats = (f"{sorted(perf_detect_ms)[n_det//2]:.0f}/"
+                        f"{max(perf_detect_ms):.0f}") if n_det else "n/a (no successful reads)"
+            print(f"[extrinsics] {title} perf: {fps:.1f} fps over {n_read} read "
+                  f"attempts ({n_det} succeeded) | read ms (median/max) = "
+                  f"{read_stats} | detect ms (median/max) = {det_stats}")
+            perf_read_ms.clear()
+            perf_detect_ms.clear()
+            perf_last_report = now
 
         vis = frame.copy()
         n_det = 0 if charuco_ids is None else len(charuco_ids)
+        live_dist_m = None
         if n_det >= 6:
             # Same refined SQPNP solve the SAVE path uses, so the drawn axes match
             # what gets averaged/stored (and jitter far less than the old default
@@ -618,9 +788,21 @@ def _solve_one_extrinsic(camera: int, intrinsics_path: str, out_path: str,
                 rvec, tvec = sol
                 cv2.drawFrameAxes(vis, camera_matrix, dist_coeffs,
                                   rvec, tvec, square_m * 2)
+                live_dist_m = float(np.linalg.norm(tvec))
         label = f"{title}  corners: {n_det}  (need >=6; SPACE solve, S skip, Q quit)"
         cv2.putText(vis, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (0, 255, 0), 2)
+        if live_dist_m is not None:
+            # Sanity-checkable BEFORE you commit a solve: a near-planar board
+            # viewed at a marginal angle/distance can converge to a pose that
+            # fits the 2D corners well (low reprojection error) but is at the
+            # WRONG physical distance — a known planar-PnP ambiguity, not a
+            # detection failure, so nothing else here would catch it. Eyeball
+            # this against the real distance before pressing SPACE.
+            dist_color = (0, 255, 255) if live_dist_m > 2.5 else (0, 255, 0)
+            cv2.putText(vis, f"solved distance: {live_dist_m:.2f} m  "
+                        f"(sanity-check against the real distance)",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, dist_color, 2)
         cv2.imshow(win, vis)
 
         key = cv2.waitKey(1) & 0xFF
@@ -631,6 +813,11 @@ def _solve_one_extrinsic(camera: int, intrinsics_path: str, out_path: str,
             print(f"[extrinsics] {title} skipped.")
             break
         if key == ord(' '):
+            # The video window doesn't update at all while _average_pose grabs
+            # its n_avg frames (no imshow in that loop) — on a camera with slow
+            # or marginal reads this looks exactly like a freeze with zero
+            # feedback. Print immediately so SPACE visibly did something.
+            print(f"[extrinsics] {title} averaging {n_avg} frames...")
             pose = _average_pose(cap, charuco_detector, board,
                                  camera_matrix, dist_coeffs, n_avg, std_tol_m)
             if pose is None:
@@ -705,7 +892,7 @@ def cmd_extrinsics_all(args: argparse.Namespace) -> None:
           f"{', '.join(f'{n}:{i}' + ('(rs)' if n in rs_names else '') for n, i in cams)}")
     print("[extrinsics-all] KEEP THE BOARD FIXED at the world origin for the WHOLE "
           "run — that shared pose is what puts all cameras in one frame.")
-    done, skipped = [], []
+    done, skipped, failed = [], [], []
     try:
         for k, (name, idx) in enumerate(cams, 1):
             intr = _named(DEFAULT_INTRINSICS, name)
@@ -720,15 +907,25 @@ def cmd_extrinsics_all(args: argparse.Namespace) -> None:
             h = args.rs_height if is_rs else args.height
             print(f"\n[extrinsics-all] ==== {title} "
                   f"({'RealSense color' if is_rs else f'camera index {idx}'}) ====")
-            ok = _solve_one_extrinsic(idx, intr, out, args.square_mm, args.n_avg,
-                                      w, h, args.max_res, title, realsense=is_rs,
-                                      std_tol_m=args.pose_std_mm / 1000.0)
-            (done if ok else skipped).append(name)
+            try:
+                ok = _solve_one_extrinsic(idx, intr, out, args.square_mm, args.n_avg,
+                                          w, h, args.max_res, title, realsense=is_rs,
+                                          std_tol_m=args.pose_std_mm / 1000.0)
+                (done if ok else skipped).append(name)
+            except SystemExit as e:
+                # Same failure mode as intrinsics-all: an uncaught sys.exit()
+                # from a per-camera error (wedged camera, bad open, ...) would
+                # otherwise kill the WHOLE walkthrough and silently abandon
+                # every camera still left in `cams`. Skip just this one.
+                print(f"[extrinsics-all] {title} FAILED: {e} — skipping this "
+                      f"camera, continuing with the rest.")
+                failed.append(name)
     except KeyboardInterrupt:
         print("\n[extrinsics-all] stopped early (Q).")
     cv2.destroyAllWindows()
     print(f"\n[extrinsics-all] done: {done or '(none)'}"
-          f"   skipped: {skipped or '(none)'}")
+          f"   skipped: {skipped or '(none)'}"
+          f"   failed: {failed or '(none)'}")
     if done:
         print("[extrinsics-all] All solved cameras now share ONE world frame "
               "(same board pose). Validate with the fusion node's reproj log.")
@@ -817,10 +1014,29 @@ def _average_pose(cap, charuco_detector, board, camera_matrix, dist_coeffs, n_av
     tvecs: list[np.ndarray] = []
     rvecs: list[np.ndarray] = []
     grabbed = 0
+    stall_since = None
+    warned_stall = False
     while grabbed < n_avg:
         ok, frame = cap.read()
         if not ok:
+            # Same silent-hang risk as the preview loop: a wedged camera mid-
+            # average would otherwise spin here forever with the window frozen
+            # and no feedback. Surface it and give up cleanly instead.
+            now = time.time()
+            if stall_since is None:
+                stall_since = now
+            elif not warned_stall and now - stall_since > 3.0:
+                print(f"[extrinsics] camera stopped returning frames mid-average "
+                      f"— still retrying...")
+                warned_stall = True
+            elif now - stall_since > 15.0:
+                print(f"[extrinsics] camera produced no frames for 15s during "
+                      f"averaging — likely disconnected or wedged. Aborting "
+                      f"this solve; check the cable/port and re-press SPACE.")
+                return None
             continue
+        stall_since = None
+        warned_stall = False
         grabbed += 1
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         cc, ci, _, _ = charuco_detector.detectBoard(gray)
@@ -897,9 +1113,17 @@ def main() -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     g = sub.add_parser("generate", help="render a printable ChArUco board PNG")
-    g.add_argument("--out", default=DEFAULT_BOARD_PNG)
-    g.add_argument("--square-mm", type=float, default=DEFAULT_SQUARE_MM,
-                   help="nominal printed square size for sizing the image")
+    g.add_argument("--out", default=None,
+                   help=f"output path (default: board.png, or board_<paper>.png "
+                        f"when --paper is not a3)")
+    g.add_argument("--square-mm", type=float, default=None,
+                   help="nominal printed square size for sizing the image "
+                        "(default: DEFAULT_SQUARE_MM, or largest that fits "
+                        "--paper if given)")
+    g.add_argument("--paper", choices=sorted(PAPER_SIZES_MM), default=None,
+                   help="paper size to size the board for (letter, a4, a3); "
+                        "default (no --paper) uses DEFAULT_SQUARE_MM on an "
+                        "A3-sized board; ignored if --square-mm is also given")
     g.add_argument("--dpi", type=int, default=300)
     g.set_defaults(func=cmd_generate)
 

@@ -16,6 +16,14 @@ Pull MuJoCo Menagerie submodule models:
 git submodule update --init --recursive
 ```
 
+The `--dashboard` flag runs a pyqtgraph (Qt 6) GUI in a separate process. On Linux, Qt
+6.5+ requires the `libxcb-cursor0` system library to load its xcb (X11) platform plugin;
+without it the dashboard process fails to start silently (no window, no error in the main
+terminal). Install it once:
+```bash
+sudo apt-get install libxcb-cursor0
+```
+
 ---
 
 ## Kinova Gen3 + LEAP Hand Pick-and-Place
@@ -93,6 +101,7 @@ python kinova_leap_pick_place.py --mode dexpilot \
 | `--multicam-realsense NAME` | none | *(with `--multicam`)* Mark a camera as an Intel RealSense — its node captures the COLOR stream via `pyrealsense2` (the `:INDEX` is then ignored; the SDK picks the device). Default 640×480 @ 30 fps (the D435I's 1080p color is only 8 fps). Repeatable. |
 | `--multicam-max-res` | off | *(with `--multicam`)* Open each camera at its highest supported resolution (forwards `--max-res`). Prefer omitting it — resolutions come from the intrinsics files automatically. |
 | `--recalibrate-extrinsics` | off | *(with `--multicam`)* Run the interactive extrinsics solve for each camera **before** teleop starts (fix the ChArUco board at the world origin, press **SPACE** per camera). Reuses each camera's calibrated resolution. Default reuses the saved extrinsics. |
+| `--square-mm MM` | `50.0` | *(with `--recalibrate-extrinsics`)* MEASURED ChArUco square size in mm, forwarded to `charuco_calibration.py extrinsics`. Must match the board actually printed/mounted on the rig — measure a square with calipers, don't trust the nominal print size. Keep in sync with `DEFAULT_SQUARE_MM` in `calibration/charuco_calibration.py` if the board changes. |
 | `--camera-views` | off | *(with `--multicam`)* Tile each camera's live feed + landmark overlay in a window (subscribes to `/hand/cam_<name>/preview`), like `run_multicam.py --show-fused`'s camera grid. |
 | `--skeleton-view` | off | *(teleop modes)* Open a separate orbitable 3D window of the fused hand skeleton (from the world landmarks in `/hand/joint_angles`). |
 | `--no-mediapipe` / `--external-hand` | off | *(teleop modes)* Do **not** spawn the built-in single-camera publisher — for when an external process already publishes `/hand/joint_angles`. Implied by `--multicam`. |
@@ -198,13 +207,14 @@ Calibration produces, per camera, the intrinsics (`camera_matrix`, `dist_coeffs`
 
 ### Board setup
 
-Generate a printable ChArUco board PNG (5×7 squares, 35 mm nominal, sized for letter paper):
+Generate a printable ChArUco board PNG (5×7 squares, 50 mm nominal, sized for A3 paper):
 
 ```bash
 python calibration/charuco_calibration.py generate
+# or: generate --paper letter   (smaller squares, same 5x7 grid, fits a normal printer)
 ```
 
-Writes `calibration/board.png` (~7.2 × 9.9 in at 300 DPI). Options: `--square-mm` (nominal square size, default 35), `--dpi` (default 300), `--out`.
+Writes `calibration/board.png` (~10.2 × 14.2 in at 300 DPI). Options: `--square-mm` (nominal square size, default 50 — `DEFAULT_SQUARE_MM` in `calibration/charuco_calibration.py`), `--paper {letter,a4,a3}` (sizes the square to fill that sheet instead), `--dpi` (default 300), `--out`.
 
 1. Print at **100% / Actual size** — never "fit to page", which silently rescales and invalidates the metric calibration. The raw PNG has no DPI metadata, so viewers that assume 96 DPI size it wrong; if your viewer misbehaves, place the image on a letter-size 300 DPI canvas first or print from an application that lets you set the scale explicitly.
 2. Glue or tape the print completely flat to something rigid (foam board, clipboard).
@@ -213,8 +223,8 @@ Writes `calibration/board.png` (~7.2 × 9.9 in at 300 DPI). Options: `--square-m
 ### Single camera
 
 ```bash
-python calibration/charuco_calibration.py intrinsics --camera 1 --square-mm 34.8
-python calibration/charuco_calibration.py extrinsics --camera 1 --square-mm 34.8
+python calibration/charuco_calibration.py intrinsics --camera 1 --square-mm 49.6
+python calibration/charuco_calibration.py extrinsics --camera 1 --square-mm 49.6
 ```
 
 `intrinsics`: wave the board across the frame; **SPACE** captures a view (collect 12+ at varied angle/tilt/distance), **C** calibrates. Aim for RMS < 1.0 px. `extrinsics`: fix the board at the desired world origin facing the camera; **SPACE** averages `--n-avg` frames and solves. Writes `calibration/camera_intrinsics.json` and `camera_extrinsics.json`.
@@ -238,7 +248,7 @@ Pick a stable `<name>` for each physical camera (e.g. `c0`, `c1`, `rs`) and note
 **1. Intrinsics.** Easiest is **auto-discovery** — one command finds every connected color camera, auto-names them (`c0`, `c1`, … and `rs` for a RealSense), and walks through calibrating each:
 
 ```bash
-python calibration/charuco_calibration.py intrinsics-all --square-mm 34.8 --max-res
+python calibration/charuco_calibration.py intrinsics-all --square-mm 49.6 --max-res
 ```
 
 Per camera: **SPACE** captures a view (12+ at varied angle/tilt/distance, fill the edges), **C** solves, **S** skips, **Q** quits. It prints the `extrinsics-all` command to run next. Because each intrinsic is stamped with the camera's hardware id, the auto-assigned names are just labels — the *identity* is what binds them at launch (so enumeration order doesn't matter later).
@@ -246,8 +256,8 @@ Per camera: **SPACE** captures a view (12+ at varied angle/tilt/distance, fill t
 Or calibrate cameras individually (independent of board placement; `--max-res` opens each at its highest mode):
 
 ```bash
-python calibration/charuco_calibration.py intrinsics --camera 0 --name c0 --square-mm 34.8 --max-res
-python calibration/charuco_calibration.py intrinsics --camera 2 --name c1 --square-mm 34.8 --max-res
+python calibration/charuco_calibration.py intrinsics --camera 0 --name c0 --square-mm 49.6 --max-res
+python calibration/charuco_calibration.py intrinsics --camera 2 --name c1 --square-mm 49.6 --max-res
 ```
 
 Each run also **stamps the camera's hardware id** (USB `vendor:product:serial`, or RealSense SDK serial) into the intrinsics file — see *Camera identity* below.
@@ -255,9 +265,9 @@ Each run also **stamps the camera's hardware id** (USB `vendor:product:serial`, 
 **2. Extrinsics — all cameras in one command** (board fixed for the whole run). Fix the board at the world origin, then `--auto` discovers every calibrated camera and walks through each:
 
 ```bash
-python calibration/charuco_calibration.py extrinsics-all --auto --square-mm 34.8
+python calibration/charuco_calibration.py extrinsics-all --auto --square-mm 49.6
 # or name them explicitly:
-# ... extrinsics-all --cam c0:0 --cam c1:2 --cam rs:8 --square-mm 34.8
+# ... extrinsics-all --cam c0:0 --cam c1:2 --cam rs:8 --square-mm 49.6
 ```
 
 Per camera: **SPACE** solves and saves, **S** skips, **Q** stops the walkthrough. `--auto` uses the same discovery + hardware-id matching as `run_multicam --auto`, so it needs each camera's stamped intrinsics from step 1. (The single-camera `extrinsics --camera <idx> --name <name>` still works to redo just one.)
@@ -304,8 +314,8 @@ python calibration/charuco_calibration.py stamp-id --camera 8 --name rs --realse
 A RealSense participates as a plain RGB camera, but its color stream is captured through `pyrealsense2` (bundled in the env) rather than bare OpenCV. Pass `--multicam-realsense <name>` (in the app) or `--realsense <name>` (in `run_multicam.py`), and use `--realsense` on the calibration commands so they capture the same stream:
 
 ```bash
-python calibration/charuco_calibration.py intrinsics --camera 8 --name rs --realsense --square-mm 34.8
-python calibration/charuco_calibration.py extrinsics-all --cam c0:0 --cam c1:2 --cam rs:8 --realsense rs --square-mm 34.8
+python calibration/charuco_calibration.py intrinsics --camera 8 --name rs --realsense --square-mm 49.6
+python calibration/charuco_calibration.py extrinsics-all --cam c0:0 --cam c1:2 --cam rs:8 --realsense rs --square-mm 49.6
 ```
 
 The D435I's 1080p color runs at only 8 fps, so RealSense capture defaults to 640×480 @ 30 fps — calibrate its intrinsics at the size you'll stream. (Factory SDK intrinsics report zero distortion; if fused landmarks warp near the frame edges, board-calibrate to recover the real coefficients.)

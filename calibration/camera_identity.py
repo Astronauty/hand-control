@@ -149,18 +149,39 @@ def find_index_by_identity(target_id: str,
     return None
 
 
+def _is_metadata_subnode(index: int) -> bool:
+    """True if this video node is a non-primary node of its USB interface.
+
+    Modern UVC drivers expose a second /dev/videoN per physical camera for
+    metadata (uncompressed frame metadata, not an image) alongside the real
+    capture node. The sysfs 'index' attribute is the node's position within
+    its interface: 0 is always the real capture node on every camera in this
+    rig, N>=1 the metadata sibling — which OpenCV can never open, but which
+    still costs a slow failed VideoCapture() probe (and a printed WARN/ERROR)
+    if we try. Skipping it via sysfs first avoids that cost entirely.
+    Returns False (don't skip) if sysfs doesn't expose this, e.g. non-Linux —
+    callers fall back to the normal open-and-check probe."""
+    val = _read(f"/sys/class/video4linux/video{index}/index")
+    try:
+        return int(val) != 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _is_color_frame(frame) -> bool:
     """Heuristic: a real COLOR frame has channel means that differ (B!=G!=R).
 
     Depth is single-plane; IR is 3-plane but gray (equal channel means). A tiny
-    tolerance rejects gray/IR while accepting even a dim color scene."""
+    tolerance rejects gray/IR while accepting even a dim, low-saturation color
+    scene — real UVC color sensors still separate channels slightly even under
+    neutral lighting, while depth/IR nodes read near-zero gap."""
     if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
         return False
     b, g, r = frame[:, :, 0].mean(), frame[:, :, 1].mean(), frame[:, :, 2].mean()
-    return (max(b, g, r) - min(b, g, r)) > 3.0
+    return (max(b, g, r) - min(b, g, r)) > 1.5
 
 
-def discover_cameras(max_index: int = 12, warmup: int = 8) -> list[dict]:
+def discover_cameras(max_index: int = 12, warmup: int = 20) -> list[dict]:
     """Auto-discover usable COLOR cameras, one entry per PHYSICAL device.
 
     Opens each /dev/video* node, keeps only those returning a color frame, and
@@ -179,17 +200,26 @@ def discover_cameras(max_index: int = 12, warmup: int = 8) -> list[dict]:
     seen_ids: set = set()
     out: list[dict] = []
     for idx in _list_video_indices(max_index):
-        cap = cv2.VideoCapture(idx)
+        if _is_metadata_subnode(idx):
+            continue
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
         if not cap.isOpened():
             cap.release()
             continue
-        frame = None
+        is_color = False
         for _ in range(warmup):
             ok, fr = cap.read()
             if ok and fr is not None:
-                frame = fr
+                # Check every warmup frame, not just the last — AWB noise can
+                # bounce a genuine color camera's channel-mean gap across the
+                # threshold frame to frame, especially under neutral lighting.
+                if _is_color_frame(fr):
+                    is_color = True
+                    break   # already have the answer — don't burn the rest
+                            # of the warmup budget (dominates discovery time
+                            # on a slow-to-open camera).
         cap.release()
-        if not _is_color_frame(frame):
+        if not is_color:
             continue                       # depth/IR/metadata node
         hw = identity_for_index(idx)
         label = label_for_index(idx)
