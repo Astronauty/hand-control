@@ -8,77 +8,55 @@
   <option cone="elliptic"/>
 
   <worldbody>
-    <!-- Pick area: visual-only reference marker, 70 cm × 70 cm -->
-    <geom name="pick_area_marker" type="box" size="0.35 0.35 0.0005" pos="0.5 0.5 0.001"
+    <!-- Pick area: visual-only reference marker, 30 cm × 30 cm -->
+    <geom name="pick_area_marker" type="box" size="0.15 0.15 0.0005" pos="0.65 0.5 0.001"
       rgba="0.6 0.6 0.6 0.35" contype="0" conaffinity="0"/>
 
     <!-- RED category: box + sphere
          z = half-height so each object rests on the floor at startup.
          Contact sites use the +x inward-normal convention (local x-axis = inward surface normal). -->
-    <body name="obj_red_box" pos="0.38 0.42 0.040">
+    <body name="obj_red_box" pos="0.60 0.42 0.040">
       <freejoint/>
       <geom name="obj_red_box_geom" type="box" size="0.040 0.040 0.040"
-        rgba="0.85 0.15 0.15 1" mass="0.25" friction="1.0 0.05 0.001" condim="3"/>
+        rgba="0.85 0.15 0.15 1" mass="0.25" friction="2.0 0.05 0.001" condim="3"/>
       <site name="obj_red_box_c1" pos="-0.040 0 0" quat="1 0 0 0"/>
       <site name="obj_red_box_c2" pos=" 0.040 0 0" quat="0 0 1 0"/>
     </body>
     
 
-    <!-- <body name="obj_red_sphere" pos="0.64 0.38 0.028">
-      <freejoint/>
-      <geom name="obj_red_sphere_geom" type="sphere" size="0.028"
-        rgba="0.80 0.20 0.10 1" mass="0.5" friction="1 0.05 0.001" condim="3"/>
-      <site name="obj_red_sphere_c1" pos="-0.028 0 0" quat="1 0 0 0"/>
-      <site name="obj_red_sphere_c2" pos=" 0.028 0 0" quat="0 0 1 0"/>
-    </body> -->
 
-    <!-- BLUE category: cylinder + capsule
+    <!-- BLUE category: cylinder
          Capsule: size=(radius, half-cylinder-length); rest height = radius + half-length. -->
-    <!-- <body name="obj_blue_cylinder" pos="0.42 0.58 0.032">
+    <!-- <body name="obj_blue_cylinder" pos="0.55 0.55 0.037">
       <freejoint/>
-      <geom name="obj_blue_cylinder_geom" type="cylinder" size="0.032 0.032"
+      <geom name="obj_blue_cylinder_geom" type="cylinder" size="0.037 0.037"
         rgba="0.15 0.25 0.85 1" mass="0.5" friction="1 0.05 0.001" condim="3"/>
-      <site name="obj_blue_cylinder_c1" pos="-0.032 0 0" quat="1 0 0 0"/>
-      <site name="obj_blue_cylinder_c2" pos=" 0.032 0 0" quat="0 0 1 0"/>
-    </body>
-
-    <body name="obj_blue_capsule" pos="0.58 0.56 0.058">
-      <freejoint/>
-      <geom name="obj_blue_capsule_geom" type="capsule" size="0.020 0.038"
-        rgba="0.20 0.15 0.75 1" mass="0.5" friction="1 0.05 0.001" condim="3"/>
-      <site name="obj_blue_capsule_c1" pos="-0.020 0 0" quat="1 0 0 0"/>
-      <site name="obj_blue_capsule_c2" pos=" 0.020 0 0" quat="0 0 1 0"/>
+      <site name="obj_blue_cylinder_c1" pos="-0.037 0 0" quat="1 0 0 0"/>
+      <site name="obj_blue_cylinder_c2" pos=" 0.037 0 0" quat="0 0 1 0"/>
     </body> -->
 
     <!-- GREEN category: box + cylinder -->
-    <body name="obj_green_box" pos="0.44 0.72 0.026">
+    <!-- <body name="obj_green_box" pos="0.60 0.62 0.030">
       <freejoint/>
-      <geom name="obj_green_box_geom" type="box" size="0.026 0.030 0.026"
+      <geom name="obj_green_box_geom" type="box" size="0.030 0.034 0.030"
         rgba="0.15 0.75 0.20 1" mass="0.5" friction="1 0.05 0.001" condim="3"/>
-      <site name="obj_green_box_c1" pos="-0.026 0 0" quat="1 0 0 0"/>
-      <site name="obj_green_box_c2" pos=" 0.026 0 0" quat="0 0 1 0"/>
-    </body>
-
-    <!-- <body name="obj_green_cylinder" pos="0.80 0.70 0.034">
-      <freejoint/>
-      <geom name="obj_green_cylinder_geom" type="cylinder" size="0.034 0.034"
-        rgba="0.10 0.70 0.30 1" mass="0.5" friction="1 0.05 0.001" condim="3"/>
-      <site name="obj_green_cylinder_c1" pos="-0.034 0 0" quat="1 0 0 0"/>
-      <site name="obj_green_cylinder_c2" pos=" 0.034 0 0" quat="0 0 1 0"/>
+      <site name="obj_green_box_c1" pos="-0.030 0 0" quat="1 0 0 0"/>
+      <site name="obj_green_box_c2" pos=" 0.030 0 0" quat="0 0 1 0"/>
     </body> -->
 
-    <!-- Place areas: one per color category, color-matched, below the robot -->
-    <site name="place_red_site" pos="0.2 -0.15 0.001" size="0.001"/>
-    <geom name="place_red_marker" type="box" size="0.10 0.10 0.0005"
-      pos="0.2 -0.5 0.001" rgba="0.85 0.15 0.15 0.35" contype="0" conaffinity="0"/>
+    <!-- Place areas: one per color category, color-matched, below the robot.
+         Laid out along -y (fixed x), spaced 0.2m apart. -->
+    <site name="place_red_site" pos="0.6 -0.15 0.001" size="0.001"/>
+    <geom name="place_red_marker" type="box" size="0.08 0.08 0.0005"
+      pos="0.6 -0.4 0.001" rgba="0.85 0.15 0.15 0.35" contype="0" conaffinity="0"/>
 
-    <site name="place_blue_site" pos="0.50 -0.15 0.001" size="0.001"/>
-    <geom name="place_blue_marker" type="box" size="0.10 0.10 0.0005"
-      pos="0.50 -0.5 0.001" rgba="0.15 0.25 0.85 0.35" contype="0" conaffinity="0"/>
+    <site name="place_blue_site" pos="0.6 -0.35 0.001" size="0.001"/>
+    <geom name="place_blue_marker" type="box" size="0.08 0.08 0.0005"
+      pos="0.6 -0.6 0.001" rgba="0.15 0.25 0.85 0.35" contype="0" conaffinity="0"/>
 
-    <site name="place_green_site" pos="0.8 -0.15 0.001" size="0.001"/>
-    <geom name="place_green_marker" type="box" size="0.10 0.10 0.0005"
-      pos="0.8 -0.5 0.001" rgba="0.15 0.75 0.20 0.35" contype="0" conaffinity="0"/>
+    <site name="place_green_site" pos="0.6 -0.55 0.001" size="0.001"/>
+    <geom name="place_green_marker" type="box" size="0.08 0.08 0.0005"
+      pos="0.6 -0.8 0.001" rgba="0.15 0.75 0.20 0.35" contype="0" conaffinity="0"/>
 
     <!-- Contact-point marker spheres for GraspPlanner3D visualisation. -->
     <body name="cp1_body" mocap="true">

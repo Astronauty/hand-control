@@ -253,6 +253,7 @@ _RANDOMIZE_OBJ_INFO = [
     ('obj_blue_capsule',   'obj_blue_capsule_geom',   [0.0, 0.0, 1.0]),
     ('obj_green_box',      'obj_green_box_geom',      [0.0, 1.0, 0.0]),
     ('obj_green_cylinder', 'obj_green_cylinder_geom', [0.0, 1.0, 0.0]),
+    ('obj_yellow_box',     'obj_yellow_box_geom',     [0.9, 0.75, 0.1]),
 ]
 
 
@@ -264,7 +265,9 @@ def _randomize_objects(model, data, rng):
     the randomized object positions throughout the IK precomputation loop.
     """
     PICK_CENTER = np.array([0.5, 0.5])
-    PICK_HALF   = np.array([0.27, 0.27])   # centers in [0.23, 0.77]² to keep objects on marker
+    PICK_HALF   = np.array([0.15, 0.15])   # centers in [0.35, 0.65]² to keep objects on marker,
+                                            # and farther from the robot base (0,0,0) to avoid
+                                            # near-base IK singularities
     MIN_SEP     = 0.10                      # minimum centre-to-centre separation (m)
     MAX_TRIES   = 2000
 
@@ -286,6 +289,8 @@ def _randomize_objects(model, data, rng):
         s   = float(size_scales[i])
         bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, bname)
         gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, gname)
+        if bid < 0 or gid < 0:
+            continue   # object commented out of the scene XML
 
         # Size: scale geom_size and bounding sphere uniformly
         model.geom_size[gid]   *= s
@@ -431,6 +436,13 @@ if __name__ == "__main__":
              "ChArUco board at the world origin and press SPACE per camera to "
              "re-solve each camera_extrinsics_<name>.json. Default reuses the saved "
              "extrinsics. Requires per-camera intrinsics to already exist.")
+    _arg_parser.add_argument(
+        '--square-mm', type=float, default=50.0,
+        help="With --recalibrate-extrinsics: MEASURED ChArUco square size in mm, "
+             "forwarded to charuco_calibration.py's --square-mm. Must match the "
+             "printed board actually on the rig (default 50.0, matching "
+             "calibration/charuco_calibration.py's DEFAULT_SQUARE_MM — keep the "
+             "two in sync if the board changes).")
     _arg_parser.add_argument(
         '--no-mediapipe', '--external-hand', dest='no_mediapipe',
         action='store_true',
@@ -638,6 +650,25 @@ if __name__ == "__main__":
         'obj_green_box_geom', 'obj_green_cylinder_geom',
         'floor',
     ]
+
+    # Tier-1 collision subset for the grasp RECOMMENDER's NLP (contact_aware_teleop).
+    # The recommender historically ran with NO arm/object collision (only the middle/ring
+    # fingertips, via the legacy path) because feeding it the full 71-geom IK set made the
+    # box solve non-converge (returns p1/p2 = None) — see _get_cat_planner. Tier 1 adds
+    # back only the palm + wrist geoms: the biggest, bluntest bodies and the most common
+    # penetrator (palm driving into the object as the arm reaches in). They sit far from
+    # the contacts, so the NLP's proximity pruning (col_prune_margin) drops them until the
+    # arm actually gets close — near-zero added cost on most solves. Escalate to more links
+    # only if this holds convergence. Empty list restores the old no-arm-collision behavior.
+    _REC_ARM_GEOMS = [
+        _gname for _gi in range(model.ngeom)
+        if (_gname := mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, _gi))
+        and _geom_contype0[_gi] != 0
+        and (mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, model.geom_bodyid[_gi]) or '')
+            in ('leap_palm', 'bracelet_link')
+    ]
+    print(f"[rec] Tier-1 recommender arm-collision geoms (palm+wrist): "
+          f"{len(_REC_ARM_GEOMS)}")
     # Diagonal posture regularization, split arm (first 7 DOF) vs LEAP hand (next 16).
     # The posture term is Σ_i w_i (q_i - q_bias_i)²; a per-block weight lets the arm's
     # redundancy float toward the tip targets (small POSTURE_W_ARM) while the fingers are
@@ -1191,23 +1222,13 @@ if __name__ == "__main__":
         _run_ik(obj_idx, obj, obj_qpos_snap)
         _run_rrt(q_start, obj['q_target'], obj)
 
-    def _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_seed,
-                            warmstart='rec_q'):
-        """contact_aware_teleop lock-in: like _run_ik but the fingertip targets come
-        from the NLP-recommended contacts (rec['p1']=thumb, rec['p2']=index in world)
-        instead of the authored contact sites. Stores the recommended contacts as
-        object-LOCAL frames on obj so the GRASP provider tracks the moving object,
-        then reuses the same DLS->SQP grasp IK to get obj['q_target'].
-
-        q_seed is the operator's live teleoped pose at lock-in — the hand is already
-        positioned at a valid, collision-free approach to the object, so we BIAS the IK
-        (posture regularization) from it rather than from Q_BIAS.
-
-        warmstart selects the IK's q_init:
-          'rec_q' — the recommender's own q (already at the contacts, ~cm residual).
-          'dls'   — a fresh DLS solve to the contacts from q_seed.
-        Both share the same q_bias=q_seed; only the initial guess differs. Exposed so
-        the debug previews can A/B the two warm-starts."""
+    def _setup_recommended_contact_frames(obj_idx, obj, obj_qpos_snap, rec, q_seed):
+        """Shared setup for both the recommender-pose commit (RRT goal) and the
+        collision-IK path. Poses _ik_data at q_seed, resolves the recommended contacts
+        (rec['p1']=thumb, rec['p2']=index) + inward normals into world + object-LOCAL
+        frames, and stores everything the GRASP phase needs on obj:
+          p_S_W, inward_S_W, ik_obj_qpos, rec_local, ik_targets.
+        Returns (p_S_W, inward_S_W) for callers that continue into an IK solve."""
         mj.mj_resetData(model, _ik_data)
         _ik_data.qpos[:N_ROBOT] = q_seed
         _ik_data.qpos[N_ROBOT:] = obj_qpos_snap
@@ -1250,6 +1271,93 @@ if __name__ == "__main__":
         # along each inward normal (same as _run_ik).
         obj['ik_targets'] = [p - _PAD_OFFSET[f] * n
                              for f, p, n in zip(FINGER_SET, p_S_W, inward_S_W)]
+        return p_S_W, inward_S_W
+
+    def _expand_rec_q(rec, q_seed):
+        """Expand the recommender's actuated-joint solution rec['q'] into a full N_ROBOT
+        pose over q_seed (the live pose supplies any joints the recommender didn't move).
+        Returns None if the candidate carries no q."""
+        _rec_q = rec.get('q')
+        if _rec_q is None:
+            return None
+        q_full = np.asarray(q_seed, float).copy()
+        for _i, _idx in enumerate(_cat_act_idx):
+            q_full[_idx] = _rec_q[_i]
+        return q_full
+
+    def _commit_recommended_pose(obj_idx, obj, obj_qpos_snap, rec, q_seed):
+        """contact_aware_teleop lock-in (committing path): set the GRASP-phase contact
+        frames from the recommended contacts and commit obj['q_target'] to the
+        RECOMMENDER's own pose (expanded), WITHOUT running the collision-aware IK.
+
+        This is the pose the RRT then plans toward and the GRASP phase holds. The
+        collision-aware IK is no longer on the commit path — it remains available for the
+        O/I debug previews (_fire_preview_ik) so the operator can still inspect what the
+        constrained solve would produce, but it does not alter the committed grasp."""
+        _setup_recommended_contact_frames(obj_idx, obj, obj_qpos_snap, rec, q_seed)
+        q_rec = _expand_rec_q(rec, q_seed)
+        if q_rec is None:
+            # No recommender q (shouldn't happen post-solve) — fall back to the live pose
+            # so RRT has a valid, in-place goal rather than crashing.
+            print("[teleop] WARNING: recommendation carries no q — committing live pose.")
+            q_rec = np.asarray(q_seed, float).copy()
+        obj['q_target'] = q_rec
+
+        # Report where the recommender's own pose lands the tip SITES vs its recommended
+        # contacts — the committed grasp's tip error (same site->contact metric the O/I
+        # previews use, so the two are directly comparable).
+        _d_chk = mj.MjData(model)
+        _d_chk.qpos[N_ROBOT:] = obj_qpos_snap
+        _d_chk.qpos[:N_ROBOT] = q_rec
+        mj.mj_forward(model, _d_chk)
+        _errs_mm = [float(np.linalg.norm(_d_chk.site_xpos[s] - p) * 1e3)
+                    for s, p in zip(id_C, obj['p_S_W'])]
+        obj['rec_ik_err_mm']         = _errs_mm
+        obj['rec_ik_contact_err_mm'] = _errs_mm
+        print(f"\r\n[commit] obj{obj_idx+1} recommender pose committed as RRT goal — "
+              f"tip errors (site->contact, mm) {FINGER_SET}: "
+              f"{[f'{e:.1f}' for e in _errs_mm]}")
+        if dash is not None:
+            dash.push({'type': 'tip_err', 'object': obj['name'],
+                       'fingers': list(FINGER_SET),
+                       'nlp': _errs_mm, 'ik': None, 'rrt': None})
+
+        # ACHIEVED contact points (tip sites pushed to the pad surface) so the markers
+        # snap to what the hand actually does — same as the IK path.
+        bid   = obj['id_body']
+        p_WoO = _d_chk.xpos[bid].copy()
+        R_WO  = _d_chk.xmat[bid].reshape(3, 3).copy()
+        _achieved, _achieved_O = [], []
+        for f, s, n in zip(FINGER_SET, id_C, obj['inward_S_W']):
+            p_ach_W = _d_chk.site_xpos[s].copy() + _PAD_OFFSET[f] * n
+            _achieved.append(p_ach_W)
+            _achieved_O.append(R_WO.T @ (p_ach_W - p_WoO))
+        obj['rec_achieved_W'] = _achieved
+        obj['rec_achieved_O'] = _achieved_O
+        _ik_markers_by_obj[obj_idx] = _make_ik_markers(obj, obj_qpos_snap)
+        _ik_solved.add(obj_idx)
+
+    def _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_seed,
+                            warmstart='rec_q'):
+        """contact_aware_teleop O/I DEBUG PREVIEW (non-committing): like _run_ik but the
+        fingertip targets come from the NLP-recommended contacts (rec['p1']=thumb,
+        rec['p2']=index in world) instead of the authored contact sites. Runs the
+        DLS->SQP collision-aware grasp IK to get obj['q_target'] so the preview can show
+        what the constrained solve produces. NOTE: as of the recommender-pose commit,
+        this is NO LONGER on the lock-in path (see _commit_recommended_pose) — it only
+        backs the O/I previews (_fire_preview_ik).
+
+        q_seed is the operator's live teleoped pose — the hand is already positioned at a
+        valid, collision-free approach to the object, so we BIAS the IK (posture
+        regularization) from it rather than from Q_BIAS.
+
+        warmstart selects the IK's q_init:
+          'rec_q' — the recommender's own q (already at the contacts, ~cm residual).
+          'dls'   — a fresh DLS solve to the contacts from q_seed.
+        Both share the same q_bias=q_seed; only the initial guess differs. Exposed so
+        the debug previews can A/B the two warm-starts."""
+        p_S_W, inward_S_W = _setup_recommended_contact_frames(
+            obj_idx, obj, obj_qpos_snap, rec, q_seed)
         # Warm-start (q_init) selection. 'rec_q': the recommender's own q, expanded to
         # a full-robot pose over q_seed — already at the contacts (~cm residual), a
         # closer start than a fresh DLS. 'dls': a fresh DLS solve to the contacts.
@@ -1341,6 +1449,9 @@ if __name__ == "__main__":
         # robot will really make — the markers snap here after lock-in so what you see
         # matches what the hand does, even when the ideal NLP contacts aren't reachable.
         # Stored in FINGER_SET order ([index, thumb]).
+        bid   = obj['id_body']
+        p_WoO = _d_chk.xpos[bid].copy()
+        R_WO  = _d_chk.xmat[bid].reshape(3, 3).copy()
         _achieved = []
         _achieved_O = []
         for f, s, n in zip(FINGER_SET, id_C, inward_S_W):
@@ -1360,10 +1471,13 @@ if __name__ == "__main__":
         _ik_solved.add(obj_idx)
 
     def _run_ik_recommended_then_rrt(obj_idx, obj, q_start, obj_qpos_snap, rec):
-        # Seed the grasp IK from the operator's live pose (q_start): the hand is
-        # already at a valid approach, so the IK lands the tips on the recommended
-        # contacts instead of failing to wrap down from the far Q_BIAS home pose.
-        _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_start)
+        # Commit the RECOMMENDER's own pose as the grasp goal (no collision-aware IK
+        # re-solve on the commit path — see _commit_recommended_pose). The recommender
+        # now carries Tier-1 palm/wrist collision awareness, and RRT plans a collision-
+        # free approach TO this pose, so the committed grasp is the one the recommender
+        # proposed rather than an IK-refined variant of it. The collision-aware IK stays
+        # available for the O/I previews so the operator can still inspect it manually.
+        _commit_recommended_pose(obj_idx, obj, obj_qpos_snap, rec, q_start)
         _run_rrt(q_start, obj['q_target'], obj)
 
     def _fire_preview_ik(obj_idx, obj, q_seed, obj_qpos_snap, rec, warmstart, slot):
@@ -1463,7 +1577,8 @@ if __name__ == "__main__":
                     _nm, _idx = _p[0], _p[1]
                     _is_rs = _nm in _rs_names
                     _ex = [sys.executable, _cal, 'extrinsics',
-                           '--camera', _idx, '--name', _nm]
+                           '--camera', _idx, '--name', _nm,
+                           '--square-mm', str(args.square_mm)]
                     # A RealSense MUST be captured via pyrealsense2 (same path the
                     # pipeline uses), NOT cv2 — forward --realsense so the solve sees
                     # the identical color stream its intrinsics were read from. cv2
@@ -1872,15 +1987,18 @@ if __name__ == "__main__":
             if p is not None:
                 return p
             o = objects[obj_idx]
-            # NOTE: passing the full arm/hand collision geoms (arm_geom_names) into the
-            # NLP was tried to make recommendations reachability-aware, but the extra
-            # ~150 softplus-SDF constraints make the box solve non-converge from the
-            # home approach (returns p1/p2 = None). Reachability is instead surfaced
-            # honestly downstream: the lock-in IK warm-starts from the operator's live
-            # pose, and the markers snap to the ACHIEVED fingertips (with a residual
-            # flag) so an unreachable recommendation is visible rather than hidden.
+            # NOTE: passing the FULL arm/hand collision geoms (all 71) into the NLP was
+            # tried and made the box solve non-converge from the home approach (the extra
+            # ~150 softplus-SDF constraints corrupt L-BFGS curvature; returns p1/p2 = None).
+            # We now pass a TIER-1 subset instead — palm + wrist only (_REC_ARM_GEOMS) —
+            # so the recommender avoids the most common gross penetration (palm into the
+            # object) while staying well inside the constraint budget the solve tolerates.
+            # These geoms are proximity-pruned each solve (col_prune_margin), so on most
+            # solves they add no active constraints. Finer reachability is still surfaced
+            # downstream: the markers snap to the ACHIEVED fingertips (with a residual flag)
+            # so an unreachable recommendation is visible rather than hidden.
             cfg = GraspConfig3D(obj_geom=o['name'] + '_geom', obj_body=o['name'],
-                                max_iter=120)
+                                max_iter=120, arm_geom_names=list(_REC_ARM_GEOMS))
             # Own MjData so the background solve never races the viewer's data.
             p = MultiStartGraspPlanner3D(model, mj.MjData(model), cfg)
             _cat_planners[obj_idx] = p
@@ -2162,6 +2280,7 @@ if __name__ == "__main__":
                 _do_lock_in = False
                 _do_record  = False        # R: append a tuning sample this frame
                 _fire_rec_ik_slot = None   # 'rec_q' | 'dls' when a constrained preview turns on
+                _dp_reset_frame = False    # set by a 'reset' key: skip physics this frame
                 while not keys.empty():
                     _k = keys.get_nowait()
                     if _k == 'quit':
@@ -2176,8 +2295,19 @@ if __name__ == "__main__":
                         # then press 8 to re-capture your current hand pose as the offset.
                         mj.mj_resetData(model, data)
                         data.qpos[:N_ROBOT] = _Q_BIAS_DP
-                        data.qvel[:N_ROBOT] = 0.0
+                        # Zero EVERY DOF's velocity/accel/applied-force (not just the
+                        # robot's): teleporting the arm home while objects snap to their
+                        # spawn poses can leave a penetration that the next mj_step would
+                        # resolve into object velocity — the objects then fly off the pick
+                        # area. _dp_reset_frame skips physics for this frame so the scene
+                        # settles at rest before stepping resumes (matches dexpilot mode;
+                        # matters here too now that the free-form drive runs --physics).
+                        data.qvel[:]         = 0.0
+                        data.qacc[:]         = 0.0
+                        data.qfrc_applied[:] = 0.0
                         mj.mj_forward(model, data)
+                        _dp_reset_frame = True
+                        _dp_target = _Q_BIAS_DP.copy()   # physics hold target back to home
                         _dexpilot_ctrl.stop()            # freeze — no tracking until press-8
                         _dexpilot_ctrl.init_home(data)   # re-anchor home to the reset pose
                         _rec_vis        = False
@@ -2270,7 +2400,12 @@ if __name__ == "__main__":
                 #   O  -> collision-aware IK, warm-started from the recommender's q
                 #   I  -> collision-aware IK, warm-started from a fresh DLS
                 # A/B them to see the collision-vs-reach gap and warm-start effect.
-                if _rec_vis and _cand is not None and _cand.get('q') is not None:
+                if _dp_reset_frame:
+                    # Reset just teleported the scene; render it at rest without a physics
+                    # step (or kinematic drive) so no teleport-penetration impulse spins up
+                    # the objects. Tracking is already frozen (init_home in the handler).
+                    mj.mj_forward(model, data)
+                elif _rec_vis and _cand is not None and _cand.get('q') is not None:
                     data.qpos[:N_ROBOT] = Q_BIAS
                     for _i, _idx in enumerate(_cat_act_idx):
                         data.qpos[_idx] = _cand['q'][_i]
@@ -2281,9 +2416,28 @@ if __name__ == "__main__":
                     data.qvel[:N_ROBOT] = 0.0
                     mj.mj_forward(model, data)
                 else:
-                    # Drive wrist (arm IK) + fingers (MediaPipe) kinematically.
+                    # Drive wrist (arm IK) + fingers (MediaPipe). Same dual-strategy
+                    # split as dexpilot mode (see the --physics branch there for the
+                    # full rationale): kinematic qpos overwrite by default, or —
+                    # with --physics — spring-only PD torque + mj_step catch-up so
+                    # the hand/arm actually collide with objects and the environment
+                    # instead of teleporting through them.
                     q_teleop = _dexpilot_ctrl.step(model, data)
-                    if q_teleop is not None:
+                    if args.physics:
+                        if q_teleop is not None:
+                            _dp_target = q_teleop
+                        _elapsed = time.time() - step_start
+                        _n_sub = int(np.clip(round(_elapsed / model.opt.timestep),
+                                             1, _DP_MAX_SUBSTEPS))
+                        for _ in range(_n_sub):
+                            tau_ctrl[:] = 0.0
+                            _err = _dp_target - data.qpos[:N_ROBOT]
+                            tau_ctrl[:7]        = _dp_Kp_arm * _err[:7]
+                            tau_ctrl[7:N_ROBOT] = Kp[7:] * _err[7:]
+                            data.qfrc_applied[:] = tau_ctrl
+                            data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
+                            mj.mj_step(model, data)
+                    elif q_teleop is not None:
                         data.qpos[:N_ROBOT] = q_teleop
                         data.qvel[:N_ROBOT] = 0.0
                         mj.mj_forward(model, data)
@@ -2397,7 +2551,11 @@ if __name__ == "__main__":
                     _draw_active_marker(viewer.user_scn)
                     _draw_bspheres(viewer.user_scn)   # 7-toggle: IK collision spheres
                 viewer.sync()
-                time.sleep(max(0, model.opt.timestep - (time.time() - step_start)))
+                # Pace to real time. In --physics we advanced _n_sub timesteps this
+                # iteration (see the dexpilot --physics branch above for why), so the
+                # wall-clock budget scales with that instead of a single timestep.
+                _budget = (_n_sub if args.physics else 1) * model.opt.timestep
+                time.sleep(max(0, _budget - (time.time() - step_start)))
                 continue
 
             # --- DexPilot teleop mode: bypass the RRT/grasp state machine ---
@@ -2676,14 +2834,14 @@ if __name__ == "__main__":
                     _jog_w[:] = 0.0
                     _grasp_wrist_track = False   # (re-armed below for teleop)
 
-                    # DIAGNOSTIC: RRT-END tip error. Completes the attribution chain
-                    # (recommender NLP -> collision IK -> RRT end). The RRT goal IS
-                    # obj['q_target'], so a planned end pose matches the IK exactly; any
-                    # EXTRA error here is the object drifting during replay (the tips aim
-                    # at where the object WAS). Measured against the recommended contacts
-                    # re-expressed at the object's CURRENT pose (via rec_local, which
-                    # tracks the object) so drift shows up. Compare to the "collision-aware
-                    # IK" line printed at lock-in: if this is larger, the object moved.
+                    # DIAGNOSTIC: RRT-END tip error. The RRT goal IS obj['q_target'] (now
+                    # the recommender's committed pose), so a planned end pose reaches that
+                    # pose exactly; any EXTRA error here is the object drifting during replay
+                    # (the tips aim at where the object WAS). Measured against the recommended
+                    # contacts re-expressed at the object's CURRENT pose (via rec_local, which
+                    # tracks the object) so drift shows up. Compare to the committed
+                    # recommender-pose tip error printed at lock-in: if this is larger, the
+                    # object moved.
                     _rec_local_dbg = objects[active_idx].get('rec_local')
                     if _CAT_MODE and _rec_local_dbg is not None:
                         _if_dbg = {f: i for i, f in enumerate(FINGER_SET)}
