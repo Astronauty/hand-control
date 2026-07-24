@@ -270,7 +270,9 @@ def min_gamma_for_accel(max_norm_accelx, max_norm_accely, max_norm_accelz,
 
 def min_gamma_for_accel_lp(max_norm_accelx, max_norm_accely, max_norm_accelz,
                            max_norm_Tx, max_norm_Ty, max_norm_Tz,
-                           n, pos, R, ncf, tan_y, tan_z, mu):
+                           n, pos, R, ncf, tan_y, tan_z, mu,
+                           moment_ref=None, grav_force=None,
+                           project_grasp_axis_moment=False):
     '''
     Alternative to min_gamma_for_accel: solves minimum gamma directly with one LP per corner wrench
     instead of binary search over feasibility LPs (exact answer, ~60x fewer LP solves)
@@ -285,11 +287,80 @@ def min_gamma_for_accel_lp(max_norm_accelx, max_norm_accely, max_norm_accelz,
     -----------------------------------------------------------------------------------
     :params: same as min_gamma_for_accel
 
+    MOMENT REFERENCE (moment_ref):
+      By default all moments (contact p x f AND the corner wrenches) are taken about the
+      object CoM (pos is contact-minus-center). For a RAISED antipodal grasp this is the
+      wrong datum: a pure lateral force about the CoM implies a spurious moment dz*F that
+      the two-point geometry cannot supply, so raising the contacts off the CoM plane
+      makes the grasp report INFEASIBLE even though it can physically hold the object.
+
+      Passing moment_ref = (3,) point (SAME frame/origin as `pos`, i.e. relative to the
+      object center) re-datums the moment balance to that point — set it to the grasp
+      midpoint 0.5*(p1+p2) so a pure lateral disturbance induces NO moment (the contacts
+      sit at zero height relative to their own connecting line). This is a pure change of
+      reference point (statically equivalent), NOT a relaxation.
+
+      Because the accel-disturbance corner wrenches are FORCES (they translate freely to
+      any reference), they are unchanged by the shift. GRAVITY, however, acts at the CoM:
+      about a shifted reference it contributes a real moment r x (m g), r = (CoM - ref) =
+      -moment_ref (pos is CoM-relative). Pass grav_force = (3,) the gravity force vector
+      m*g in the SAME frame as pos/R; its re-datum moment (-moment_ref) x grav_force is
+      ADDED to every corner. (For a grasp midpoint directly above the CoM, moment_ref is
+      purely vertical and grav_force purely vertical, so the cross product is zero and
+      gravity is unaffected — but the term is computed honestly for the general case.)
+      grav_force defaults to None (no gravity re-datum) which is correct when the corners
+      do not fold gravity into them.
+
+    project_grasp_axis_moment (n==2 only): zero the grasp-axis component of the GRAVITY
+      moment. A two-point pinch cannot resist torque about the line through its contacts;
+      when the grasp midpoint is off-CoM, gravity about the datum induces such a torque
+      that would (wrongly) make the grasp report infeasible even though it can carry the
+      object. This extends the grasp-axis projection already applied to the accel torque
+      budget (see solve_gamma_live) to the gravity moment. Only meaningful with grav_force
+      set. Default False.
+
     :return float min_gamma: where minimum normal contact force = normal component of (min_gamma * f_internal)
                              None if no gamma can resist the requested wrenches
     '''
+    # Re-datum contact positions to the moment reference (grasp point) if requested.
+    if moment_ref is not None:
+        _ref = np.asarray(moment_ref, float).reshape(3)
+        pos = [np.asarray(p, float).reshape(3, 1) - _ref.reshape(3, 1) for p in pos]
+
     wrench_checker = WrenchCheck(n, pos, R, ncf, tan_y, tan_z, mu)
     nverts = wrench_checker.nverts
+
+    # Gravity as an explicit constant wrench added to EVERY corner. Its FORCE is always
+    # present (invariant); its MOMENT depends on the reference: about the reference point,
+    # gravity acts at the CoM, arm r = (CoM - ref). pos is CoM-relative so with a shifted
+    # reference the contact positions were re-datumed above; the CoM sits at (0 - ref) =
+    # -moment_ref relative to the reference (or 0 when moment_ref is None -> CoM ref).
+    # _grav_wrench = [moment(3), force(3)] in the [Tx,Ty,Tz,Fx,Fy,Fz] convention.
+    _grav_wrench = np.zeros(6)
+    if grav_force is not None:
+        _gf = np.asarray(grav_force, float).reshape(3)
+        _r_cg = (-np.asarray(moment_ref, float).reshape(3)
+                 if moment_ref is not None else np.zeros(3))       # CoM relative to ref
+        _grav_wrench[:3] = np.cross(_r_cg, _gf)                     # gravity moment
+        _grav_wrench[3:] = _gf                                      # gravity force (always)
+
+        # Grasp-axis projection of the gravity MOMENT (n==2 only). A two-contact pinch
+        # cannot resist torque about the grasp axis (the line through the contacts): the
+        # friction-cone forces have no moment arm about it. When the grasp midpoint is
+        # off-CoM (e.g. slid along the face), gravity about the datum induces a moment
+        # whose grasp-axis component is unresistable and would make the LP report None,
+        # even though the grasp can carry the object. Zero that component — the same
+        # principle already applied to the accel TORQUE budget by callers (solve_gamma_live
+        # / the NLP), extended here to the gravity moment. Only the grasp-axis component is
+        # removed; the perpendicular moment (which the grasp CAN resist) is kept honest.
+        if project_grasp_axis_moment and n == 2:
+            _ga = (np.asarray(pos[1], float).reshape(3)
+                   - np.asarray(pos[0], float).reshape(3))
+            _gn = np.linalg.norm(_ga)
+            if _gn > 1e-9:
+                _ga = _ga / _gn
+                _m = _grav_wrench[:3]
+                _grav_wrench[:3] = _m - np.dot(_m, _ga) * _ga      # kill grasp-axis torque
 
     # cone vertices and tangential-internal-force wrench at gamma = 1
     V1 = np.vstack([wrench_checker.single_wrench_cone(1.0, pos[i], R[i], ncf[i], mu[i])
@@ -324,9 +395,12 @@ def min_gamma_for_accel_lp(max_norm_accelx, max_norm_accely, max_norm_accelz,
                             if any(corner):
                                 corners.add(corner)
 
+    # Gravity (when passed as grav_force) is a CONSTANT wrench [T(3), F(3)] added to every
+    # corner before the LP: force always present, moment reference-dependent (see above).
     min_gamma = 0.0
     for corner in corners:
-        res = linprog(c=c, A_eq=A_eq, b_eq=np.array(corner), A_ub=A_ub, b_ub=b_ub, bounds=bounds)
+        _b = np.array(corner, float) + _grav_wrench
+        res = linprog(c=c, A_eq=A_eq, b_eq=_b, A_ub=A_ub, b_ub=b_ub, bounds=bounds)
         if not res.success:
             return None
         min_gamma = max(min_gamma, res.x[-1])

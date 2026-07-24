@@ -722,6 +722,14 @@ class GraspConfig3D:
     wrench_constraint: bool  = True   # embedded LP wrench constraint in NLP
     max_iter:          int   = 50    # per-stage max iterations (Picard loop uses n_normal_relinearize+1 stages)
 
+    # Grasp-axis alignment cost: penalize the grasp axis (p2-p1, normalized) deviating
+    # from the contact inward normal, so the two contacts stay ANTIPODALLY OPPOSED (the
+    # squeeze force routes straight between them). Shape-agnostic force-closure geometry:
+    # box -> opposing faces, sphere/cyl -> diameter. Keeps IK-only solves from lifting the
+    # contacts into a wrench-infeasible offset. 0.0 = off. Uses the frozen normal (box) /
+    # symbolic normal (curved), same as the wrench frame.
+    w_align:           float = 0.0
+
     col_clearance_m:  float = 0.005
 
     # Full-arm collision (proximity-pruned softplus SDFs).
@@ -1193,6 +1201,21 @@ class GraspPlanner3D:
             _cost_reg = ca.sumsqr((_q - ca.DM(_q_reg)) / cfg.q_scale) / _n_dof
             _cost = cfg.w_ik * _cost_ik + cfg.w_reg * _cost_reg
 
+            # ── Grasp-axis alignment (shape-agnostic force-closure geometry) ──
+            # Penalize the grasp axis g_hat = (p2 - p1)/||p2 - p1|| deviating from the
+            # contact-1 inward normal n1_in. When aligned, the two contacts are directly
+            # opposed and the squeeze force routes straight between them (resistable);
+            # when offset, squeezing makes an unresistable couple (the IK-only failure).
+            # Uses the frozen inward normal from the seed face direction d1_lp (box) — a
+            # constant per face, so this is a smooth quadratic in p1/p2 only.
+            if cfg.w_align > 0.0 and d1_lp is not None:
+                _n1_in_al = ca.DM(-np.asarray(d1_lp, float)
+                                  / (np.linalg.norm(d1_lp) + 1e-12))
+                _dp = _p2 - _p1
+                _g_hat = _dp / (ca.norm_2(_dp) + 1e-9)
+                _cost_align = ca.sumsqr(_g_hat - _n1_in_al)
+                _cost = _cost + cfg.w_align * _cost_align
+
             # ── 1. Joint limits (vectorized) ──────────────────────────────
             if cfg.joint_limits:
                 _opti.subject_to(_opti.bounded(
@@ -1254,12 +1277,30 @@ class GraspPlanner3D:
                     _R1_expr = _R1_param
                     _R2_expr = _R2_param
 
+                # Grasp-axis torque projection. A 2-contact pinch geometrically CANNOT
+                # resist torque about the grasp axis (the line through the two contacts):
+                # the friction-cone forces have no moment arm about it, so any nonzero
+                # torque budget on that axis makes every wrench corner infeasible (the
+                # Tx=None antipodal case in 3D_minimum_NCF). Zero the torque budget's
+                # grasp-axis component so the hard-equality cone stays feasible — the same
+                # projection solve_gamma_live already applies in the live GRASP path.
+                # Frozen (not symbolic): the face-pin keeps each box contact on its seed
+                # face, so p1_ws/p2_ws (hence the grasp axis) are static across the solve;
+                # updated between Picard iterations along with the normals. Computed in the
+                # OBJECT body frame, matching the torque budget's frame.
+                _tb = np.array([_nlp_tx, _nlp_ty, _nlp_tz], float)
+                _ga_w = np.asarray(p2_ws, float) - np.asarray(p1_ws, float)
+                _ga_n = float(np.linalg.norm(_ga_w))
+                if _ga_n > 1e-9:
+                    _ga_O = (obj_R_np.T @ _ga_w) / _ga_n          # grasp axis, object frame
+                    _tb = _tb - np.dot(_tb, _ga_O) * _ga_O        # kill grasp-axis torque
+                    _tb = np.abs(_tb)                             # per-axis magnitudes
                 _gamma_lp, _y1_list, _y2_list, _corners, _s_list = _embed_wrench_cone_ca(
                     _opti, _p1, _p2,
                     _R1_expr, _R2_expr,
                     obj_center_np, obj_R_np, _mu,
                     np.array([_nlp_fx, _nlp_fy, _nlp_fz]),
-                    np.array([_nlp_tx, _nlp_ty, _nlp_tz]),
+                    _tb,
                     cfg.gamma_max,
                     use_slack=(cfg.w_slack is not None))
                 
@@ -1763,7 +1804,13 @@ class GraspPlanner3D:
         _tol_deg   = 2.0     # 2° normal mismatch → normals are accurate enough
         res = {}
         _best_res  = {}      # best stage result by cost (Picard has no descent guarantee)
-        for _ri in range(cfg.n_normal_relinearize + 1):
+        # Box (geom_type 6) needs NO Picard relinearization: the face-pin surface
+        # constraint keeps each contact on its seed face, where the inward normal is
+        # CONSTANT (a flat face doesn't rotate as the contact slides), so the frozen
+        # normal set at seed time is already exact for the whole solve. Curved surfaces
+        # (sphere/cylinder) still relinearize since their normals genuinely turn with p.
+        _n_relin = 0 if geom_type == 6 else cfg.n_normal_relinearize
+        for _ri in range(_n_relin + 1):
             res = _run_stage(_q_ws, _p1_ws, _p2_ws,
                              include_surface=True,
                              d1_lp=_d1_lp,
@@ -1776,7 +1823,7 @@ class GraspPlanner3D:
             if (res.get('cost') is not None and
                     (not _best_res or res['cost'] < _best_res.get('cost', float('inf')))):
                 _best_res = res
-            if _ri >= cfg.n_normal_relinearize or res.get('p1') is None:
+            if _ri >= _n_relin or res.get('p1') is None:
                 break
 
             _p1r = np.asarray(res['p1'])
