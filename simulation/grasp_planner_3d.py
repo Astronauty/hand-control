@@ -98,6 +98,18 @@ except Exception as e:
     min_gamma_for_accel_lp = None
     _NCF_AVAILABLE = False
 
+# The DATUM/Task-B certificate uses the HARD LP from 3D_minimum_NCF (the SAME function
+# kinova_leap_pick_place.solve_gamma_live calls at grasp time), so the recommender's
+# feasibility flag is byte-for-byte the grasp-time definition — no slack masking. That
+# module carries the moment_ref / grav_force / project_grasp_axis_moment datum params;
+# the slack module above does not. Kept as a separate handle so the legacy CoM path is
+# unchanged.
+try:
+    _ncf_hard_mod = _importlib.import_module('3D_minimum_NCF')
+    min_gamma_for_accel_lp_hard = _ncf_hard_mod.min_gamma_for_accel_lp
+except Exception:
+    min_gamma_for_accel_lp_hard = None
+
 try:
     import casadi as ca
     _CASADI_AVAILABLE = True
@@ -505,8 +517,16 @@ def _symbolic_box_sdf_smooth(p_sym: ca.MX,
 
 
 def _sym_geom_surface_con(opti, p_sym, d, geom_type: int,
-                           center_np, mat_np, size):
-    """Apply shape-appropriate surface constraint to p_sym in opti."""
+                           center_np, mat_np, size, edge_margin: float = 0.0):
+    """Apply shape-appropriate surface constraint to p_sym in opti.
+
+    edge_margin (BOX only): keep the contact at least this far (m) from every face
+    EDGE by shrinking the tangential bounds. HARD — a contact cannot be placed in the
+    rim band, so a grasp that needs a near-edge contact becomes INFEASIBLE (the solve
+    returns no contacts) rather than slipping. Per-axis auto-clamped so the band can
+    never exceed the half-extent (would empty the feasible set); a warning-free clamp
+    leaves a thin sliver at the face center for very small faces.
+    """
     if d is None:
         return
     p_loc = ca.DM(mat_np.T) @ (p_sym - ca.DM(center_np))
@@ -515,10 +535,14 @@ def _sym_geom_surface_con(opti, p_sym, d, geom_type: int,
         coord = float(center_np[ax] + np.sign(d[ax]) * float(size[ax]))
         opti.subject_to(p_sym[ax] == coord)
         for ta in [i for i in range(3) if i != ax]:
+            # Half-extent minus the keep-out margin, clamped to a small positive sliver
+            # so the box never collapses to an empty interval on tiny faces.
+            _half = max(float(size[ta]) - float(edge_margin),
+                        0.05 * float(size[ta]))
             opti.subject_to(opti.bounded(
-                float(center_np[ta] - size[ta]),
+                float(center_np[ta]) - _half,
                 p_sym[ta],
-                float(center_np[ta] + size[ta])))
+                float(center_np[ta]) + _half))
     elif geom_type == 5:  # CYLINDER
         R_c, H = float(size[0]), float(size[1])
         d_loc  = mat_np.T @ np.asarray(d, float)
@@ -730,6 +754,14 @@ class GraspConfig3D:
     # symbolic normal (curved), same as the wrench frame.
     w_align:           float = 0.0
 
+    # Edge margin (HARD): keep contacts at least this far from every FACE EDGE, where a
+    # pinch slips (short moment arm, friction cone falls off the face). Implemented by
+    # shrinking the tangential face BOUNDS in _sym_geom_surface_con — a contact cannot be
+    # placed in the rim band, so a grasp that needs a near-edge contact becomes INFEASIBLE
+    # (solve returns no contacts) rather than slipping. Per-axis auto-clamped so the band
+    # never empties a small face. BOX only. 0.0 = off (full face usable).
+    edge_margin_m:     float = 0.010   # hard keep-out band width from each face edge (m)
+
     col_clearance_m:  float = 0.005
 
     # Full-arm collision (proximity-pruned softplus SDFs).
@@ -793,6 +825,16 @@ class GraspConfig3D:
     ang_accel_budget_xyz: tuple = (0.5, 0.5, 0.5)   # rad/s² angular, principal axes
     # accel_budget_xyz:     tuple = (0.5, 0.5, 0.5)   # m/s² linear, per world axis
     # ang_accel_budget_xyz: tuple = (0.05, 0.05, 0.05)   # rad/s² angular, principal axes
+
+    # Datum / Task-B semantics for verify()'s post-solve gamma LP (aligns it with
+    # kinova_leap_pick_place.solve_gamma_live). When True: reference the linear disturbance
+    # at the GRASP MIDPOINT (moment_ref), pass gravity as a separate re-datumed wrench with
+    # its grasp-axis moment projected out, and project the grasp-axis component of the
+    # angular budget. This certifies a RAISED, reachable antipodal pinch as wrench-feasible
+    # for a hold/transport task (see RAISED_CONTACT_WRENCH_FINDINGS.md sec 5). When False:
+    # legacy CoM formulation (gravity folded into the accel box). Intended to pair with
+    # wrench_constraint=False so the NLP is IK-only and verify() is the datum certificate.
+    datum_gamma:          bool = False
 
     gamma_max: float = 25   # N — hard upper bound on the wrench-cone squeeze force gamma
 
@@ -1216,6 +1258,9 @@ class GraspPlanner3D:
                 _cost_align = ca.sumsqr(_g_hat - _n1_in_al)
                 _cost = _cost + cfg.w_align * _cost_align
 
+            # Edge margin is now a HARD constraint (tightened tangential face bounds in
+            # _sym_geom_surface_con via cfg.edge_margin_m) — no cost term needed.
+
             # ── 1. Joint limits (vectorized) ──────────────────────────────
             if cfg.joint_limits:
                 _opti.subject_to(_opti.bounded(
@@ -1228,7 +1273,8 @@ class GraspPlanner3D:
                 for _p, _d_lp in ((_p1, d1_lp), (_p2, d2_lp)):
                     _pl = _Rt_dm @ (_p - _c_dm)   # local frame
                     _sym_geom_surface_con(_opti, _p, _d_lp,
-                                            geom_type, obj_center_np, obj_R_np, geom_size)
+                                            geom_type, obj_center_np, obj_R_np, geom_size,
+                                            edge_margin=cfg.edge_margin_m)
 
 
             # Bounding box: prevents p1/p2 from flying to infinity
@@ -1966,23 +2012,46 @@ class GraspPlanner3D:
                 R_WO_v   = data_v.xmat[_bid_v].reshape(3, 3)
                 _g_O_v   = R_WO_v.T @ model.opt.gravity
                 _ab_v    = cfg.accel_budget_xyz
-                _accel_v = tuple(_ab_v[i] + abs(_g_O_v[i]) for i in range(3))
                 _p1_O_v  = R_WO_v.T @ (p1_np - obj_pos)
                 _p2_O_v  = R_WO_v.T @ (p2_np - obj_pos)
                 R1_O     = R_WO_v.T @ R1
                 R2_O     = R_WO_v.T @ R2
-                gamma_min, max_slack_norm = min_gamma_for_accel_lp(
-                    _mass_v * _accel_v[0], _mass_v * _accel_v[1], _mass_v * _accel_v[2],
-                    float(_inert_v[0])*_aab_v[0], float(_inert_v[1])*_aab_v[1], float(_inert_v[2])*_aab_v[2],
-                    n=2,
-                    pos=[_p1_O_v.reshape(3, 1), _p2_O_v.reshape(3, 1)],
-                    R=[R1_O, R2_O],
-                    ncf=[1.0, 1.0],
-                    tan_y=[0.0, 0.0],
-                    tan_z=[0.0, 0.0],
-                    mu=[_mu_v, _mu_v],
-                    slack_penalty=cfg.verify_slack_penalty,
-                )
+                _pos_v   = [_p1_O_v.reshape(3, 1), _p2_O_v.reshape(3, 1)]
+                # Torque box = I * angular budget (principal axes).
+                _T_v = np.array([float(_inert_v[i]) * _aab_v[i] for i in range(3)])
+                if cfg.datum_gamma:
+                    # Datum / Task-B: match solve_gamma_live exactly. Reference the
+                    # disturbance at the grasp midpoint, add gravity as a separate
+                    # re-datumed / grasp-axis-projected wrench, and let the LP project the
+                    # grasp-axis torque out of EACH corner (project_grasp_axis_torque) — the
+                    # exact per-corner removal, so the FULL per-axis budget _T_v is passed
+                    # (no lossy budget-vector pre-projection). Accel box is a PURE force box.
+                    _mref_v = (0.5 * (_p1_O_v + _p2_O_v)).reshape(3)
+                    _grav_v = _mass_v * _g_O_v
+                    # HARD LP (no slack): returns a single γ or None — a true feasibility
+                    # gate identical to solve_gamma_live. max_slack_norm is N/A here.
+                    gamma_min = min_gamma_for_accel_lp_hard(
+                        _mass_v * _ab_v[0], _mass_v * _ab_v[1], _mass_v * _ab_v[2],
+                        _T_v[0], _T_v[1], _T_v[2],
+                        n=2, pos=_pos_v, R=[R1_O, R2_O],
+                        ncf=[1.0, 1.0], tan_y=[0.0, 0.0], tan_z=[0.0, 0.0],
+                        mu=[_mu_v, _mu_v],
+                        moment_ref=_mref_v, grav_force=_grav_v,
+                        project_grasp_axis_moment=True,
+                        project_grasp_axis_torque=True,
+                    )
+                    max_slack_norm = None
+                else:
+                    # Legacy CoM / Task-A: gravity folded into the accel budget.
+                    _accel_v = tuple(_ab_v[i] + abs(_g_O_v[i]) for i in range(3))
+                    gamma_min, max_slack_norm = min_gamma_for_accel_lp(
+                        _mass_v * _accel_v[0], _mass_v * _accel_v[1], _mass_v * _accel_v[2],
+                        _T_v[0], _T_v[1], _T_v[2],
+                        n=2, pos=_pos_v, R=[R1_O, R2_O],
+                        ncf=[1.0, 1.0], tan_y=[0.0, 0.0], tan_z=[0.0, 0.0],
+                        mu=[_mu_v, _mu_v],
+                        slack_penalty=cfg.verify_slack_penalty,
+                    )
                 wf_feasible = (gamma_min is not None)
                 _slack_bad = (max_slack_norm is not None
                               and max_slack_norm > cfg.verify_slack_tol)

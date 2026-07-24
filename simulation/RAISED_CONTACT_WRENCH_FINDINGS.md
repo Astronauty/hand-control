@@ -140,12 +140,14 @@ The decoupled test on the REAL IK contacts now passes end-to-end. Four pieces to
      12 cm : ik 11/12, LP-feasible 12/12, gamma ~1.03
     (was 0/12 LP-feasible before). gamma ~1.0 = efficient grasp.
 
-CRITICAL last condition: the ANGULAR accel budget must also match a hold task (~0). A
-nonzero angular budget adds +/-Ty,+/-Tz corners that the raised/off-center grasp cannot
-resist — the same force-torque coupling as the lateral case, from the angular side. So the
-full statement is: **raised, reachable contacts are wrench-feasible FOR A HOLD/TRANSPORT
-TASK** — lateral disturbance referenced at the grasp interface, no commanded angular
-acceleration. For genuine object angular acceleration, a two-point pinch is the wrong tool.
+CRITICAL last condition (SUPERSEDED by Section 6 — read that): this section originally
+concluded the ANGULAR accel budget had to match a hold task (~0), because a nonzero
+angular budget appeared to add unresistable +/-Ty,+/-Tz corners. Section 6 shows that was
+an ARTIFACT of a lossy grasp-axis projection; with the projection done exactly per corner,
+raised contacts are feasible at the FULL angular budget (ang=1.0). The grasp-axis torque
+is the only strictly-unresistable angular DOF; the off-axis torque IS resistable. For
+genuine LARGE object angular acceleration a two-point pinch is still weak, but the small
+hold-task angular budget is fine.
 
 Two findings that corrected earlier claims:
 - `w_align` does MORE than expected: for face-pinned contacts it drives them to EQUAL
@@ -164,8 +166,62 @@ Two findings that corrected earlier claims:
   `solve_gamma_live`; `w_align` alignment cost; `n_normal_relinearize = 0` for boxes.
 
 ### Open follow-ups
-- Wire the datum + gravity-projection + w_align stack into the LIVE recommender (contacts
-  searched, wrench cone on) rather than the decoupled harness, with hold-appropriate
-  lateral/angular budgets, and confirm end-to-end.
 - w_align is blind to common-mode contact translation; if centering is ever wanted for
   other reasons, a separate midpoint-offset term (not alignment) is required.
+- Cylinders/spheres: the hard edge margin and the datum certificate are box-only; curved
+  geoms fall through to the legacy CoM slack path in verify().
+
+## 6. LIVE WIRING + the grasp-axis projection correction (supersedes the "ang≈0" claim)
+
+The stack is now wired into the LIVE pipeline, and along the way the Section-5 "angular
+budget must be ~0" conclusion was found to be WRONG — an artifact, not physics.
+
+### 6a. Decoupled + aligned architecture (live)
+The recommender no longer embeds the wrench cone in the NLP. Instead:
+  - NLP runs IK-ONLY (`wrench_constraint=False`) — solving reachable, antipodal
+    (`w_align=2`), off-edge (`edge_margin_m`) contacts.
+  - gamma is certified as a POST-SOLVE hard LP in `verify()` under DATUM semantics
+    (`datum_gamma=True`), calling the SAME `3D_minimum_NCF.min_gamma_for_accel_lp`
+    (hard, no slack) that the controller's `solve_gamma_live` uses at grasp time.
+So the recommender's feasibility flag is byte-for-byte the grasp-time definition.
+Live config: `kinova_leap_pick_place._get_cat_planner` sets these plus the controller's
+own `NCF_ACCEL_BUDGET_XYZ` / `NCF_ANG_ACCEL_BUDGET` so both certify the same budgets.
+
+Latent bug found: `verify()` was calling the SLACK LP (`3D_minimum_NCF_slack`) with a
+`slack_penalty` kwarg and gating `wf_feasible = (gamma_min is not None)` — slack mode never
+returns None, so it MASKED true infeasibility (CoM raised grasps reported 12/12 "feasible"
+with large slack). The datum branch now uses the HARD LP, an honest None/gamma gate. The
+legacy CoM branch is unchanged.
+
+### 6b. The grasp-axis torque projection was lossy — corrected to EXACT per-corner
+The projection that zeros the unresistable grasp-axis TORQUE was being applied to the
+angular-budget VECTOR before the box was sign-expanded into corners:
+    _T = |_T - (_T·ga) ga|         # WRONG: on the budget vector
+For a grasp axis that is not perfectly frame-aligned (real IK contacts give
+ga ≈ [-1, 0.004, 0.014]), this (i) leaves a grasp-axis residual on the individual box
+CORNERS, and (ii) leaves small off-axis residuals. That residual — not any real physical
+limit — is what made raised grasps report infeasible at ang=1.0 and produced the false
+"off-axis capacity is only ~0.03 rad/s2" reading.
+
+Fix: `min_gamma_for_accel_lp(..., project_grasp_axis_torque=True)` projects the grasp-axis
+component out of EACH corner's torque triple inside the LP (exact), so the full per-axis
+budget can be passed. Both `solve_gamma_live` and `verify()` now pass the FULL budget and
+let the LP project; the lossy budget-vector pre-projection at the call sites was removed.
+
+Result (5 cm box, one IK grasp, exact per-corner projection, full isotropic ang budget):
+    ang = 0.00 -> gamma 0.9804
+    ang = 0.05 -> gamma 0.9806
+    ang = 0.20 -> gamma 0.9811
+    ang = 1.00 -> gamma 0.9838     (feasible at EVERY budget; gamma barely moves)
+So the grasp-axis torque is the ONLY strictly-unresistable angular DOF; the off-axis
+torque within a full 1.0 rad/s2 budget IS resistable. No angular-budget reduction needed.
+
+### 6c. End-to-end (aligned, live semantics, at the controller's real ang=1.0)
+`verify()` datum certificate on the IK-only NLP contacts, budgets acc=20 ang=1.0:
+    4 cm : ik 12/12, wf-feasible 12/12, gamma_med 8.98
+    5 cm : ik 12/12, wf-feasible 12/12, gamma_med 9.08
+    6 cm : ik 11/12, wf-feasible 11/11, gamma_med 9.26
+(datum=False CoM path reports "12/12" but only via slack masking — see 6a.)
+
+Corrected claim: Section 5 piece-count stands, but its "ANGULAR a=0" condition is void.
+The real requirement is only that the grasp-axis torque be removed EXACTLY per corner.

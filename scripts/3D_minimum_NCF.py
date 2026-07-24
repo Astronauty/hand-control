@@ -272,7 +272,8 @@ def min_gamma_for_accel_lp(max_norm_accelx, max_norm_accely, max_norm_accelz,
                            max_norm_Tx, max_norm_Ty, max_norm_Tz,
                            n, pos, R, ncf, tan_y, tan_z, mu,
                            moment_ref=None, grav_force=None,
-                           project_grasp_axis_moment=False):
+                           project_grasp_axis_moment=False,
+                           project_grasp_axis_torque=False):
     '''
     Alternative to min_gamma_for_accel: solves minimum gamma directly with one LP per corner wrench
     instead of binary search over feasibility LPs (exact answer, ~60x fewer LP solves)
@@ -383,6 +384,21 @@ def min_gamma_for_accel_lp(max_norm_accelx, max_norm_accely, max_norm_accelz,
     b_ub = np.zeros(n)
     bounds = [(0, None)] * nvar
 
+    # Grasp-axis torque projection (n==2). A two-contact pinch cannot resist ANY torque
+    # about the grasp axis (the line through the contacts). The disturbance torque budget
+    # is a BOX, sign-expanded into corners; projecting the budget VECTOR before expansion
+    # does NOT remove the grasp-axis component from the individual corners (and for a
+    # tilted grasp axis leaves off-axis residuals). The exact fix is to project the
+    # grasp-axis component out of EACH corner's torque triple here, before it enters the
+    # LP. Only the strictly-unresistable grasp-axis DOF is removed; the perpendicular
+    # torque the grasp CAN resist (within its small capacity) is kept honest.
+    _ga_t = None
+    if project_grasp_axis_torque and n == 2:
+        _ga_t = (np.asarray(pos[1], float).reshape(3)
+                 - np.asarray(pos[0], float).reshape(3))
+        _gn_t = np.linalg.norm(_ga_t)
+        _ga_t = _ga_t / _gn_t if _gn_t > 1e-9 else None
+
     # collect unique nonzero corner wrenches
     corners = set()
     for tx in [-max_norm_Tx, max_norm_Tx]:
@@ -391,7 +407,12 @@ def min_gamma_for_accel_lp(max_norm_accelx, max_norm_accely, max_norm_accelz,
                 for ax in [-max_norm_accelx, max_norm_accelx]:
                     for ay in [-max_norm_accely, max_norm_accely]:
                         for az in [-max_norm_accelz, max_norm_accelz]:
-                            corner = (tx, ty, tz, ax, ay, az)
+                            if _ga_t is not None:
+                                _tvec = np.array([tx, ty, tz], float)
+                                _tvec = _tvec - np.dot(_tvec, _ga_t) * _ga_t
+                                corner = (_tvec[0], _tvec[1], _tvec[2], ax, ay, az)
+                            else:
+                                corner = (tx, ty, tz, ax, ay, az)
                             if any(corner):
                                 corners.add(corner)
 

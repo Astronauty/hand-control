@@ -51,7 +51,7 @@ _ncf_spec.loader.exec_module(_ncf)
 
 
 def solve_gamma_live(p_O, R_O_inward, mu, mass, accel_box_xyz, ang_accel_box_xyz,
-                     inertia_diag):
+                     inertia_diag, grav_O=None):
     """Minimum internal-force scale gamma that keeps the grasp no-slip for the given
     acceleration/torque disturbance box, from the live grasp geometry. Wraps
     3D_minimum_NCF.min_gamma_for_accel_lp; verified against its native antipodal cases
@@ -61,15 +61,31 @@ def solve_gamma_live(p_O, R_O_inward, mu, mass, accel_box_xyz, ang_accel_box_xyz
       * unit mass: min_gamma_for_accel_lp assumes m=1, so the "accel box" is really a
         FORCE box (m*a) and the "torque box" a real torque (I*alpha) -> scale here.
 
+    Task definition (grav_O given -> Task B / datum; grav_O None -> Task A / CoM):
+      * grav_O is None (legacy CoM mode): the caller must have folded gravity INTO
+        accel_box_xyz, and the whole force box is referenced about the CoM. A raised
+        or off-center pinch is then correctly reported infeasible for a lateral force.
+      * grav_O given (datum mode): accel_box_xyz is the PURE accel budget (no gravity);
+        the disturbance is referenced about the GRASP MIDPOINT (moment_ref), so a raised
+        symmetric grasp can resist a lateral disturbance at the contact interface; and
+        gravity is passed as grav_force with its grasp-axis moment projected out
+        (project_grasp_axis_moment) so residual off-CoM drift doesn't spuriously break
+        feasibility. This is the hold/transport formulation (see
+        RAISED_CONTACT_WRENCH_FINDINGS.md sec 5). Pair it with an angular budget whose
+        grasp-axis component has been zeroed (the caller already does that).
+
     Args:
         p_O:            list of (3,) contact positions in the OBJECT body frame.
         R_O_inward:     list of (3,3) contact->object rotations, col0 = inward normal.
         mu:             list of per-contact friction coefficients.
         mass:           object mass (kg).
-        accel_box_xyz:  (ax,ay,az) linear-accel budget incl. gravity, object-body axes.
+        accel_box_xyz:  (ax,ay,az) linear-accel budget, object-body axes. Includes
+                        gravity in CoM mode; PURE accel (gravity separate) in datum mode.
         ang_accel_box_xyz: (alpha_x,alpha_y,alpha_z) angular-accel budget, PRINCIPAL axes.
         inertia_diag:   (Ix,Iy,Iz) principal moments (model.body_inertia). Multiplies the
                         angular-accel budget into a torque box.
+        grav_O:         (3,) gravitational acceleration in the OBJECT frame (R_WO.T @ g).
+                        When given, switches to the datum/Task-B formulation above.
 
     Returns:
         gamma (float), or None if the grasp geometrically cannot resist the box.
@@ -81,6 +97,17 @@ def solve_gamma_live(p_O, R_O_inward, mu, mass, accel_box_xyz, ang_accel_box_xyz
     pos = [np.asarray(p, float).reshape(3, 1) for p in p_O]
     fx, fy, fz = (mass * a for a in accel_box_xyz)        # force box = m * a
     tx, ty, tz = (I * al for I, al in zip(inertia_diag, ang_accel_box_xyz))  # torque = I*alpha
+    if grav_O is not None and n == 2:
+        # Datum / Task-B formulation: reference the disturbance about the grasp midpoint,
+        # add gravity as an explicit re-datumed wrench, and project its grasp-axis moment.
+        _mref = (0.5 * (pos[0] + pos[1])).reshape(3)
+        _grav = mass * np.asarray(grav_O, float)          # gravity force, object frame
+        return _ncf.min_gamma_for_accel_lp(
+            fx, fy, fz, tx, ty, tz, n, pos, R_out, [1.0] * n,
+            [0.0] * n, [0.0] * n, list(mu),
+            moment_ref=_mref, grav_force=_grav,
+            project_grasp_axis_moment=True,
+            project_grasp_axis_torque=True)
     return _ncf.min_gamma_for_accel_lp(
         fx, fy, fz, tx, ty, tz, n, pos, R_out, [1.0] * n,
         [0.0] * n, [0.0] * n, list(mu))
@@ -982,6 +1009,18 @@ if __name__ == "__main__":
     # jog commands zero angular velocity).
     NCF_ACCEL_BUDGET_XYZ = (20.0, 20.0, 20.0)   # m/s^2   object-frame linear-accel budget
     NCF_ANG_ACCEL_BUDGET = (1.0, 1.0, 1.0)   # rad/s^2 principal-frame angular-accel budget
+
+    # Task definition for the gamma LP (see RAISED_CONTACT_WRENCH_FINDINGS.md sec 5):
+    #   True  -> DATUM / Task-B: the linear disturbance is referenced at the GRASP
+    #            MIDPOINT and gravity is a separate re-datumed wrench with its grasp-axis
+    #            moment projected out. This makes a RAISED, reachable antipodal pinch
+    #            wrench-feasible for a hold/transport task (the recommender's contacts
+    #            lift naturally up the face). Requires the recommended contacts to be a
+    #            clean antipodal pair -> pair with w_align on the recommender config.
+    #   False -> legacy CoM / Task-A: gravity folded into the accel box, disturbance at
+    #            the CoM. A raised/off-center pinch is then reported infeasible (falls
+    #            back to GAMMA_FALLBACK), which is correct for a free-body lateral accel.
+    NCF_DATUM_MODE = True
 
     # Conservative multiplier on the solved gamma before it drives the squeeze: the LP
     # gives the MINIMUM no-slip gamma for the box (1.0x margin), which leaves nothing for
@@ -1997,8 +2036,30 @@ if __name__ == "__main__":
             # solves they add no active constraints. Finer reachability is still surfaced
             # downstream: the markers snap to the ACHIEVED fingertips (with a residual flag)
             # so an unreachable recommendation is visible rather than hidden.
+            # w_align keeps the recommended contacts a CLEAN ANTIPODAL PAIR (grasp axis
+            # along the face normal, equal height) — the precondition the datum gamma
+            # formulation (NCF_DATUM_MODE) needs to certify the naturally-lifted contacts
+            # as wrench-feasible. See RAISED_CONTACT_WRENCH_FINDINGS.md sec 5.
+            # edge_margin_m keeps contacts OFF the face rim as a HARD bound (the datum γ
+            # formulation lets the IK cost pull contacts toward the edges, where a pinch
+            # slips). Hard: a grasp needing a near-edge contact is rejected, not slipped.
+            #
+            # DECOUPLED architecture: the NLP runs IK-only (wrench_constraint=False) —
+            # solving for reachable, antipodal (w_align), off-edge (edge_margin_m) contacts
+            # — and γ is certified as a post-solve LP in verify() under DATUM semantics
+            # (datum_gamma=True), the SAME formulation the controller's solve_gamma_live
+            # uses at grasp time. This aligns the recommender's feasibility definition with
+            # the one that actually gates the squeeze, and removes the 630 wrench-cone
+            # variables from the NLP. See RAISED_CONTACT_WRENCH_FINDINGS.md sec 5.
+            # Certify γ under the SAME disturbance budgets the controller uses at grasp
+            # time (solve_gamma_live), so the recommender's feasibility flag agrees with
+            # the one that gates the squeeze.
             cfg = GraspConfig3D(obj_geom=o['name'] + '_geom', obj_body=o['name'],
-                                max_iter=120, arm_geom_names=list(_REC_ARM_GEOMS))
+                                max_iter=120, arm_geom_names=list(_REC_ARM_GEOMS),
+                                w_align=2.0, edge_margin_m=0.010,
+                                wrench_constraint=False, datum_gamma=True,
+                                accel_budget_xyz=tuple(NCF_ACCEL_BUDGET_XYZ),
+                                ang_accel_budget_xyz=tuple(NCF_ANG_ACCEL_BUDGET))
             # Own MjData so the background solve never races the viewer's data.
             p = MultiStartGraspPlanner3D(model, mj.MjData(model), cfg)
             _cat_planners[obj_idx] = p
@@ -2894,27 +2955,30 @@ if __name__ == "__main__":
                         _R_in  = [R_WO.T @ data.site_xmat[s].reshape(3, 3) for s in obj_grasp['id_S']]
                     _mu    = [float(model.geom_friction[obj_grasp['id_geom'], 0])] * N_FINGERS
                     _mass  = float(model.body_mass[_bid])
-                    # Gravity component per OBJECT-body axis, added to the linear budget.
+                    # Gravity component per OBJECT-body axis. In CoM mode it is folded
+                    # into the linear budget; in datum mode it is passed SEPARATELY to
+                    # solve_gamma_live as grav_O (re-datumed, grasp-axis moment projected)
+                    # so the budget stays a pure accel box referenced at the grasp datum.
                     _g_O   = R_WO.T @ model.opt.gravity           # (3,), object frame
-                    _accel_box = tuple(NCF_ACCEL_BUDGET_XYZ[i] + abs(_g_O[i]) for i in range(3))
+                    if NCF_DATUM_MODE:
+                        _accel_box = tuple(NCF_ACCEL_BUDGET_XYZ)
+                    else:
+                        _accel_box = tuple(NCF_ACCEL_BUDGET_XYZ[i] + abs(_g_O[i]) for i in range(3))
                     _inertia   = model.body_inertia[_bid]         # principal moments (Ix,Iy,Iz)
                     # A 2-contact antipodal pinch geometrically CANNOT resist torque about
                     # the grasp axis (the line through the two contacts) — the friction
-                    # cones have no moment arm about it, so any nonzero angular budget on
-                    # that axis makes the LP infeasible (matches the Tx=None antipodal case
-                    # in 3D_minimum_NCF). Zero the angular budget's grasp-axis component so
-                    # the solve stays feasible; resisting that DOF needs a 3rd contact or
-                    # soft-finger torsion (deferred).
-                    # (Assumes the object's principal-inertia frame ≈ its body frame, so
-                    # the body-frame grasp axis aligns with the principal-frame angular
-                    # budget — true for the current objects, whose body_iquat is identity.)
-                    _grasp_axis = _p_O[0] - _p_O[1]
-                    _grasp_axis = _grasp_axis / (np.linalg.norm(_grasp_axis) + 1e-12)
-                    _ang_budget = np.array(NCF_ANG_ACCEL_BUDGET, float)
-                    _ang_budget -= np.dot(_ang_budget, _grasp_axis) * _grasp_axis
-                    _ang_budget = np.abs(_ang_budget)   # per-axis magnitudes for the box
+                    # cones have no moment arm about it. In datum mode the LP removes that
+                    # component EXACTLY per corner (project_grasp_axis_torque=True inside
+                    # solve_gamma_live), so we pass the FULL per-axis angular budget here and
+                    # let the LP project — no lossy budget-vector pre-projection (which for a
+                    # tilted grasp axis would leave off-axis residuals and mishandle the box
+                    # corners). The remaining OFF-axis torque capacity of a raised pinch is
+                    # small (see RAISED_CONTACT_WRENCH_FINDINGS.md), so NCF_ANG_ACCEL_BUDGET
+                    # is set to a hold-task value.
+                    _ang_budget = np.abs(np.array(NCF_ANG_ACCEL_BUDGET, float))
                     _gamma = solve_gamma_live(_p_O, _R_in, _mu, _mass,
-                                              _accel_box, tuple(_ang_budget), _inertia)
+                                              _accel_box, tuple(_ang_budget), _inertia,
+                                              grav_O=(_g_O if NCF_DATUM_MODE else None))
                     if _gamma is None or not np.isfinite(_gamma) or _gamma <= 0.0:
                         gamma_raw  = GAMMA_FALLBACK
                         gamma_live = GAMMA_FALLBACK
