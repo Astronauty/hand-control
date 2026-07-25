@@ -85,6 +85,8 @@ class GraspController:
         self.q_target = None
         self.squeeze = False
         self.last_f_c = None   # (3*n_fingers,) contact-frame forces from last compute()
+        self.last_f_c_W = None # (n_fingers, 3) same forces mapped to WORLD frame (R_WS @ f_ck)
+        self.last_contacts_W = None  # (n_fingers, 3) grasp-map contact points in WORLD frame
 
     def set_target(self, q_target):
         """Set the (n_robot,) joint-space PD setpoint."""
@@ -222,8 +224,16 @@ class GraspController:
                                               inward_dirs=inward_dirs)
         self.last_f_c = f_c
 
+        n_f = len(J_list)
+        f_c_W = np.zeros((n_f, 3))
+        pts_W = np.zeros((n_f, 3))
         tau_int = np.zeros(n)
-        for k in range(len(J_list)):
+        for k in range(n_f):
             f_ck_W = R_WS_list[k] @ f_c[3*k:3*k+3]
+            f_c_W[k] = f_ck_W
+            # Grasp-map contact point in world (contacts store object-frame p_OSk_O).
+            pts_W[k] = p_WoO + R_WO @ contacts[k]['p']
             tau_int += J_list[k].T @ f_ck_W
+        self.last_f_c_W = f_c_W
+        self.last_contacts_W = pts_W
         return tau_int

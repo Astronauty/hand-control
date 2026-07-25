@@ -113,6 +113,109 @@ def main():
                       "mismatch; look at pos offset / soft-contact tracking.")
     print()
 
+    # ------------------------------------------------------------------
+    # RESIDUAL-WRENCH TEST (does the ~15mm contact-position offset CAUSE the drift?).
+    # The controller solves G(r_rec) @ f_c = w_des, so at the RECOMMENDED points the
+    # commanded forces balance the support wrench. Physics applies those same forces at
+    # the ACTUAL contacts, so the box sees an uncommanded residual:
+    #     d_tau = sum_k (r_true_k - r_rec_k) x f_ck_W          (a pure torque)
+    # If |d_tau| is large while gripping AND its axis matches the box's observed angular
+    # drift -> position offset is the cause. If d_tau ~ 0 -> position is exonerated.
+    if all(k in d.files for k in ('rec_pt', 'act_pt', 'fc_vec')):
+        rec_pt = d['rec_pt']    # (n,2,3) world
+        act_pt = d['act_pt']    # (n,2,3) world
+        fc_W = d['fc_vec']      # (n,2,3) world commanded force
+        box_q = d['box_xquat']  # (n,4) wxyz
+
+        def _quat_to_R(q):
+            w, x, y, z = q
+            return np.array([
+                [1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w)],
+                [2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w)],
+                [2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)]])
+
+        grip = (nf.min(1) > 3.0)
+        gi = np.where(grip)[0]
+        print("  RESIDUAL-WRENCH TEST (uncommanded torque from contact-position offset):")
+        if len(gi) < 2:
+            print("    <2 gripping frames with logged vectors; run a fresh trace with the "
+                  "updated instrumentation.")
+        else:
+            # Per-frame residual torque d_tau (world), and the force/moment-arm scales.
+            dtau = np.full((n, 3), np.nan)
+            frc = np.full((n, 3), np.nan)         # net commanded force (should ~ support)
+            arm = np.full(n, np.nan)              # mean |r_true - r_rec| offset, mm
+            fmag = np.full(n, np.nan)             # mean |f_ck| N
+            for i in gi:
+                dt = np.zeros(3); f_net = np.zeros(3); arms = []; fms = []
+                ok = False
+                for k in range(rec_pt.shape[1]):
+                    rr, ra, fk = rec_pt[i, k], act_pt[i, k], fc_W[i, k]
+                    if not (np.all(np.isfinite(rr)) and np.all(np.isfinite(ra))
+                            and np.all(np.isfinite(fk))):
+                        continue
+                    dt += np.cross(ra - rr, fk)
+                    f_net += fk
+                    arms.append(np.linalg.norm(ra - rr) * 1e3)
+                    fms.append(np.linalg.norm(fk))
+                    ok = True
+                if ok:
+                    dtau[i] = dt; frc[i] = f_net
+                    arm[i] = np.mean(arms); fmag[i] = np.mean(fms)
+
+            valid = np.isfinite(dtau).all(1)
+            vi = np.where(valid)[0]
+            if len(vi) == 0:
+                print("    no frames had all vectors finite (contacts not solid?).")
+            else:
+                dmag = np.linalg.norm(dtau[vi], axis=1)        # N*m
+                # Weight-support reference torque magnitude, for scale comparison.
+                m_obj = 0.25  # box mass (kg); matches live default
+                g = 9.81
+                # gravity torque about origin ~ |r_com x m g|; use offset*weight as scale ref.
+                w_support = m_obj * g
+                print(f"    frames with full vectors: {len(vi)}")
+                print(f"    mean pos offset |r_true-r_rec|: {np.nanmean(arm[vi]):.1f} mm  "
+                      f"(max {np.nanmax(arm[vi]):.1f})")
+                print(f"    mean |f_ck| commanded: {np.nanmean(fmag[vi]):.2f} N")
+                print(f"    residual torque |d_tau|: mean={dmag.mean()*1e3:.2f} "
+                      f"max={dmag.max()*1e3:.2f} mN*m")
+                print(f"      (weight-support wrench ~ {w_support:.2f} N; a {np.nanmean(arm[vi]):.0f}mm "
+                      f"arm on the support force alone = {w_support*np.nanmean(arm[vi])*1e-3*1e3:.1f} mN*m torque)")
+
+                # Does d_tau's axis match the box's angular drift? Compare mean residual
+                # torque axis to the net rotation axis of the box over the grip phase.
+                R0 = _quat_to_R(box_q[vi[0]]); R1 = _quat_to_R(box_q[vi[-1]])
+                dR = R1 @ R0.T
+                ang = np.arccos(np.clip((np.trace(dR) - 1) / 2, -1, 1))
+                # rotation axis from skew part
+                axis = np.array([dR[2, 1]-dR[1, 2], dR[0, 2]-dR[2, 0], dR[1, 0]-dR[0, 1]])
+                if np.linalg.norm(axis) > 1e-9:
+                    axis /= np.linalg.norm(axis)
+                dtau_mean = np.nanmean(dtau[vi], axis=0)
+                dtau_dir = dtau_mean / (np.linalg.norm(dtau_mean) + 1e-12)
+                align = float(dtau_dir @ axis) if np.linalg.norm(axis) > 1e-9 else np.nan
+                print(f"    box net rotation over grip: {np.degrees(ang):.1f} deg about "
+                      f"[{axis[0]:+.2f},{axis[1]:+.2f},{axis[2]:+.2f}]")
+                print(f"    residual-torque axis:        "
+                      f"[{dtau_dir[0]:+.2f},{dtau_dir[1]:+.2f},{dtau_dir[2]:+.2f}]  "
+                      f"(align with drift axis = {align:+.2f})")
+                # Verdict.
+                if dmag.mean()*1e3 > 5.0 and abs(align) > 0.5:
+                    print("    -> VERDICT: residual torque is SIGNIFICANT and its axis ALIGNS "
+                          "with the box's rotational drift. Contact-position offset is a "
+                          "CAUSE of the drift; building G at the actual contact removes it.")
+                elif dmag.mean()*1e3 > 5.0:
+                    print(f"    -> residual torque is significant but its axis does NOT align "
+                          f"with the observed drift (align={align:+.2f}). Position contributes "
+                          "a wrench but is not the dominant drift driver; also audit "
+                          "support-weight sign / gamma direction.")
+                else:
+                    print("    -> VERDICT: residual torque is SMALL. Contact-position offset "
+                          "does NOT explain the drift. Look elsewhere: support-weight moment-arm "
+                          "sign, null(G)@gamma direction, or MuJoCo soft-contact (solref/solimp).")
+    print()
+
     # Timeline.
     step = args.every or max(1, n // 40)
     print(f"{'t':>6} {'ramp':>4} {'jogz':>6} {'boxz':>7} {'palmz':>7} {'rel':>6} "

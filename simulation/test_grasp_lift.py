@@ -320,6 +320,21 @@ def main():
     # HOLD at the top for `args.hold` s — the real test is whether the grip holds the box up
     # over time, not just the instant after the jog. Track the box height; a slipping grasp
     # sags/drops during the hold.
+    # Per-finger contact-count / patch diagnostic: a fingertip that touches the box at a
+    # single point rolls/slides under load regardless of normal force. Compare against the
+    # live trace (which showed thumb=1ct). geom ids for the two active tips.
+    _if_gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, 'leap_if_tip')
+    _th_gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, 'leap_th_tip')
+    def _tip_ncon(gid):
+        pts = [data.contact[ci].pos for ci in range(data.ncon)
+               if obj_gid in (data.contact[ci].geom1, data.contact[ci].geom2)
+               and gid in (data.contact[ci].geom1, data.contact[ci].geom2)]
+        if not pts:
+            return 0, 0.0
+        pts = np.array(pts)
+        spread = float(np.linalg.norm(pts.max(0) - pts.min(0))) if len(pts) > 1 else 0.0
+        return len(pts), spread
+    _ncon_if, _ncon_th, _spread_if, _spread_th = [], [], [], []
     z_trace = []
     for _ in range(int(args.hold / dt)):
         data.qvel[:N_ROBOT] = 0.0
@@ -332,7 +347,13 @@ def main():
         data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
         mj.mj_step(model, data)
         z_trace.append(data.xpos[obj_bid][2])
+        nc_if, sp_if = _tip_ncon(_if_gid); nc_th, sp_th = _tip_ncon(_th_gid)
+        _ncon_if.append(nc_if); _ncon_th.append(nc_th)
+        _spread_if.append(sp_if); _spread_th.append(sp_th)
     z_trace = np.array(z_trace)
+    print(f"[patch] hold contact count/patch:  index={np.mean(_ncon_if):.1f}ct "
+          f"(spread {np.mean(_spread_if)*1e3:.1f}mm)  thumb={np.mean(_ncon_th):.1f}ct "
+          f"(spread {np.mean(_spread_th)*1e3:.1f}mm)")
 
     box_z_final = data.xpos[obj_bid][2]
     lifted = (box_z_final - box_z_pregrasp)

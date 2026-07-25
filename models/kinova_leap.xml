@@ -29,10 +29,18 @@
         <geom material="black"/>
       </default>
       <default class="leap_tip">
-        <geom type="mesh" friction="0.5" material="white" mesh="tip"/>
+        <!-- solref=(2*timestep, 1): 0.004s is the stability floor for the 2ms sim
+             timestep, critically damped. The parent leap_main solref="0.0001" is 40x
+             below that floor -> the friction constraint can't hold a static tangential
+             load and the grasped object creeps through the fingers. solimp reverts to
+             MuJoCo's default (smooth soft->hard impedance) from the degenerate
+             dmin=dmax=0.999. -->
+        <geom type="mesh" friction="0.5" material="white" mesh="tip"
+              solref="0.004 1" solimp="0.95 0.99 0.001 0.5 2"/>
       </default>
       <default class="leap_thumb_tip">
-        <geom type="mesh" friction="0.5" material="white" mesh="thumb_tip"/>
+        <geom type="mesh" friction="0.5" material="white" mesh="thumb_tip"
+              solref="0.004 1" solimp="0.95 0.99 0.001 0.5 2"/>
       </default>
       <default class="leap_mcp">
         <joint limited="true" range="-0.314 2.23"/>

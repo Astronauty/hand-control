@@ -4,8 +4,16 @@
   <!-- Elliptic friction cone: the default pyramidal approximation degenerates at high
        friction (its basis edges n±mu*t go near-tangential), which let the mu=4 red box
        equilibrate ~6.7mm INTO the floor instead of ~0.1mm. Elliptic represents high-mu
-       contacts exactly (and is the MuJoCo-recommended cone for grasping). -->
-  <option cone="elliptic"/>
+       contacts exactly (and is the MuJoCo-recommended cone for grasping).
+       impratio=10: at the default impratio=1 the FRICTION (tangential) constraints are as
+       soft as the normal ones, so a firmly-gripped box slides straight DOWN between the
+       fingers (pads stay put, contact walks up the box face) at only 3-6% friction
+       utilization pure tangential softness, not a cone violation. An isolated two-plate
+       pinch (scratchpad/pinch_test.py) confirmed impratio is the lever: box creep over 4s
+       fell ~20x from impratio 1 (2.5mm) to 20 (0.13mm), monotonic, independent of
+       solref/condim/cone. Set to 10 (a stable middle: strong tangential hold without the
+       lift-transient excitation seen at >=20 in the full arm+squeeze pipeline). -->
+  <option cone="elliptic" impratio="100"/>
 
   <worldbody>
     <!-- Pick area: visual-only reference marker, 30 cm × 30 cm -->

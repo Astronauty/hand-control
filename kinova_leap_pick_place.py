@@ -4250,12 +4250,20 @@ if __name__ == "__main__":
                 # commanded |f_c|, jog velocity, squeeze ramp, palm/box z.
                 if _grasp_trace is not None:
                     _f_c = grasp_ctrl.last_f_c if grasp_ctrl is not None else None
+                    _f_c_W = grasp_ctrl.last_f_c_W if grasp_ctrl is not None else None
+                    _pts_W = grasp_ctrl.last_contacts_W if grasp_ctrl is not None else None
                     _, _, _tr_norm, _tr_tan = _hand_object_contact_metrics(active_idx)
                     _act_geom = _actual_contact_geometry(active_idx)
                     _rec_local_tr = obj_grasp.get('rec_local')
                     _slip = np.zeros(N_FINGERS)
                     _norm_ang = np.full(N_FINGERS, np.nan)   # rec-vs-actual normal angle (deg)
                     _pos_off = np.full(N_FINGERS, np.nan)    # rec-vs-actual contact pos (mm)
+                    # Raw world-frame vectors for the residual-wrench diagnostic
+                    # (tau_res = sum (r_true - r_rec) x f_c). All NaN where unavailable.
+                    _rec_pt = np.full((N_FINGERS, 3), np.nan)   # recommended (grasp-map) contact pt, world
+                    _act_pt = np.full((N_FINGERS, 3), np.nan)   # MuJoCo actual contact pt, world
+                    _rec_nrm = np.full((N_FINGERS, 3), np.nan)  # recommended inward normal, world
+                    _fc_vec = np.full((N_FINGERS, 3), np.nan)   # full commanded force 3-vector, world
                     for _k, _f in enumerate(FINGER_SET):
                         if _rec_local_tr is not None:
                             _pO, _RO = _rec_local_tr[_k]
@@ -4268,10 +4276,21 @@ if __name__ == "__main__":
                             _inW = data.site_xmat[_sid_tr].reshape(3, 3)[:, 0]
                         _anchor = _cW - _PAD_OFFSET[_f] * _inW
                         _slip[_k] = float(np.linalg.norm(data.site_xpos[id_C[_k]] - _anchor))
+                        # r_rec: prefer the grasp map's own contact point (what the
+                        # allocator actually used); fall back to the reconstructed _cW.
+                        if _pts_W is not None and _k < len(_pts_W):
+                            _rec_pt[_k] = _pts_W[_k]
+                        else:
+                            _rec_pt[_k] = _cW
+                        _rec_nrm[_k] = _inW
+                        # World-frame commanded force (R_WS @ f_ck), for tau_res = r x f.
+                        if _f_c_W is not None and _k < len(_f_c_W):
+                            _fc_vec[_k] = _f_c_W[_k]
                         # RECOMMENDED (grasp-map) normal/pos vs MuJoCo ACTUAL contact.
                         _ag = _act_geom.get(_f)
                         if _ag is not None:
                             _p_act, _n_act = _ag
+                            _act_pt[_k] = _p_act
                             _norm_ang[_k] = float(np.degrees(np.arccos(
                                 np.clip(_inW @ _n_act, -1, 1))))
                             _pos_off[_k] = float(np.linalg.norm(_cW - _p_act) * 1e3)
@@ -4290,6 +4309,10 @@ if __name__ == "__main__":
                         slip=_slip,
                         norm_ang=_norm_ang,   # rec-vs-MuJoCo contact normal angle, deg
                         pos_off=_pos_off,     # rec-vs-MuJoCo contact position offset, mm
+                        rec_pt=_rec_pt,       # recommended (grasp-map) contact pt, world (N_F,3)
+                        act_pt=_act_pt,       # MuJoCo actual contact pt, world (N_F,3)
+                        rec_normal=_rec_nrm,  # recommended inward normal, world (N_F,3)
+                        fc_vec=_fc_vec,       # full commanded force 3-vector, world (N_F,3)
                         jog_v=_jog_v.copy(),
                         q_arm=data.qpos[:7].copy(),
                         gamma_live=float(gamma_live))
