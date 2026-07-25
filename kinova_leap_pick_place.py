@@ -387,6 +387,13 @@ if __name__ == "__main__":
              "deprecated alias).  | dexpilot: live MediaPipe kinematic retargeting "
              "teleop via ROS 2.")
     _arg_parser.add_argument(
+        '--recommender-grasp', action='store_true',
+        help="contact_aware_autonomous: source grasp contacts from the RECOMMENDER (the same "
+             "MultiStartGraspPlanner3D + _commit_recommended_pose path teleop uses) instead of "
+             "the authored per-object contact sites. Lets autonomous exercise all the "
+             "recommender fixes (finger-link collision, surface-pin, r_tip, orient_weight, "
+             "mf/rf ground) and watch the grasp/lift in the viewer with the shared gains.")
+    _arg_parser.add_argument(
         '--camera', type=int, default=None,
         help="Force SINGLE-camera teleop on this index, forwarded to "
              "ui/mediapipe_joint_angles.py (the 'Hand Tracking [cam N]' window). "
@@ -989,17 +996,32 @@ if __name__ == "__main__":
         f_c = grasp_ctrl.last_f_c
         _, _, normals, tangentials = _hand_object_contact_metrics(active_idx)
         mu = float(model.geom_friction[obj_grasp['id_geom'], 0])
+        # Contact reference for the slip anchor. When the grasp came from the RECOMMENDER
+        # (rec_local set — teleop lock-in OR --recommender-grasp autonomous), the real
+        # contacts are the recommended object-LOCAL frames tracking the object, NOT the
+        # authored sites. Measuring slip vs the authored sites in that case reports the fixed
+        # authored-vs-recommended OFFSET as phantom slip (e.g. ~35mm at the first frame before
+        # any motion). Use rec_local when present; fall back to the authored sites otherwise.
+        _rec_local = obj_grasp.get('rec_local')
         parts = []
         for k, f in enumerate(FINGER_SET):
             cmd = (float(np.linalg.norm(f_c[3 * k:3 * k + 3]))
                    if f_c is not None else float('nan'))
             n_meas, t_meas = normals[f], tangentials[f]
             util = t_meas / (mu * n_meas) if n_meas > 1e-6 else float('inf')
-            # Slip vs the pad-offset anchor (where the tip SITE sits when the pad
-            # surface is flush), not the raw surface site 10mm ahead of it.
-            sid_S = obj_grasp['id_S'][k]
-            inward_W = d.site_xmat[sid_S].reshape(3, 3)[:, 0]
-            anchor_W = d.site_xpos[sid_S] - _PAD_OFFSET[f] * inward_W
+            # Slip vs the pad-offset anchor (where the tip SITE sits when the pad surface is
+            # flush), not the raw surface point 10mm ahead of it.
+            if _rec_local is not None:
+                p_O, R_O = _rec_local[k]
+                p_WoO_l = d.xpos[obj_grasp['id_body']]
+                R_WO_l  = d.xmat[obj_grasp['id_body']].reshape(3, 3)
+                contact_W = p_WoO_l + R_WO_l @ p_O
+                inward_W  = R_WO_l @ R_O[:, 0]
+            else:
+                sid_S = obj_grasp['id_S'][k]
+                contact_W = d.site_xpos[sid_S]
+                inward_W  = d.site_xmat[sid_S].reshape(3, 3)[:, 0]
+            anchor_W = contact_W - _PAD_OFFSET[f] * inward_W
             slip_mm = 1e3 * float(np.linalg.norm(d.site_xpos[id_C[k]] - anchor_W))
             parts.append(f"{f}: cmd={cmd:.1f}N meas={n_meas:.1f}N "
                          f"fric={util:.0%} slip={slip_mm:.1f}mm")
@@ -1706,6 +1728,46 @@ if __name__ == "__main__":
         # The collision-aware ConstrainedIKSolver remains available for the O/I debug previews
         # (_fire_preview_ik) but is no longer on the commit path.
         _commit_recommended_pose(obj_idx, obj, obj_qpos_snap, rec, q_start)
+        _run_rrt(q_start, obj['q_target'], obj)
+
+    def _run_recommender_then_rrt(obj_idx, obj, q_start, obj_qpos_snap):
+        """AUTONOMOUS (--recommender-grasp): source the grasp from the RECOMMENDER instead of
+        the authored contact sites. Solves the NLP SYNCHRONOUSLY here in the plan thread (no
+        background continuous recommender like teleop), commits the recommended pose via the
+        same single-solve path teleop uses (_commit_recommended_pose -> recommender q as the
+        RRT goal), then plans the RRT. This routes autonomous through every recommender fix
+        (finger-link collision, surface-pin frame, r_tip, orient_weight, mf/rf ground) with the
+        shared GRASP gains, so the grasp/lift can be watched in the viewer.
+
+        q_start is the arm's current pose; the recommender regularizes toward it (reg_arm_
+        toward_current), same as teleop seeds from the operator's live pose."""
+        planner = _get_cat_planner(obj_idx)
+        planner._planner.data.qpos[:N_ROBOT] = q_start
+        planner._planner.data.qpos[N_ROBOT:] = obj_qpos_snap
+        mj.mj_forward(model, planner._planner.data)
+        _q_snap = np.array([q_start[i] for i in _cat_act_idx])
+        _obj_pos = planner._planner.data.xpos[obj['id_body']].copy()
+        try:
+            res = planner.solve(_q_snap, _obj_pos, max_seeds=_REC_NC)
+        except Exception:
+            traceback.print_exc()
+            res = {}
+        if res.get('p1') is None or res.get('p2') is None:
+            print(f"\r\n[auto-rec] recommender did not converge for {obj['name']} — "
+                  f"falling back to authored-site IK.")
+            _run_ik_then_rrt(obj_idx, obj, q_start, obj_qpos_snap)
+            return
+        # Wrench-feasibility check (same datum LP gate teleop uses to accept a candidate).
+        try:
+            _wf = bool((planner._planner.verify(res) or {}).get('wrench_feasible', False))
+        except Exception:
+            _wf = False
+        if not _wf:
+            print(f"\r\n[auto-rec] WARNING: recommended grasp for {obj['name']} is not "
+                  f"wrench-feasible — committing anyway for inspection.")
+        print(f"\r\n[auto-rec] {obj['name']}: recommender contacts committed "
+              f"(cost={res.get('cost')}, wf={_wf})")
+        _commit_recommended_pose(obj_idx, obj, obj_qpos_snap, res, q_start)
         _run_rrt(q_start, obj['q_target'], obj)
 
     def _fire_preview_ik(obj_idx, obj, q_seed, obj_qpos_snap, rec, warmstart, slot):
@@ -3575,6 +3637,29 @@ if __name__ == "__main__":
                               f"(mass={_mass:.3f}kg mu={_mu[0]:.1f}, "
                               f"~{gamma_live/np.sqrt(2):.2f} N/contact)")
 
+                    # --- Grasp-quality diagnostic at the COMMITTED pose ---
+                    # The lift test calls a grasp "good" at pad-alignment <~15deg and pad-gap
+                    # ~0-8mm. Print the SAME metrics for the live committed grasp so a live
+                    # slip can be attributed: an oblique pad (high angle) or a large gap can't
+                    # hold the weight even though the contacts "look" antipodal. _p_O/_R_in are
+                    # the object-frame contact frames (col0 = inward normal); pad-vs-inward is
+                    # the alignment; the tip-geom-to-object exact distance is the pad gap.
+                    try:
+                        _gq_ft = np.zeros(6)
+                        _gq_parts = []
+                        for _k, _f in enumerate(FINGER_SET):
+                            _nin_W = R_WO @ _R_in[_k][:, 0]        # inward normal, world
+                            _pad_W = -data.site_xmat[id_C[_k]].reshape(3, 3)[:, 0]
+                            _ang = np.degrees(np.arccos(np.clip(_pad_W @ _nin_W, -1, 1)))
+                            _tg = _TIP_GEOM_IDS[_f]
+                            _gap = mj.mj_geomDistance(model, data, _tg,
+                                                      obj_grasp['id_geom'], 0.1, _gq_ft) * 1e3
+                            _gq_parts.append(f"{_f}: pad_align={_ang:.0f}deg gap={_gap:.1f}mm")
+                        print("[grasp-quality] " + "  |  ".join(_gq_parts)
+                              + "   (good: align<15deg, gap 0-8mm)")
+                    except Exception:
+                        traceback.print_exc()
+
                     # Internal-force machinery for the Enter-toggled squeeze. Only
                     # internal_force_torques() is used — the joint PD hold stays in the
                     # GRASP branch below, on top of the shared bias comp.
@@ -3773,7 +3858,17 @@ if __name__ == "__main__":
                                          and np.max(np.abs(
                                              obj_qpos_snap
                                              - objects[obj_i]['ik_obj_qpos'])) < IK_STALE_TOL)
-                            if _ik_fresh:
+                            if args.recommender_grasp:
+                                # Autonomous with RECOMMENDER contacts: always re-solve the NLP
+                                # from the current pose (no IK cache reuse — the recommender is
+                                # cheap enough and its contacts depend on q_start), commit its
+                                # pose, then RRT. Routes through every recommender fix.
+                                plan_thread = threading.Thread(
+                                    target=_plan_thread_main,
+                                    args=(_run_recommender_then_rrt, obj_i, objects[obj_i],
+                                          q_start, obj_qpos_snap),
+                                    daemon=True)
+                            elif _ik_fresh:
                                 # IK cached and scene unchanged — go straight to RRT
                                 plan_thread = threading.Thread(
                                     target=_plan_thread_main,

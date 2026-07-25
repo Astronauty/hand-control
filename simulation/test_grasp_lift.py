@@ -92,6 +92,13 @@ def main():
                          'config and the gamma solve (kept consistent, matching live)')
     ap.add_argument('--edge', type=float, default=0.015, help='edge_margin_m (m)')
     ap.add_argument('--lift', type=float, default=0.08, help='+z jog distance (m)')
+    ap.add_argument('--jog-vel', type=float, default=0.2,
+                    help='lift speed (m/s); lower = slower lift (live "pick up" is gradual, '
+                         'which gives the capped slip-correction time to drift)')
+    ap.add_argument('--slip-kp', type=float, default=200.0,
+                    help='slip_correction spring stiffness (live default 200)')
+    ap.add_argument('--slip-fmax', type=float, default=10.0,
+                    help='slip_correction per-finger force cap N (live default 10)')
     ap.add_argument('--settle', type=float, default=1.5, help='settle time per phase (s)')
     ap.add_argument('--hold', type=float, default=2.0, help='hold time at top after lift (s)')
     args = ap.parse_args()
@@ -245,7 +252,7 @@ def main():
         squeeze_steps += 1
         ramp = min(1.0, squeeze_steps * dt / SQUEEZE_RAMP_S)
         tau[:N_ROBOT] += gc.internal_force_torques(data, scale=ramp)
-        tau[:N_ROBOT] += gc.slip_correction_torques(data)
+        tau[:N_ROBOT] += gc.slip_correction_torques(data, kp=args.slip_kp, f_max=args.slip_fmax)
         data.qfrc_applied[:] = tau
         data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
         mj.mj_step(model, data)
@@ -280,12 +287,18 @@ def main():
           f"thumb={_th_f:.1f}N ({len(_fc['thumb'])}ct)")
 
     # ── 5. Jog palm +z (lift) ────────────────────────────────────────────────────
-    n_lift = int((args.lift / JOG_VEL) / dt)     # steps to travel `lift` at JOG_VEL
+    jog_vel = args.jog_vel
+    n_lift = int((args.lift / jog_vel) / dt)     # steps to travel `lift` at jog_vel
+    # Track the box's height RELATIVE to the palm during the lift — this separates the two
+    # failure modes: box-slips-through-fingers (relative drops) vs arm-sags-with-box (relative
+    # constant, absolute drops). Live shows slow slip during a gradual lift.
+    palm_z0 = data.xpos[palm_bid][2]; box_z0 = data.xpos[obj_bid][2]
+    rel0 = box_z0 - palm_z0
     for _ in range(n_lift):
         Jp = np.zeros((3, model.nv)); Jr = np.zeros((3, model.nv))
         mj.mj_jacBody(model, data, Jp, Jr, palm_bid)
         J6 = np.vstack([Jp[:, :7], Jr[:, :7]])
-        v6 = np.array([0.0, 0.0, JOG_VEL, 0.0, 0.0, 0.0])   # +z linear
+        v6 = np.array([0.0, 0.0, jog_vel, 0.0, 0.0, 0.0])   # +z linear
         sig = np.linalg.svd(J6, compute_uv=False)[-1]
         lam2 = 0.0 if sig >= JOG_SING_EPS else (1 - (sig / JOG_SING_EPS) ** 2) * JOG_LAM_MAX ** 2
         qdot = J6.T @ np.linalg.solve(J6 @ J6.T + lam2 * np.eye(6), v6)
@@ -296,11 +309,14 @@ def main():
         tau[:N_ROBOT] = (kp_eff * (q_hold - data.qpos[:N_ROBOT])
                          + kd_eff * (np.r_[qdot, np.zeros(16)] - data.qvel[:N_ROBOT]))
         tau[:N_ROBOT] += gc.internal_force_torques(data, scale=1.0)
-        tau[:N_ROBOT] += gc.slip_correction_torques(data)
+        tau[:N_ROBOT] += gc.slip_correction_torques(data, kp=args.slip_kp, f_max=args.slip_fmax)
         data.qfrc_applied[:] = tau
         data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
         mj.mj_step(model, data)
     box_z_top = data.xpos[obj_bid][2]
+    rel_top = box_z_top - data.xpos[palm_bid][2]
+    print(f"[5b] lift @ {jog_vel} m/s: box-rel-palm drift during lift = "
+          f"{(rel_top - rel0)*1e3:+.1f}mm (neg = box slipped DOWN through fingers)")
     # HOLD at the top for `args.hold` s — the real test is whether the grip holds the box up
     # over time, not just the instant after the jog. Track the box height; a slipping grasp
     # sags/drops during the hold.
@@ -311,7 +327,7 @@ def main():
         tau = np.zeros(model.nv)
         tau[:N_ROBOT] = kp_eff * (q_hold - data.qpos[:N_ROBOT]) + kd_eff * (0 - data.qvel[:N_ROBOT])
         tau[:N_ROBOT] += gc.internal_force_torques(data, scale=1.0)
-        tau[:N_ROBOT] += gc.slip_correction_torques(data)
+        tau[:N_ROBOT] += gc.slip_correction_torques(data, kp=args.slip_kp, f_max=args.slip_fmax)
         data.qfrc_applied[:] = tau
         data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
         mj.mj_step(model, data)
