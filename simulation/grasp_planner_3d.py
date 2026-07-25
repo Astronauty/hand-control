@@ -126,6 +126,7 @@ try:
     from grasp_control import SpatialIKSolver
     from grasp_control.constrained_ik import (
         _SitePositionCallbackAnalytic,
+        _SiteAxisCallbackAnalytic,
         _BatchedGeomPositionCallbackAnalytic,
         _softplus_sphere_box_distance,
         _softplus_sphere_cylinder_distance,
@@ -766,6 +767,21 @@ class GraspConfig3D:
     # symbolic normal (curved), same as the wrench frame.
     w_align:           float = 0.0
 
+    # Fingertip PAD alignment cost: penalize each tip's pad axis (R_tip(q) @ pad_axis, the
+    # fingerpad normal in world) deviating from the contact INWARD surface normal, so the pad
+    # meets the surface flush rather than at an oblique edge-contact. This is the recommender
+    # analog of ConstrainedIKSolver.orient_weight (same _SiteAxisCallbackAnalytic FK and same
+    # pad_axis convention), added so the SINGLE committed solve (the recommender) can control
+    # pad orientation directly instead of relying on the removed post-solve collision IK.
+    # Distinct from w_align: w_align aligns the GRASP AXIS (p2-p1, contact geometry); this
+    # aligns each FINGERPAD (tip orientation, a function of q). 0.0 = off. Adds one
+    # _SiteAxisCallbackAnalytic per contact finger to the NLP (a q-dependent rotational FK —
+    # keep the weight modest and watch convergence, per the symbolic-normals lesson).
+    orient_weight:     float = 0.0
+    # Fingerpad normal direction in the tip SITE frame (unit). Matches
+    # ConstrainedIKSolver.pad_axis: -x of the LEAP fingertip site frame.
+    pad_axis:          tuple = (-1.0, 0.0, 0.0)
+
     # Edge margin (HARD): keep contacts at least this far from every FACE EDGE, where a
     # pinch slips (short moment arm, friction cone falls off the face). Implemented by
     # shrinking the tangential face BOUNDS in _sym_geom_surface_con — a contact cannot be
@@ -1278,6 +1294,17 @@ class GraspPlanner3D:
             index_cb = _SitePositionCallbackAnalytic(
                 f'gp3_if_{_uid}', model, self._index_sid, n_act, obj_qpos_snap)
 
+            # Fingerpad-axis FK (R_tip(q) @ pad_axis in world) for the orient_weight cost —
+            # only built when the term is active, since each adds a q-dependent rotational
+            # callback to the NLP.
+            thumb_axis_cb = index_axis_cb = None
+            if cfg.orient_weight > 0.0:
+                _pad_ax = np.asarray(cfg.pad_axis, float)
+                thumb_axis_cb = _SiteAxisCallbackAnalytic(
+                    f'gp3_th_ax_{_uid}', model, self._thumb_sid, _pad_ax, n_act, obj_qpos_snap)
+                index_axis_cb = _SiteAxisCallbackAnalytic(
+                    f'gp3_if_ax_{_uid}', model, self._index_sid, _pad_ax, n_act, obj_qpos_snap)
+
             # ── Arm collision callback (active pairs only) ─────────────────
             arm_col_cb = None
             if _active_arm:
@@ -1351,6 +1378,26 @@ class GraspPlanner3D:
                 _g_hat = _dp / (ca.norm_2(_dp) + 1e-9)
                 _cost_align = ca.sumsqr(_g_hat - _n1_in_al)
                 _cost = _cost + cfg.w_align * _cost_align
+
+            # ── Fingerpad-normal alignment (orient_weight) ────────────────────
+            # Penalize each tip's pad axis (R_tip(q) @ pad_axis, world) deviating from that
+            # contact's INWARD surface normal, so the pad meets the face flush. Same term as
+            # ConstrainedIKSolver's orient_weight (‖R_tip@pad_axis − n_in‖² per contact). The
+            # inward normals are the frozen seed directions (-d1_lp thumb, -d2_lp index),
+            # constant per stage like the wrench frame, so the only q-dependence is the tip
+            # rotation (via the axis callbacks). Sentinel-zero when off so the log helper can
+            # always evaluate it.
+            _cost_orient = ca.DM(0.0)
+            if (cfg.orient_weight > 0.0 and thumb_axis_cb is not None
+                    and d1_lp is not None and d2_lp is not None):
+                _n1_in_or = ca.DM(-np.asarray(d1_lp, float)
+                                  / (np.linalg.norm(d1_lp) + 1e-12))
+                _n2_in_or = ca.DM(-np.asarray(d2_lp, float)
+                                  / (np.linalg.norm(d2_lp) + 1e-12))
+                _e_th = thumb_axis_cb(_q) - _n1_in_or
+                _e_if = index_axis_cb(_q) - _n2_in_or
+                _cost_orient = ca.dot(_e_th, _e_th) + ca.dot(_e_if, _e_if)
+                _cost = _cost + cfg.orient_weight * _cost_orient
 
             # Edge margin is now a HARD constraint (tightened tangential face bounds in
             # _sym_geom_surface_con via cfg.edge_margin_m) — no cost term needed.

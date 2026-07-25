@@ -561,14 +561,6 @@ if __name__ == "__main__":
         _arg_parser.error("--trial-log only supports --mode dexpilot or "
                           "contact_aware_teleop (the two methods with a defined "
                           "attempt trigger in trial_logger.py).")
-    if args.trial_log and args.mode == 'dexpilot' and not args.physics:
-        # Kinematic replay (dexpilot's default) never calls mj_step and has NO contact
-        # response — the arm passes through objects, so the trial detectors (which key
-        # off real contacts/lift height/velocity) would never fire. Force it on rather
-        # than silently logging a batch of meaningless all-timeout trials.
-        args.physics = True
-        print("[trial-log] --physics auto-enabled (required for dexpilot trials — "
-              "kinematic replay has no collision response).")
 
     model = mj.MjModel.from_xml_path('models/scene_pick_place.xml')
     data  = mj.MjData(model)
@@ -1687,18 +1679,25 @@ if __name__ == "__main__":
         _ik_solved.add(obj_idx)
 
     def _run_ik_recommended_then_rrt(obj_idx, obj, q_start, obj_qpos_snap, rec):
-        # Commit path: re-solve the collision-aware IK to the RECOMMENDED contacts, then
-        # plan the RRT to that IK pose. The recommender optimizes contacts/normals/wrench
-        # but models fingers as POINTS, so its raw q routinely buries a finger LINK ~1cm
-        # inside the object (measured: leap_if_md_collision_5 at -12mm). Committing that q
-        # verbatim made the RRT goal interpenetrate — admitted only because _endpoint_grace
-        # forgives it — so switching back to physics resolved the overlap as a contact
-        # impulse and the object jumped. _run_ik_recommended runs constrained_ik with
-        # per-geom clearance (reduced_clearance_geoms) and inward_dirs, which bounds link
-        # penetration, while KEEPING the recommender's contact points + inward normals
-        # (via _setup_recommended_contact_frames) and warm-starting from the recommender's
-        # own q ('rec_q'), so it stays in the recommended basin and is fast.
-        _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_start, warmstart='rec_q')
+        # Commit path: SINGLE-SOLVE architecture — commit the RECOMMENDER's own q directly
+        # as the RRT goal, no second IK. What you see (the recommended markers/pose) is
+        # exactly what gets committed.
+        #
+        # History: the commit path used to re-solve a SEPARATE collision-aware IK
+        # (ConstrainedIKSolver) to the recommended contacts, because the old recommender
+        # modeled fingers as POINTS and its raw q buried a finger LINK ~12mm inside the
+        # object (leap_if_md_collision_5 at -12mm) — committing that verbatim made the RRT
+        # goal interpenetrate and the object jumped on the physics handoff. That second
+        # solve, however, optimized a DIFFERENT objective (posture bias = live q_seed) with a
+        # DIFFERENT tip offset (_PAD_OFFSET 10mm directional vs the recommender's r_tip 19mm
+        # radial), so the committed grasp landed at a visibly different pose/contacts than the
+        # displayed recommendation even on a perfectly STATIC object — the "grasp changes on
+        # lock-in" bug. Now that the recommender's NLP carries the finger-link collision
+        # constraints (obj_clearance_by_geom, penetration bounded to the tier, validated
+        # 20/20), its raw q is collision-safe to commit, so we drop the second solve entirely.
+        # The collision-aware ConstrainedIKSolver remains available for the O/I debug previews
+        # (_fire_preview_ik) but is no longer on the commit path.
+        _commit_recommended_pose(obj_idx, obj, obj_qpos_snap, rec, q_start)
         _run_rrt(q_start, obj['q_target'], obj)
 
     def _fire_preview_ik(obj_idx, obj, q_seed, obj_qpos_snap, rec, warmstart, slot):
@@ -2312,7 +2311,7 @@ if __name__ == "__main__":
             cfg = GraspConfig3D(obj_geom=o['name'] + '_geom', obj_body=o['name'],
                                 max_iter=120, arm_geom_names=_rec_arm_geoms,
                                 obj_clearance_by_geom=_rec_obj_clearance,
-                                w_align=10.0, edge_margin_m=0.015,
+                                w_align=10.0, orient_weight=2.0, edge_margin_m=0.015,
                                 wrench_constraint=False, datum_gamma=True,
                                 accel_budget_xyz=tuple(NCF_ACCEL_BUDGET_XYZ),
                                 ang_accel_budget_xyz=tuple(NCF_ANG_ACCEL_BUDGET))
