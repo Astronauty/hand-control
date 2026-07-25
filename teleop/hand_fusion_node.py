@@ -44,7 +44,7 @@ from triangulation import (CameraModel, triangulate_landmarks,
                            reprojection_errors, per_camera_reproj)
 from hand_message import (WORLD_FROM_BOARD, get_euler_angles,
                           get_flexion_angles, get_wrist_orientation_euler,
-                          build_message)
+                          build_message, sensor_qos)
 
 _CALIB_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "calibration")
@@ -196,27 +196,38 @@ class HandFusionNode(Node):
         # atomic under the GIL and the timer snapshots whole tuples, so no lock.
         from rclpy.callback_groups import ReentrantCallbackGroup
         cbg = ReentrantCallbackGroup()
+        # BEST_EFFORT sensor QoS on ALL the high-rate streams (see sensor_qos):
+        # reliable QoS here let a slow consumer back-pressure and WEDGE the
+        # upstream camera publishers (the "press-8 freezes a camera" bug).
         for n in names:
             self.create_subscription(
                 Float32MultiArray, f"/hand/cam_{n}/landmarks",
-                lambda msg, nm=n: self._on_cam(nm, msg), 10, callback_group=cbg)
+                lambda msg, nm=n: self._on_cam(nm, msg), sensor_qos(),
+                callback_group=cbg)
             if show:
                 self.create_subscription(
                     CompressedImage, f"/hand/cam_{n}/preview",
-                    lambda msg, nm=n: self._on_preview(nm, msg), 2,
+                    lambda msg, nm=n: self._on_preview(nm, msg), sensor_qos(),
                     callback_group=cbg)
 
         self._pub = self.create_publisher(
-            Float32MultiArray, "/hand/joint_angles", 10)
+            Float32MultiArray, "/hand/joint_angles", sensor_qos())
 
         # One Euro on the FUSED output (moved here from the single-cam publisher).
-        self._f_world = _OneEuroArray(63, freq=30.0, min_cutoff=1.5, beta=0.2)
-        self._f_wrist = _OneEuroArray(6, freq=30.0, min_cutoff=0.5, beta=0.15)
+        # freq MUST match the actual call cadence: these are called from the fixed
+        # 60 Hz publish timer below with t=None, so the filter uses this fixed freq
+        # instead of re-deriving it from wall-clock intervals. Feeding time.time()
+        # here made freq swing with scheduling jitter (the fusion loop's span was
+        # 9-51 ms), which modulated the cutoff and injected jitter into the wrist
+        # track — the single-cam publisher didn't hit this because its camera rate
+        # was steady. See _fuse_and_publish (t=None on the wrist/world filters).
+        self._f_world = _OneEuroArray(63, freq=60.0, min_cutoff=1.5, beta=0.2)
+        self._f_wrist = _OneEuroArray(6, freq=60.0, min_cutoff=0.5, beta=0.15)
         # ABSOLUTE-skeleton filter for the 3D viewer. The published message uses
         # wrist-relative filtered points; the viewer shows the skeleton at its true
         # world pose, so it needs its own filter on the absolute points (otherwise
         # it displayed RAW jitter while the message was already smoothed).
-        self._f_view = _OneEuroArray(63, freq=30.0, min_cutoff=1.2, beta=0.15)
+        self._f_view = _OneEuroArray(63, freq=60.0, min_cutoff=1.2, beta=0.15)
 
         # Fuse + publish on a timer (decoupled from any single camera's rate).
         # Same reentrant group so it never blocks the subscription callbacks.
@@ -520,10 +531,16 @@ class HandFusionNode(Node):
         # Wrist position: the triangulated wrist in the shared world frame (metres).
         wrist_pos = pts[_LM_WRIST].copy()
 
+        # Wall-clock t drives the health log / fps window below (real elapsed time),
+        # NOT the filters. The filters are called with t=None so the One Euro uses
+        # its fixed freq (the 60 Hz timer cadence) rather than re-deriving freq from
+        # jittery wall-clock intervals. The publish timer is fixed-rate, so a stable
+        # dt is the correct model; wall-clock dt here only fed scheduling jitter into
+        # the cutoff and roughened the wrist track.
         t = time.time()
         wrist_state = self._f_wrist(
-            np.concatenate([wrist_pos, wrist_euler]), t)
-        world_state = self._f_world(world_lm.ravel(), t).reshape(N_LM, 3)
+            np.concatenate([wrist_pos, wrist_euler]), None)
+        world_state = self._f_world(world_lm.ravel(), None).reshape(N_LM, 3)
 
         cfg = build_message(
             wrist_state[:3], wrist_state[3:], euler, flexion,
@@ -597,7 +614,9 @@ class HandFusionNode(Node):
         # Absolute fused world points drive the 3D viewer (not the wrist-relative
         # world_lm the message uses) so the skeleton sits at its true world pose.
         # One-Euro-smoothed so the display isn't the raw (jittery) triangulation.
-        pts_view = self._f_view(pts.ravel(), t).reshape(N_LM, 3)
+        # t=None: fixed-freq like the wrist/world filters (see above) — the display
+        # filter runs on the same fixed-rate timer, so wall-clock dt only added jitter.
+        pts_view = self._f_view(pts.ravel(), None).reshape(N_LM, 3)
         return pts_view, getattr(self, "_view_info", "")
 
     def _fill_gaps(self, pts: np.ndarray, ok: np.ndarray) -> np.ndarray:

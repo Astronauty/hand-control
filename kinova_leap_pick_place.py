@@ -20,6 +20,8 @@ import time
 import threading
 import traceback
 import queue
+from datetime import datetime
+from pathlib import Path
 
 # Windows consoles often report a legacy codepage (e.g. cp1252) for stdout even in
 # UTF-8-capable terminals (Git Bash/Windows Terminal), which crashes on the arrow
@@ -35,6 +37,9 @@ from scripts.rrt_planner import RRTPlanner
 from grasp_control import SpatialIKSolver, ConstrainedIKSolver, GraspController
 from grasp_control.constrained_ik import configure_sqp
 from live_dashboard import Dashboard
+from trial_logger import (EventLogger, TrialRunner, TrialPhase, TraceBuffer,
+                          DexPilotAttemptTrigger, ContactAwareAttemptTrigger,
+                          rest_half_height, LIFT_HEIGHT_M, TRIAL_TIMEOUT_S)
 
 # NLP grasp recommender (contact_aware_teleop mode). simulation/ hosts the planner;
 # _geom_normal_np gives the outward surface normal used to build inward contact frames.
@@ -364,22 +369,23 @@ if __name__ == "__main__":
              "kinematic replay (qpos overwrite + mj_forward) forever, so the IK solution and "
              "RRT path can be inspected without any dynamics interference.")
     _arg_parser.add_argument(
-        '--dashboard', action='store_true',
+        '--dashboard', action='store_true', default=True,
         help="Launch a live pyqtgraph metrics dashboard (separate process): planning mode "
              "(Approach/Grasp/Transport), proximity-based active object, scrolling "
              "fingertip→object distances, net hand→object wrench, per-finger contact "
-             "normal forces, and a combined RRT+IK planner solution log.")
+             "normal forces, and a combined RRT+IK planner solution log. On by default.")
     _arg_parser.add_argument(
         '--mode',
         choices=['contact_aware_autonomous', 'contact_aware_teleop', 'dexpilot',
                  'rrt'],
-        default='contact_aware_autonomous',
-        help="contact_aware_autonomous (default): autonomous RRT+IK grasp controller, "
-             "plans to predefined per-object contact sites ('rrt' is a deprecated alias). "
-             "| contact_aware_teleop: teleop the wrist (DexPilot mapping) with MediaPipe "
-             "fingers while an NLP continuously recommends grasp contacts for the nearest "
-             "object; press L to lock in and approach via RRT, then GRASP with the NLP's "
-             "gamma.  | dexpilot: live MediaPipe kinematic retargeting teleop via ROS 2.")
+        default='contact_aware_teleop',
+        help="contact_aware_teleop (default): teleop the wrist (DexPilot mapping) with "
+             "MediaPipe fingers while an NLP continuously recommends grasp contacts for "
+             "the nearest object; press L to lock in and approach via RRT, then GRASP "
+             "with the NLP's gamma.  | contact_aware_autonomous: autonomous RRT+IK grasp "
+             "controller, plans to predefined per-object contact sites ('rrt' is a "
+             "deprecated alias).  | dexpilot: live MediaPipe kinematic retargeting "
+             "teleop via ROS 2.")
     _arg_parser.add_argument(
         '--camera', type=int, default=None,
         help="Camera index forwarded to ui/mediapipe_joint_angles.py in dexpilot mode "
@@ -398,23 +404,25 @@ if __name__ == "__main__":
              "layout (positions and sizes). Default: fresh entropy every run. "
              "Ignored with --no-randomize.")
     _arg_parser.add_argument(
-        '--no-randomize', action='store_true',
+        '--no-randomize', action='store_true', default=True,
         help="Skip object randomization: objects keep the positions, sizes, and colors "
-             "authored in models/scene_pick_place.xml (default: randomize positions on "
-             "the pick marker, ±12%% sizes, pure R/G/B colors).")
+             "authored in models/scene_pick_place.xml. On by default — there is "
+             "currently no flag to force randomization back on; edit this default or "
+             "the argparse call directly if a run needs it.")
     _arg_parser.add_argument(
         '--hand-self-collision', action='store_true',
         help="Re-enable LEAP hand self-collision (finger↔finger, finger↔palm contact "
              "physics). Disabled by default: hand geoms are moved to contype=2 so "
              "hand↔hand pairs never match, while hand↔object/floor/arm keep colliding.")
     _arg_parser.add_argument(
-        '--physics', action='store_true',
+        '--physics', action='store_true', default=True,
         help="dexpilot mode: drive the robot with PD torques + gravity comp and hand off "
              "to mj_step, so the arm/hand PHYSICALLY collide with objects, the floor, and "
-             "(with --hand-self-collision) themselves — they can push/knock things. Default "
-             "is kinematic replay (qpos overwrite; rigid, exact tracking with NO collision "
-             "response — the robot passes through everything), which is best for orientation "
-             "calibration. Calibration holds (M/C/V) stay kinematic even with --physics.")
+             "(with --hand-self-collision) themselves — they can push/knock things. On by "
+             "default. The alternative (currently no flag to select it) is kinematic "
+             "replay — qpos overwrite, rigid, exact tracking with NO collision response — "
+             "which was previously the default and is best for orientation calibration; "
+             "calibration holds (M/C/V) stay kinematic regardless of this flag.")
     _arg_parser.add_argument(
         '--ik-solver', choices=['sqp', 'ipopt'], default='sqp',
         help="sqp (default): sqpmethod + OSQP + softplus SDF + analytic FK Jacobians — "
@@ -450,12 +458,13 @@ if __name__ == "__main__":
              "The D435I's 1080p color is only 8fps, so default 640x480 @30fps. "
              "Repeatable. Forwards --realsense NAME to run_multicam.py.")
     _arg_parser.add_argument(
-        '--multicam-max-res', action='store_true',
+        '--multicam-max-res', action='store_true', default=True,
         help="With --multicam: open each camera at its HIGHEST supported resolution "
              "(forwards --max-res to run_multicam.py). Use this when your per-camera "
              "intrinsics were calibrated at max res. Otherwise cameras open at 640x480 "
              "and their intrinsics MUST match that — set a per-camera :WxH in --multicam "
-             "(e.g. --multicam c0:0:1920x1080) to match each camera's calibrated size.")
+             "(e.g. --multicam c0:0:1920x1080) to match each camera's calibrated size. "
+             "On by default; has no effect unless --multicam or --multicam-auto is set.")
     _arg_parser.add_argument(
         '--recalibrate-extrinsics', action='store_true',
         help="With --multicam: run the INTERACTIVE extrinsics-all walkthrough "
@@ -485,12 +494,24 @@ if __name__ == "__main__":
              "--show-fused's camera grid), by subscribing to /hand/cam_<name>/preview. "
              "Camera names come from --multicam.")
     _arg_parser.add_argument(
-        '--skeleton-view', action='store_true',
+        '--trial-log', metavar='RUN_DIR', nargs='?', const='', default=None,
+        help="Enable automated trial benchmarking (dexpilot / contact_aware_teleop): "
+             "logs/<RUN_DIR>/events.jsonl (sparse per-trial-per-phase-per-attempt "
+             "event stream) + trial_<id>_<method>_<object>_<outcome>.npz (per-mj_step "
+             "fingertip pos/force, object pose/vel). RUN_DIR is optional — bare "
+             "--trial-log auto-names it <mode>_<timestamp>. A new trial starts on "
+             "each Ctrl+<digit> target selection (dexpilot: pressing 8) and ends on "
+             "arrival at the matching place site, a 60s timeout, or an abandoned "
+             "mid-trial target switch — see trial_logger.py for the full state "
+             "machine. Omit the flag entirely (default) to disable trial logging: "
+             "the tool then behaves exactly as without this flag.")
+    _arg_parser.add_argument(
+        '--skeleton-view', action='store_true', default=True,
         help="dexpilot / contact_aware_teleop: open a separate orbitable 3D window "
              "showing the hand skeleton from the WORLD landmarks in /hand/joint_angles "
              "(raw[57:120]) — the same fused skeleton run_multicam.py --show draws, so "
              "you can watch the multi-camera fusion while teleoping. No camera-preview "
-             "grid (those images aren't in the joint_angles message).")
+             "grid (those images aren't in the joint_angles message). On by default.")
     args = _arg_parser.parse_args()
     if args.mode == 'rrt':          # deprecated alias
         args.mode = 'contact_aware_autonomous'
@@ -537,6 +558,24 @@ if __name__ == "__main__":
     if args.camera_views and not args.multicam:
         _arg_parser.error("--camera-views requires --multicam (it needs the camera "
                           "names to subscribe to /hand/cam_<name>/preview)")
+    # args.trial_log is None (flag omitted -> trial logging off), '' (bare --trial-log
+    # -> auto-name), or an explicit RUN_DIR string. Resolve '' to a timestamped name
+    # BEFORE any check below, so every downstream use just sees None or a real name.
+    if args.trial_log == '':
+        args.trial_log = f'{args.mode}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        print(f"[trial-log] no RUN_DIR given — auto-named logs/{args.trial_log}/")
+    if args.trial_log and args.mode not in ('dexpilot', 'contact_aware_teleop'):
+        _arg_parser.error("--trial-log only supports --mode dexpilot or "
+                          "contact_aware_teleop (the two methods with a defined "
+                          "attempt trigger in trial_logger.py).")
+    if args.trial_log and args.mode == 'dexpilot' and not args.physics:
+        # Kinematic replay (dexpilot's default) never calls mj_step and has NO contact
+        # response — the arm passes through objects, so the trial detectors (which key
+        # off real contacts/lift height/velocity) would never fire. Force it on rather
+        # than silently logging a batch of meaningless all-timeout trials.
+        args.physics = True
+        print("[trial-log] --physics auto-enabled (required for dexpilot trials — "
+              "kinematic replay has no collision response).")
 
     model = mj.MjModel.from_xml_path('models/scene_pick_place.xml')
     data  = mj.MjData(model)
@@ -785,6 +824,56 @@ if __name__ == "__main__":
     _FINGER_BY_GID  = {mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g): f
                        for f in FINGER_SET for g in _finger_collision_geoms(model, f)}
 
+    # --- Trial benchmarking (--trial-log) ------------------------------------------
+    # Inert (None) unless --trial-log is passed — every call site below is guarded on
+    # _trial_runner is not None, so omitting the flag leaves this file's behavior
+    # unchanged. See trial_logger.py for the full state machine this drives.
+    _trial_runner  = None
+    _trial_state   = None
+    _trial_events  = None
+    _trial_rest_hh = {}   # obj_idx -> rest half-height (m), for the lift-height check
+    _dp_trigger    = None   # DexPilotAttemptTrigger, mode == 'dexpilot'
+    _cat_trigger   = None   # ContactAwareAttemptTrigger, mode == 'contact_aware_teleop'
+    _trial_dofadr = {}   # obj_idx -> freejoint dof address (qvel[adr:adr+3] = linear v)
+    if args.trial_log:
+        for _oi, _o in enumerate(objects):
+            _gid = _o['id_geom']
+            _trial_rest_hh[_oi] = rest_half_height(int(model.geom_type[_gid]),
+                                                    model.geom_size[_gid])
+            _trial_dofadr[_oi] = int(model.jnt_dofadr[model.body_jntadr[_o['id_body']]])
+        _trial_events = EventLogger(Path('logs') / args.trial_log)
+        _trial_runner = TrialRunner(_trial_events, Path('logs') / args.trial_log)
+        if args.mode == 'dexpilot':
+            _dp_trigger = DexPilotAttemptTrigger()
+        else:
+            _cat_trigger = ContactAwareAttemptTrigger()
+        print(f"[trial-log] enabled -> logs/{args.trial_log}/  "
+              f"(mode={args.mode})")
+
+    # Always-on pose recorder (independent of trials/phases): one row per loop iteration
+    # capturing the full robot+object qpos and wall/sim time, saved to
+    # logs/<RUN_DIR>/pose_trace.npz at exit. A PD/gamma tuning harness slices REACH-phase
+    # warmstarts out of this by cross-referencing the phase_enter timestamps in
+    # events.jsonl. Throttled to ~50 Hz sim-time so the file stays small.
+    _pose_trace   = TraceBuffer() if args.trial_log else None
+    _pose_last_t  = -1.0
+    _POSE_DT      = 0.02   # s sim-time between recorded pose rows (~50 Hz)
+
+    # obj_<color>_<shape> -> place_<color>_site, by matching the color token common to
+    # both names (scene_pick_place.xml's naming convention — see place_red/blue/green/
+    # yellow_site). Built once here rather than per-step string parsing in the hot loop.
+    _PLACE_COLORS = ('red', 'blue', 'green', 'yellow')
+    _trial_place_sid = {}
+    if args.trial_log:
+        for _oi, _o in enumerate(objects):
+            _color = next((c for c in _PLACE_COLORS if c in _o['name']), None)
+            _sid = (mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, f'place_{_color}_site')
+                    if _color else -1)
+            if _sid < 0:
+                print(f"[trial-log] WARNING: no place_<color>_site match for "
+                      f"'{_o['name']}' — arrival can never be detected for this object.")
+            _trial_place_sid[_oi] = _sid
+
     def _hand_object_contact_metrics(obj_idx):
         """Scan live contacts once and return
           (f_net, tau_net): net world-frame wrench the HAND applies to objects[obj_idx],
@@ -831,6 +920,25 @@ if __name__ == "__main__":
         dash = Dashboard(FINGER_SET, horizon_s=5.0, dt_hint=3 * model.opt.timestep)
         dash.start()
         print("[dashboard] launched (separate process)")
+        # Tee trial events to the dashboard's live event log (the logger is created
+        # before dash exists, so attach here). No-op when trial logging is disabled.
+        if args.trial_log:
+            _trial_events._dashboard = dash
+
+    def _push_trial_time(state, t_now):
+        """Push the trial countdown to the dashboard each frame. `state` is the current
+        TrialState (or None between trials). No-op when the dashboard is disabled."""
+        if dash is None:
+            return
+        if state is None or state.outcome is not None:
+            dash.push({'type': 'trial_time', 'remaining': None,
+                       'elapsed': None, 'trial_id': None})
+            return
+        elapsed = t_now - state.t_start
+        dash.push({'type': 'trial_time',
+                   'remaining': TRIAL_TIMEOUT_S - elapsed,
+                   'elapsed': elapsed,
+                   'trial_id': state.trial_id})
 
     def _push_ipopt(obj_name, dls_ms=None, ipopt_ms=None):
         """Forward ConstrainedIKSolver.last_metrics + stage timing to the dashboard's
@@ -987,9 +1095,12 @@ if __name__ == "__main__":
 
     # Per-joint PD gains for REACH phase: 7 arm joints + 16 LEAP finger joints.
     # Arm gains sized for Gen3's forcerange (±105/±52 Nm); finger gains mirror the small
-    # values used for the planar model's tiny finger actuators.
-    Kp = np.concatenate([np.full(7, 40.0), np.full(16, 0.8)])
-    Kd = np.concatenate([np.full(7, 4.0),  np.full(16, 0.05)])
+    # values used for the planar model's tiny finger actuators. Finger gains bumped 1.5x
+    # (Kp 0.8->1.2, Kd 0.05->0.075) so the LEAP fingers close harder/faster toward the
+    # retargeted/grasp angles. Shared by the dexpilot torque drive and contact_aware
+    # REACH/GRASP controller (the dexpilot drive is Kp-only, so Kd[7:] applies to REACH).
+    Kp = np.concatenate([np.full(7, 40.0), np.full(16, 1.2)])
+    Kd = np.concatenate([np.full(7, 4.0),  np.full(16, 0.075)])
 
     # Internal squeeze force scale (GRASP, toggled with Enter): f_c = null(G) @ gamma.
     # gamma is now SOLVED per object at the REACH->GRASP transition (solve_gamma_live)
@@ -1102,14 +1213,9 @@ if __name__ == "__main__":
             mj.mj_forward(model, _d)
             positions = [_d.site_xpos[s].copy() for s in _GHOST_SITES]
             markers.append((positions, rgba))
-        # DIAGNOSTIC (recommended-IK path only): the recommender's INTENDED contacts —
-        # where the NLP wanted the tip sites to land (p_S_W). Drawn in magenta so the gap
-        # to the gold ACHIEVED tips above is visible; the delta is exactly what the
-        # collision-constrained IK gave up to stay clearance-feasible. p_S_W is world at
-        # solve time; the object is static during a lock-in solve so this is aligned.
-        if obj.get('p_S_W') is not None and obj.get('rec_local') is not None:
-            markers.append(([np.asarray(p, float).copy() for p in obj['p_S_W']],
-                            np.array([1.0, 0.0, 1.0, 0.9], dtype=np.float32)))
+        # (The magenta "intended contacts" diagnostic markers were removed — they
+        # duplicated the rec1/rec2 contact mocaps. The gold ACHIEVED-tip spheres above
+        # show where the committed recommender pose lands the fingertips.)
         return markers
 
     _ik_markers_by_obj = [None] * len(objects)
@@ -1179,6 +1285,14 @@ if __name__ == "__main__":
         if dash is not None:
             dash.push({'type': 'rrt', 'object': obj_target['name'], 'n_wp': len(path),
                        'plan_time': plan_time, 'fallback': fallback})
+        if _trial_events is not None and _trial_state is not None:
+            # Wall-clock timestamp (not data.time): this runs on the background
+            # plan_thread, which must never touch live `data` concurrently with the
+            # main thread's mj_step — sim-time correlation isn't needed for a
+            # diagnostic solver-timing entry.
+            _trial_events.log_solve(_trial_state.trial_id, time.time(), 'rrt',
+                                    plan_time * 1e3, object=obj_target['name'],
+                                    n_waypoints=len(path), fallback=fallback)
         _plan_result['waypoints'] = path
         _update_ghost_markers(path)
 
@@ -1226,6 +1340,12 @@ if __name__ == "__main__":
         ipopt_grasp_ms = (time.time() - _t0) * 1e3
         _push_ipopt(obj['name'],
                     dls_ms=dls_grasp_ms, ipopt_ms=ipopt_grasp_ms)
+        if _trial_events is not None and _trial_state is not None:
+            _now_wc = time.time()
+            _trial_events.log_solve(_trial_state.trial_id, _now_wc, 'ik_dls',
+                                    dls_grasp_ms, object=obj['name'])
+            _trial_events.log_solve(_trial_state.trial_id, _now_wc, 'ik_ipopt',
+                                    ipopt_grasp_ms, object=obj['name'])
 
         total_ms = dls_grasp_ms + ipopt_grasp_ms
         print(f"\r\n[IK] obj{obj_idx+1}: grasp DLS {dls_grasp_ms:.0f}ms + SQP {ipopt_grasp_ms:.0f}ms"
@@ -1378,13 +1498,14 @@ if __name__ == "__main__":
 
     def _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_seed,
                             warmstart='rec_q'):
-        """contact_aware_teleop O/I DEBUG PREVIEW (non-committing): like _run_ik but the
+        """contact_aware_teleop LOCK-IN + O/I DEBUG PREVIEW: like _run_ik but the
         fingertip targets come from the NLP-recommended contacts (rec['p1']=thumb,
         rec['p2']=index in world) instead of the authored contact sites. Runs the
-        DLS->SQP collision-aware grasp IK to get obj['q_target'] so the preview can show
-        what the constrained solve produces. NOTE: as of the recommender-pose commit,
-        this is NO LONGER on the lock-in path (see _commit_recommended_pose) — it only
-        backs the O/I previews (_fire_preview_ik).
+        DLS->SQP collision-aware grasp IK to get obj['q_target'] so the committed grasp
+        (and the preview) reflects what the CONSTRAINED solve produces — with finger-link
+        penetration bounded — rather than the recommender's raw q (which models fingers as
+        points and can bury a link in the object). This backs BOTH the lock-in commit path
+        (_run_ik_recommended_then_rrt) and the O/I previews (_fire_preview_ik).
 
         q_seed is the operator's live teleoped pose — the hand is already positioned at a
         valid, collision-free approach to the object, so we BIAS the IK (posture
@@ -1510,13 +1631,18 @@ if __name__ == "__main__":
         _ik_solved.add(obj_idx)
 
     def _run_ik_recommended_then_rrt(obj_idx, obj, q_start, obj_qpos_snap, rec):
-        # Commit the RECOMMENDER's own pose as the grasp goal (no collision-aware IK
-        # re-solve on the commit path — see _commit_recommended_pose). The recommender
-        # now carries Tier-1 palm/wrist collision awareness, and RRT plans a collision-
-        # free approach TO this pose, so the committed grasp is the one the recommender
-        # proposed rather than an IK-refined variant of it. The collision-aware IK stays
-        # available for the O/I previews so the operator can still inspect it manually.
-        _commit_recommended_pose(obj_idx, obj, obj_qpos_snap, rec, q_start)
+        # Commit path: re-solve the collision-aware IK to the RECOMMENDED contacts, then
+        # plan the RRT to that IK pose. The recommender optimizes contacts/normals/wrench
+        # but models fingers as POINTS, so its raw q routinely buries a finger LINK ~1cm
+        # inside the object (measured: leap_if_md_collision_5 at -12mm). Committing that q
+        # verbatim made the RRT goal interpenetrate — admitted only because _endpoint_grace
+        # forgives it — so switching back to physics resolved the overlap as a contact
+        # impulse and the object jumped. _run_ik_recommended runs constrained_ik with
+        # per-geom clearance (reduced_clearance_geoms) and inward_dirs, which bounds link
+        # penetration, while KEEPING the recommender's contact points + inward normals
+        # (via _setup_recommended_contact_frames) and warm-starting from the recommender's
+        # own q ('rec_q'), so it stays in the recommended basin and is fast.
+        _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_start, warmstart='rec_q')
         _run_rrt(q_start, obj['q_target'], obj)
 
     def _fire_preview_ik(obj_idx, obj, q_seed, obj_qpos_snap, rec, warmstart, slot):
@@ -1668,7 +1794,15 @@ if __name__ == "__main__":
             # rejects the projection as invalid).
             if args.multicam_max_res:
                 _mc_cmd += ['--max-res']
-            _mediapipe_proc = subprocess.Popen(_mc_cmd)
+            # start_new_session=True puts the multicam supervisor in its OWN
+            # session/process group, so a terminal Ctrl-C is delivered ONLY to
+            # this (parent) process, NOT directly to the child and its grandchildren
+            # (the landmark + fusion nodes). Without this, Ctrl-C hit the whole
+            # foreground group at once: the parent could exit while the child was
+            # mid-teardown, orphaning the grandchildren (they kept logging + holding
+            # /dev/video* after the sim exited). Now teardown is driven solely by our
+            # finally block, which signals the child's whole group (see below).
+            _mediapipe_proc = subprocess.Popen(_mc_cmd, start_new_session=True)
             print(f"[DexPilot] multicam pipeline launched (pid {_mediapipe_proc.pid}): "
                   f"{len(args.multicam)} cameras -> /hand/joint_angles.")
         elif args.no_mediapipe:
@@ -1787,7 +1921,21 @@ if __name__ == "__main__":
         # Cap on physics substeps per loop iteration (real-time catch-up). Bounds
         # the work if a single iteration hitches badly, so it can't spiral; ~5 covers
         # the ~1.7 ms retarget + IK + draw overhead at dt=2 ms with margin.
+        # NOTE: _elapsed (below) is measured BEFORE the substep loop, so it only sizes
+        # _n_sub to cover spin()+draw+step() cost — anything added AFTER the substep
+        # loop each iteration (trial-logging, skeleton/camera draw, viewer.sync()) is
+        # structurally invisible to this catch-up mechanism and accrues as pure,
+        # uncompensated sim-time lag. DP_PROFILE below measures exactly where that
+        # per-iteration wall-time actually goes.
         _DP_MAX_SUBSTEPS = 5
+        # Per-iteration wall-time breakdown (opt-in via DP_PROFILE=1), same pattern as
+        # GRASP_PROFILE — printed once/sec so a live session can show which section is
+        # actually responsible for sim-time falling behind wall-time.
+        DP_PROFILE = os.environ.get('DP_PROFILE', '0') == '1'
+        _dpp_acc = {'spin_draw': 0.0, 'spin': 0.0, 'skel': 0.0, 'camviews': 0.0,
+                    'step': 0.0, 'substeps': 0.0, 'trial_log': 0.0,
+                    'viz_sync': 0.0, 'iter': 0.0, 'n': 0}
+        _dpp_last = time.time()
         if args.physics:
             _Mfull = np.zeros((model.nv, model.nv))
             mj.mj_fullM(model, _Mfull, data.qM)
@@ -1858,6 +2006,12 @@ if __name__ == "__main__":
         _skel_viewer = SkeletonViewer(name="teleop hand skeleton")
         print("[teleop] skeleton view on — orbit with mouse, r reset, z flip up.")
 
+    # Wall-clock of the last skeleton draw, for throttling (list = mutable closure cell).
+    _skel_last_draw = [0.0]
+    SKEL_DRAW_HZ = 30.0   # the fused hand data only updates at ~20 Hz; drawing the
+                          # separate GLFW window every ~2ms sim iter (~110 Hz) cost
+                          # ~5ms/iter (the bulk of spin_draw) for no new information.
+
     def _draw_skeleton():
         """Feed the latest ABSOLUTE world-frame hand skeleton to the viewer.
 
@@ -1867,9 +2021,17 @@ if __name__ == "__main__":
         is NOT what the fusion node's own viewer shows. Re-add the absolute wrist
         position (raw[0:3], the triangulated wrist in the shared world frame) to
         recover the true world pose the multicam viewer draws. Draws empty until a
-        hand is tracked; no-op if the viewer isn't enabled."""
+        hand is tracked; no-op if the viewer isn't enabled.
+
+        Throttled to SKEL_DRAW_HZ: the GLFW render is ~5ms and the source data only
+        refreshes at camera rate (~20 Hz), so redrawing every sim iteration just burns
+        wall-time (inflating the real-time catch-up deficit) with nothing new to show."""
         if _skel_viewer is None:
             return
+        _now = time.time()
+        if _now - _skel_last_draw[0] < 1.0 / SKEL_DRAW_HZ:
+            return
+        _skel_last_draw[0] = _now
         raw = _dexpilot_ctrl.raw_msg
         pts = None
         n_lm = 0
@@ -1898,6 +2060,7 @@ if __name__ == "__main__":
         from sensor_msgs.msg import CompressedImage as _CompressedImage  # noqa: E402
         sys.path.insert(0, __file__.rsplit('/', 1)[0] + '/teleop')
         from skeleton_viewer import CameraGridWindow       # noqa: E402
+        from hand_message import sensor_qos                # noqa: E402
         _cam_names = [s.split(':')[0] for s in args.multicam]
         # rclpy is already init()'d by the DexPilot ROSInterface; just add a node.
         _cam_grid_node = _RclNode("teleop_camera_grid")
@@ -1911,8 +2074,11 @@ if __name__ == "__main__":
             return _cb
 
         for _nm in _cam_names:
+            # BEST_EFFORT sensor QoS: this preview grid must never back-pressure
+            # the landmark nodes' preview publisher (the press-8 camera freeze).
             _cam_grid_node.create_subscription(
-                _CompressedImage, f"/hand/cam_{_nm}/preview", _mk_preview_cb(_nm), 2)
+                _CompressedImage, f"/hand/cam_{_nm}/preview", _mk_preview_cb(_nm),
+                sensor_qos())
         _cam_grid = CameraGridWindow(_cam_names, name="teleop camera feeds")
         print(f"[teleop] camera feeds on — tiling {_cam_names} "
               f"from /hand/cam_<name>/preview.")
@@ -1963,6 +2129,12 @@ if __name__ == "__main__":
     _rec_result_lock  = threading.Lock()
     _rec_last_solve   = 0.0     # wall-clock of the last solve start
     _rec_obj_idx      = -1      # object the latest recommendation is for
+    # Anti-jitter for the continuously-firing recommender: warm-start each solve from the
+    # last ACCEPTED contacts (so a static object returns to the same basin), and apply
+    # display hysteresis (only replace the shown candidate on a moved object, a new object,
+    # or a meaningfully-better cost) so the markers stop hopping between local optima.
+    _REC_HYST_COST_FRAC = 0.15   # new cost must beat shown by >15% to replace it
+    _REC_OBJ_MOVE_M     = 0.010  # object move (m) that forces a fresh recommendation
     _rec_vis          = False   # P: hold the robot at the recommender's OWN q (debug)
     _rec_ik_mode      = None    # None | 'rec_q' (O) | 'dls' (I): which constrained-IK
                                 #   preview is held (warm-start variant)
@@ -2056,7 +2228,7 @@ if __name__ == "__main__":
             # the one that gates the squeeze.
             cfg = GraspConfig3D(obj_geom=o['name'] + '_geom', obj_body=o['name'],
                                 max_iter=120, arm_geom_names=list(_REC_ARM_GEOMS),
-                                w_align=2.0, edge_margin_m=0.010,
+                                w_align=10.0, edge_margin_m=0.015,
                                 wrench_constraint=False, datum_gamma=True,
                                 accel_budget_xyz=tuple(NCF_ACCEL_BUDGET_XYZ),
                                 ang_accel_budget_xyz=tuple(NCF_ANG_ACCEL_BUDGET))
@@ -2073,33 +2245,82 @@ if __name__ == "__main__":
             # collision/surface geometry; sync qpos before solving.
             planner._planner.data.qpos[:] = data.qpos[:]
             mj.mj_forward(model, planner._planner.data)
+            # Warm-start from the last ACCEPTED contacts for THIS object, so a re-solve on
+            # a static object returns to the same basin instead of a fresh random optimum.
+            _warm = None
+            with _rec_result_lock:
+                _prev = _rec_result.get('candidate')
+                if (_prev is not None and _rec_result.get('obj_idx') == obj_idx
+                        and _prev.get('p1') is not None):
+                    _warm = (_prev['p1'].copy(), _prev['p2'].copy())
             _t0 = time.time()
             try:
-                res = planner.solve(q_snap, obj_pos, max_seeds=_REC_NC)
+                res = planner.solve(q_snap, obj_pos, max_seeds=_REC_NC,
+                                    warm_contacts=_warm)
             except Exception:
                 traceback.print_exc()
                 return
             _solve_ms = (time.time() - _t0) * 1e3
             if res.get('p1') is None or res.get('p2') is None:
                 return
+            # Certify wrench feasibility (datum LP inside verify()) BEFORE deciding whether
+            # to show this candidate — the visualization must only ever recommend a
+            # wrench-feasible grasp. Also feeds the dashboard below.
+            _vinfo = {}
+            try:
+                _vinfo = planner._planner.verify(res) or {}
+            except Exception:
+                traceback.print_exc()
+            _wf = bool(_vinfo.get('wrench_feasible', False))
+            _new_cost = res.get('cost')
+            _new_p1 = np.asarray(res['p1'], float).copy()
+            _new_p2 = np.asarray(res['p2'], float).copy()
             with _rec_result_lock:
-                _rec_result['candidate'] = {
-                    'q':  np.asarray(res['q'], float).copy(),
-                    'p1': np.asarray(res['p1'], float).copy(),   # thumb
-                    'p2': np.asarray(res['p2'], float).copy(),   # index
-                    'status': res.get('status'),
-                }
-                _rec_result['obj_idx'] = obj_idx
+                _prev = _rec_result.get('candidate')
+                _same_obj = (_rec_result.get('obj_idx') == obj_idx)
+                # WF GATE: never show a grasp that is not wrench-feasible.
+                if not _wf:
+                    _accept = False
+                    # If the object has since MOVED, the previously-shown feasible marker
+                    # is stale (wrong position) — drop it rather than display a feasible
+                    # grasp at an outdated location. Otherwise keep the last feasible one.
+                    if (_same_obj and _prev is not None
+                            and _prev.get('obj_pos') is not None
+                            and float(np.linalg.norm(obj_pos - _prev['obj_pos']))
+                                > _REC_OBJ_MOVE_M):
+                        _rec_result.pop('candidate', None)
+                else:
+                    # Display hysteresis: keep the shown candidate unless (a) it is for
+                    # another object, (b) the object moved, or (c) the new solve is
+                    # meaningfully better. Prevents frame-to-frame marker hopping between
+                    # near-equal local optima. A stale infeasible shown candidate (e.g.
+                    # object just moved) is always replaced by a feasible one.
+                    _prev_wf = bool(_prev.get('wrench_feasible')) if _prev else False
+                    _obj_moved = True
+                    if _same_obj and _prev is not None and _prev.get('obj_pos') is not None:
+                        _obj_moved = (float(np.linalg.norm(obj_pos - _prev['obj_pos']))
+                                      > _REC_OBJ_MOVE_M)
+                    _better = True
+                    if (_same_obj and not _obj_moved and _prev_wf and _prev is not None
+                            and _prev.get('cost') is not None and _new_cost is not None):
+                        _better = (_new_cost < _prev['cost'] * (1.0 - _REC_HYST_COST_FRAC))
+                    _accept = (not _same_obj) or _obj_moved or (not _prev_wf) or _better
+                if _accept:
+                    _rec_result['candidate'] = {
+                        'q':  np.asarray(res['q'], float).copy(),
+                        'p1': _new_p1,   # thumb
+                        'p2': _new_p2,   # index
+                        'status': res.get('status'),
+                        'cost': _new_cost,
+                        'obj_pos': np.asarray(obj_pos, float).copy(),
+                        'wrench_feasible': _wf,
+                    }
+                    _rec_result['obj_idx'] = obj_idx
 
-            # --- Push solve stats to the dashboard (verify() gives gamma_min + IK) ---
+            # --- Push solve stats to the dashboard (verify() gave gamma_min + IK) ---
             if dash is not None:
                 _all = res.get('all_results') or [res]
                 _nconv = sum(1 for r in _all if r.get('status') == 'converged')
-                _vinfo = {}
-                try:
-                    _vinfo = planner._planner.verify(res) or {}
-                except Exception:
-                    traceback.print_exc()
                 dash.push({
                     'type':            'grasp_rec',
                     'object':          objects[obj_idx]['name'],
@@ -2112,6 +2333,22 @@ if __name__ == "__main__":
                     'n_converged':     _nconv,
                     'n_seeds':         len(_all),
                 })
+            if _trial_events is not None:
+                # The recommender fires continuously (proximity-based) BEFORE lock-in
+                # starts a trial, so a solve for this object may predate any matching
+                # trial — attribute to the current trial only if it's already running
+                # for THIS object; otherwise log under trial_id=0 (pre-trial / hover),
+                # still useful for the timing table but never counted into a trial's
+                # own outcome accounting.
+                _rec_trial_id = (_trial_state.trial_id
+                                 if (_trial_state is not None
+                                     and _trial_state.outcome is None
+                                     and _trial_state.object_name == objects[obj_idx]['name'])
+                                 else 0)
+                _trial_events.log_solve(_rec_trial_id, time.time(), 'grasp_rec',
+                                        _solve_ms, object=objects[obj_idx]['name'],
+                                        status=res.get('status'),
+                                        n_seeds=len(res.get('all_results') or [res]))
         t = threading.Thread(target=_run, daemon=True, name='cat-recommender')
         t.start()
         return t
@@ -2274,19 +2511,10 @@ if __name__ == "__main__":
                 scn.ngeom += 1
 
         def _draw_active_marker(scn):
-            """Translucent sphere hovering above the proximity-based 'active object'
-            (min average fingertip signed distance, _prox_idx) so the viewer always
-            shows which object the hand is currently nearest."""
-            if scn is None or scn.ngeom >= scn.maxgeom:
-                return
-            o = objects[_prox_idx]
-            pos = data.xpos[o['id_body']].copy()
-            pos[2] += model.geom_rbound[o['id_geom']] + 0.06
-            mj.mjv_initGeom(scn.geoms[scn.ngeom], mj.mjtGeom.mjGEOM_SPHERE,
-                            np.array([0.022, 0.022, 0.022]), pos,
-                            np.eye(3, dtype=np.float64).flatten(),
-                            np.array([0.25, 1.0, 0.55, 0.4], dtype=np.float32))
-            scn.ngeom += 1
+            """No-op: the hover sphere above the nearest object was removed — the
+            recommended contact points already show which object is active. Kept as a
+            stub so existing call sites need no change."""
+            return
 
         def _render_kinematic_frame():
             """Push ghost/IK markers to the scene and sync the viewer for one
@@ -2323,6 +2551,21 @@ if __name__ == "__main__":
             step_start = time.time()
             _n_sub = 1   # physics catch-up substeps this iteration (dexpilot --physics)
 
+            # Always-on pose recorder: one throttled row per iteration, ALL phases (the
+            # trial trace only runs post-lock-in). Phase is reconstructed offline from
+            # events.jsonl phase_enter timestamps vs `t` here. Uses last frame's qpos
+            # (one-frame lag is immaterial for a warmstart snapshot).
+            # (data.time < _pose_last_t marks a reset — sample immediately and re-anchor.)
+            if _pose_trace is not None and (data.time < _pose_last_t
+                                            or (data.time - _pose_last_t) >= _POSE_DT):
+                _pose_last_t = data.time
+                _pose_trace.sample(
+                    t=float(data.time),          # sim-time; RESETS to 0 on backspace reset
+                    t_wall=float(time.time()),   # wall-clock; monotonic across resets
+                    q_robot=data.qpos[:N_ROBOT].copy(),
+                    obj_qpos=data.qpos[N_ROBOT:].copy(),
+                    prox_idx=int(_prox_idx))
+
             # --- contact_aware_teleop: teleop wrist+fingers, NLP recommends contacts.
             # Runs ONLY pre-lock-in; after L it falls through to the shared REACH/GRASP
             # machinery below (like autonomous mode) with recommended contacts. ---
@@ -2354,6 +2597,11 @@ if __name__ == "__main__":
                         # hand), re-anchor home to the reset pose, and clear the live
                         # recommendation so stale markers/candidates don't linger. You
                         # then press 8 to re-capture your current hand pose as the offset.
+                        # Backspace is the ONLY abandon path — end any running trial here,
+                        # before mj_resetData zeroes data.time (keeps the duration valid).
+                        if (_trial_runner is not None and _trial_state is not None
+                                and _trial_state.outcome is None):
+                            _trial_runner.abandon_trial(_trial_state, data.time)
                         mj.mj_resetData(model, data)
                         data.qpos[:N_ROBOT] = _Q_BIAS_DP
                         # Zero EVERY DOF's velocity/accel/applied-force (not just the
@@ -2386,6 +2634,19 @@ if __name__ == "__main__":
                     elif _k == 'teleop_start':
                         _dexpilot_ctrl.start(data)
                         print("[teleop] tracking started — home pose captured.")
+                        if _trial_runner is not None:
+                            # Trial starts on press-8, same as dexpilot mode. Re-pressing
+                            # 8 mid-trial abandons the running one and starts fresh; a
+                            # clean end otherwise comes only from timeout or place.
+                            if _trial_state is not None and _trial_state.outcome is None:
+                                _trial_runner.abandon_trial(_trial_state, data.time)
+                            _trial_id = (_trial_state.trial_id + 1
+                                        if _trial_state is not None else 1)
+                            _trial_state = _trial_runner.start_trial(
+                                _trial_id, args.mode, objects[_prox_idx]['name'],
+                                data.time)
+                            if _cat_trigger is not None:
+                                _cat_trigger.reset()
                     elif _k == 'bspheres':
                         _show_bspheres = not _show_bspheres
                         print(f"[teleop] IK collision bounding-sphere overlay "
@@ -2562,6 +2823,9 @@ if __name__ == "__main__":
                                 data.qpos[:N_ROBOT] = _q_live
                                 data.qvel[:N_ROBOT] = 0.0
                                 mj.mj_forward(model, data)
+                        # Lock-in no longer starts or abandons a trial: the trial began
+                        # on press-8 and continues through lock-in. It ends only on
+                        # timeout / place, or is abandoned by a Backspace reset.
                         active_idx = _prox_idx
                         active_tgt = _prox_idx + 1        # targets[0] is home
                         _teleop_active = False
@@ -2585,7 +2849,9 @@ if __name__ == "__main__":
 
                 # --- Dashboard streams (same panels as autonomous mode) ---
                 if dash is not None:
-                    _mode = 'Locking in' if not _teleop_active else 'Teleop'
+                    # Pre-RRT teleop = Approach (standardized). 'Locking in' is the brief
+                    # hand-off frame after L before the Pick pipeline takes over.
+                    _mode = 'Locking in' if not _teleop_active else 'Approach'
                     if (_mode, active_tgt) != _dash_last_mode:
                         dash.push({'type': 'mode', 'mode': _mode,
                                    'target': objects[_prox_idx]['name']})
@@ -2595,6 +2861,7 @@ if __name__ == "__main__":
                                    'name': objects[_prox_idx]['name']})
                         _dash_last_prox = _prox_idx
                     if _dash_i % DASH_PUSH_EVERY == 0:
+                        _push_trial_time(_trial_state, data.time)
                         _t = time.time() - _dash_t0
                         _ogid = objects[_prox_idx]['id_geom']
                         _dvals = {f: _guarded_geom_dist(_TIP_GEOM_IDS[f], _ogid)
@@ -2621,12 +2888,21 @@ if __name__ == "__main__":
 
             # --- DexPilot teleop mode: bypass the RRT/grasp state machine ---
             if args.mode == 'dexpilot':
+                _dpp_iter0 = time.perf_counter() if DP_PROFILE else 0.0
                 _dexpilot_ctrl.spin()
+                if DP_PROFILE:
+                    _t = time.perf_counter(); _dpp_acc['spin'] += _t - _dpp_iter0; _dpp_s = _t
                 _draw_skeleton()   # fused-hand overlay (no-op unless --skeleton-view)
+                if DP_PROFILE:
+                    _t = time.perf_counter(); _dpp_acc['skel'] += _t - _dpp_s; _dpp_s = _t
                 _draw_camera_views()   # per-camera feed grid (no-op unless --camera-views)
+                if DP_PROFILE:
+                    _t = time.perf_counter(); _dpp_acc['camviews'] += _t - _dpp_s
                 _check_pipeline_alive()  # warn if the multicam child died
                 if _tune_retarget:
                     _dexpilot_ctrl.poll_retarget_config()  # hot-reload retarget_config.json edits
+                if DP_PROFILE:
+                    _dpp_acc['spin_draw'] += time.perf_counter() - _dpp_iter0
                 _dp_reset_frame = False   # set by a 'reset' key: skip physics this frame
                 # Drain key queue — handle quit and teleop start/re-zero
                 while not keys.empty():
@@ -2638,6 +2914,9 @@ if __name__ == "__main__":
                         # FREEZE tracking (stop chasing the hand) so the robot holds
                         # the wrist-down home pose. Just like launch, you then press 8
                         # to re-capture your current hand pose as the offset.
+                        if (_trial_runner is not None and _trial_state is not None
+                                and _trial_state.outcome is None):
+                            _trial_runner.abandon_trial(_trial_state, data.time)
                         mj.mj_resetData(model, data)
                         data.qpos[:N_ROBOT] = _Q_BIAS_DP
                         # Zero EVERY DOF's velocity/accel/applied-force (not just the
@@ -2662,6 +2941,20 @@ if __name__ == "__main__":
                         _dexpilot_ctrl.start(data)
                         print("[dexpilot] tracking started — home pose captured "
                               "(hold your hand at the desired neutral orientation).")
+                        if _trial_runner is not None:
+                            # DexPilot has no per-object selection state (see
+                            # trial_logger.py wiring notes) — the scene is expected to
+                            # contain exactly ONE manipulated object per trial batch, so
+                            # objects[0] is unambiguously the target. Re-pressing 8
+                            # mid-trial abandons whatever was running, same as the other
+                            # modes' mid-trial supersession handling.
+                            if _trial_state is not None and _trial_state.outcome is None:
+                                _trial_runner.abandon_trial(_trial_state, data.time)
+                            _trial_id = (_trial_state.trial_id + 1
+                                        if _trial_state is not None else 1)
+                            _trial_state = _trial_runner.start_trial(
+                                _trial_id, 'dexpilot', objects[0]['name'], data.time)
+                            _dp_trigger.reset()
                     elif _k == 'calib_orient':
                         # Hold hand to MATCH the robot wrist, then press 9 to
                         # capture the constant orientation correction.
@@ -2703,7 +2996,10 @@ if __name__ == "__main__":
                     # objects. Tracking is already frozen (init_home above).
                     mj.mj_forward(model, data)
                 else:
+                    _dpp_t0 = time.perf_counter() if DP_PROFILE else 0.0
                     q_teleop = _dexpilot_ctrl.step(model, data)
+                    if DP_PROFILE:
+                        _dpp_acc['step'] += time.perf_counter() - _dpp_t0
                     if args.physics:
                         # PHYSICS teleop: drive the robot toward the retarget target
                         # with a SPRING-only torque (Kp) + gravity comp and mj_step,
@@ -2730,6 +3026,8 @@ if __name__ == "__main__":
                         _elapsed = time.time() - step_start
                         _n_sub = int(np.clip(round(_elapsed / model.opt.timestep),
                                              1, _DP_MAX_SUBSTEPS))
+                        _dpp_t0 = time.perf_counter() if DP_PROFILE else 0.0
+                        _dpp_t0 = time.perf_counter() if DP_PROFILE else 0.0
                         for _ in range(_n_sub):
                             tau_ctrl[:] = 0.0
                             # Arm: inertia-scaled Kp (_dp_Kp_arm, ~3 Hz tracking).
@@ -2740,11 +3038,83 @@ if __name__ == "__main__":
                             data.qfrc_applied[:] = tau_ctrl
                             data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
                             mj.mj_step(model, data)
+                        if DP_PROFILE:
+                            _dpp_acc['substeps'] += time.perf_counter() - _dpp_t0
                     elif q_teleop is not None:
                         # KINEMATIC replay: overwrite qpos (rigid, no collisions).
                         data.qpos[:N_ROBOT] = q_teleop
                         data.qvel[:N_ROBOT] = 0.0
                         mj.mj_forward(model, data)
+
+                _dpp_t0 = time.perf_counter() if DP_PROFILE else 0.0
+                # --- Detect out-of-band resets (MuJoCo's BADQACC auto-reset on
+                # numerical divergence, or the viewer's own Reset button) — same
+                # backstop as the shared autonomous/contact_aware_teleop loop
+                # (_last_sim_time, defined above). Without this, an out-of-band reset
+                # snaps data.time back near 0 with NO key event to catch it, silently
+                # corrupting a running trial's timeout math (t_now - t_start going
+                # negative) instead of cleanly abandoning it.
+                if data.time < _last_sim_time - 1e-12:
+                    if (_trial_runner is not None and _trial_state is not None
+                            and _trial_state.outcome is None):
+                        _trial_runner.abandon_trial(_trial_state, _last_sim_time)
+                _last_sim_time = data.time
+
+                # --- Trial benchmarking (--trial-log, dexpilot): DexPilot has no
+                # control_phase / squeeze_on / object-selection state at all (see
+                # trial_logger.py wiring notes), so approach-contact-counting and the
+                # pick/transport state machine run CONCURRENTLY from trial_start
+                # onward, both keyed to objects[0] (the scene's one manipulated
+                # object — see the single-object-per-trial design). No-op unless
+                # --trial-log was passed (implies --physics, forced above).
+                if (_trial_runner is not None and _trial_state is not None
+                        and _trial_state.outcome is None):
+                    _tnow_dp = data.time
+                    _dp_obj  = objects[0]
+                    _trial_runner.step_approach(
+                        _trial_state, _tnow_dp, data.contact[:data.ncon],
+                        _HAND_GIDS, _dp_obj['id_geom'])
+                    _hh_dp = _trial_rest_hh[0]
+                    _height_above_rest_dp = (float(data.geom_xpos[_dp_obj['id_geom']][2])
+                                             - _hh_dp)
+                    _d_s1_dp = _dexpilot_ctrl.retargeter.last_d_s1
+                    _touching_dp = _dp_obj['id_geom'] in {
+                        (c.geom2 if c.geom1 in _HAND_GIDS else c.geom1)
+                        for c in data.contact[:data.ncon]
+                        if c.geom1 in _HAND_GIDS or c.geom2 in _HAND_GIDS}
+                    _fired_dp  = _dp_trigger.update(_d_s1_dp, _touching_dp)
+                    _active_dp = (min(_d_s1_dp) < _dp_trigger.eps) and _touching_dp
+                    _sid_dp = _trial_place_sid.get(0, -1)
+                    _xy_off_dp = _spd_dp = None
+                    if _sid_dp >= 0:
+                        _xy_off_dp = float(np.linalg.norm(
+                            data.geom_xpos[_dp_obj['id_geom']][:2]
+                            - data.site_xpos[_sid_dp][:2]))
+                        _dofadr_dp = _trial_dofadr[0]
+                        _spd_dp = float(np.linalg.norm(data.qvel[_dofadr_dp:_dofadr_dp + 3]))
+                    _arrived_dp = _trial_runner.step_pick_or_transport(
+                        _trial_state, _tnow_dp, trigger_fired=_fired_dp,
+                        trigger_active=_active_dp,
+                        height_above_rest=_height_above_rest_dp,
+                        place_xy_offset=_xy_off_dp, object_speed=_spd_dp)
+                    _dp_thumb_sid = id_C[FINGER_SET.index('thumb')]
+                    _dp_index_sid = id_C[FINGER_SET.index('index')]
+                    _trial_runner.trace.sample(
+                        t=_tnow_dp,
+                        p_thumb=data.site_xpos[_dp_thumb_sid].copy(),
+                        p_index=data.site_xpos[_dp_index_sid].copy(),
+                        obj_pos=data.geom_xpos[_dp_obj['id_geom']].copy(),
+                        obj_quat=data.xquat[_dp_obj['id_body']].copy(),
+                        obj_linvel=data.qvel[_trial_dofadr[0]:_trial_dofadr[0] + 3].copy(),
+                        height_above_rest=_height_above_rest_dp,
+                        phase=1 if _trial_state.phase == TrialPhase.TRANSPORT else 0)
+                    if (_arrived_dp
+                            or _trial_runner.check_timeout(_trial_state, _tnow_dp)):
+                        _trial_runner.end_trial(_trial_state, _tnow_dp)
+                if DP_PROFILE:
+                    _dpp_acc['trial_log'] += time.perf_counter() - _dpp_t0
+                    _dpp_t0 = time.perf_counter()
+
                 # Visualise BOTH the IK target frame (thick, the pose the arm IK
                 # drives pinch_site toward) AND the robot's CURRENT pinch_site
                 # frame (thin). The GAP between them is the live IK error —
@@ -2783,6 +3153,38 @@ if __name__ == "__main__":
                                 data.site_xmat[_psid].reshape(3, 3).copy(),
                                 0.06, 0.004)
                 viewer.sync()
+                # Trial countdown to the dashboard. The dexpilot branch has its own
+                # viewer.sync()+continue and never falls through to the shared dashboard
+                # block below, so the timer push lives here (throttled like the shared
+                # streams). Event-log rows arrive independently via the EventLogger tee.
+                if dash is not None and _dash_i % DASH_PUSH_EVERY == 0:
+                    _push_trial_time(_trial_state, data.time)
+                _dash_i += 1
+                if DP_PROFILE:
+                    _dpp_acc['viz_sync'] += time.perf_counter() - _dpp_t0
+                    _dpp_acc['iter'] += time.perf_counter() - _dpp_iter0
+                    _dpp_acc['n'] += 1
+                    if time.time() - _dpp_last >= 1.0:
+                        _n = max(_dpp_acc['n'], 1)
+                        print(f"\r\n[dexpilot-profile] {_dpp_acc['n']} iters/s | "
+                              f"per-iter ms: "
+                              f"spin_draw={_dpp_acc['spin_draw']/_n*1e3:.3f} "
+                              f"[spin={_dpp_acc['spin']/_n*1e3:.3f} "
+                              f"skel={_dpp_acc['skel']/_n*1e3:.3f} "
+                              f"camviews={_dpp_acc['camviews']/_n*1e3:.3f}] "
+                              f"step={_dpp_acc['step']/_n*1e3:.3f} "
+                              f"substeps={_dpp_acc['substeps']/_n*1e3:.3f} "
+                              f"trial_log={_dpp_acc['trial_log']/_n*1e3:.3f} "
+                              f"viz_sync={_dpp_acc['viz_sync']/_n*1e3:.3f} "
+                              f"| TOTAL={_dpp_acc['iter']/_n*1e3:.3f}  "
+                              f"(budget/iter={model.opt.timestep*1e3:.2f}ms x up to "
+                              f"{_DP_MAX_SUBSTEPS} substeps = "
+                              f"{model.opt.timestep*_DP_MAX_SUBSTEPS*1e3:.1f}ms cap)")
+                        _dpp_acc = {'spin_draw': 0.0, 'spin': 0.0, 'skel': 0.0,
+                                    'camviews': 0.0, 'step': 0.0, 'substeps': 0.0,
+                                    'trial_log': 0.0, 'viz_sync': 0.0, 'iter': 0.0,
+                                    'n': 0}
+                        _dpp_last = time.time()
                 # Pace to real time. In --physics we advanced _n_sub timesteps this
                 # iteration, so the wall-clock budget is _n_sub*timestep (else one).
                 # On a fast machine this sleeps the remainder; when the iteration
@@ -2799,10 +3201,11 @@ if __name__ == "__main__":
                                    for _tg in _ALL_TIP_GIDS]) for _o in objects]
                 _prox_idx = int(np.argmin(_avg_d))
             if dash is not None:
-                # Display terminology: PLAN/REACH → Approach; GRASP → Grasp, or
-                # Transport while the object is being jogged (arrow keys held).
-                _mode = ('Approach' if control_phase in ('PLAN', 'REACH')
-                         else ('Transport' if _held_arrows else 'Grasp'))
+                # Standardized display terminology (see TrialPhase): the whole post-lock-in
+                # RRT+grasp pipeline (PLAN/REACH/GRASP) is PICK; Transport while the object
+                # is being jogged/lifted (arrow keys held). Pre-lock-in teleop shows
+                # 'Approach' from the teleop branch's own _mode (see the _teleop_active path).
+                _mode = 'Transport' if _held_arrows else 'Pick'
                 if (_mode, active_tgt) != _dash_last_mode:
                     dash.push({'type': 'mode', 'mode': _mode,
                                'target': targets[active_tgt]['label']})
@@ -2811,6 +3214,7 @@ if __name__ == "__main__":
                     dash.push({'type': 'active_obj', 'name': objects[_prox_idx]['name']})
                     _dash_last_prox = _prox_idx
                 if _dash_i % DASH_PUSH_EVERY == 0:
+                    _push_trial_time(_trial_state, data.time)
                     _t = time.time() - _dash_t0
                     # distmax=2.0 (scene ~1 m): distances above this clamp to 2.0, so the
                     # cap is set high enough to show most of the reach, not just contact.
@@ -3154,6 +3558,14 @@ if __name__ == "__main__":
                     # live scene (IK staleness check below re-solves if objects moved).
                     new_tgt = int(key[4:])
                     if 0 <= new_tgt < len(targets):
+                        if (_trial_runner is not None and _trial_state is not None
+                                and _trial_state.outcome is None):
+                            # ANY new selection (home, a different object, or a re-plan
+                            # on the SAME object) preempts a still-running trial — force-
+                            # end it rather than silently orphaning it below. Re-planning
+                            # the same object starts a fresh trial_id, consistent with
+                            # the lock-in path's re-lock-in handling.
+                            _trial_runner.abandon_trial(_trial_state, data.time)
                         active_tgt = new_tgt
                         active_idx = max(0, active_tgt - 1)  # map back to objects[]
                         _ik_vis_mode = None   # exit vis mode when switching target
@@ -3197,6 +3609,14 @@ if __name__ == "__main__":
                                     daemon=True)
                             plan_thread.start()
                             control_phase = 'PLAN'
+                            if _trial_runner is not None:
+                                _trial_id = (_trial_state.trial_id + 1
+                                            if _trial_state is not None else 1)
+                                _trial_state = _trial_runner.start_trial(
+                                    _trial_id, args.mode, objects[obj_i]['name'],
+                                    data.time)
+                                if _dp_trigger is not None:
+                                    _dp_trigger.reset()
                         print(f"\r\n[Control] → {targets[active_tgt]['label']}")
 
                 elif key == 'quit':
@@ -3212,6 +3632,11 @@ if __name__ == "__main__":
             # re-solves automatically if the restored scene differs from the snapshot a
             # cache entry was solved against.
             if _reset_req:
+                if (_trial_runner is not None and _trial_state is not None
+                        and _trial_state.outcome is None):
+                    # Backspace re-homes the whole scene mid-trial — force-end it rather
+                    # than leaving it orphaned across the reset.
+                    _trial_runner.abandon_trial(_trial_state, data.time)
                 if plan_thread is not None:
                     _plan_discard = True   # in-flight IK/RRT started pre-reset: drop it
                 mj.mj_resetData(model, data)
@@ -3516,6 +3941,66 @@ if __name__ == "__main__":
                                'torque': 0.0, 'step': 0.0, 'n': 0}
                     _gp_last = time.time()
 
+            # --- Trial benchmarking (--trial-log): detectors + trace, every real
+            # physics step, independent of which control_phase branch ran above. See
+            # trial_logger.py for the state machine this drives. No-op when the trial
+            # runner wasn't constructed (--trial-log omitted).
+            if (_trial_runner is not None and _trial_state is not None
+                    and _trial_state.outcome is None):   # skip once ended, until the
+                                                           # next trial_start replaces it
+                _tid  = _trial_state.trial_id
+                _tnow = data.time
+                if control_phase in ('PLAN', 'REACH'):
+                    _trial_runner.set_phase(_trial_state, _tnow, control_phase)
+                    _trial_runner.step_approach(
+                        _trial_state, _tnow, data.contact[:data.ncon],
+                        _HAND_GIDS, obj['id_geom'])
+                    if _trial_runner.check_timeout(_trial_state, _tnow):
+                        _trial_runner.end_trial(_trial_state, _tnow)
+                elif control_phase == 'GRASP':
+                    _hh = _trial_rest_hh[active_idx]
+                    _height_above_rest = float(data.geom_xpos[obj['id_geom']][2]) - _hh
+                    if _dp_trigger is not None:
+                        _d_s1 = (_dexpilot_ctrl.retargeter.last_d_s1
+                                 if _dexpilot_ctrl is not None else [float('inf')] * 3)
+                        _touching = obj['id_geom'] in {
+                            (c.geom2 if c.geom1 in _HAND_GIDS else c.geom1)
+                            for c in data.contact[:data.ncon]
+                            if c.geom1 in _HAND_GIDS or c.geom2 in _HAND_GIDS}
+                        _fired  = _dp_trigger.update(_d_s1, _touching)
+                        _active = (min(_d_s1) < _dp_trigger.eps) and _touching
+                    else:
+                        _fired  = _cat_trigger.update(squeeze_on)
+                        _active = squeeze_on
+                    _sid = _trial_place_sid.get(active_idx, -1)
+                    _xy_off = _spd = None
+                    if _sid >= 0:
+                        _xy_off = float(np.linalg.norm(
+                            data.geom_xpos[obj['id_geom']][:2] - data.site_xpos[_sid][:2]))
+                        _dofadr = _trial_dofadr[active_idx]
+                        _spd = float(np.linalg.norm(data.qvel[_dofadr:_dofadr + 3]))
+                    _arrived = _trial_runner.step_pick_or_transport(
+                        _trial_state, _tnow, trigger_fired=_fired,
+                        trigger_active=_active, height_above_rest=_height_above_rest,
+                        place_xy_offset=_xy_off, object_speed=_spd)
+                    _trial_runner.trace.sample(
+                        t=_tnow,
+                        p_thumb=data.site_xpos[id_C[FINGER_SET.index('thumb')]].copy(),
+                        p_index=data.site_xpos[id_C[FINGER_SET.index('index')]].copy(),
+                        obj_pos=data.geom_xpos[obj['id_geom']].copy(),
+                        obj_quat=data.xquat[obj['id_body']].copy(),
+                        obj_linvel=data.qvel[_trial_dofadr[active_idx]:
+                                             _trial_dofadr[active_idx] + 3].copy(),
+                        height_above_rest=_height_above_rest,
+                        phase=1 if _trial_state.phase == TrialPhase.TRANSPORT else 0,
+                        # Robot joint config (full arm+hand) — the warmstart q_seed a PD/
+                        # gamma tuning harness replays: recommender -> RRT -> grasp -> lift.
+                        # Full object qpos (pos+quat) pairs with it as the recommender input.
+                        q_robot=data.qpos[:N_ROBOT].copy(),
+                        obj_qpos=data.qpos[N_ROBOT:].copy())
+                    if _arrived or _trial_runner.check_timeout(_trial_state, _tnow):
+                        _trial_runner.end_trial(_trial_state, _tnow)
+
             # Teleop: keep the achieved-contact markers pinned to the object as it
             # moves (jog during GRASP) by re-expressing the stored object-local
             # achieved contacts in the world. Hidden until a lock-in plan succeeds.
@@ -3562,6 +4047,12 @@ if __name__ == "__main__":
             time.sleep(max(0, model.opt.timestep - (time.time() - step_start)))
 
     _kb_listener.stop()
+    # Persist the always-on pose recorder (warmstart source for PD/gamma tuning).
+    if _pose_trace is not None and len(_pose_trace) > 0:
+        _pose_path = Path('logs') / args.trial_log / 'pose_trace.npz'
+        _pose_n = len(_pose_trace)
+        _pose_trace.save(_pose_path)
+        print(f"[pose-trace] saved {_pose_path} ({_pose_n} rows)")
     if dash is not None:
         dash.close()
     # (retargeting sliders live in the MediaPipe subprocess window; it cleans up
@@ -3582,12 +4073,30 @@ if __name__ == "__main__":
         # fusion subprocesses and tears them down on SIGINT; SIGTERM would orphan
         # them. The single-cam publisher handles SIGTERM fine. Send SIGINT for the
         # pipeline, then wait (with a grace fallback to terminate).
+        #
+        # Because the child was launched with start_new_session=True it's the
+        # leader of its own process group (pgid == pid), so we signal the WHOLE
+        # GROUP via os.killpg — this reaches the grandchildren (landmark + fusion
+        # nodes) even if the supervisor itself has already died, which is what
+        # left orphans holding /dev/video* before. Fall back to signalling just
+        # the child if the group lookup fails (e.g. it already exited).
+        def _signal_child_group(sig):
+            try:
+                os.killpg(os.getpgid(_mediapipe_proc.pid), sig)
+            except (ProcessLookupError, PermissionError):
+                # Group already gone, or not our leader — signal the child directly.
+                try:
+                    _mediapipe_proc.send_signal(sig)
+                except ProcessLookupError:
+                    pass
         if args.multicam:
-            _mediapipe_proc.send_signal(signal.SIGINT)
+            _signal_child_group(signal.SIGINT)
             try:
                 _mediapipe_proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
-                _mediapipe_proc.terminate()
+                # Supervisor didn't tear down in time — SIGKILL the whole group so
+                # no landmark/fusion grandchild is left running or holding a camera.
+                _signal_child_group(signal.SIGKILL)
                 _mediapipe_proc.wait()
         else:
             _mediapipe_proc.terminate()

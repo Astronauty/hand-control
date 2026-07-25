@@ -760,7 +760,7 @@ class GraspConfig3D:
     # placed in the rim band, so a grasp that needs a near-edge contact becomes INFEASIBLE
     # (solve returns no contacts) rather than slipping. Per-axis auto-clamped so the band
     # never empties a small face. BOX only. 0.0 = off (full face usable).
-    edge_margin_m:     float = 0.010   # hard keep-out band width from each face edge (m)
+    edge_margin_m:     float = 0.015   # hard keep-out band width from each face edge (m)
 
     col_clearance_m:  float = 0.005
 
@@ -799,6 +799,14 @@ class GraspConfig3D:
     n_seeds:             int  = 5    # seed pairs per multi-start (each from _seed_pair)
     n_normal_relinearize: int  = 1
     verbose_profile:      bool = False
+
+    # Antipodal-march jitter (deg): _seed_pair marches from contact 1 along its inward
+    # normal rotated by up to +/- this angle to find contact 2. Large values (the old 45)
+    # let the march exit through an ADJACENT box face ~half the time; since each contact
+    # is then HARD-PINNED to its seed face, the solve returns a non-opposite grasp that
+    # w_align cannot rescue. A smaller angle keeps contact 2 on the opposing face while
+    # still allowing some obliqueness.
+    seed_march_jitter_deg: float = 15.0
 
     # Solver — use_slsqp=True  → SQP+OSQP (default; linear face-pin + wrench constraints exact)
     #           use_slsqp=False → IPOPT (interior-point; use for non-box geometries)
@@ -2168,8 +2176,18 @@ class MultiStartGraspPlanner3D:
             f"(I={np.round(_inert_init,6).tolist()}  α={list(_aab_init)})")
 
     def solve(self, q_ref: np.ndarray, obj_pos: np.ndarray,
-              max_seeds: int | None = None) -> dict:
-        """Try _seed_pair seeds (up to max_seeds), return best result ranked by cost."""
+              max_seeds: int | None = None,
+              warm_contacts: tuple | None = None) -> dict:
+        """Try _seed_pair seeds (up to max_seeds), return best result ranked by cost.
+
+        warm_contacts : optional (p1_world, p2_world) from a PRIOR accepted solve. When
+            given, a deterministic seed reconstructed from those contacts (normals recom-
+            puted from the current object geometry) is tried FIRST, ahead of the random
+            seeds. This anchors a repeated solve on a static object back to the previous
+            basin, so the recommended contacts stop jumping between local optima frame to
+            frame. It counts against the seed budget; the random seeds still run for
+            exploration, and _rank keeps whichever is genuinely best.
+        """
         c       = np.asarray(obj_pos, float)
         cfg     = self._planner.cfg
         dash    = self._planner.dash
@@ -2228,7 +2246,8 @@ class MultiStartGraspPlanner3D:
         # sample seeds for solver
         while len(seeds) < n_seeds and attempts < max_attempts:
             attempts += 1
-            s = _seed_pair(geom_type, geom_size, c, obj_R_np, bbox_r, self._rng)
+            s = _seed_pair(geom_type, geom_size, c, obj_R_np, bbox_r, self._rng,
+                           delta_max=np.deg2rad(cfg.seed_march_jitter_deg))
             # # Hemisphere check — n1 and n2 must point into opposing hemispheres
             # if float(np.dot(s['n1_in'], s['n2_in'])) >= 0:
             #     rejected += 1
@@ -2248,6 +2267,34 @@ class MultiStartGraspPlanner3D:
         log.info(
             f"[seed_gen] {len(seeds)} seeds in {(time.perf_counter()-_t0)*1e3:.1f}ms "
             f"({attempts} attempts, {rejected} rejected)")
+
+        # Warm-start seed from the prior accepted contacts (project onto the CURRENT
+        # surface, recompute normals) — tried first so a re-solve on a static object
+        # returns to the same basin instead of a fresh random local optimum. Only used
+        # if both reconstructed contacts are reachable; drops one random seed to keep
+        # the total at n_seeds.
+        if warm_contacts is not None:
+            try:
+                _wp1 = _project_to_surface_np(np.asarray(warm_contacts[0], float),
+                                              geom_type, c, obj_R_np, geom_size)
+                _wp2 = _project_to_surface_np(np.asarray(warm_contacts[1], float),
+                                              geom_type, c, obj_R_np, geom_size)
+                _wn1 = -_geom_normal_np(_wp1, geom_type, c, obj_R_np, geom_size)
+                _wn2 = -_geom_normal_np(_wp2, geom_type, c, obj_R_np, geom_size)
+                if (_reachable_contact(_wp1, _ground_z, _r_tip_min) and
+                        _reachable_contact(_wp2, _ground_z, _r_tip_min)):
+                    _warm_seed = {'p1': _wp1.copy(), 'p2': _wp2.copy(),
+                                  'p1s': _wp1, 'p2s': _wp2,
+                                  'n1_in': _wn1, 'n2_in': _wn2,
+                                  'offsets': (0.0, 0.0), 'delta_deg': 0.0}
+                    if len(seeds) >= n_seeds and seeds:
+                        seeds[-1] = _warm_seed        # replace a random seed
+                    else:
+                        seeds.append(_warm_seed)
+                    seeds.insert(0, seeds.pop())      # try the warm seed FIRST
+                    log.info("[seed_gen] warm-start seed from prior contacts prepended")
+            except Exception as _e:
+                log.debug(f"[seed_gen] warm-start seed skipped: {_e}")
 
         results = []
         for i, seed in enumerate(seeds):

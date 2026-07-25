@@ -93,6 +93,7 @@ class DexPilotController:
         self._arm.init_home(data)
 
     def shutdown(self) -> None:
+        self._arm.close()   # stop the background IK worker thread
         self._ros.shutdown()
 
     # ------------------------------------------------------------------
@@ -211,6 +212,13 @@ class DexPilotController:
             palm_R, _     = self._retarg.human_palm_frame_robot_aligned(world_lm)
         q_arm          = self._arm.step(cam_wrist, data, palm_R=palm_R)
 
+        # The arm IK now solves on a BACKGROUND thread (see DexPilotArmController)
+        # and returns None until the worker has produced its first solution (the
+        # first frame or two after press-8 / reset). Propagate that None — the
+        # teleop loop already holds the last pose when step() returns None — rather
+        # than concatenating it (np.concatenate([None, ...]) crashes on a 0-d array).
+        if q_arm is None:
+            return None
         return np.concatenate([q_arm, q_hand])
 
     @property

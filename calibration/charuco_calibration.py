@@ -299,12 +299,37 @@ def _open_camera(index: int, width: int, height: int,
     if max_res:
         _request_max_res(cap)
     else:
+        # Force MJPG BEFORE requesting the size. These UVC webcams only expose
+        # their high-res modes (e.g. 1920x1080) under MJPG; the default YUYV
+        # format tops out at 640x480, so a bare 1920x1080 request silently
+        # CLAMPS to 640x480 YUYV — the exact trap that produced the squashed
+        # c1/c2 intrinsics. (_request_max_res already does this; the fixed-size
+        # path was missing it.)
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except Exception:
+            pass
         if width:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         if height:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Refuse to proceed if the camera substituted a different size than asked
+    # for. Calibrating at a silently-clamped resolution bakes a mis-scaled K
+    # (and a wrong image_size) into the file — invisible until every extrinsic
+    # distance solved against it comes out wrong. max_res has no target to
+    # check against (it takes whatever the ladder tops out at); realsense is
+    # fixed at construction and never reaches here.
+    if not max_res and width and height and (aw, ah) != (width, height):
+        cap.release()
+        sys.exit(
+            f"ERROR: camera index {index} would not open at the requested "
+            f"{width}x{height} — it clamped to {aw}x{ah}. That mode is not "
+            f"available on this camera/pixel-format (check "
+            f"v4l2-ctl --list-formats-ext). Calibrating at the clamped size "
+            f"would bake a mis-scaled camera matrix into the file. Pass a "
+            f"--width/--height the camera actually supports, or --max-res.")
     print(f"[camera] index {index} opened at {aw}x{ah} — intrinsics will be "
           f"valid ONLY at this size.")
     return cap
@@ -632,6 +657,53 @@ def _warn_if_distortion_overfit(dist) -> None:
               "or capture more views with the board pushed into the CORNERS.")
 
 
+def _warn_if_intrinsics_geometry_bad(camera_matrix, image_size) -> None:
+    """Flag a squashed/wrong-aspect intrinsic — the signature of calibrating on
+    frames whose actual geometry didn't match the declared image_size (e.g. a
+    camera streaming a scaled/letterboxed mode into a buffer of a different
+    resolution). Two independent tells, both resolution-bound so focus/motion
+    can't cause them:
+
+      - fx != fy: real webcam pixels are square, so fx/fy should be ~1. A large
+        ratio means one axis was scaled relative to the other before calibration.
+        This corrupts the metric focal length, so every extrinsic distance solved
+        against this K is off by the same factor — right board size, wrong range.
+      - principal point far from the frame centre: cx,cy normally land within
+        ~15% of (W/2, H/2). A cy sitting near H/4 is the vertical-squash smoking
+        gun (the centre of a scaled-in image lands at a fraction of the buffer).
+
+    Warn (not error) so an unusual-but-intentional sensor still saves; the RMS
+    can be excellent (sharp corners) while the geometry is wrong, so this catches
+    what the reprojection error and the distortion guard both miss.
+    """
+    fx, fy = float(camera_matrix[0][0]), float(camera_matrix[1][1])
+    cx, cy = float(camera_matrix[0][2]), float(camera_matrix[1][2])
+    W, H = int(image_size[0]), int(image_size[1])
+    ratio = fx / fy if fy else float("inf")
+    # 10% aspect and 15% principal-point tolerances pass every genuine square-
+    # pixel calibration seen on this rig while flagging the ~1.44 squash we hit.
+    aspect_bad = abs(ratio - 1.0) > 0.10
+    pp_bad = (abs(cx - W / 2.0) > 0.15 * W) or (abs(cy - H / 2.0) > 0.15 * H)
+    if not (aspect_bad or pp_bad):
+        return
+    print("[intrinsics] *** WARNING: intrinsic geometry looks WRONG ***")
+    if aspect_bad:
+        # Recover the stream height that WOULD make pixels square, so the message
+        # points straight at the likely real capture size to recalibrate at.
+        implied_h = H * (fy / fx) if fx else 0.0
+        print(f"[intrinsics]   fx={fx:.0f} fy={fy:.0f} (fx/fy={ratio:.3f}); "
+              f"square pixels need fx~=fy. This vertical field matches a stream "
+              f"height of ~{implied_h:.0f}px, not the declared {H}.")
+    if pp_bad:
+        print(f"[intrinsics]   principal point (cx,cy)=({cx:.0f},{cy:.0f}) is far "
+              f"from the frame centre ({W//2},{H//2}).")
+    print("[intrinsics]   The camera likely streamed a SCALED/letterboxed mode, "
+          "not a native {}x{} frame. Every extrinsic distance solved against this "
+          "K will be off. Confirm the real capture size (v4l2-ctl "
+          "--list-formats-ext) and recalibrate at a native, square-pixel mode."
+          .format(W, H))
+
+
 def _run_intrinsics_calib(board, all_corners, all_ids, image_size, out_path,
                           fix_k3: bool = False, hardware_id: str | None = None) -> None:
     # Build object/image point correspondences per view from the board model,
@@ -663,6 +735,7 @@ def _run_intrinsics_calib(board, all_corners, all_ids, image_size, out_path,
     print(f"[intrinsics] camera_matrix=\n{camera_matrix}")
     print(f"[intrinsics] dist_coeffs={dist_coeffs.ravel()}")
     _warn_if_distortion_overfit(dist_coeffs.ravel())
+    _warn_if_intrinsics_geometry_bad(camera_matrix, image_size)
 
     data = {
         "image_size": list(image_size),

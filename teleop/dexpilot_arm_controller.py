@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 import numpy as np
 import mujoco as mj
@@ -274,8 +275,28 @@ class DexPilotArmController:
         self._ik      = SpatialIKSolver(n_robot=n_arm, adaptive_damping=True,
                                         lambda_max=0.15, w0=0.02)
 
-        # Scratch MjData so the IK iterations don't affect the main sim state
+        # Scratch MjData so the IK iterations don't affect the main sim state.
+        # OWNED BY THE IK WORKER THREAD (see _ik_worker) — never touch it from the
+        # control thread once the worker is running, or the two race on qpos.
         self._scratch = mj.MjData(model)
+
+        # --- Off-thread IK -------------------------------------------------
+        # The DLS solve (up to max_iter Jacobian iterations, each an
+        # mj_kinematics+jacSite+inv) is far too heavy to run on the render/control
+        # thread at frame rate — doing so froze the MuJoCo window the instant
+        # tracking started (press-8). Instead a daemon worker owns self._scratch
+        # and solves continuously from the LATEST target the control thread posts;
+        # step() posts the new target and returns the most recently SOLVED q_arm
+        # (one-frame latency, standard for async IK). All shared state below is
+        # guarded by _ik_lock; _ik_target_evt wakes the worker on a new target.
+        self._ik_lock   = threading.Lock()
+        self._ik_target_evt = threading.Event()
+        self._ik_pending: dict | None = None      # {seed, pos, orientation} to solve
+        self._ik_result: np.ndarray | None = None  # latest solved q_arm (n_arm,)
+        self._ik_stop   = threading.Event()
+        self._ik_thread = threading.Thread(
+            target=self._ik_worker, name="dexpilot-arm-ik", daemon=True)
+        self._ik_thread.start()
 
         self._q_arm_prev: np.ndarray | None = None
         self._cam_home:   np.ndarray | None = None   # first received camera wrist xy
@@ -455,24 +476,73 @@ class DexPilotArmController:
         else:
             self._tgt_R = None
 
-        # Seed the scratch state from the current arm configuration
-        self._scratch.qpos[:self._n_arm] = data.qpos[:self._n_arm].copy()
-        mj.mj_forward(self._model, self._scratch)
+        # Hand the target off to the IK worker (which owns self._scratch) and
+        # return the LATEST solved q_arm without blocking. The seed is the CURRENT
+        # arm configuration so the worker warm-starts from where the robot actually
+        # is this frame. First few frames (before the worker has produced anything)
+        # return None, matching the pre-tracking contract callers already handle.
+        with self._ik_lock:
+            self._ik_pending = {
+                "seed": data.qpos[:self._n_arm].copy(),
+                "pos": pos_target,
+                "orientation": orientation,
+            }
+            q_solved = None if self._ik_result is None else self._ik_result.copy()
+        self._ik_target_evt.set()
 
-        q_full = self._ik.solve(
-            self._model, self._scratch,
-            [self._site_id], [pos_target],
-            orientations=[orientation],
-            q_bias=self._q_bias,
-            null_gain=0.3,
-        )
-        q_arm = q_full[:self._n_arm].copy()
+        if q_solved is None:
+            # No solution yet — hold the previous smoothed target (or None on the
+            # very first frame) so the arm doesn't jump to an unsolved pose.
+            return None if self._q_arm_prev is None else self._q_arm_prev.copy()
 
-        # EMA smoothing
+        # EMA smoothing (on the control thread, against the last returned target).
         if self._q_arm_prev is not None:
-            q_arm = self._alpha * q_arm + (1.0 - self._alpha) * self._q_arm_prev
+            q_arm = self._alpha * q_solved + (1.0 - self._alpha) * self._q_arm_prev
+        else:
+            q_arm = q_solved
         self._q_arm_prev = q_arm.copy()
         return q_arm
+
+    def _ik_worker(self) -> None:
+        """Background loop: solve IK from the latest posted target, forever.
+
+        Owns self._scratch exclusively. Blocks on _ik_target_evt until step()
+        posts a target, then solves and publishes q_arm under _ik_lock. Only ever
+        solves the MOST RECENT target — if several arrive while one solve is in
+        flight, the stale ones are skipped (we always chase the freshest hand
+        pose, never a backlog). Exits when _ik_stop is set (see close())."""
+        while not self._ik_stop.is_set():
+            # Wait for a target; time out periodically so a set _ik_stop is noticed.
+            if not self._ik_target_evt.wait(timeout=0.1):
+                continue
+            self._ik_target_evt.clear()
+            with self._ik_lock:
+                job = self._ik_pending
+                self._ik_pending = None
+            if job is None:
+                continue
+            self._scratch.qpos[:self._n_arm] = job["seed"]
+            mj.mj_forward(self._model, self._scratch)
+            try:
+                q_full = self._ik.solve(
+                    self._model, self._scratch,
+                    [self._site_id], [job["pos"]],
+                    orientations=[job["orientation"]],
+                    q_bias=self._q_bias,
+                    null_gain=0.3,
+                )
+            except Exception as e:   # noqa: BLE001 — a bad solve must not kill the worker
+                print(f"[arm] IK worker solve error (skipping): {e!r}")
+                continue
+            with self._ik_lock:
+                self._ik_result = q_full[:self._n_arm].copy()
+
+    def close(self) -> None:
+        """Stop the IK worker thread. Safe to call multiple times."""
+        self._ik_stop.set()
+        self._ik_target_evt.set()   # unblock the wait so it sees the stop flag
+        if self._ik_thread.is_alive():
+            self._ik_thread.join(timeout=1.0)
 
     def target_frame(self) -> tuple[np.ndarray, np.ndarray] | None:
         """Return the last IK target pose (pos, R) in world coords, or None.
@@ -592,3 +662,8 @@ class DexPilotArmController:
         self._board_ref   = None   # re-snap the absolute board zero on press-8
         self._palm_R_home = None
         self._R_align     = np.eye(3)   # re-capture press-8 orientation alignment
+        # Drop any stale async IK solution so the first frame after re-zeroing
+        # doesn't return a q_arm solved against the PRE-reset target.
+        with self._ik_lock:
+            self._ik_pending = None
+            self._ik_result  = None

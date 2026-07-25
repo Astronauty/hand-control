@@ -87,6 +87,7 @@ class DexPilotRetargeter:
         self._n_arm = n_arm
         self._n_hand = 16
         self.debug = debug   # print S1 pinch distances vs EPS each frame
+        self.last_d_s1: list[float] = [float('inf')] * 3   # set on first retarget()
 
         # Promote the class-attribute defaults to per-instance fields so the live
         # tuner (and the eps override / saved config below) mutate only this
@@ -433,6 +434,8 @@ class DexPilotRetargeter:
         """
         human_vecs = self._human_vectors(world_lm, tip_lm=image_lm)
         d_s1 = [float(np.linalg.norm(human_vecs[4 + i]['r'])) for i in range(3)]
+        self.last_d_s1 = d_s1   # exposed for pinch-trigger detection (trial_logger.py);
+                                 # index/middle/ring tip -> thumb tip distances (m)
 
         x0 = (q_prev if q_prev is not None
                else (self._q_prev if self._q_prev is not None

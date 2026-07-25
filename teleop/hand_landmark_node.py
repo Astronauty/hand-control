@@ -57,7 +57,7 @@ from sensor_msgs.msg import CompressedImage
 
 import mediapipe as mp
 
-from hand_message import HAND_CONNECTIONS, WORLD_FROM_BOARD
+from hand_message import HAND_CONNECTIONS, WORLD_FROM_BOARD, sensor_qos
 
 # Model lives next to the original publisher.
 _MODEL_PATH = os.path.join(
@@ -259,14 +259,17 @@ class HandLandmarkNode(Node):
         self._name = name
         self._show = show
         self._realsense = realsense
+        # BEST_EFFORT sensor QoS (see hand_message.sensor_qos): publish() must
+        # NEVER block on a slow subscriber, or a wedged consumer back-pressures
+        # this node's capture loop and freezes the camera (the press-8 freeze).
         self._pub = self.create_publisher(
-            Float32MultiArray, f"/hand/cam_{name}/landmarks", 10)
+            Float32MultiArray, f"/hand/cam_{name}/landmarks", sensor_qos())
 
         # Downscaled JPEG PREVIEW thumbnail on a SEPARATE, throttled topic — for
         # the combined viewer only. Kept small (thumb width) + low-rate so it never
         # competes with the full-res landmark stream or /hand/joint_angles.
         self._preview_pub = self.create_publisher(
-            CompressedImage, f"/hand/cam_{name}/preview", 2)
+            CompressedImage, f"/hand/cam_{name}/preview", sensor_qos())
         # Preview is now the PRIMARY camera view (tiled in its own window), so it
         # is larger + faster than a corner thumbnail. Still JPEG-compressed on a
         # throttled topic so it never competes with the full-res landmark stream.
@@ -287,6 +290,13 @@ class HandLandmarkNode(Node):
             self._cap = cv2.VideoCapture(camera)
             if not self._cap.isOpened():
                 raise RuntimeError(f"could not open camera index {camera}")
+            # Newest frame only: keeps read() from serving a queued stale buffer, both
+            # in steady state and after a wedge (matched on the reopen path). Best-
+            # effort — some backends ignore it.
+            try:
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
 
             if max_res:
                 width, height = self._request_max_res()
@@ -311,6 +321,12 @@ class HandLandmarkNode(Node):
         # dropout instead of exiting (a clean exit tore the whole pipeline down).
         self._camera_idx = camera
         self._cap_w, self._cap_h = width, height
+        # Reopen escalation: a kernel-level UVC wedge (identical-frame freeze under
+        # load) is often NOT cleared by immediately reopening the same busy /dev/videoN
+        # — the reopened handle re-serves the same stale buffer and the freeze detector
+        # re-trips forever. Count consecutive failed reopens so we can wait longer each
+        # time (let the driver actually release the device) instead of tight-looping.
+        self._reopen_fails = 0
 
         # ACTUAL capture size (the camera may clamp our request to a supported
         # mode). This is what gets published as cam_w/cam_h and what the camera's
@@ -405,9 +421,16 @@ class HandLandmarkNode(Node):
         return best
 
     def _reopen_camera(self) -> bool:
-        """Reopen the camera after a dropout, restoring the resolution. Returns
-        True on success. Keeps the pipeline alive across a transient USB glitch
-        that would otherwise close the handle and exit the node (code 0)."""
+        """Reopen the camera after a dropout/wedge, restoring the resolution. Returns
+        True on success. Keeps the pipeline alive across a transient USB glitch that
+        would otherwise close the handle and exit the node (code 0).
+
+        Hardened for the kernel-level UVC wedge behind a PERSISTENT identical-frame
+        freeze: (1) sleep after release() with an escalating backoff so the driver
+        actually frees the busy device before we grab it again — reopening instantly
+        just re-acquires the same wedged handle; (2) force the V4L2 backend + MJPG so
+        we don't silently fall back to a wrong mode; (3) CAP_PROP_BUFFERSIZE=1 so the
+        reopened handle can't keep re-serving a queued stale buffer (the freeze)."""
         try:
             self._cap.release()
         except Exception:
@@ -418,15 +441,44 @@ class HandLandmarkNode(Node):
                 self._cap = _RealSenseCapture(self._cap_w or 640,
                                               self._cap_h or 480, fps=None)
             except Exception:
+                self._reopen_fails += 1
                 return False
-            return self._cap.isOpened()
-        self._cap = cv2.VideoCapture(self._camera_idx)
+            ok = self._cap.isOpened()
+            if not ok:
+                self._reopen_fails += 1
+            return ok
+        # Escalating settle delay: 1st reopen waits ~0.2 s, then grows (0.4, 0.6 …)
+        # capped at 2 s, so a stubborn wedge gets progressively longer to clear
+        # without the loop spinning on a dead handle.
+        settle = min(0.2 * (self._reopen_fails + 1), 2.0)
+        time.sleep(settle)
+        # Explicit V4L2 backend: a plain VideoCapture(idx) may reattach to the same
+        # wedged device node; requesting the backend forces a fresh V4L2 open path.
+        self._cap = cv2.VideoCapture(self._camera_idx, cv2.CAP_V4L2)
         if not self._cap.isOpened():
+            self._reopen_fails += 1
             return False
+        # Newest frame only — never re-serve a queued stale buffer (the freeze).
+        try:
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        # Mirror the initial-open MJPG-before-size ordering so we don't clamp to a
+        # low mode (the c0 1080p->480p fallback bug).
+        if self._cap_w and self._cap_h:
+            try:
+                self._cap.set(cv2.CAP_PROP_FOURCC,
+                              cv2.VideoWriter_fourcc(*"MJPG"))
+            except Exception:
+                pass
         if self._cap_w:
             self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._cap_w)
         if self._cap_h:
             self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._cap_h)
+        # NOTE: do NOT reset _reopen_fails here. A UVC wedge reopens "successfully"
+        # then immediately re-freezes; resetting on open-success would keep the
+        # backoff pinned at its minimum forever. It's reset only when a genuinely
+        # FRESH frame arrives (feed actually recovered — see spin_capture).
         return True
 
     def spin_capture(self) -> None:
@@ -477,14 +529,25 @@ class HandLandmarkNode(Node):
                 if frozen_streak in (30, 150) or frozen_streak % 300 == 0:
                     self.get_logger().warn(
                         f"[{self._name}] camera frame FROZEN (identical for "
-                        f"{frozen_streak} reads) — reopening.")
+                        f"{frozen_streak} reads) — reopening "
+                        f"(attempt {self._reopen_fails + 1}, "
+                        f"settle {min(0.2 * (self._reopen_fails + 1), 2.0):.1f}s).")
+                    # Count each freeze-triggered reopen so the settle delay in
+                    # _reopen_camera escalates — a UVC wedge reopens "successfully"
+                    # but re-freezes, so open-success alone must NOT clear this.
+                    self._reopen_fails += 1
                     self._reopen_camera()
                     last_sample = None
                 time.sleep(0.005)
                 continue
             if frozen_streak:
-                self.get_logger().info(f"[{self._name}] camera unfroze.")
+                self.get_logger().info(
+                    f"[{self._name}] camera unfroze after {self._reopen_fails} "
+                    f"reopen attempt(s).")
                 frozen_streak = 0
+            # A genuinely fresh frame arrived — the feed actually recovered, so the
+            # escalating reopen backoff can reset.
+            self._reopen_fails = 0
             last_sample = sample
 
             # MediaPipe VIDEO mode REQUIRES strictly increasing timestamps. Wall

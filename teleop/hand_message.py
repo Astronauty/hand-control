@@ -22,6 +22,28 @@ from __future__ import annotations
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+
+def sensor_qos(depth: int = 1):
+    """QoS for the high-rate hand-tracking streams (landmarks / joint_angles /
+    preview). BEST_EFFORT + KEEP_LAST(1) so a SLOW CONSUMER DROPS old frames
+    instead of applying reliable-QoS backpressure to the publisher.
+
+    This is the fix for the "press-8 freezes a camera" bug: those topics were on
+    the default RELIABLE, depth-10 QoS. Once tracking starts, each teleop frame
+    runs the retarget + arm IK and the main process drains /hand/joint_angles
+    slower than the 60 Hz it's published at; its reliable queue fills, DDS back-
+    pressures the fusion publisher, which stalls fusion's consumption of the
+    landmark topics, which back-pressures the landmark nodes' publish() and WEDGES
+    their capture loop — the camera "freezes" and never recovers. Streaming sensor
+    data must never block the producer: drop, don't wedge. Imported lazily so this
+    pure-data module doesn't hard-depend on rclpy."""
+    from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+    return QoSProfile(
+        reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        history=QoSHistoryPolicy.KEEP_LAST,
+        depth=depth,
+    )
+
 # Joint order for the [6:51] Euler block. Must match the downstream reader.
 JOINT_ORDER = [
     "thumb_cmc", "thumb_mcp", "thumb_ip",

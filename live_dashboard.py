@@ -19,7 +19,15 @@ Message protocol (plain dicts put on the queue):
                         'max_site_mm': float, 'max_pad_deg': float|None,
                         'min_slack_mm': float|None,
                         'dls_ms': float|None, 'ipopt_ms': float|None}
-    {'type': 'mode',    'mode': str, 'target': str}   # Approach / Grasp / Transport
+    {'type': 'trial_time',                            # trial countdown, pushed each
+                        'remaining': float|None,      #   frame; None clears the timer
+                        'elapsed': float|None,        #   (no active trial). remaining =
+                        'trial_id': int|None}         #   TRIAL_TIMEOUT_S - elapsed sim-time
+    {'type': 'event',   'trial_id': int, 't': float,  # mirror of one events.jsonl row;
+                        'event': str, ...}            #   teed by EventLogger.log(). Extra
+                        #   event-specific fields pass through and render inline. Panel is
+                        #   cleared on 'trial_start' (scoped to the current trial).
+    {'type': 'mode',    'mode': str, 'target': str}   # Approach / Pick / Transport / Place
     {'type': 'active_obj', 'name': str}               # proximity-based active object
     {'type': 'squeeze', 'on': bool, 'gamma': float,   # GRASP internal-force toggle;
                         'f_contact': float}           #   commanded N per contact
@@ -34,8 +42,10 @@ Message protocol (plain dicts put on the queue):
     {'type': 'tip_err',                               # per-stage tip-error attribution
         'object': str, 'fingers': [str],              #   (contact_aware_teleop lock-in);
         'nlp': [float]|None,                          #   overwrites a fixed readout.
-        'ik':  [float]|None,                          #   each list is per-finger mm in
-        'rrt': [float]|None}                          #   'fingers' order (None = n/a)
+        'ik':  [float]|None,                          #   nlp=committed recommender pose,
+        'rrt': [float]|None}                          #   ik=colIK (O/I preview only),
+                                                      #   rrt=executed end. per-finger mm
+                                                      #   in 'fingers' order (None = n/a).
     None                                              # sentinel: quit
 
 Usage from the sim process:
@@ -106,9 +116,24 @@ def _run(queue, fingers, horizon_s, dt_hint):
     mode_box = QtWidgets.QVBoxLayout()
     mode_box.addWidget(mode_lbl)
     mode_box.addWidget(target_lbl)
+    # Trial countdown: TRIAL_TIMEOUT_S minus elapsed sim-time, fed by 'trial_time'
+    # messages. Neutral until a trial is active; amber under 10 s, red under 3 s.
+    _TIME_IDLE_STYLE = "font-size: 30px; font-weight: bold; color: #777777;"
+    _TIME_OK_STYLE   = "font-size: 30px; font-weight: bold; color: #55cc88;"
+    _TIME_WARN_STYLE = "font-size: 30px; font-weight: bold; color: #ffb020;"
+    _TIME_CRIT_STYLE = "font-size: 30px; font-weight: bold; color: #ff5555;"
+    time_lbl = QtWidgets.QLabel("—")
+    time_lbl.setStyleSheet(_TIME_IDLE_STYLE)
+    time_sub_lbl = QtWidgets.QLabel("no active trial")
+    time_sub_lbl.setStyleSheet("font-size: 12px; color: #999999;")
+    time_box = QtWidgets.QVBoxLayout()
+    time_box.addWidget(time_lbl, alignment=QtCore.Qt.AlignRight)
+    time_box.addWidget(time_sub_lbl, alignment=QtCore.Qt.AlignRight)
     header = QtWidgets.QHBoxLayout()
     header.addLayout(mode_box)
     header.addStretch(1)
+    header.addLayout(time_box)
+    header.addSpacing(30)
     header.addWidget(grasp_rec_lbl)
     header.addSpacing(30)
     header.addWidget(squeeze_lbl)
@@ -208,10 +233,20 @@ def _run(queue, fingers, horizon_s, dt_hint):
     grasp_rec_log.setMaximumBlockCount(400)
     grasp_rec_log.setStyleSheet("font-family: monospace; font-size: 11px;")
 
+    # --- (6b) trial event log: mirrors events.jsonl live (one line per state
+    # transition). Scoped to the CURRENT trial — cleared on each trial_start — so it
+    # tracks the trial in progress alongside the countdown timer. ---
+    event_log = QtWidgets.QPlainTextEdit()
+    event_log.setReadOnly(True)
+    event_log.setMaximumBlockCount(400)
+    event_log.setStyleSheet("font-family: monospace; font-size: 11px;")
+
     # --- (7) tip-error attribution readout (contact_aware_teleop). Fixed panel that
-    # shows the LATEST lock-in's per-stage tip error (recommender NLP -> collision IK ->
+    # shows the LATEST lock-in's per-stage tip error (committed recommender pose ->
     # RRT end), overwritten each solve rather than scrolling, so the current grasp's
-    # accuracy chain is always visible at a glance. Colours match the viewer markers.
+    # accuracy chain is always visible at a glance. The collision-aware IK row is only
+    # populated by an O/I preview (it is no longer on the commit path). Colours match
+    # the viewer markers.
     tip_err_lbl = QtWidgets.QLabel(
         "<span style='color:#888'>tip errors: waiting for a lock-in…</span>")
     tip_err_lbl.setTextFormat(QtCore.Qt.RichText)
@@ -220,7 +255,7 @@ def _run(queue, fingers, horizon_s, dt_hint):
     tip_err_lbl.setWordWrap(True)
 
     # --- (8) colour legend: maps viewer marker + dashboard trace colours to meaning so
-    # the magenta/gold spheres and finger traces are self-documenting. Static HTML. ---
+    # the gold spheres and finger traces are self-documenting. Static HTML. ---
     def _swatch(hexcol):
         return (f"<span style='color:{hexcol}; font-size:16px;'>&#9632;</span>")
     _finger_leg = "".join(
@@ -229,11 +264,12 @@ def _run(queue, fingers, horizon_s, dt_hint):
     legend_lbl = QtWidgets.QLabel(
         "<b>Legend</b><br>"
         "<u>MuJoCo viewer markers</u><br>"
-        f"{_swatch('#ff00ff')} recommender NLP intended contacts&nbsp;&nbsp;"
-        f"{_swatch('#ffcc00')} achieved fingertip sites (collision IK)<br>"
+        f"{_swatch('#33ff4d')}{_swatch('#33e6ff')} recommended contacts "
+        "(thumb / index, wrench-feasible only)&nbsp;&nbsp;"
+        f"{_swatch('#ffcc00')} achieved fingertip sites (committed pose)<br>"
         "<u>Tip-error stages</u><br>"
-        f"{_swatch('#55cc88')} recommender NLP&nbsp;&nbsp;"
-        f"{_swatch('#ff9944')} collision-aware IK&nbsp;&nbsp;"
+        f"{_swatch('#55cc88')} recommender committed pose (RRT goal)&nbsp;&nbsp;"
+        f"{_swatch('#ff9944')} collision-aware IK (O/I preview only)&nbsp;&nbsp;"
         f"{_swatch('#ff5555')} RRT end (executed)<br>"
         f"<u>Finger traces</u><br>{_finger_leg}")
     legend_lbl.setTextFormat(QtCore.Qt.RichText)
@@ -245,7 +281,9 @@ def _run(queue, fingers, horizon_s, dt_hint):
     tip_box.addWidget(tip_err_lbl)
     tip_box.addSpacing(8)
     tip_box.addWidget(legend_lbl)
-    tip_box.addStretch(1)
+    tip_box.addSpacing(8)
+    tip_box.addWidget(QtWidgets.QLabel("<b>Trial events (current trial)</b>"))
+    tip_box.addWidget(event_log, 1)
     tip_widget = QtWidgets.QWidget()
     tip_widget.setLayout(tip_box)
 
@@ -316,6 +354,39 @@ def _run(queue, fingers, horizon_s, dt_hint):
                 if dls_ms is not None and ipo_ms is not None:
                     lines.append(f"    DLS {dls_ms:.0f} ms + NLP {ipo_ms:.0f} ms")
                 plan_log.appendPlainText("\n".join(lines))
+            elif mt == 'trial_time':
+                rem = msg.get('remaining')
+                tid = msg.get('trial_id')
+                if rem is None:
+                    time_lbl.setText("—")
+                    time_lbl.setStyleSheet(_TIME_IDLE_STYLE)
+                    time_sub_lbl.setText("no active trial")
+                else:
+                    rem = max(0.0, float(rem))
+                    time_lbl.setText(f"{rem:0.1f}s")
+                    time_lbl.setStyleSheet(
+                        _TIME_CRIT_STYLE if rem < 3.0
+                        else _TIME_WARN_STYLE if rem < 10.0
+                        else _TIME_OK_STYLE)
+                    el = msg.get('elapsed')
+                    el_s = "" if el is None else f"   elapsed {float(el):0.1f}s"
+                    time_sub_lbl.setText(
+                        f"trial {tid} — remaining{el_s}" if tid is not None
+                        else f"remaining{el_s}")
+            elif mt == 'event':
+                # One line per events.jsonl row. Clear on trial_start so the panel
+                # only shows the current trial (matches the countdown's scope).
+                ev  = msg.get('event', '?')
+                tid = msg.get('trial_id', '?')
+                et  = msg.get('t', float('nan'))
+                if ev == 'trial_start':
+                    event_log.clear()
+                # Compact one-liner: known fields inline, everything else appended.
+                shown = {'trial_id', 't', 'event', 'type'}
+                extra = "  ".join(f"{k}={v}" for k, v in msg.items()
+                                  if k not in shown)
+                event_log.appendPlainText(
+                    f"[{et:6.2f}] t{tid}  {ev}" + (f"   {extra}" if extra else ""))
             elif mt == 'mode':
                 mode_lbl.setText(msg.get('mode', '—'))
                 target_lbl.setText(f"target: {msg.get('target', '—')}")
@@ -410,16 +481,29 @@ def _run(queue, fingers, horizon_s, dt_hint):
                 rows = [
                     f"<b>{obj}</b> &nbsp; tip error (mm)",
                     f"<span style='color:#aaa'>finger&nbsp;&nbsp;{hdr}</span>",
-                    f"NLP&nbsp;&nbsp;&nbsp;&nbsp; {_fmt(nlp, '#55cc88')}",
-                    f"colIK&nbsp;&nbsp; {_fmt(ik,  '#ff9944')}",
+                    # 'nlp' now carries the COMMITTED recommender pose's tip error (the
+                    # pose RRT plans to and the Pick phase holds) — the collision IK is no longer
+                    # on the commit path, so 'colIK' is populated only by an O/I preview.
+                    f"recPose {_fmt(nlp, '#55cc88')}",
+                    f"colIK&nbsp;&nbsp; {_fmt(ik,  '#ff9944')}<span style='color:#666'>"
+                    f" (O/I preview)</span>",
                     f"RRTend {_fmt(rrt, '#ff5555')}",
                 ]
-                # Deltas: how much each downstream stage gave up vs the NLP ideal.
+                # Deltas: how much each downstream stage gave up vs the committed pose.
                 if nlp is not None and ik is not None:
                     d = [b - a for a, b in zip(nlp, ik)]
-                    rows.append(f"<span style='color:#999'>Δ IK−NLP&nbsp; "
+                    rows.append(f"<span style='color:#999'>Δ IK−recPose&nbsp; "
                                 + "  ".join(f"{v:+5.1f}" for v in d) + "</span>")
-                if ik is not None and rrt is not None:
+                # Replay drift: RRT end vs the committed recommender pose (nlp). On the
+                # commit path colIK is absent, so this is the meaningful "did the object
+                # move during replay" signal; fall back to RRT−IK when a preview populated
+                # the IK row instead.
+                if rrt is not None and nlp is not None:
+                    d = [b - a for a, b in zip(nlp, rrt)]
+                    rows.append(f"<span style='color:#999'>Δ RRT−recPose&nbsp; "
+                                + "  ".join(f"{v:+5.1f}" for v in d)
+                                + "  (replay drift)</span>")
+                elif ik is not None and rrt is not None:
                     d = [b - a for a, b in zip(ik, rrt)]
                     rows.append(f"<span style='color:#999'>Δ RRT−IK&nbsp; "
                                 + "  ".join(f"{v:+5.1f}" for v in d)

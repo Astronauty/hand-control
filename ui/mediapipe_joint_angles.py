@@ -600,7 +600,13 @@ def init_ros():
     rclpy.init()
     ros_node = rclpy.create_node('hand_joint_publisher')
     
-    joint_angles_pub = ros_node.create_publisher(Float32MultiArray, '/hand/joint_angles', 10)
+    # BEST_EFFORT sensor QoS so a slow teleop consumer drops frames instead of
+    # back-pressuring (and freezing) this 30 Hz publisher — must match the
+    # dexpilot subscriber's QoS (teleop/hand_message.sensor_qos).
+    from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+    _sensor_qos = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                             history=QoSHistoryPolicy.KEEP_LAST, depth=1)
+    joint_angles_pub = ros_node.create_publisher(Float32MultiArray, '/hand/joint_angles', _sensor_qos)
     calibration_pub = ros_node.create_publisher(Empty, '/teleop/trigger_calibration', 10)
 
     ros_node.get_logger().info("ROS 2 Node Started. Publishing to /hand/joint_angles")

@@ -32,9 +32,18 @@ class ROSInterface:
                 "rclpy not available — cannot initialize ROS 2 interface")
         rclpy.init()
         self._ros_node = Node("dexpilot")
+        # BEST_EFFORT sensor QoS (must match the fusion publisher). Reliable QoS
+        # here made this subscriber back-pressure the 60 Hz fusion publisher once
+        # the teleop loop slowed post-press-8 — cascading upstream and freezing a
+        # camera. Best-effort => we just drop stale frames; the producer never
+        # blocks. See teleop/hand_message.sensor_qos for the full failure chain.
+        try:
+            from teleop.hand_message import sensor_qos   # package import (main app)
+        except ImportError:
+            from hand_message import sensor_qos           # same-dir import (scripts)
         self._ros_node.create_subscription(
             Float32MultiArray, "/hand/joint_angles",
-            lambda msg: self._on_hand_message(list(msg.data)), 10)
+            lambda msg: self._on_hand_message(list(msg.data)), sensor_qos())
 
     def _on_hand_message(self, data_list: list) -> None:
         self._raw_msg = data_list

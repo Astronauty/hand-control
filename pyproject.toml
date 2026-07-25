@@ -31,4 +31,6 @@ dependencies = [
     "protobuf>=4.25.8,<5",
     "sentencepiece>=0.2.1",
     "pyrealsense2>=2.58.3.10794",
+    "pandas>=2.3.3",
+    "pyarrow>=25.0.0",
 ]

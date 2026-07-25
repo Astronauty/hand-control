@@ -36,6 +36,11 @@ _FUSION = os.path.join(_HERE, "hand_fusion_node.py")
 _CALIB_DIR = os.path.join(os.path.dirname(_HERE), "calibration")
 
 
+class _PipelineDown(Exception):
+    """Raised inside the supervise loop when a child has hard-failed (exceeded its
+    restart budget), to break out to the shared teardown in the finally block."""
+
+
 def _parse_cam(spec: str) -> tuple[str, int | None, tuple[int, int] | None]:
     """Parse a --cam <name>[:<index>][:<W>x<H>] spec.
 
@@ -263,11 +268,25 @@ def main():
         ap.error(f"duplicate camera names: {names}")
     _check_calibration(names)
 
-    procs: list[subprocess.Popen] = []
+    # Each child is a dict so the supervisor can RESPAWN it on death (a transient
+    # camera open failure — USB-bandwidth loss at startup, slow device release from
+    # a prior run — otherwise leaves the pipeline running permanently degraded on the
+    # surviving cameras, or, before per-camera restart, killed the whole pipeline).
+    # 'restarts'/'first_death' bound the retries: a camera that keeps dying fast
+    # (unplugged, wrong index) is given up on after RESTART_MAX within RESTART_WINDOW.
+    procs: list[dict] = []
+    RESTART_MAX    = 5      # max respawns of one child within RESTART_WINDOW
+    RESTART_WINDOW = 30.0   # s; deaths older than this reset the restart counter
 
     def spawn(argv: list[str], label: str) -> None:
         print(f"[run] starting {label}: {' '.join(argv)}")
-        procs.append(subprocess.Popen([sys.executable] + argv))
+        procs.append({
+            "argv":     argv,
+            "label":    label,
+            "proc":     subprocess.Popen([sys.executable] + argv),
+            "restarts": 0,
+            "first_death": None,   # timestamp of the first death in the current window
+        })
 
     try:
         # One landmark node per camera. Resolution precedence per camera:
@@ -320,31 +339,50 @@ def main():
         print(f"\n[run] pipeline up: {len(names)} cameras -> /hand/joint_angles. "
               f"Run your teleop (dexpilot / contact-aware) as usual. Ctrl-C to stop.\n")
 
-        # Supervise: if any child dies, tear the rest down.
+        # Supervise: RESPAWN a died child (per-camera restart) instead of tearing the
+        # whole pipeline down, so a transient camera open failure self-heals. A child
+        # that keeps dying fast (RESTART_MAX deaths within RESTART_WINDOW) is a hard
+        # failure — give up on it and tear the pipeline down so it isn't silently lost.
         while True:
             time.sleep(0.5)
-            dead = [p for p in procs if p.poll() is not None]
-            if dead:
-                print(f"[run] a child process exited (code {dead[0].returncode}); "
-                      f"shutting the pipeline down.")
-                break
-    except KeyboardInterrupt:
-        print("\n[run] Ctrl-C — stopping pipeline.")
+            now = time.time()
+            for entry in procs:
+                rc = entry["proc"].poll()
+                if rc is None:
+                    continue   # still alive
+                # Reset the restart counter if the previous death aged out of the window.
+                if entry["first_death"] is None or (now - entry["first_death"]) > RESTART_WINDOW:
+                    entry["first_death"] = now
+                    entry["restarts"] = 0
+                entry["restarts"] += 1
+                if entry["restarts"] > RESTART_MAX:
+                    print(f"[run] {entry['label']} exited (code {rc}) and has failed "
+                          f"{entry['restarts']} times in {RESTART_WINDOW:.0f}s — giving "
+                          f"up and shutting the pipeline down.")
+                    raise _PipelineDown()
+                print(f"[run] {entry['label']} exited (code {rc}); respawning "
+                      f"(attempt {entry['restarts']}/{RESTART_MAX}).")
+                # A dying camera can hold /dev/videoN briefly; give the driver a beat
+                # to release before the reopen (mirrors the startup stagger).
+                time.sleep(1.0)
+                entry["proc"] = subprocess.Popen([sys.executable] + entry["argv"])
+    except (KeyboardInterrupt, _PipelineDown):
+        print("\n[run] stopping pipeline.")
     finally:
-        for p in procs:
-            if p.poll() is None:
-                p.send_signal(signal.SIGINT)
+        for entry in procs:
+            if entry["proc"].poll() is None:
+                entry["proc"].send_signal(signal.SIGINT)
         # Give them a moment to clean up, then hard-kill any stragglers.
         deadline = time.time() + 3.0
-        for p in procs:
-            if p.poll() is None and time.time() < deadline:
+        for entry in procs:
+            if entry["proc"].poll() is None and time.time() < deadline:
                 try:
-                    p.wait(timeout=max(0.1, deadline - time.time()))
+                    entry["proc"].wait(timeout=max(0.1, deadline - time.time()))
                 except subprocess.TimeoutExpired:
                     pass
-        for p in procs:
-            if p.poll() is None:
-                p.kill()
+        for entry in procs:
+            if entry["proc"].poll() is None:
+                entry["proc"].kill()
         print("[run] pipeline stopped.")
 
 
