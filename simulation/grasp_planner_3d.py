@@ -430,6 +430,23 @@ def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
     }
 
 
+def _assign_seed_by_finger(seed, live_thumb, live_index):
+    """Orient a seed's contact labels to the operator's actual hand: p1/p1s/n1_in is the
+    THUMB seed, p2/p2s/n2_in the INDEX seed. _seed_pair labels the two contacts by a random
+    march direction, so the thumb/index assignment is a coin flip — the cause of run-to-run
+    finger flips and of awkward assignments the pinned-face NLP can't undo. Swap in place iff
+    doing so reduces the total (thumb->contact) + (index->contact) distance, i.e. put the
+    thumb on whichever contact it actually reaches. Mutates `seed`."""
+    p1, p2 = seed['p1s'], seed['p2s']
+    lt, li = np.asarray(live_thumb, float), np.asarray(live_index, float)
+    d_keep = np.linalg.norm(p1 - lt) + np.linalg.norm(p2 - li)   # p1=thumb, p2=index
+    d_swap = np.linalg.norm(p2 - lt) + np.linalg.norm(p1 - li)   # swapped
+    if d_swap < d_keep:
+        seed['p1'],    seed['p2']    = seed['p2'],    seed['p1']
+        seed['p1s'],   seed['p2s']   = seed['p2s'],   seed['p1s']
+        seed['n1_in'], seed['n2_in'] = seed['n2_in'], seed['n1_in']
+
+
 def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis):
     """
     One deterministic, perfectly antipodal seed pair along a fixed axis
@@ -698,6 +715,11 @@ def _embed_wrench_cone_ca(opti, p1, p2,
 # geom is still kept for the FLOOR constraint. Chosen well below any physically-meaningful
 # negative clearance (bounding-sphere phantom penetration tops out ~-0.02 m).
 _COL_DISABLE_SENTINEL = -0.5   # m
+
+# Fixed RNG seed reset at the start of every MultiStartGraspPlanner3D.solve() so the random
+# seed stream is identical across solves — see the re-seed note in solve(). A constant, NOT a
+# per-pose hash (which would be discontinuous under sub-mm teleop jitter).
+_SEED_RNG_CONST = 42
 
 
 @dataclass
@@ -2341,6 +2363,36 @@ class MultiStartGraspPlanner3D:
         obj_center_np = self._planner.data.geom_xpos[obj_gid].copy()
         obj_R_np      = self._planner.data.geom_xmat[obj_gid].reshape(3, 3).copy()
 
+        # DETERMINISTIC seeding: reset self._rng to a FIXED seed at the START of every solve.
+        # Without this the RNG advances across solves, so the same (or a marginally-moved)
+        # starting pose draws a DIFFERENT random stream on a re-solve -> different best-of-N
+        # winner -> the run-to-run finger/contact flip. Resetting to a constant makes the
+        # STREAM of random draws identical every solve, so _seed_pair (which is continuous in
+        # the object pose) maps a nearby pose to nearby contacts instead of hopping to an
+        # unrelated basin. NOTE: deliberately NOT a hash of the pose — a hash is discontinuous,
+        # so sub-mm teleop jitter straddling a quantization boundary would flip the seed and
+        # reintroduce the instability; a fixed constant + the pose-continuity of _seed_pair is
+        # what actually gives stability under marginal pose changes. Frame-to-frame stickiness
+        # on a static object is further handled by the warm-start seed + display hysteresis.
+        self._rng = np.random.default_rng(_SEED_RNG_CONST)
+
+        # Operator's LIVE thumb/index tip positions at q_ref, for KINEMATIC finger
+        # assignment of each seed pair (below). Each _seed_pair labels its two contacts
+        # p1s/p2s by a RANDOM march direction, so which physical contact becomes the THUMB
+        # seed (p1, hard-pinned to its face for the solve) vs the INDEX seed (p2) is
+        # arbitrary — the source of the run-to-run finger-assignment flip AND of awkward
+        # assignments the pinned-face NLP cannot escape. We reassign so p1 goes to whichever
+        # contact is nearer the operator's actual thumb tip (and p2 to the index), matching
+        # the hand's real geometry instead of a coin flip. FK on _fk_data (the seed-gen
+        # buffer): object qpos is already synced into self._planner.data by the caller, so
+        # carry it over and overwrite only the actuated robot joints with q_ref.
+        _fkd = self._fk_data
+        _fkd.qpos[:] = self._planner.data.qpos[:]
+        _fkd.qpos[act_idx] = np.asarray(q_ref, float)[:len(act_idx)]
+        mj.mj_kinematics(model, _fkd)
+        _live_th = _fkd.site_xpos[self._planner._thumb_sid].copy()
+        _live_if = _fkd.site_xpos[self._planner._index_sid].copy()
+
         # Task wrench bounds (mirrors GraspPlanner3D.solve logic)
         _bid   = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, cfg.obj_body)
         _mass  = float(model.body_mass[_bid])
@@ -2398,6 +2450,7 @@ class MultiStartGraspPlanner3D:
                     not _reachable_contact(s['p2s'], _ground_z, _r_tip_min)):
                 rejected += 1
                 continue
+            _assign_seed_by_finger(s, _live_th, _live_if)
             seeds.append(s)
 
         if len(seeds) < n_seeds:
@@ -2427,6 +2480,9 @@ class MultiStartGraspPlanner3D:
                                   'p1s': _wp1, 'p2s': _wp2,
                                   'n1_in': _wn1, 'n2_in': _wn2,
                                   'offsets': (0.0, 0.0), 'delta_deg': 0.0}
+                    # Same kinematic finger assignment as the random seeds (the prior
+                    # contacts were already assigned, so this normally keeps them).
+                    _assign_seed_by_finger(_warm_seed, _live_th, _live_if)
                     if len(seeds) >= n_seeds and seeds:
                         seeds[-1] = _warm_seed        # replace a random seed
                     else:
