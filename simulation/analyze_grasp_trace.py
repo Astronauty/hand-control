@@ -87,6 +87,32 @@ def main():
                   "or the contact geometry can't route the load).")
     print()
 
+    # LP-vs-MuJoCo contact-model mismatch: recommended (grasp-map) normal/pos vs the ACTUAL
+    # MuJoCo contact. A persistent angle/offset means the commanded 'internal' force pair is
+    # NOT net-zero in physics -> a residual wrench that drifts the object even when held still.
+    if 'norm_ang' in d:
+        na = d['norm_ang']; po = d['pos_off']
+        # while gripping (both fingers have force)
+        grip = (nf.min(1) > 3.0)
+        if grip.any():
+            na_g = na[grip]; po_g = po[grip]
+            na_valid = na_g[np.isfinite(na_g).all(1)] if na_g.ndim > 1 else na_g[np.isfinite(na_g)]
+            print("  LP-vs-MuJoCo contact mismatch WHILE GRIPPING (rec normal/pos vs actual):")
+            with np.errstate(invalid='ignore'):
+                print(f"    normal angle (deg): mean={np.nanmean(na_g):.1f} "
+                      f"median={np.nanmedian(na_g):.1f} max={np.nanmax(na_g):.1f}")
+                print(f"    contact pos offset (mm): mean={np.nanmean(po_g):.1f} "
+                      f"max={np.nanmax(po_g):.1f}")
+            _bad = np.nanmedian(na_g)
+            if _bad > 15:
+                print(f"    -> LARGE normal divergence ({_bad:.0f}deg): the grasp map's normals "
+                      "disagree with MuJoCo's real contact, so the internal force isn't net-zero "
+                      "-> residual wrench drifts the box. This is the LP-vs-MuJoCo mismatch.")
+            else:
+                print(f"    -> normals agree ({_bad:.0f}deg): the drift is NOT from normal "
+                      "mismatch; look at pos offset / soft-contact tracking.")
+    print()
+
     # Timeline.
     step = args.every or max(1, n // 40)
     print(f"{'t':>6} {'ramp':>4} {'jogz':>6} {'boxz':>7} {'palmz':>7} {'rel':>6} "

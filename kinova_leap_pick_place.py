@@ -917,6 +917,45 @@ if __name__ == "__main__":
                 tau_net += np.cross(con.pos - com, f_W) + sgn * (R_con.T @ ft[3:6])
         return f_net, tau_net, normals, tangentials
 
+    def _actual_contact_geometry(obj_idx):
+        """Per FINGER_SET finger: MuJoCo's ACTUAL contact point + INWARD normal on the object,
+        force-weighted-averaged over that finger's contacts vs objects[obj_idx]. Returns
+        {finger: (pos_W (3,), inward_normal_W (3,)) or None}. Used to compare against the
+        RECOMMENDED contact geometry the grasp map / LP certificate assumes — a divergence
+        means the commanded 'internal' force pair isn't net-zero in physics and drifts the
+        object (the LP-vs-MuJoCo mismatch)."""
+        _og = objects[obj_idx]['id_geom']
+        acc = {f: [np.zeros(3), np.zeros(3), 0.0] for f in FINGER_SET}  # sum p*fn, sum n*fn, sum fn
+        _ft = np.zeros(6)
+        for ci in range(data.ncon):
+            con = data.contact[ci]
+            g1, g2 = con.geom1, con.geom2
+            if g1 in _HAND_GIDS and g2 == _og:
+                hand_gid, sgn = g1, 1.0     # normal row0 points g1->g2 = hand->obj = inward
+            elif g2 in _HAND_GIDS and g1 == _og:
+                hand_gid, sgn = g2, -1.0    # row0 points obj->hand = outward -> negate
+            else:
+                continue
+            fname = _FINGER_BY_GID.get(hand_gid)
+            if fname is None:
+                continue
+            mj.mj_contactForce(model, data, ci, _ft)
+            fn = float(_ft[0])
+            if fn <= 1e-9:
+                continue
+            n_in_W = sgn * con.frame.reshape(3, 3)[0]   # world inward normal (hand->obj)
+            acc[fname][0] += con.pos * fn
+            acc[fname][1] += n_in_W * fn
+            acc[fname][2] += fn
+        out = {}
+        for f in FINGER_SET:
+            p_sum, n_sum, w = acc[f]
+            if w > 1e-9:
+                out[f] = (p_sum / w, n_sum / (np.linalg.norm(n_sum) + 1e-12))
+            else:
+                out[f] = None
+        return out
+
     # Live metrics dashboard (separate process; opt-in via --dashboard). Started before the
     # IK precompute so the grasp IPOPT solves below are reported too. dash is None
     # when disabled; every push site is guarded on it.
@@ -4212,8 +4251,11 @@ if __name__ == "__main__":
                 if _grasp_trace is not None:
                     _f_c = grasp_ctrl.last_f_c if grasp_ctrl is not None else None
                     _, _, _tr_norm, _tr_tan = _hand_object_contact_metrics(active_idx)
+                    _act_geom = _actual_contact_geometry(active_idx)
                     _rec_local_tr = obj_grasp.get('rec_local')
                     _slip = np.zeros(N_FINGERS)
+                    _norm_ang = np.full(N_FINGERS, np.nan)   # rec-vs-actual normal angle (deg)
+                    _pos_off = np.full(N_FINGERS, np.nan)    # rec-vs-actual contact pos (mm)
                     for _k, _f in enumerate(FINGER_SET):
                         if _rec_local_tr is not None:
                             _pO, _RO = _rec_local_tr[_k]
@@ -4226,6 +4268,13 @@ if __name__ == "__main__":
                             _inW = data.site_xmat[_sid_tr].reshape(3, 3)[:, 0]
                         _anchor = _cW - _PAD_OFFSET[_f] * _inW
                         _slip[_k] = float(np.linalg.norm(data.site_xpos[id_C[_k]] - _anchor))
+                        # RECOMMENDED (grasp-map) normal/pos vs MuJoCo ACTUAL contact.
+                        _ag = _act_geom.get(_f)
+                        if _ag is not None:
+                            _p_act, _n_act = _ag
+                            _norm_ang[_k] = float(np.degrees(np.arccos(
+                                np.clip(_inW @ _n_act, -1, 1))))
+                            _pos_off[_k] = float(np.linalg.norm(_cW - _p_act) * 1e3)
                     _grasp_trace.sample(
                         t=float(data.time), t_wall=float(time.time()),
                         squeeze_on=int(bool(squeeze_on)),
@@ -4239,6 +4288,8 @@ if __name__ == "__main__":
                                           for k in range(N_FINGERS)])
                                 if _f_c is not None else np.full(N_FINGERS, np.nan)),
                         slip=_slip,
+                        norm_ang=_norm_ang,   # rec-vs-MuJoCo contact normal angle, deg
+                        pos_off=_pos_off,     # rec-vs-MuJoCo contact position offset, mm
                         jog_v=_jog_v.copy(),
                         q_arm=data.qpos[:7].copy(),
                         gamma_live=float(gamma_live))
