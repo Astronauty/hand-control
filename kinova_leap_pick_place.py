@@ -494,7 +494,16 @@ if __name__ == "__main__":
              "mid-trial target switch — see trial_logger.py for the full state "
              "machine. Omit the flag entirely (default) to disable trial logging: "
              "the tool then behaves exactly as without this flag.")
+    _arg_parser.add_argument(
+        '--grasp-trace', metavar='RUN_DIR', nargs='?', const='', default=None,
+        help="Record a per-mj_step GRASP-phase diagnostic trace to "
+             "logs/<RUN_DIR>/grasp_trace.npz for offline slip analysis: box pose, per-finger "
+             "measured normal/tangential force, commanded contact force |f_c|, tip->contact "
+             "slip, jog velocity, squeeze ramp, and palm/box z. Works in ANY mode (unlike "
+             "--trial-log). Bare --grasp-trace auto-names the dir.")
     args = _arg_parser.parse_args()
+    if args.grasp_trace == '':
+        args.grasp_trace = f'{args.mode}_grasp_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
     # In-code defaults for behaviours that used to be always-True CLI flags. These
     # never had a way to turn them OFF from the command line, so they only cluttered
     # --help. They live here as plain constants now; flip one for a run by editing it.
@@ -850,6 +859,10 @@ if __name__ == "__main__":
     _pose_trace   = TraceBuffer() if args.trial_log else None
     _pose_last_t  = -1.0
     _POSE_DT      = 0.02   # s sim-time between recorded pose rows (~50 Hz)
+
+    # GRASP-phase diagnostic trace (--grasp-trace): per-mj_step during GRASP, for offline
+    # slip analysis. Unthrottled (every step) so the slip-onset transient is captured.
+    _grasp_trace  = TraceBuffer() if args.grasp_trace else None
 
     # obj_<color>_<shape> -> place_<color>_site, by matching the color token common to
     # both names (scene_pick_place.xml's naming convention — see place_red/blue/green/
@@ -4193,6 +4206,43 @@ if __name__ == "__main__":
                     tau_ctrl[:N_ROBOT] += grasp_ctrl.slip_correction_torques(data)
                     _squeeze_diag(data)
 
+                # GRASP-phase diagnostic trace (every step): everything needed to attribute a
+                # slip offline — box pose, per-finger measured normal/tangential force + slip,
+                # commanded |f_c|, jog velocity, squeeze ramp, palm/box z.
+                if _grasp_trace is not None:
+                    _f_c = grasp_ctrl.last_f_c if grasp_ctrl is not None else None
+                    _, _, _tr_norm, _tr_tan = _hand_object_contact_metrics(active_idx)
+                    _rec_local_tr = obj_grasp.get('rec_local')
+                    _slip = np.zeros(N_FINGERS)
+                    for _k, _f in enumerate(FINGER_SET):
+                        if _rec_local_tr is not None:
+                            _pO, _RO = _rec_local_tr[_k]
+                            _bid_tr = obj_grasp['id_body']
+                            _cW = data.xpos[_bid_tr] + data.xmat[_bid_tr].reshape(3, 3) @ _pO
+                            _inW = data.xmat[_bid_tr].reshape(3, 3) @ _RO[:, 0]
+                        else:
+                            _sid_tr = obj_grasp['id_S'][_k]
+                            _cW = data.site_xpos[_sid_tr].copy()
+                            _inW = data.site_xmat[_sid_tr].reshape(3, 3)[:, 0]
+                        _anchor = _cW - _PAD_OFFSET[_f] * _inW
+                        _slip[_k] = float(np.linalg.norm(data.site_xpos[id_C[_k]] - _anchor))
+                    _grasp_trace.sample(
+                        t=float(data.time), t_wall=float(time.time()),
+                        squeeze_on=int(bool(squeeze_on)),
+                        ramp=float(min(1.0, _squeeze_steps * model.opt.timestep / SQUEEZE_RAMP_S)),
+                        box_xpos=data.xpos[obj_grasp['id_body']].copy(),
+                        box_xquat=data.xquat[obj_grasp['id_body']].copy(),
+                        palm_z=float(data.xpos[_PALM_BID][2]),
+                        norm_force=np.array([_tr_norm[f] for f in FINGER_SET]),
+                        tan_force=np.array([_tr_tan[f] for f in FINGER_SET]),
+                        fc_cmd=(np.array([float(np.linalg.norm(_f_c[3*k:3*k+3]))
+                                          for k in range(N_FINGERS)])
+                                if _f_c is not None else np.full(N_FINGERS, np.nan)),
+                        slip=_slip,
+                        jog_v=_jog_v.copy(),
+                        q_arm=data.qpos[:7].copy(),
+                        gamma_live=float(gamma_live))
+
             if GRASP_PROFILE and control_phase == 'GRASP':
                 _gp_acc['torque'] += time.perf_counter() - _t_tq0
             data.qfrc_applied[:] = tau_ctrl
@@ -4328,6 +4378,12 @@ if __name__ == "__main__":
         _pose_n = len(_pose_trace)
         _pose_trace.save(_pose_path)
         print(f"[pose-trace] saved {_pose_path} ({_pose_n} rows)")
+    if _grasp_trace is not None and len(_grasp_trace) > 0:
+        _gt_path = Path('logs') / args.grasp_trace / 'grasp_trace.npz'
+        _gt_path.parent.mkdir(parents=True, exist_ok=True)
+        _gt_n = len(_grasp_trace)
+        _grasp_trace.save(_gt_path)
+        print(f"[grasp-trace] saved {_gt_path} ({_gt_n} rows)")
     if dash is not None:
         dash.close()
     # (retargeting sliders live in the MediaPipe subprocess window; it cleans up
