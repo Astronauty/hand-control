@@ -85,11 +85,17 @@ def pad_offset(model, tip, site):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--pd-scale', type=float, default=2.0)
+    ap.add_argument('--pd-scale', type=float, default=5.0)   # live SQUEEZE_PD_SCALE
     ap.add_argument('--gamma-mult', type=float, default=5.0)
+    ap.add_argument('--accel', type=float, default=20.0,
+                    help='linear accel budget per axis (m/s^2), used for BOTH the recommender '
+                         'config and the gamma solve (kept consistent, matching live)')
+    ap.add_argument('--edge', type=float, default=0.015, help='edge_margin_m (m)')
     ap.add_argument('--lift', type=float, default=0.08, help='+z jog distance (m)')
     ap.add_argument('--settle', type=float, default=1.5, help='settle time per phase (s)')
+    ap.add_argument('--hold', type=float, default=2.0, help='hold time at top after lift (s)')
     args = ap.parse_args()
+    accel_budget = (args.accel, args.accel, args.accel)
 
     model = mj.MjModel.from_xml_path(SCENE_XML)
     dt = model.opt.timestep
@@ -107,7 +113,8 @@ def main():
             'thumb': pad_offset(model, 'leap_th_tip', 'leap_th_ds_tip')}
 
     # ── 1. Recommend at the SIM START pose ──────────────────────────────────────
-    cfg, _ = base.build_live_config(model)
+    cfg, _ = base.build_live_config(model, accel_budget=accel_budget,
+                                    edge_margin_m=args.edge)
     planner = MultiStartGraspPlanner3D(model, mj.MjData(model), cfg)
     # sim start: home robot (qpos0) + object at its spawn pose.
     d0 = mj.MjData(model)
@@ -205,8 +212,8 @@ def main():
     _mu = [float(model.geom_friction[obj_gid, 0])] * N_FINGERS
     _mass = float(model.body_mass[obj_bid])
     _g_O = R_WO_l.T @ model.opt.gravity
-    _accel_box = tuple(NCF_ACCEL_BUDGET_XYZ) if NCF_DATUM_MODE else \
-        tuple(NCF_ACCEL_BUDGET_XYZ[i] + abs(_g_O[i]) for i in range(3))
+    _accel_box = tuple(accel_budget) if NCF_DATUM_MODE else \
+        tuple(accel_budget[i] + abs(_g_O[i]) for i in range(3))
     _inertia = model.body_inertia[obj_bid]
     _gamma = solve_gamma_live(_p_O, _R_in, _mu, _mass, _accel_box,
                               tuple(np.abs(NCF_ANG_ACCEL_BUDGET)), _inertia,
@@ -293,8 +300,12 @@ def main():
         data.qfrc_applied[:] = tau
         data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
         mj.mj_step(model, data)
-    # settle at the top
-    for _ in range(int(0.5 / dt)):
+    box_z_top = data.xpos[obj_bid][2]
+    # HOLD at the top for `args.hold` s — the real test is whether the grip holds the box up
+    # over time, not just the instant after the jog. Track the box height; a slipping grasp
+    # sags/drops during the hold.
+    z_trace = []
+    for _ in range(int(args.hold / dt)):
         data.qvel[:N_ROBOT] = 0.0
         kp_eff, kd_eff = gc.effective_gains()
         tau = np.zeros(model.nv)
@@ -304,19 +315,27 @@ def main():
         data.qfrc_applied[:] = tau
         data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
         mj.mj_step(model, data)
+        z_trace.append(data.xpos[obj_bid][2])
+    z_trace = np.array(z_trace)
 
     box_z_final = data.xpos[obj_bid][2]
     lifted = (box_z_final - box_z_pregrasp)
-    # Slip check: did the box stay between the fingers? tip-to-box distance still small.
+    sag = (box_z_top - box_z_final)   # how much it dropped DURING the hold
     held = all(mj.mj_geomDistance(model, data, mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g),
                                   obj_gid, 0.2, _ft) < 0.01 for g in ('leap_if_tip', 'leap_th_tip'))
-    print(f"[5] jogged +{args.lift*1e3:.0f}mm; box_z={box_z_final:.4f} "
-          f"lifted={lifted*1e3:+.1f}mm  held={held}")
+    # Held ABOVE ground throughout: min box height over the hold stayed well above rest.
+    min_hold_z = float(z_trace.min()) if len(z_trace) else box_z_final
+    stayed_up = (min_hold_z - box_z_pregrasp) > 0.5 * args.lift
+    print(f"[5] jogged +{args.lift*1e3:.0f}mm; box_z_top={box_z_top:.4f}")
+    print(f"[6] held {args.hold:.1f}s: box_z_final={box_z_final:.4f}  lifted={lifted*1e3:+.1f}mm  "
+          f"sag_during_hold={sag*1e3:+.1f}mm  min_z_during_hold={(min_hold_z-box_z_pregrasp)*1e3:+.1f}mm  "
+          f"held={held} stayed_up={stayed_up}")
     print()
-    verdict = ('LIFTED & HELD' if lifted > 0.5 * args.lift and held else
-               'PARTIAL' if lifted > 0.01 else 'FAILED (box not lifted)')
-    print(f"  pd_scale={args.pd_scale} gamma_mult={args.gamma_mult}: {verdict} "
-          f"(box rose {lifted*1e3:+.1f}mm of {args.lift*1e3:.0f}mm commanded)")
+    verdict = ('LIFTED & HELD' if lifted > 0.5 * args.lift and held and stayed_up else
+               'PARTIAL/SLIPPED' if lifted > 0.01 else 'FAILED (box not lifted)')
+    print(f"  accel={args.accel} pd_scale={args.pd_scale} gamma_mult={args.gamma_mult} "
+          f"edge={args.edge*1e3:.0f}mm: {verdict} "
+          f"(rose {lifted*1e3:+.1f}mm of {args.lift*1e3:.0f}mm, sag {sag*1e3:+.1f}mm over {args.hold:.0f}s)")
 
 
 if __name__ == '__main__':

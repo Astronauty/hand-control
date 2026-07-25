@@ -814,6 +814,14 @@ class GraspConfig3D:
 
     col_clearance_m:  float = 0.005
 
+    # FLOOR clearance (m) for the ground constraint, separate from the object clearance above.
+    # None -> use col_clearance_m (back-compat). Set slightly larger than col_clearance_m to
+    # give the curled non-active fingers (middle/ring) extra margin against the table: their
+    # links are modeled as coarse bounding SPHERES, so a sphere center clearing col_clearance_m
+    # can still have the real thin link dip below the floor. A few mm of extra floor margin
+    # absorbs that bounding-sphere slack without affecting the object grasp geometry.
+    ground_clearance_m: float | None = None
+
     # Full-arm collision (proximity-pruned softplus SDFs).
     arm_geom_names:   list  = field(default_factory=list)
     col_prune_margin: float = 0.10
@@ -1289,9 +1297,11 @@ class GraspPlanner3D:
                 # Floor proximity: every geom needs the ground constraint (section 5a), so a
                 # geom close to the floor is kept even when far from the object. z of the
                 # sphere surface vs ground_z.
+                _clr_gr = float(cfg.ground_clearance_m
+                                if cfg.ground_clearance_m is not None else cfg.col_clearance_m)
                 _near_flr = (cfg.col_use_ground
                              and (float(_gp[2]) - _ar - float(cfg.ground_z))
-                                  < cfg.col_clearance_m + cfg.col_prune_margin)
+                                  < _clr_gr + cfg.col_prune_margin)
                 if _near_obj or _near_flr:
                     _active_arm.append(_ai)
 
@@ -1606,6 +1616,9 @@ class GraspPlanner3D:
             # ── 5a. Full-arm collision (geometry-appropriate softplus SDF) ─
             _ground_n = ca.DM([0.0, 0.0, 1.0])
             _ground_p = ca.DM([0.0, 0.0, float(cfg.ground_z)])
+            # Floor clearance: ground_clearance_m if set, else col_clearance_m (back-compat).
+            _clr_ground = float(cfg.ground_clearance_m
+                                if cfg.ground_clearance_m is not None else cfg.col_clearance_m)
             if arm_col_cb is not None:
                 _arm_pos = arm_col_cb(_q)   # (3*n_active,) CasADi vector
                 _obj_R_dm = ca.DM(obj_R_np)
@@ -1634,7 +1647,7 @@ class GraspPlanner3D:
                     if cfg.col_use_ground:
                         _opti.subject_to(
                             _sphere_plane_distance(_gp, _r, _ground_p, _ground_n)
-                            >= cfg.col_clearance_m)
+                            >= _clr_ground)
 
             # ── 5b. Thumb + index vs ground (unconditional) ────────────────
             # These two tips are absent from the arm_col loop.
@@ -1644,7 +1657,7 @@ class GraspPlanner3D:
                                 (_tp2, float(cfg.r_index))):
                     _opti.subject_to(
                         _sphere_plane_distance(_tp, _r, _ground_p, _ground_n)
-                        >= cfg.col_clearance_m)
+                        >= _clr_ground)
 
             # ── Initial guess ─────────────────────────────────────────────
             _opti.set_initial(_q,  q_ws)

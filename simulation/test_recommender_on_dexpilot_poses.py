@@ -43,7 +43,7 @@ OBJ_NAME = 'obj_red_box'
 OBJ_GEOM = 'obj_red_box_geom'
 
 # Disturbance budgets — must match the live NCF_* defaults the recommender uses.
-NCF_ACCEL_BUDGET_XYZ = (0.25, 0.25, 0.25)
+NCF_ACCEL_BUDGET_XYZ = (20.0, 20.0, 20.0)   # match the live top-level budget
 NCF_ANG_ACCEL_BUDGET = (0.5, 0.5, 0.5)
 
 FINGER_CODES_ACTIVE = ('if', 'th')   # FINGER_SET = index + thumb
@@ -75,10 +75,15 @@ def active_obj_clearance(g):
     return 0.002
 
 
-def build_live_config(model):
-    """Reproduce _get_cat_planner's live GraspConfig3D, INCLUDING the finger-link
-    constraints just added (palm/wrist _REC_ARM_GEOMS + active-finger non-contact links
-    with tiered obj clearance)."""
+def build_live_config(model, accel_budget=None, ang_budget=None, edge_margin_m=0.015):
+    """Reproduce _get_cat_planner's live GraspConfig3D EXACTLY (single source of truth for
+    the recommender config across all tests): palm/wrist + active-finger links (tiered obj
+    clearance) + non-active middle/ring (ground-only), orient_weight, ground_clearance_m.
+
+    accel_budget/ang_budget/edge_margin_m override the disturbance budget and edge tolerance
+    for sweeping — defaults match live."""
+    accel_budget = tuple(accel_budget) if accel_budget is not None else NCF_ACCEL_BUDGET_XYZ
+    ang_budget = tuple(ang_budget) if ang_budget is not None else NCF_ANG_ACCEL_BUDGET
     robot_geoms = build_robot_geom_names(model)
 
     rec_arm_geoms = [
@@ -91,20 +96,29 @@ def build_live_config(model):
                            if any(g.startswith(f'leap_{c}_') for c in FINGER_CODES_ACTIVE)}
     rec_finger_geoms = sorted(g for g in active_finger_geoms
                               if not ('_ds_' in g or g.endswith('_tip')))
-    arm_geom_names = list(rec_arm_geoms) + rec_finger_geoms
+    # Non-active fingers (middle/ring): GROUND-ONLY protection (disable object constraint via
+    # the sentinel; the floor test still applies). Matches _get_cat_planner.
+    rec_nonactive_geoms = sorted(
+        g for g in robot_geoms
+        if (g.startswith('leap_mf_') or g.startswith('leap_rf_'))
+        and not ('_ds_' in g or g.endswith('_tip')))
+    arm_geom_names = list(rec_arm_geoms) + rec_finger_geoms + rec_nonactive_geoms
     obj_clearance = {g: active_obj_clearance(g) for g in rec_finger_geoms}
+    obj_clearance.update({g: ANOBJ_DISABLE for g in rec_nonactive_geoms})
 
     print(f"[cfg] recommender collision geoms: {len(rec_arm_geoms)} palm/wrist + "
-          f"{len(rec_finger_geoms)} active-finger links = {len(arm_geom_names)} total")
+          f"{len(rec_finger_geoms)} active + {len(rec_nonactive_geoms)} non-active "
+          f"(ground-only) = {len(arm_geom_names)} total")
 
     cfg = GraspConfig3D(
         obj_geom=OBJ_GEOM, obj_body=OBJ_NAME,
         max_iter=120, arm_geom_names=arm_geom_names,
         obj_clearance_by_geom=obj_clearance,
-        w_align=10.0, orient_weight=2.0, edge_margin_m=0.015,
+        w_align=10.0, orient_weight=2.0, edge_margin_m=edge_margin_m,
+        ground_clearance_m=0.010,
         wrench_constraint=False, datum_gamma=True,
-        accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
-        ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
+        accel_budget_xyz=accel_budget,
+        ang_accel_budget_xyz=ang_budget,
     )
     return cfg, active_finger_geoms
 

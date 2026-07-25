@@ -1137,7 +1137,15 @@ if __name__ == "__main__":
     # pulls back proportionally, so measured contact force saturates well below
     # GAMMA/sqrt(2) instead of scaling with it.
     # SQUEEZE_PD_SCALE = 50.0
-    SQUEEZE_PD_SCALE = 2.0
+    # 2.0 was too SOFT to hold a sustained lift: the fingers deliver normal force fine
+    # (~22N/contact) but are too compliant to resist the TANGENTIAL shear as the object hangs
+    # under gravity, so the box slips out over ~2s (a momentary lift, no hold). A grasp-lift
+    # integration test (test_grasp_lift.py, live accel=20 budget, 3s hold) found 2.0/3.0
+    # slip (sag +7-15mm, box drops) while 5.0 holds (sag ~0, box lifts +73-79mm and stays)
+    # robustly across gamma x3-x10 — the fix is finger STIFFNESS, not squeeze force (29N/
+    # contact already far exceeds the 0.25kg box's weight). 5.0 is stiff enough to hold the
+    # shear while still soft enough to let the internal force deliver the normal squeeze.
+    SQUEEZE_PD_SCALE = 5.0
 
     # Ramp the squeeze force 0->GAMMA over this many seconds of sim time after each
     # squeeze-on. The internal force pair only cancels once BOTH contacts exist; at
@@ -2303,15 +2311,31 @@ if __name__ == "__main__":
             _rec_finger_geoms = sorted(
                 g for g in _active_finger_geoms
                 if not ('_ds_' in g or g.endswith('_tip')))   # drop contact tier
-            _rec_arm_geoms = list(_REC_ARM_GEOMS) + _rec_finger_geoms
+            # NON-ACTIVE fingers (middle/ring) get GROUND-ONLY protection: they don't grasp
+            # (so no object constraint — clearance set to the disable sentinel, which skips
+            # the object test but KEEPS the floor test in the SDF loop), but their curled
+            # links were dipping through the table in the committed recommender q. Proximity
+            # pruning (floor-aware) drops the ones already well clear of the floor, so most
+            # solves add few active constraints. Contact-tier ds/tip excluded like the active
+            # fingers — a non-grasping fingertip has no reason to be near the floor plane the
+            # proximal links don't already cover.
+            _rec_nonactive_geoms = sorted(
+                g for g in _robot_geom_names
+                if (g.startswith('leap_mf_') or g.startswith('leap_rf_'))
+                and not ('_ds_' in g or g.endswith('_tip')))
+            _rec_arm_geoms = list(_REC_ARM_GEOMS) + _rec_finger_geoms + _rec_nonactive_geoms
             _rec_obj_clearance = {g: _active_obj_clearance(g) for g in _rec_finger_geoms}
+            _rec_obj_clearance.update({g: ANOBJ_DISABLE for g in _rec_nonactive_geoms})
             print(f"[rec] recommender collision geoms: {len(_REC_ARM_GEOMS)} palm/wrist + "
-                  f"{len(_rec_finger_geoms)} active-finger links "
+                  f"{len(_rec_finger_geoms)} active-finger links + "
+                  f"{len(_rec_nonactive_geoms)} non-active (ground-only) "
                   f"(tiers: adjacent -10mm, proximal +2mm)")
             cfg = GraspConfig3D(obj_geom=o['name'] + '_geom', obj_body=o['name'],
                                 max_iter=120, arm_geom_names=_rec_arm_geoms,
                                 obj_clearance_by_geom=_rec_obj_clearance,
                                 w_align=10.0, orient_weight=2.0, edge_margin_m=0.015,
+                                ground_clearance_m=0.010,   # +5mm over col_clearance for
+                                                            # curled middle/ring vs the table
                                 wrench_constraint=False, datum_gamma=True,
                                 accel_budget_xyz=tuple(NCF_ACCEL_BUDGET_XYZ),
                                 ang_accel_budget_xyz=tuple(NCF_ANG_ACCEL_BUDGET))
