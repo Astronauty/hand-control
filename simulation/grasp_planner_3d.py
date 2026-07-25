@@ -531,18 +531,23 @@ def _sym_geom_surface_con(opti, p_sym, d, geom_type: int,
         return
     p_loc = ca.DM(mat_np.T) @ (p_sym - ca.DM(center_np))
     if geom_type == 6:   # BOX
-        ax    = int(np.argmax(np.abs(d)))
-        coord = float(center_np[ax] + np.sign(d[ax]) * float(size[ax]))
-        opti.subject_to(p_sym[ax] == coord)
+        # Pin in the OBJECT LOCAL frame (p_loc), NOT world (p_sym). For a ROTATED box the
+        # face is a tilted plane; constraining the world coordinate p_sym[ax]==const pins the
+        # contact to a world-axis plane that is not the face, so the contact floats off the
+        # surface by several mm (measured: up to +8mm on rotated boxes). p_loc is already
+        # object-centred, so the face is simply p_loc[ax] == ±size[ax] and the tangential
+        # bounds are on p_loc[ta] (matching the cylinder/sphere branches below). The
+        # face-normal axis is chosen from the normal expressed in the LOCAL frame.
+        d_loc = mat_np.T @ np.asarray(d, float)
+        ax    = int(np.argmax(np.abs(d_loc)))
+        coord = float(np.sign(d_loc[ax]) * float(size[ax]))
+        opti.subject_to(p_loc[ax] == coord)
         for ta in [i for i in range(3) if i != ax]:
             # Half-extent minus the keep-out margin, clamped to a small positive sliver
             # so the box never collapses to an empty interval on tiny faces.
             _half = max(float(size[ta]) - float(edge_margin),
                         0.05 * float(size[ta]))
-            opti.subject_to(opti.bounded(
-                float(center_np[ta]) - _half,
-                p_sym[ta],
-                float(center_np[ta]) + _half))
+            opti.subject_to(opti.bounded(-_half, p_loc[ta], _half))
     elif geom_type == 5:  # CYLINDER
         R_c, H = float(size[0]), float(size[1])
         d_loc  = mat_np.T @ np.asarray(d, float)
@@ -687,6 +692,13 @@ def _embed_wrench_cone_ca(opti, p1, p2,
 # GraspConfig3D
 # ─────────────────────────────────────────────────────────────────────────────
 
+# obj_clearance_by_geom values at or below this turn the arm-collision OBJECT constraint
+# OFF for that geom (contact-tier fingertips/distal links that must touch the object). The
+# geom is still kept for the FLOOR constraint. Chosen well below any physically-meaningful
+# negative clearance (bounding-sphere phantom penetration tops out ~-0.02 m).
+_COL_DISABLE_SENTINEL = -0.5   # m
+
+
 @dataclass
 class GraspConfig3D:
     """Configuration for the 3D grasp planner (Kinova Gen3 + LEAP hand)."""
@@ -768,6 +780,22 @@ class GraspConfig3D:
     arm_geom_names:   list  = field(default_factory=list)
     col_prune_margin: float = 0.10
     col_use_ground:   bool  = True
+
+    # Per-geom OBJECT clearance override for the arm-collision SDF loop (section 5a).
+    # Maps an arm_geom_name -> the minimum sphere-vs-object signed distance required for
+    # THAT geom (metres). Geoms absent from the dict use the scalar col_clearance_m. A
+    # value <= _COL_DISABLE_SENTINEL (see below) turns the object constraint OFF for that
+    # geom entirely — used for the CONTACT-tier fingertip/distal geoms, which must be free
+    # to touch/wrap the object. The FLOOR constraint is never affected by this dict; every
+    # geom keeps full col_clearance_m vs the ground plane so no link can drop underground.
+    # This mirrors the ConstrainedIKSolver's reduced_clearance_geoms tiering so the
+    # recommender's collision definition can be made to match the post-solve refinement's.
+    # Negative values are legitimate here for the SAME reason they are in
+    # _active_clearance_by_geom: each arm geom is modeled as its coarse bounding SPHERE
+    # (geom_rbound), which over-approximates a thin link, so a link legitimately at the
+    # surface reads several mm of phantom penetration. Once the link model is upgraded to
+    # exact boxes these can go non-negative.
+    obj_clearance_by_geom: dict = field(default_factory=dict)
 
     # Support-plane z coordinate (world frame) used to filter unreachable seeds.
     # Contacts whose outward normal points more than 60° below horizontal, or whose
@@ -944,9 +972,30 @@ class GraspPlanner3D:
         self._cp3_gid    = self._optional_geom(c.cp3_geom)
         self._cp4_gid    = self._optional_geom(c.cp4_geom)
 
-        # Fingertip effective radius (site centroid to contact-surface distance)
-        # is always measured from the model geometry — never a hardcoded guess.
-        def _tip_radius(gid):
+        # Fingertip effective radius (site centroid to contact-surface distance) is always
+        # measured from the model geometry — never a hardcoded guess. Used as the IK offset:
+        # the tip SITE is targeted at contact + r_tip*outward_normal so the pad surface (not
+        # the site centroid) lands on the object.
+        #
+        # For a MESH tip (the LEAP fingertips), geom_rbound is the bounding sphere about the
+        # mesh FRAME ORIGIN, which over-estimates the pad extent from the SITE (measured:
+        # rbound 23.8mm; farthest mesh vertex from the site 19.5mm). We use the MAX vertex
+        # distance from the site when a site id is given — the honest "max pad offset".
+        #
+        # Choice of MAX (not mean/min): the offset sets the IK target contact + r_tip*normal.
+        # The cost is ASYMMETRIC — too small drives the pad INTO the object (penetration the
+        # squeeze only worsens as it presses deeper), while too large leaves a GAP the squeeze
+        # closes. A headless physics test (test_squeeze_closes_gap.py) showed the squeeze
+        # closes a gap up to ~4mm object shift GENTLY. Measured pad-to-box gaps at recommended
+        # q: MEAN offset (16.8mm) centres the gap on ZERO -> ~half the contacts PENETRATE (to
+        # -6.1mm) — the exact failure to avoid; MAX offset (19.5mm) shifts the whole
+        # distribution ~+2.7mm so contacts hover on the SAFE side with worst-case gap inside
+        # the squeeze's gentle-closing window. So MAX is the correctly-calibrated choice: it
+        # keeps the worst contact non-penetrating without exceeding the shove threshold.
+        # (Directional sampling along the actual contact normal would tighten the gap toward 0
+        # but needs the tip orientation as a symbolic function of q inside the NLP — a
+        # non-smooth support function that degrades L-BFGS convergence — not worth it.)
+        def _tip_radius(gid, sid=None):
             gt = int(model.geom_type[gid])
             gs = model.geom_size[gid]
             if gt == 2:   # mjGEOM_SPHERE: size[0] = radius
@@ -955,11 +1004,25 @@ class GraspPlanner3D:
                 return float(gs[0])
             if gt == 6:   # mjGEOM_BOX: use min half-extent as a conservative radius
                 return float(np.min(gs[:3]))
-            # mjGEOM_MESH (7) and others: geom_rbound is MuJoCo's bounding radius
+            if gt == 7 and sid is not None:   # mjGEOM_MESH with a known site
+                did  = int(model.geom_dataid[gid])
+                if did >= 0:
+                    vadr = int(model.mesh_vertadr[did])
+                    vnum = int(model.mesh_vertnum[did])
+                    V = model.mesh_vert[vadr:vadr + vnum].reshape(-1, 3)   # mesh local
+                    # Site in the mesh(geom) local frame; the site pose relative to the geom is
+                    # model-static, so read it at qpos0.
+                    _d0 = mj.MjData(model)
+                    mj.mj_forward(model, _d0)
+                    gpos = _d0.geom_xpos[gid]
+                    gmat = _d0.geom_xmat[gid].reshape(3, 3)
+                    site_local = gmat.T @ (_d0.site_xpos[sid] - gpos)
+                    return float(np.max(np.linalg.norm(V - site_local, axis=1)))
+            # MESH without a site (middle/ring) or other: MuJoCo's bounding radius.
             return float(model.geom_rbound[gid])
 
-        c.r_thumb  = _tip_radius(self._thumb_gid)
-        c.r_index  = _tip_radius(self._index_gid)
+        c.r_thumb  = _tip_radius(self._thumb_gid, self._thumb_sid)
+        c.r_index  = _tip_radius(self._index_gid, self._index_sid)
         c.r_middle = _tip_radius(self._middle_gid)
         c.r_ring   = _tip_radius(self._ring_gid)
         self.log.info(
@@ -1024,14 +1087,23 @@ class GraspPlanner3D:
         self._lo_vec = np.array(lo_list)
         self._hi_vec = np.array(hi_list)
 
-        # Full-arm collision geoms
+        # Full-arm collision geoms. _arm_obj_clearance is the per-geom OBJECT clearance
+        # (section 5a), resolved once here from cfg.obj_clearance_by_geom with the scalar
+        # col_clearance_m as the default. A geom whose resolved clearance is the disable
+        # sentinel gets NO object constraint (contact-tier fingertips/distal links that must
+        # touch); it is still kept for the FLOOR constraint. Parallel-indexed with
+        # _arm_gids/_arm_radii so the solve loop can look up by the same _ai.
         self._arm_gids  = []
         self._arm_radii = []
+        self._arm_obj_clearance = []
+        _obj_clr_map = dict(getattr(c, 'obj_clearance_by_geom', None) or {})
         for gname in (c.arm_geom_names or []):
             gid = self._optional_geom(gname)
             if gid is not None:
                 self._arm_gids.append(gid)
                 self._arm_radii.append(float(model.geom_rbound[gid]))
+                self._arm_obj_clearance.append(
+                    float(_obj_clr_map.get(gname, c.col_clearance_m)))
             else:
                 self.log.warning(f"GraspPlanner3D: arm_geom '{gname}' not found — skipped")
 
@@ -1168,7 +1240,21 @@ class GraspPlanner3D:
                 _gp = _data_prune.geom_xpos[_agid]
                 _arm_dist = (_geom_sdf_np(_gp, geom_type, obj_center_np,
                                           obj_R_np, geom_size) - _ar)
-                if _arm_dist < cfg.col_clearance_m + cfg.col_prune_margin:
+                # Prune against THIS geom's own object clearance, not the scalar default —
+                # a proximal finger link with a tighter required clearance must be kept even
+                # when it sits slightly farther than col_clearance_m would demand. Contact-
+                # tier geoms (object constraint disabled) use the sentinel as their prune
+                # threshold, so the object test never keeps them for the object's sake.
+                _clr_ai   = float(self._arm_obj_clearance[_ai])
+                _near_obj = (_clr_ai > _COL_DISABLE_SENTINEL
+                             and _arm_dist < _clr_ai + cfg.col_prune_margin)
+                # Floor proximity: every geom needs the ground constraint (section 5a), so a
+                # geom close to the floor is kept even when far from the object. z of the
+                # sphere surface vs ground_z.
+                _near_flr = (cfg.col_use_ground
+                             and (float(_gp[2]) - _ar - float(cfg.ground_z))
+                                  < cfg.col_clearance_m + cfg.col_prune_margin)
+                if _near_obj or _near_flr:
                     _active_arm.append(_ai)
 
         # ── inner: build + run one Opti problem ────────────────────────────
@@ -1458,17 +1544,24 @@ class GraspPlanner3D:
                 for _j, _ai in enumerate(_active_arm):
                     _gp = _arm_pos[3*_j : 3*_j+3]
                     _r  = float(self._arm_radii[_ai])
-                    if geom_type == 6:   # BOX
-                        _d_obj = _softplus_sphere_box_distance(
-                            _gp, _r, _obj_c_dm, _obj_R_dm, ca.DM([hx, hy, hz]))
-                    elif geom_type == 5:  # CYLINDER
-                        _d_obj = _softplus_sphere_cylinder_distance(
-                            _gp, _r, _obj_c_dm, _obj_R_dm,
-                            float(geom_size[0]), float(geom_size[1]))
-                    else:                 # SPHERE or fallback
-                        _obj_r = float(geom_size[0])
-                        _d_obj = _sphere_sphere_distance(_gp, _r, _obj_c_dm, _obj_r)
-                    _opti.subject_to(_d_obj >= cfg.col_clearance_m)
+                    # Per-geom OBJECT clearance (defaults to col_clearance_m; see
+                    # GraspConfig3D.obj_clearance_by_geom). At/below the disable sentinel the
+                    # object constraint is skipped entirely for this geom (contact-tier
+                    # fingertips/distal links that must touch), but the FLOOR constraint below
+                    # is still applied so it can never drop underground.
+                    _clr_obj = float(self._arm_obj_clearance[_ai])
+                    if _clr_obj > _COL_DISABLE_SENTINEL:
+                        if geom_type == 6:   # BOX
+                            _d_obj = _softplus_sphere_box_distance(
+                                _gp, _r, _obj_c_dm, _obj_R_dm, ca.DM([hx, hy, hz]))
+                        elif geom_type == 5:  # CYLINDER
+                            _d_obj = _softplus_sphere_cylinder_distance(
+                                _gp, _r, _obj_c_dm, _obj_R_dm,
+                                float(geom_size[0]), float(geom_size[1]))
+                        else:                 # SPHERE or fallback
+                            _obj_r = float(geom_size[0])
+                            _d_obj = _sphere_sphere_distance(_gp, _r, _obj_c_dm, _obj_r)
+                        _opti.subject_to(_d_obj >= _clr_obj)
                     if cfg.col_use_ground:
                         _opti.subject_to(
                             _sphere_plane_distance(_gp, _r, _ground_p, _ground_n)

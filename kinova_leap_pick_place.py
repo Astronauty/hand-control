@@ -45,7 +45,7 @@ from trial_logger import (EventLogger, TrialRunner, TrialPhase, TraceBuffer,
 # _geom_normal_np gives the outward surface normal used to build inward contact frames.
 sys.path.insert(0, __file__.rsplit('/', 1)[0] + '/simulation')
 from grasp_planner_3d import (GraspConfig3D, MultiStartGraspPlanner3D,  # noqa: E402
-                              _geom_normal_np)
+                              _geom_normal_np, _geom_sdf_np)
 
 # 3D_minimum_NCF.py isn't an importable module name (leading digit), so load it by path.
 import importlib.util as _ilu
@@ -369,11 +369,11 @@ if __name__ == "__main__":
              "kinematic replay (qpos overwrite + mj_forward) forever, so the IK solution and "
              "RRT path can be inspected without any dynamics interference.")
     _arg_parser.add_argument(
-        '--dashboard', action='store_true', default=True,
-        help="Launch a live pyqtgraph metrics dashboard (separate process): planning mode "
-             "(Approach/Grasp/Transport), proximity-based active object, scrolling "
-             "fingertip→object distances, net hand→object wrench, per-finger contact "
-             "normal forces, and a combined RRT+IK planner solution log. On by default.")
+        '--collision-view', action='store_true',
+        help="Open the viewer showing only collision geoms (group 3) with the LEAP-hand "
+             "and arm visual meshes (groups 1 & 2) hidden, so you see the actual boxes the "
+             "physics and the recommender's collision model act on. Equivalent to pressing "
+             "1 and 2 to hide visuals and 3 to show collision geoms in the viewer.")
     _arg_parser.add_argument(
         '--mode',
         choices=['contact_aware_autonomous', 'contact_aware_teleop', 'dexpilot',
@@ -388,8 +388,10 @@ if __name__ == "__main__":
              "teleop via ROS 2.")
     _arg_parser.add_argument(
         '--camera', type=int, default=None,
-        help="Camera index forwarded to ui/mediapipe_joint_angles.py in dexpilot mode "
-             "(default: auto-select — prefers external/USB camera at index ≥1).")
+        help="Force SINGLE-camera teleop on this index, forwarded to "
+             "ui/mediapipe_joint_angles.py (the 'Hand Tracking [cam N]' window). "
+             "Passing this opts OUT of the default multicam fusion. Omit it to use "
+             "the default: auto-discovered multi-camera fusion (see --multicam-auto).")
     _arg_parser.add_argument(
         '--position-mode', choices=['relative', 'absolute'], default=None,
         help="dexpilot position mapping. relative: press-8 re-zeroable, robot tracks "
@@ -404,25 +406,10 @@ if __name__ == "__main__":
              "layout (positions and sizes). Default: fresh entropy every run. "
              "Ignored with --no-randomize.")
     _arg_parser.add_argument(
-        '--no-randomize', action='store_true', default=True,
-        help="Skip object randomization: objects keep the positions, sizes, and colors "
-             "authored in models/scene_pick_place.xml. On by default — there is "
-             "currently no flag to force randomization back on; edit this default or "
-             "the argparse call directly if a run needs it.")
-    _arg_parser.add_argument(
         '--hand-self-collision', action='store_true',
         help="Re-enable LEAP hand self-collision (finger↔finger, finger↔palm contact "
              "physics). Disabled by default: hand geoms are moved to contype=2 so "
              "hand↔hand pairs never match, while hand↔object/floor/arm keep colliding.")
-    _arg_parser.add_argument(
-        '--physics', action='store_true', default=True,
-        help="dexpilot mode: drive the robot with PD torques + gravity comp and hand off "
-             "to mj_step, so the arm/hand PHYSICALLY collide with objects, the floor, and "
-             "(with --hand-self-collision) themselves — they can push/knock things. On by "
-             "default. The alternative (currently no flag to select it) is kinematic "
-             "replay — qpos overwrite, rigid, exact tracking with NO collision response — "
-             "which was previously the default and is best for orientation calibration; "
-             "calibration holds (M/C/V) stay kinematic regardless of this flag.")
     _arg_parser.add_argument(
         '--ik-solver', choices=['sqp', 'ipopt'], default='sqp',
         help="sqp (default): sqpmethod + OSQP + softplus SDF + analytic FK Jacobians — "
@@ -449,7 +436,10 @@ if __name__ == "__main__":
              "its calibration by hardware id (no --multicam specs needed). "
              "Equivalent to run_multicam.py --auto. Uses every calibrated camera "
              "currently plugged in (>=2); RealSense auto-flagged. Mutually exclusive "
-             "with --multicam.")
+             "with --multicam. THIS IS THE DEFAULT in dexpilot / contact_aware_teleop "
+             "modes — a bare run already auto-discovers and fuses cameras; pass this "
+             "explicitly only for clarity. Opt OUT with --no-mediapipe (external "
+             "publisher) or --camera N (force the single-cam publisher).")
     _arg_parser.add_argument(
         '--multicam-realsense', action='append', default=[], metavar='NAME',
         help="With --multicam: mark a camera NAME as an Intel RealSense (captures the "
@@ -457,14 +447,6 @@ if __name__ == "__main__":
              "selects the device); :WxH (or 640x480 default) sets the color size. "
              "The D435I's 1080p color is only 8fps, so default 640x480 @30fps. "
              "Repeatable. Forwards --realsense NAME to run_multicam.py.")
-    _arg_parser.add_argument(
-        '--multicam-max-res', action='store_true', default=True,
-        help="With --multicam: open each camera at its HIGHEST supported resolution "
-             "(forwards --max-res to run_multicam.py). Use this when your per-camera "
-             "intrinsics were calibrated at max res. Otherwise cameras open at 640x480 "
-             "and their intrinsics MUST match that — set a per-camera :WxH in --multicam "
-             "(e.g. --multicam c0:0:1920x1080) to match each camera's calibrated size. "
-             "On by default; has no effect unless --multicam or --multicam-auto is set.")
     _arg_parser.add_argument(
         '--recalibrate-extrinsics', action='store_true',
         help="With --multicam: run the INTERACTIVE extrinsics-all walkthrough "
@@ -505,24 +487,35 @@ if __name__ == "__main__":
              "mid-trial target switch — see trial_logger.py for the full state "
              "machine. Omit the flag entirely (default) to disable trial logging: "
              "the tool then behaves exactly as without this flag.")
-    _arg_parser.add_argument(
-        '--skeleton-view', action='store_true', default=True,
-        help="dexpilot / contact_aware_teleop: open a separate orbitable 3D window "
-             "showing the hand skeleton from the WORLD landmarks in /hand/joint_angles "
-             "(raw[57:120]) — the same fused skeleton run_multicam.py --show draws, so "
-             "you can watch the multi-camera fusion while teleoping. No camera-preview "
-             "grid (those images aren't in the joint_angles message). On by default.")
     args = _arg_parser.parse_args()
+    # In-code defaults for behaviours that used to be always-True CLI flags. These
+    # never had a way to turn them OFF from the command line, so they only cluttered
+    # --help. They live here as plain constants now; flip one for a run by editing it.
+    args.dashboard = True          # live pyqtgraph metrics dashboard (separate proc)
+    args.no_randomize = True       # keep scene_pick_place.xml object layout (no randomization)
+    args.physics = True            # dexpilot: PD torques + mj_step (physical collisions)
+    args.multicam_max_res = True   # open each multicam camera at its highest resolution
+    args.skeleton_view = True      # orbitable fused-hand skeleton window (teleop modes)
     if args.mode == 'rrt':          # deprecated alias
         args.mode = 'contact_aware_autonomous'
     if args.multicam and args.multicam_auto:
         _arg_parser.error("--multicam and --multicam-auto are mutually exclusive")
+    # Multicam fusion is the DEFAULT hand source in teleop modes: a bare run
+    # auto-discovers calibrated cameras and fuses them, so the single-cam publisher
+    # (ui/mediapipe_joint_angles.py, the "Hand Tracking [cam N]" window) never opens.
+    # Opt out explicitly with --no-mediapipe/--external-hand (external publisher) or
+    # --camera N (force the single-cam publisher on that index). Passing --multicam
+    # specs or --multicam-auto also takes this path with the given/discovered cameras.
+    _wants_single_cam = args.no_mediapipe or args.camera is not None
+    if (args.mode in ('dexpilot', 'contact_aware_teleop')
+            and not args.multicam and not _wants_single_cam):
+        args.multicam_auto = True
     if args.multicam_auto:
         # Discover + match calibrated cameras by hardware id, and synthesise the
         # equivalent --multicam / --multicam-realsense lists so ALL downstream code
         # (name extraction, camera-views subscriptions, the run_multicam command)
-        # works unchanged. The child pipeline is launched with --auto (below), but
-        # the app still needs the resolved NAMES here.
+        # works unchanged. The child pipeline is launched with the resolved explicit
+        # --cam specs (below), and the app needs the resolved NAMES here too.
         import sys as _sys
         _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                          'calibration'))
@@ -1496,6 +1489,31 @@ if __name__ == "__main__":
         _ik_markers_by_obj[obj_idx] = _make_ik_markers(obj, obj_qpos_snap)
         _ik_solved.add(obj_idx)
 
+    def _audit_finger_penetration(q_full, obj, obj_qpos_snap):
+        """Exact per-active-finger-geom signed distance to the target object at pose q_full,
+        via mj_geomDistance (the SAME exact box distance ConstrainedIKSolver uses — NOT the
+        recommender's bounding-sphere proxy). Returns (worst_geom, worst_dist_m, {geom: dist}).
+        Negative = real interpenetration. Used to baseline how deep the recommender's RAW q
+        buries a finger link before the collision-aware refinement pulls it out — the ground
+        truth for deciding whether the exact-box recommender upgrade is worth its cost."""
+        _d = mj.MjData(model)
+        _d.qpos[N_ROBOT:] = obj_qpos_snap
+        _d.qpos[:N_ROBOT] = q_full
+        mj.mj_forward(model, _d)
+        _ft = np.zeros(6)
+        _og = obj['id_geom']
+        _pen = {}
+        for g in _active_finger_geoms:
+            _gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g)
+            # Lower bound guards mj_geomDistance's collision-margin cutoff (returns the
+            # margin, not the true deep-penetration distance, past a point) — same pattern
+            # as the _run_ik audit at ~L1374.
+            _lb = (np.linalg.norm(_d.geom_xpos[_og] - _d.geom_xpos[_gid])
+                   - model.geom_rbound[_gid] - model.geom_rbound[_og])
+            _pen[g] = max(mj.mj_geomDistance(model, _d, _gid, _og, 1.0, _ft), _lb)
+        _wg, _wd = min(_pen.items(), key=lambda kv: kv[1])
+        return _wg, _wd, _pen
+
     def _run_ik_recommended(obj_idx, obj, obj_qpos_snap, rec, q_seed,
                             warmstart='rec_q'):
         """contact_aware_teleop LOCK-IN + O/I DEBUG PREVIEW: like _run_ik but the
@@ -1538,9 +1556,29 @@ if __name__ == "__main__":
             _d_nlp.qpos[N_ROBOT:] = obj_qpos_snap
             _d_nlp.qpos[:N_ROBOT] = _q_nlp
             mj.mj_forward(model, _d_nlp)
+            # Measure against the target the recommender NLP ACTUALLY optimizes:
+            # contact + r_tip*outward_normal == p_S_W - r_tip*inward_S_W (grasp_planner_3d.py
+            # _run_stage: _tp_tgt = p + r_tip*d_outward). The tip SITE sits at the tip-mesh
+            # centroid, so it legitimately stands r_tip (~19mm) proud of the bare contact;
+            # measuring site-vs-bare-contact reported that fixed offset as if it were error
+            # (the spurious "~24mm plateau"). Use the recommender's OWN r_tip (per finger)
+            # from its planner config so the number is true convergence error (sub-mm when
+            # the NLP solves well). FINGER_SET order = [index, thumb] -> [r_index, r_thumb].
+            _rec_cfg = _get_cat_planner(obj_idx)._planner.cfg
+            _r_tip_by_finger = {'index': float(_rec_cfg.r_index),
+                                'thumb': float(_rec_cfg.r_thumb)}
+            _nlp_tgts = [p - _r_tip_by_finger[f] * n
+                         for f, p, n in zip(FINGER_SET, p_S_W, inward_S_W)]
             obj['rec_nlp_err_mm'] = [
-                float(np.linalg.norm(_d_nlp.site_xpos[s] - p) * 1e3)
-                for s, p in zip(id_C, p_S_W)]
+                float(np.linalg.norm(_d_nlp.site_xpos[s] - t) * 1e3)
+                for s, t in zip(id_C, _nlp_tgts)]
+            # BASELINE (Step 2): exact-distance penetration of the recommender's RAW q,
+            # before any collision-aware refinement. This is the depth the refinement has
+            # to pull out — the number that decides whether the exact-box recommender
+            # upgrade is worth it. Stored so the post-refinement audit can print the delta.
+            _nlp_wg, _nlp_wd, _ = _audit_finger_penetration(_q_nlp, obj, obj_qpos_snap)
+            obj['rec_nlp_pen_mm'] = _nlp_wd * 1e3
+            obj['rec_nlp_pen_geom'] = _nlp_wg
         if warmstart == 'rec_q' and _rec_q is not None:
             q_warm = np.asarray(q_seed, float).copy()
             for _i, _idx in enumerate(_cat_act_idx):
@@ -1562,21 +1600,39 @@ if __name__ == "__main__":
         print(f"\r\n[IK] obj{obj_idx+1} (recommended): warm-start {_ws_src} + "
               f"SQP {sqp_ms:.0f}ms")
 
+        # BASELINE (Step 2): exact-distance penetration AFTER the collision-aware refinement,
+        # and the before->after delta. `raw` is what the recommender's IK-only NLP produces
+        # (models fingers as points => can bury a link); `refined` is what constrained_ik
+        # pulls it back to (bounded by the tiered clearance). The delta is exactly the
+        # collision the second solve exists to fix — if it's small in practice, a lighter
+        # recommender collision proxy suffices; if large (~-12mm as previously measured), the
+        # exact-box upgrade is justified. All via exact mj_geomDistance (not bounding sphere).
+        _ref_wg, _ref_wd, _ = _audit_finger_penetration(obj['q_target'], obj, obj_qpos_snap)
+        obj['rec_ik_pen_mm'] = _ref_wd * 1e3
+        _raw_pen = obj.get('rec_nlp_pen_mm')
+        if _raw_pen is not None:
+            _delta = _ref_wd * 1e3 - _raw_pen
+            _flag = '  ** RAW q PENETRATES **' if _raw_pen < -2.0 else ''
+            print(f"[IK] obj{obj_idx+1} finger-link penetration (exact dist, worst geom):\n"
+                  f"       recommender RAW q : {_raw_pen:+6.1f} mm ({obj.get('rec_nlp_pen_geom')}){_flag}\n"
+                  f"       collision-aware IK: {_ref_wd*1e3:+6.1f} mm ({_ref_wg})\n"
+                  f"       refinement fixed  : {_delta:+6.1f} mm  <- collision the 2nd solve removes")
+
         _d_chk = mj.MjData(model)
         _d_chk.qpos[N_ROBOT:] = obj_qpos_snap
         _d_chk.qpos[:N_ROBOT] = obj['q_target']
         mj.mj_forward(model, _d_chk)
         _errs_mm = [float(np.linalg.norm(_d_chk.site_xpos[s] - t) * 1e3)
                     for s, t in zip(id_C, obj['ik_targets'])]
-        # Same site-vs-CONTACT metric the recommender error uses (measured against
-        # p_S_W, not the pad-backed-off ik_targets), so the two numbers are directly
-        # comparable and the gap the collision constraints introduce is visible.
-        _errs_contact_mm = [float(np.linalg.norm(_d_chk.site_xpos[s] - p) * 1e3)
-                            for s, p in zip(id_C, p_S_W)]
-        # Side-by-side attribution (FINGER_SET order = {FINGER_SET}): the discrepancy
-        # between what the NLP reported and what the robot actually reaches is the delta
-        # (collision-constrained IK pulling the tips off the ideal contacts to satisfy
-        # clearance). All measured site->contact (p_S_W) for a like-for-like compare.
+        # Attribution metric: each stage's TRUE convergence residual, i.e. how far the tip
+        # site lands from the target THAT stage optimizes. The recommender NLP targets
+        # p_S_W - r_tip*inward (_nlp_tgts above); the collision-aware IK targets
+        # obj['ik_targets'] = p_S_W - _PAD_OFFSET*inward. Both are pad-standoff offsets from
+        # the bare contact, just different magnitudes (r_tip vs _PAD_OFFSET). Measuring each
+        # site against its OWN target (not the bare p_S_W) removes the fixed standoff that
+        # previously showed up as ~19mm phantom "error"; the residuals are now sub-mm when a
+        # stage converges, and their DELTA is the real pull-off the clearance constraints add.
+        _errs_contact_mm = _errs_mm   # collision-IK residual vs ITS target (ik_targets)
         # Emitted as one multi-line block (each stage on its own line) so the chain reads
         # cleanly in the console instead of running together with prior output.
         _nlp_e = obj.get('rec_nlp_err_mm')
@@ -1584,7 +1640,7 @@ if __name__ == "__main__":
                   else "n/a (no rec-q)")
         _lines = [
             "",   # leading blank line: separates this block from the SQP-timing line
-            f"[IK] obj{obj_idx+1} tip-error attribution (site->contact, mm), "
+            f"[IK] obj{obj_idx+1} tip-error attribution (site->stage target, mm), "
             f"fingers {FINGER_SET}:",
             f"       recommender NLP q : {_nlp_s}",
             f"       collision-aware IK: {[f'{e:.1f}' for e in _errs_contact_mm]}",
@@ -2226,8 +2282,36 @@ if __name__ == "__main__":
             # Certify γ under the SAME disturbance budgets the controller uses at grasp
             # time (solve_gamma_live), so the recommender's feasibility flag agrees with
             # the one that gates the squeeze.
+            # FINGER-LINK COLLISION IN THE RECOMMENDER (was: palm+wrist only). The IK-only
+            # NLP modeled fingers as points, so its raw q buried a finger link ~13mm inside
+            # the object (measured), which the post-solve refinement then had to pull 50mm+
+            # off the recommended contacts — abandoning the very grasp the datum-γ was
+            # certified for. Adding the active-finger links here lets the NLP place contacts
+            # its own q can reach without link penetration, so the γ certificate finally
+            # corresponds to a reachable, collision-free pose.
+            #
+            # Constraint-budget care (see the all-71-geoms non-convergence note above): we
+            # add ONLY the active grasping fingers' ADJACENT + PROXIMAL links, and EXCLUDE
+            # the contact-tier (ds/tip) geoms — those carry no object constraint anyway
+            # (clearance disabled so they can touch), so including them would only add prune
+            # cost and floor constraints without protecting anything. Each added geom is
+            # proximity-pruned per solve, so on most solves few are active.
+            # Clearance TIERS reuse _active_obj_clearance verbatim (adjacent -10mm, proximal
+            # +2mm) — the SAME tiering the post-solve ConstrainedIKSolver uses — so the
+            # recommender's collision definition matches the refinement's by construction.
+            # The negative adjacent tier compensates for the bounding-SPHERE over-approx and
+            # goes non-negative once the link model is upgraded to exact boxes.
+            _rec_finger_geoms = sorted(
+                g for g in _active_finger_geoms
+                if not ('_ds_' in g or g.endswith('_tip')))   # drop contact tier
+            _rec_arm_geoms = list(_REC_ARM_GEOMS) + _rec_finger_geoms
+            _rec_obj_clearance = {g: _active_obj_clearance(g) for g in _rec_finger_geoms}
+            print(f"[rec] recommender collision geoms: {len(_REC_ARM_GEOMS)} palm/wrist + "
+                  f"{len(_rec_finger_geoms)} active-finger links "
+                  f"(tiers: adjacent -10mm, proximal +2mm)")
             cfg = GraspConfig3D(obj_geom=o['name'] + '_geom', obj_body=o['name'],
-                                max_iter=120, arm_geom_names=list(_REC_ARM_GEOMS),
+                                max_iter=120, arm_geom_names=_rec_arm_geoms,
+                                obj_clearance_by_geom=_rec_obj_clearance,
                                 w_align=10.0, edge_margin_m=0.015,
                                 wrench_constraint=False, datum_gamma=True,
                                 accel_budget_xyz=tuple(NCF_ACCEL_BUDGET_XYZ),
@@ -2424,11 +2508,40 @@ if __name__ == "__main__":
     _ik_vis_mode   = None          # None | 'grasp': freeze physics to show IK config
     _show_bspheres = False         # 7: overlay the IK's per-geom collision bounding spheres
 
-    # Precomputed (geom_id, bounding-sphere radius) for every hand geom the IK constrains —
-    # this is the coarse sphere model the IK actually "sees" (finger links 15-24mm), which
-    # is why the fingers can't be both constrained and reach a small object. Toggle with B.
-    _BSPHERES = [(mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g), float(model.geom_rbound[
-                    mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g)]))
+    # Precomputed (geom_id, bounding-sphere radius, tier) for every hand geom the IK
+    # constrains — this is the coarse sphere model the IK actually "sees" (finger links
+    # 15-24mm), which is why the fingers can't be both constrained and reach a small
+    # object. Toggle with 7.
+    #
+    # `tier` is the recommender-side classification we are about to enforce in the NLP:
+    #   'contact'  — active ds/tip geom, clearance disabled (must touch the surface)
+    #   'adjacent' — active if_md/th_px link, -10mm bounded-penetration tolerance
+    #   'proximal' — active finger link that must stay +2mm off the surface
+    #   'passive'  — a non-active-finger geom (palm/wrist/other fingers): full clearance
+    # Coloring by tier makes the tolerance profile legible in-scene, and the penetration
+    # highlight (see _draw_bspheres) shows when a sphere overlaps the ACTIVE object beyond
+    # what its tier permits — exactly the -12mm bury the recommender currently can't see.
+    def _bsphere_tier(g):
+        if g not in _active_finger_geoms:
+            return 'passive'
+        clr = _active_obj_clearance(g)
+        if clr <= ANOBJ_DISABLE + 1e-9:
+            return 'contact'
+        if clr < 0.0:
+            return 'adjacent'
+        return 'proximal'
+
+    _BSPHERE_TIER_RGBA = {
+        'contact':  np.array([0.30, 0.85, 0.35, 0.22], np.float32),  # green  — must touch
+        'adjacent': np.array([0.95, 0.75, 0.20, 0.22], np.float32),  # amber  — -10mm ok
+        'proximal': np.array([0.25, 0.55, 1.00, 0.22], np.float32),  # blue   — stay +2mm off
+        'passive':  np.array([0.55, 0.55, 0.55, 0.15], np.float32),  # grey   — full clearance
+    }
+    _BSPHERE_VIOLATE_RGBA = np.array([1.0, 0.1, 0.1, 0.45], np.float32)  # red — over-tier
+    _BSPHERES = [(mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g),
+                  float(model.geom_rbound[mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g)]),
+                  _bsphere_tier(g),
+                  _active_obj_clearance(g) if g in _active_finger_geoms else 0.005)
                  for g in _robot_geom_names]
 
     # Dashboard streaming state: wall-clock t0 for the scrolling x-axis, a step counter
@@ -2487,6 +2600,13 @@ if __name__ == "__main__":
 
     with mj.viewer.launch_passive(model, data, key_callback=make_key_callback(keys)) as viewer:
         viewer.opt.frame = mj.mjtFrame.mjFRAME_WORLD
+        if args.collision_view:
+            # Show only the collision geoms (group 3); hide the LEAP-hand (group 1) and arm
+            # (group 2) visual meshes. Lets you see the exact boxes the recommender's
+            # collision model is (about to be) built from. Toggle back live with 1/2/3.
+            viewer.opt.geomgroup[1] = 0
+            viewer.opt.geomgroup[2] = 0
+            viewer.opt.geomgroup[3] = 1
         if args.viz_only:
             viewer.opt.flags[mj.mjtVisFlag.mjVIS_CONTACTFORCE] = False
             viewer.opt.label = mj.mjtLabel.mjLABEL_NONE
@@ -2498,16 +2618,45 @@ if __name__ == "__main__":
         def _draw_bspheres(scn):
             """Append the IK's collision bounding spheres (translucent) to the scene at the
             current pose — one per constrained hand geom, radius = model.geom_rbound. Lets
-            you see the coarse sphere model the IK uses. No-op unless the B toggle is on."""
+            you see the coarse sphere model the recommender/IK uses. No-op unless the 7
+            toggle is on.
+
+            Each sphere is COLORED BY ITS RECOMMENDER TIER (green=contact/must-touch,
+            amber=adjacent/-10mm, blue=proximal/+2mm, grey=passive/full-clearance), so the
+            tolerance profile we are about to enforce in the NLP is visible in-scene.
+
+            A sphere turns RED when it penetrates the ACTIVE object's surface deeper than its
+            tier permits: the bounding-sphere signed distance to the object is
+            `_geom_sdf_np(center) - rb`, and the tier is violated when that drops below the
+            tier's clearance. This is exactly the ~-12mm finger-link bury the recommender's
+            IK-only NLP currently cannot see — turn it on to watch which link goes red at a
+            recommended pose BEFORE we add the constraints, then confirm it stays tier-colored
+            AFTER."""
             if not _show_bspheres or scn is None:
                 return
             _eye9 = np.eye(3, dtype=np.float64).flatten()
-            rgba  = np.array([0.2, 0.6, 1.0, 0.25], dtype=np.float32)  # translucent blue
-            for gid, rb in _BSPHERES:
+            # Active object's geom for the penetration check (None => no highlight, just tiers).
+            _obj = objects[active_idx] if 0 <= active_idx < len(objects) else None
+            _ogid = _obj['id_geom'] if _obj is not None else None
+            if _ogid is not None:
+                _ogtype = int(model.geom_type[_ogid])
+                _oc     = data.geom_xpos[_ogid].copy()
+                _oR     = data.geom_xmat[_ogid].reshape(3, 3).copy()
+                _osize  = model.geom_size[_ogid]
+            for gid, rb, tier, clr in _BSPHERES:
                 if scn.ngeom >= scn.maxgeom:
                     break
+                _center = data.geom_xpos[gid].copy()
+                rgba = _BSPHERE_TIER_RGBA[tier]
+                if _ogid is not None:
+                    # Signed distance of this bounding SPHERE to the active object surface —
+                    # the same quantity the recommender's SDF constraint bounds. Below the
+                    # tier's clearance => over-tier penetration => red.
+                    _sd = _geom_sdf_np(_center, _ogtype, _oc, _oR, _osize) - rb
+                    if _sd < clr - 1e-4:
+                        rgba = _BSPHERE_VIOLATE_RGBA
                 mj.mjv_initGeom(scn.geoms[scn.ngeom], mj.mjtGeom.mjGEOM_SPHERE,
-                                np.array([rb, rb, rb]), data.geom_xpos[gid].copy(), _eye9, rgba)
+                                np.array([rb, rb, rb]), _center, _eye9, rgba)
                 scn.ngeom += 1
 
         def _draw_active_marker(scn):
@@ -2651,6 +2800,10 @@ if __name__ == "__main__":
                         _show_bspheres = not _show_bspheres
                         print(f"[teleop] IK collision bounding-sphere overlay "
                               f"{'ON' if _show_bspheres else 'off'}  (7 to toggle)")
+                        if _show_bspheres:
+                            print("           tiers: green=contact(must touch)  "
+                                  "amber=adjacent(-10mm)  blue=proximal(+2mm)  "
+                                  "grey=passive(full)  RED=over-tier penetration of active obj")
                     elif _k == 'lock_in':
                         _do_lock_in = True
                     elif _k == 'rec_vis':
@@ -3541,6 +3694,10 @@ if __name__ == "__main__":
                     _show_bspheres = not _show_bspheres
                     print(f"\r\n[bspheres] IK collision bounding-sphere overlay "
                           f"{'ON' if _show_bspheres else 'off'}  (7 to toggle)")
+                    if _show_bspheres:
+                        print("           tiers: green=contact(must touch)  "
+                              "amber=adjacent(-10mm)  blue=proximal(+2mm)  "
+                              "grey=passive(full)  RED=over-tier penetration of active obj")
 
                 elif key.startswith('sel_') and control_phase == 'GRASP':
                     print("\r\n[Control] target selection blocked during GRASP — "
