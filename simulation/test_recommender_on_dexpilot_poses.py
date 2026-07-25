@@ -101,7 +101,7 @@ def build_live_config(model):
         obj_geom=OBJ_GEOM, obj_body=OBJ_NAME,
         max_iter=120, arm_geom_names=arm_geom_names,
         obj_clearance_by_geom=obj_clearance,
-        w_align=10.0, edge_margin_m=0.015,
+        w_align=10.0, orient_weight=2.0, edge_margin_m=0.015,
         wrench_constraint=False, datum_gamma=True,
         accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
         ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
