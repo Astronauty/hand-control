@@ -2663,6 +2663,12 @@ if __name__ == "__main__":
     # until data.time reaches this, giving the fingers a GRASP_SETTLE_S window to seat under
     # the squeeze before carrying. 0.0 = no pending settle (track immediately once armed).
     _grasp_track_after = 0.0
+    # One-shot latch: log the wrist pose ERROR at the instant tracking actually starts
+    # carrying (settle window ends). A large step here means the DexPilot target diverged
+    # from where the arm settled, so tracking begins with a shove the soft grasp must
+    # absorb — the prime suspect for teleop-only grasp destabilization. Reset to True each
+    # time tracking is (re-)armed at the REACH->GRASP transition.
+    _grasp_track_logged = False
     _ARM_IK_ITER_SAVE  = 500       # arm IK max_iter to restore after wrist-track carry
     _jog_w         = np.zeros(3)   # slew-limited angular velocity cmd (wrist tracking)
     # Wrist-target cache: the DexPilot arm IK solve (step()) is ~ms and the ROS wrist
@@ -2670,8 +2676,26 @@ if __name__ == "__main__":
     # real-time. Refresh the cached target on a wall-clock interval; the P-controller
     # tracks the cached target every step.
     _wrist_tgt     = None          # cached (p_tgt, R_tgt) for pinch_site
-    _wrist_tgt_t   = 0.0           # wall-clock of last refresh
-    WRIST_TGT_REFRESH_S = 0.033    # ~30 Hz — matches the camera/publisher rate
+    # SIM-TIME (data.time) of last refresh — NOT wall-clock. The GRASP loop runs one
+    # mj_step per iteration paced to real-time, but the in-loop spin()/palm-frame cost can
+    # push an iteration past one dt, so under load sim-time lags wall-clock. Gating the
+    # target refresh on wall-clock then advances the setpoint in wall-time chunks while
+    # physics only integrates sim-dt chunks — the per-step qdot_jog inflates past the accel
+    # budget the gamma/impratio no-slip guarantee was tuned for, shearing the grasp loose
+    # (the teleop-only slip). Stamping in sim-time keeps the target advance in lockstep with
+    # integrated physics, so tracking is bit-for-bit the autonomous jog's velocity profile
+    # regardless of loop speed. Cost: the wrist visibly lags a fast hand when loaded.
+    _wrist_tgt_t   = 0.0           # sim-time (data.time) of last target refresh
+    # Relative-tracking datum, captured at the instant carrying starts (settle window ends).
+    # The raw DexPilot target sits wherever the operator's hand happens to be, which is NOT
+    # where the arm settled during GRASP_SETTLE_S (measured: 25mm / 32deg off — a shove that
+    # ejects the object on step one). We track the target RELATIVE to this datum instead:
+    #   p_eff = p_tgt + _wrist_off_p ,  R_eff = _wrist_off_R @ R_tgt
+    # chosen so p_eff/R_eff == the current wrist pose AT arm time (zero initial error), and
+    # thereafter only the operator's hand MOTION relative to the datum drives the arm.
+    _wrist_off_p   = None          # (3,) position offset  p_cur - p_tgt  at arm time
+    _wrist_off_R   = None          # (3,3) rotation offset R_cur @ R_tgt.T at arm time
+    WRIST_TGT_REFRESH_S = 0.033    # ~30 Hz of SIM-time between refreshes (see _wrist_tgt_t)
     # GRASP-branch per-step timing (opt-in via GRASP_PROFILE): accumulates wall-time of
     # the wrist-track compute, torque compute, and mj_step, printing a breakdown once/sec.
     GRASP_PROFILE = os.environ.get('GRASP_PROFILE', '0') == '1'
@@ -2680,6 +2704,27 @@ if __name__ == "__main__":
     # DexPilot step() is the bottleneck: if the sim is smooth with this set but slow
     # without, the cost is in step(); if slow both ways, it's elsewhere (physics/loop).
     WRIST_NO_REFRESH = os.environ.get('WRIST_NO_REFRESH', '0') == '1'
+    # Debug: orientation-tracking bisect (mechanism #2 — ongoing rotation shearing the soft
+    # grasp loose during carry, after the arm-time datum already zeroed the start error).
+    #   WRIST_TRACK_ORI=0        -> position-only tracking: _v_ang is forced to zero, the
+    #                               wrist orientation is HELD at its arm-time pose. If the
+    #                               grasp stays put with this set but walks off without it,
+    #                               the shear is rotation-driven.
+    #   WRIST_ANG_GAIN_SCALE=k   -> multiply ONLY the angular gain by k (default 1.0) to
+    #                               rate-limit rotation independently of position — e.g.
+    #                               0.25 tracks hand rotation 4x more gently than translation.
+    # These stack: ORI=0 wins (hard off). Both default to full orientation tracking.
+    WRIST_TRACK_ORI = os.environ.get('WRIST_TRACK_ORI', '1') == '1'
+    try:
+        WRIST_ANG_GAIN_SCALE = float(os.environ.get('WRIST_ANG_GAIN_SCALE', '1.0'))
+    except ValueError:
+        WRIST_ANG_GAIN_SCALE = 1.0
+    if not WRIST_TRACK_ORI:
+        print("[teleop] WRIST_TRACK_ORI=0 — position-only wrist tracking "
+              "(orientation held at arm-time pose).")
+    elif WRIST_ANG_GAIN_SCALE != 1.0:
+        print(f"[teleop] WRIST_ANG_GAIN_SCALE={WRIST_ANG_GAIN_SCALE:.3g} — "
+              "angular tracking gain scaled independently of position.")
     _gp_acc = {'track': 0.0, 'refresh': 0.0, 'spin': 0.0, 'step_ik': 0.0,
                'torque': 0.0, 'step': 0.0, 'n': 0}
     _gp_last = time.time()
@@ -3854,6 +3899,9 @@ if __name__ == "__main__":
                         _ARM_IK_ITER_SAVE = _dexpilot_ctrl._arm._ik.max_iter
                         _dexpilot_ctrl._arm._ik.max_iter = 20
                         _grasp_wrist_track = True
+                        _grasp_track_logged = False   # arm the one-shot arm-time error log
+                        _wrist_off_p = None           # capture a fresh relative datum at arm time
+                        _wrist_off_R = None
                         # Hold the wrist still for GRASP_SETTLE_S (sim time) so the fingers
                         # seat under the ramping squeeze before the arm starts carrying.
                         _grasp_track_after = data.time + GRASP_SETTLE_S
@@ -4235,7 +4283,7 @@ if __name__ == "__main__":
                     # seat under the ramping squeeze first. Keep the DexPilot target fresh (so
                     # tracking starts from the current hand pose without a jump when the window
                     # ends) but command zero wrist velocity. The finger squeeze still ramps.
-                    _now = time.time()
+                    _now = data.time   # sim-time gate (see _wrist_tgt_t) — NOT wall-clock
                     if (_now - _wrist_tgt_t >= WRIST_TGT_REFRESH_S
                             and not (WRIST_NO_REFRESH and _wrist_tgt is not None)):
                         _dexpilot_ctrl.spin()
@@ -4253,7 +4301,7 @@ if __name__ == "__main__":
                     # rate only — the arm IK solve inside step() is far too costly to run
                     # every 1ms sim step. Between refreshes, keep tracking the cached
                     # target (it's a setpoint, so holding it a few ms is fine).
-                    _now = time.time()
+                    _now = data.time   # sim-time gate (see _wrist_tgt_t) — NOT wall-clock
                     if (_now - _wrist_tgt_t >= WRIST_TGT_REFRESH_S
                             and not (WRIST_NO_REFRESH and _wrist_tgt is not None)):
                         _t_ref0 = time.perf_counter() if GRASP_PROFILE else 0.0
@@ -4278,14 +4326,50 @@ if __name__ == "__main__":
                     _R_cur = data.site_xmat[_PINCH_SID].reshape(3, 3)
                     if _wrist_tgt is not None:
                         _p_tgt, _R_tgt = _wrist_tgt
-                        # P-control toward the target pose: desired Cartesian velocity =
-                        # gain * pose error. Slew-limited below so accel stays in budget.
-                        _v_lin = WRIST_TRACK_GAIN * (_p_tgt - _p_cur)
-                        _R_err = _R_tgt @ _R_cur.T
+                        # Capture the relative-tracking datum on the FIRST carry step: the
+                        # offset that maps the raw DexPilot target onto the current wrist
+                        # pose, so tracking begins with ZERO error instead of a 25mm/32deg
+                        # shove into the soft grasp. Thereafter only the operator's hand
+                        # motion relative to this datum drives the arm.
+                        if _wrist_off_p is None:
+                            _wrist_off_p = _p_cur - _p_tgt
+                            _wrist_off_R = _R_cur @ _R_tgt.T
+                        # Effective (datum-corrected) target the arm actually tracks.
+                        _p_eff = _p_tgt + _wrist_off_p
+                        _R_eff = _wrist_off_R @ _R_tgt
+                        # P-control toward the effective target pose: desired Cartesian
+                        # velocity = gain * pose error. Slew-limited below so accel stays
+                        # in budget.
+                        _v_lin = WRIST_TRACK_GAIN * (_p_eff - _p_cur)
+                        _R_err = _R_eff @ _R_cur.T
                         _ang   = np.array([_R_err[2, 1] - _R_err[1, 2],
                                            _R_err[0, 2] - _R_err[2, 0],
                                            _R_err[1, 0] - _R_err[0, 1]]) * 0.5
-                        _v_ang = WRIST_TRACK_GAIN * _ang
+                        # Orientation-tracking bisect (mechanism #2): hard-off holds the
+                        # wrist orientation at its arm-time pose (_R_eff error unused);
+                        # otherwise track it with an independently-scalable angular gain.
+                        if not WRIST_TRACK_ORI:
+                            _v_ang = np.zeros(3)
+                        else:
+                            _v_ang = (WRIST_TRACK_GAIN * WRIST_ANG_GAIN_SCALE) * _ang
+                        if not _grasp_track_logged:
+                            # First carry step: report the RAW error the datum just
+                            # cancelled (target-vs-settled-wrist), so the effect of the
+                            # correction stays visible. |dp| is metres of translation and
+                            # |ang| (deg) the rotation that WOULD have been driven into the
+                            # soft grasp on step one had we tracked the target absolutely.
+                            _raw_R  = _R_tgt @ _R_cur.T
+                            _raw_ang = np.array([_raw_R[2, 1] - _raw_R[1, 2],
+                                                 _raw_R[0, 2] - _raw_R[2, 0],
+                                                 _raw_R[1, 0] - _raw_R[0, 1]]) * 0.5
+                            _dp_norm  = float(np.linalg.norm(_p_tgt - _p_cur))
+                            _ang_norm = float(np.linalg.norm(_raw_ang))
+                            print(f"[teleop] wrist-track ARMED @ t={data.time:.2f}s — "
+                                  f"raw target error CANCELLED by datum: "
+                                  f"|dp|={_dp_norm*1e3:.1f}mm  "
+                                  f"|ang|={np.degrees(_ang_norm):.1f}deg  "
+                                  f"(now tracking relative — start error ~0)")
+                            _grasp_track_logged = True
                     else:
                         _v_lin = np.zeros(3)
                         _v_ang = np.zeros(3)
@@ -4428,7 +4512,31 @@ if __name__ == "__main__":
                         fc_vec=_fc_vec,       # full commanded force 3-vector, world (N_F,3)
                         jog_v=_jog_v.copy(),
                         q_arm=data.qpos[:7].copy(),
-                        gamma_live=float(gamma_live))
+                        gamma_live=float(gamma_live),
+                        # FULL MuJoCo dynamic state, every step — enough to reconstruct and
+                        # deterministically replay the sim offline (no reliance on the curated
+                        # fields above). qpos+qvel+act is the complete integrator state; qacc,
+                        # ctrl, qfrc_applied/actuator capture the forces driving the step;
+                        # xpos/xquat/xfrc give body kinematics + external wrenches. Full arrays
+                        # (all bodies/DOFs), not just the active grasp, so nothing is lost.
+                        qpos=data.qpos.copy(),
+                        qvel=data.qvel.copy(),
+                        qacc=data.qacc.copy(),
+                        act=data.act.copy(),
+                        ctrl=data.ctrl.copy(),
+                        # tau_applied = the torque this step actually applies (tau_ctrl,
+                        # written into qfrc_applied at line ~4519 just below, then bias-comp
+                        # added). data.qfrc_applied here still holds the PREVIOUS step's value
+                        # — capture tau_ctrl directly so the replay drives the exact forces.
+                        tau_applied=tau_ctrl.copy(),
+                        qfrc_applied_prev=data.qfrc_applied.copy(),
+                        xfrc_applied=data.xfrc_applied.copy(),
+                        qfrc_actuator=data.qfrc_actuator.copy(),
+                        qfrc_bias=data.qfrc_bias.copy(),
+                        qfrc_constraint=data.qfrc_constraint.copy(),
+                        xpos=data.xpos.copy(),
+                        xquat=data.xquat.copy(),
+                        ncon=int(data.ncon))
 
             if GRASP_PROFILE and control_phase == 'GRASP':
                 _gp_acc['torque'] += time.perf_counter() - _t_tq0
