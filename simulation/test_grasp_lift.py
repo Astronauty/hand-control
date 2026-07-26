@@ -101,11 +101,41 @@ def main():
                     help='slip_correction per-finger force cap N (live default 10)')
     ap.add_argument('--settle', type=float, default=1.5, help='settle time per phase (s)')
     ap.add_argument('--hold', type=float, default=2.0, help='hold time at top after lift (s)')
+    ap.add_argument('--lift-mode', choices=['clamped', 'physical'], default='clamped',
+                    help="clamped (default): the arm velocity is OVERWRITTEN to the ideal jog "
+                         "each step (data.qvel[:7]=qdot, fingers zeroed) -- a near-rigid, "
+                         "perfectly-tracked lift. Holds the box at any impratio; a clean "
+                         "reference but it removes the lift-transient disturbance.  |  "
+                         "physical: the arm is driven ONLY by PD torque + mj_step (no qvel "
+                         "injection), matching the LIVE pick_place loop -- the arm has real "
+                         "compliance and the jog/lift transient can knock the box out, so this "
+                         "reproduces the live ejection and can evaluate impratio/other fixes on "
+                         "the real failure.")
     args = ap.parse_args()
     accel_budget = (args.accel, args.accel, args.accel)
 
     model = mj.MjModel.from_xml_path(SCENE_XML)
     dt = model.opt.timestep
+    # 'physical' lift-mode matches the LIVE GRASP arm config: a SOFT position spring
+    # (Kp=40 via GraspController.effective_gains) against HEAVY implicit joint damping
+    # (dof_damping[:7] = 2*I*wn, wn=100 rad/s ~ critical), exactly as kinova_leap_pick_place
+    # sets it (see the args.physics block ~L2116). Without this heavy damping the soft
+    # Kp=40 arm is underdamped and can't hold the grasp load at all. 'clamped' mode never
+    # integrates arm dynamics (qvel overwritten), so this damping is inert there.
+    # 'physical' arm damping: computed here, but APPLIED only after grip-formation (below),
+    # because the heavy implicit damping is incompatible with the qvel-zeroing used to hold the
+    # arm rigid while the grip seats. Grip-formation mirrors clamped mode exactly (which forms
+    # the grip); the heavy damping + soft PD only take over for the lift/hold, matching live GRASP.
+    _dp_arm_damping = None
+    if args.lift_mode == 'physical':
+        _Mfull = np.zeros((model.nv, model.nv))
+        _d_tmp = mj.MjData(model); mj.mj_forward(model, _d_tmp)
+        mj.mj_fullM(model, _Mfull, _d_tmp.qM)
+        _I_arm = np.clip(np.diag(_Mfull)[:7], 1e-3, None)
+        _WN = 100.0
+        _dp_arm_damping = 2.0 * _I_arm * _WN
+        print(f"[cfg] physical lift-mode: arm dof_damping[:7]={np.round(_dp_arm_damping,1)} "
+              f"(2*I*wn, wn=100 ~critical) will be applied after grip-formation, matching live GRASP.")
     obj_bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, OBJ_BODY)
     obj_gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, OBJ_GEOM)
     th_s = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'leap_th_ds_tip')
@@ -243,10 +273,94 @@ def main():
                          pad_offsets=[_PAD['index'], _PAD['thumb']],
                          obj_contact_provider=provider)
     gc.set_target(q_hold); gc.set_squeeze(True)
+
+    # ── 3b. Grip-formation stage (physical mode only) ────────────────────────────
+    # In physical mode the arm is soft (Kp=40) during the squeeze, so if the internal
+    # squeeze force fires while the pads are still ~10mm off the box, the arm recoils and
+    # the grip never seats. Live avoids this by entering GRASP from a settled REACH hold
+    # with STIFF (inertia-scaled) arm gains while the fingers curl in. Mirror that: hold the
+    # arm rigid with _dp_Kp_arm and let the finger PD close the gap under NO internal force,
+    # until both fingers register normal force. Then the soft-arm squeeze/lift below runs on
+    # an established grip (so it can reproduce the live slip/eject instead of failing to grip).
+    def _finger_forces(d):
+        _if = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, 'leap_if_tip')
+        _th = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, 'leap_th_tip')
+        acc = {'index': 0.0, 'thumb': 0.0}
+        f6 = np.zeros(6)
+        for ci in range(d.ncon):
+            c = d.contact[ci]; other = None
+            if c.geom1 == obj_gid: other = c.geom2
+            elif c.geom2 == obj_gid: other = c.geom1
+            if other is None: continue
+            nm = mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, other) or ''
+            mj.mj_contactForce(model, d, ci, f6); fn = abs(f6[0])
+            if nm.startswith('leap_if_'): acc['index'] += fn
+            elif nm.startswith('leap_th_'): acc['thumb'] += fn
+        return acc
+    if args.lift_mode == 'physical':
+        # The committed q_grasp HOVERS the pads ~8mm off the box (the r_tip offset), and
+        # q_hold == q_grasp is the finger PD target, so the position PD alone makes ~0 error
+        # and never closes the gap. The gap is closed by the INTERNAL squeeze force pushing
+        # the fingers past their hover target into the surface. So the grip-formation stage
+        # ramps in the internal force (like the squeeze) but holds the arm STIFF so it seats
+        # against a rigid base; then step 4 below hands off to the soft-arm GRASP config.
+        # Grip-formation mirrors clamped mode's squeeze EXACTLY (which reliably seats the grip):
+        # the arm is held rigid by zeroing its velocity each step, and the fingers curl in under
+        # their PD + the ramped internal squeeze force (the internal force is what pushes the pads
+        # past their r_tip hover into contact; the position PD alone can't, since q_hold==q_grasp).
+        _grip_steps = int(SQUEEZE_RAMP_S / dt) + int(0.5 / dt)   # ramp + brief settle
+        _gs = 0
+        for _ in range(_grip_steps):
+            data.qvel[:N_ROBOT] = 0.0
+            kp_eff, kd_eff = gc.effective_gains()
+            tau = np.zeros(model.nv)
+            tau[:N_ROBOT] = kp_eff * (q_hold - data.qpos[:N_ROBOT]) + kd_eff * (0 - data.qvel[:N_ROBOT])
+            _gs += 1
+            _ramp = min(1.0, _gs * dt / SQUEEZE_RAMP_S)
+            tau[:N_ROBOT] += gc.internal_force_torques(data, scale=_ramp)
+            tau[:N_ROBOT] += gc.slip_correction_torques(data, kp=args.slip_kp, f_max=args.slip_fmax)
+            data.qfrc_applied[:] = tau
+            data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
+            mj.mj_step(model, data)
+        _gf = _finger_forces(data)
+        print(f"[grip] formed (rigid arm): index={_gf['index']:.1f}N  thumb={_gf['thumb']:.1f}N "
+              f"({'bilateral OK' if min(_gf.values()) > 1.0 else 'WEAK/one-sided'})")
+        # Hand off to the soft physical arm. The clamp->free transition is a stiff
+        # discontinuity (1.5s of forced qvel=0, then free integration into heavy implicit
+        # damping) that blows up QACC if done as a step-jump. Remedies:
+        #  1) resync: zero qvel once + mj_forward so accelerations are consistent at release;
+        #  2) RAMP the implicit dof_damping in over ~0.3s (soft Kp=40 arm holds meanwhile) so
+        #     the damper never sees a step change against a nonzero velocity.
+        data.qvel[:N_ROBOT] = 0.0
+        mj.mj_forward(model, data)
+        _damp_ramp_steps = int(0.3 / dt)
+        for _k in range(_damp_ramp_steps):
+            _f = (_k + 1) / _damp_ramp_steps
+            model.dof_damping[:7] = _f * _dp_arm_damping
+            kp_eff, _ = gc.effective_gains()
+            tau = np.zeros(model.nv)
+            tau[:N_ROBOT] = kp_eff * (q_hold - data.qpos[:N_ROBOT])   # Kp-only (implicit damping)
+            tau[:N_ROBOT] += gc.internal_force_torques(data, scale=1.0)
+            tau[:N_ROBOT] += gc.slip_correction_torques(data, kp=args.slip_kp, f_max=args.slip_fmax)
+            data.qfrc_applied[:] = tau
+            data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
+            mj.mj_step(model, data)
+        model.dof_damping[:7] = _dp_arm_damping
+
+    # In physical mode the arm is damped IMPLICITLY (model.dof_damping[:7], set above), exactly
+    # like live GRASP — so the explicit arm-Kd term must be zeroed to avoid double-damping (which
+    # spikes and blows up QACC). Fingers keep their explicit Kd. Clamped mode is unaffected (it
+    # zeros qvel, so the Kd term is 0 there anyway).
+    def _arm_kd_mask(kd_eff):
+        if args.lift_mode == 'physical':
+            kd_eff = kd_eff.copy(); kd_eff[:7] = 0.0
+        return kd_eff
+
     squeeze_steps = 0
     for _ in range(int(args.settle / dt)):
-        data.qvel[:N_ROBOT] = 0.0
-        kp_eff, kd_eff = gc.effective_gains()
+        if args.lift_mode == 'clamped':
+            data.qvel[:N_ROBOT] = 0.0
+        kp_eff, kd_eff = gc.effective_gains(); kd_eff = _arm_kd_mask(kd_eff)
         tau = np.zeros(model.nv)
         tau[:N_ROBOT] = kp_eff * (q_hold - data.qpos[:N_ROBOT]) + kd_eff * (0 - data.qvel[:N_ROBOT])
         squeeze_steps += 1
@@ -303,8 +417,12 @@ def main():
         lam2 = 0.0 if sig >= JOG_SING_EPS else (1 - (sig / JOG_SING_EPS) ** 2) * JOG_LAM_MAX ** 2
         qdot = J6.T @ np.linalg.solve(J6 @ J6.T + lam2 * np.eye(6), v6)
         q_hold[:7] += qdot * dt
-        data.qvel[:N_ROBOT] = 0.0; data.qvel[:7] = qdot
-        kp_eff, kd_eff = gc.effective_gains()
+        if args.lift_mode == 'clamped':
+            # Rigid reference: force the arm to exactly the commanded jog each step.
+            data.qvel[:N_ROBOT] = 0.0; data.qvel[:7] = qdot
+        # else 'physical': leave data.qvel alone -> arm integrates under PD torque + physics
+        # (matches the live pick_place loop; the lift transient can knock the box out).
+        kp_eff, kd_eff = gc.effective_gains(); kd_eff = _arm_kd_mask(kd_eff)
         tau = np.zeros(model.nv)
         tau[:N_ROBOT] = (kp_eff * (q_hold - data.qpos[:N_ROBOT])
                          + kd_eff * (np.r_[qdot, np.zeros(16)] - data.qvel[:N_ROBOT]))
@@ -337,8 +455,9 @@ def main():
     _ncon_if, _ncon_th, _spread_if, _spread_th = [], [], [], []
     z_trace = []
     for _ in range(int(args.hold / dt)):
-        data.qvel[:N_ROBOT] = 0.0
-        kp_eff, kd_eff = gc.effective_gains()
+        if args.lift_mode == 'clamped':
+            data.qvel[:N_ROBOT] = 0.0
+        kp_eff, kd_eff = gc.effective_gains(); kd_eff = _arm_kd_mask(kd_eff)
         tau = np.zeros(model.nv)
         tau[:N_ROBOT] = kp_eff * (q_hold - data.qpos[:N_ROBOT]) + kd_eff * (0 - data.qvel[:N_ROBOT])
         tau[:N_ROBOT] += gc.internal_force_torques(data, scale=1.0)
