@@ -34,12 +34,18 @@
              below that floor -> the friction constraint can't hold a static tangential
              load and the grasped object creeps through the fingers. solimp reverts to
              MuJoCo's default (smooth soft->hard impedance) from the degenerate
-             dmin=dmax=0.999. -->
-        <geom type="mesh" friction="0.5" material="white" mesh="tip"
+             dmin=dmax=0.999.
+             condim=6 + torsional/rolling friction (2nd/3rd terms): a 2-point pinch
+             leaves the object's rotation ABOUT THE PINCH AXIS unresisted (observed
+             |rot.grasp_axis|=1.00 as it slips), because condim=3 has NO torsional
+             friction. condim=6 adds a torsional (spin) + rolling friction patch at the
+             pad so the box can't twist/roll off the fingertip. friction expands to
+             (slide tors roll): tors 0.05, roll 0.005. -->
+        <geom type="mesh" friction="0.5 0.05 0.005" condim="6" material="white" mesh="tip"
               solref="0.004 1" solimp="0.95 0.99 0.001 0.5 2"/>
       </default>
       <default class="leap_thumb_tip">
-        <geom type="mesh" friction="0.5" material="white" mesh="thumb_tip"
+        <geom type="mesh" friction="0.5 0.05 0.005" condim="6" material="white" mesh="thumb_tip"
               solref="0.004 1" solimp="0.95 0.99 0.001 0.5 2"/>
       </default>
       <default class="leap_mcp">
