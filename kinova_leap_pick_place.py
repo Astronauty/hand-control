@@ -503,16 +503,7 @@ if __name__ == "__main__":
              "mid-trial target switch — see trial_logger.py for the full state "
              "machine. Omit the flag entirely (default) to disable trial logging: "
              "the tool then behaves exactly as without this flag.")
-    _arg_parser.add_argument(
-        '--grasp-trace', metavar='RUN_DIR', nargs='?', const='', default=None,
-        help="Record a per-mj_step GRASP-phase diagnostic trace to "
-             "logs/<RUN_DIR>/grasp_trace.npz for offline slip analysis: box pose, per-finger "
-             "measured normal/tangential force, commanded contact force |f_c|, tip->contact "
-             "slip, jog velocity, squeeze ramp, and palm/box z. Works in ANY mode (unlike "
-             "--trial-log). Bare --grasp-trace auto-names the dir.")
     args = _arg_parser.parse_args()
-    if args.grasp_trace == '':
-        args.grasp_trace = f'{args.mode}_grasp_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
     # In-code defaults for behaviours that used to be always-True CLI flags. These
     # never had a way to turn them OFF from the command line, so they only cluttered
     # --help. They live here as plain constants now; flip one for a run by editing it.
@@ -868,10 +859,7 @@ if __name__ == "__main__":
     _pose_trace   = TraceBuffer() if args.trial_log else None
     _pose_last_t  = -1.0
     _POSE_DT      = 0.02   # s sim-time between recorded pose rows (~50 Hz)
-
-    # GRASP-phase diagnostic trace (--grasp-trace): per-mj_step during GRASP, for offline
-    # slip analysis. Unthrottled (every step) so the slip-onset transient is captured.
-    _grasp_trace  = TraceBuffer() if args.grasp_trace else None
+    _prev_control_phase = None   # last-seen control_phase, for phase_enter transition logging
 
     # obj_<color>_<shape> -> place_<color>_site, by matching the color token common to
     # both names (scene_pick_place.xml's naming convention — see place_red/blue/green/
@@ -925,45 +913,6 @@ if __name__ == "__main__":
                 f_net   += f_W
                 tau_net += np.cross(con.pos - com, f_W) + sgn * (R_con.T @ ft[3:6])
         return f_net, tau_net, normals, tangentials
-
-    def _actual_contact_geometry(obj_idx):
-        """Per FINGER_SET finger: MuJoCo's ACTUAL contact point + INWARD normal on the object,
-        force-weighted-averaged over that finger's contacts vs objects[obj_idx]. Returns
-        {finger: (pos_W (3,), inward_normal_W (3,)) or None}. Used to compare against the
-        RECOMMENDED contact geometry the grasp map / LP certificate assumes — a divergence
-        means the commanded 'internal' force pair isn't net-zero in physics and drifts the
-        object (the LP-vs-MuJoCo mismatch)."""
-        _og = objects[obj_idx]['id_geom']
-        acc = {f: [np.zeros(3), np.zeros(3), 0.0] for f in FINGER_SET}  # sum p*fn, sum n*fn, sum fn
-        _ft = np.zeros(6)
-        for ci in range(data.ncon):
-            con = data.contact[ci]
-            g1, g2 = con.geom1, con.geom2
-            if g1 in _HAND_GIDS and g2 == _og:
-                hand_gid, sgn = g1, 1.0     # normal row0 points g1->g2 = hand->obj = inward
-            elif g2 in _HAND_GIDS and g1 == _og:
-                hand_gid, sgn = g2, -1.0    # row0 points obj->hand = outward -> negate
-            else:
-                continue
-            fname = _FINGER_BY_GID.get(hand_gid)
-            if fname is None:
-                continue
-            mj.mj_contactForce(model, data, ci, _ft)
-            fn = float(_ft[0])
-            if fn <= 1e-9:
-                continue
-            n_in_W = sgn * con.frame.reshape(3, 3)[0]   # world inward normal (hand->obj)
-            acc[fname][0] += con.pos * fn
-            acc[fname][1] += n_in_W * fn
-            acc[fname][2] += fn
-        out = {}
-        for f in FINGER_SET:
-            p_sum, n_sum, w = acc[f]
-            if w > 1e-9:
-                out[f] = (p_sum / w, n_sum / (np.linalg.norm(n_sum) + 1e-12))
-            else:
-                out[f] = None
-        return out
 
     # Live metrics dashboard (separate process; opt-in via --dashboard). Started before the
     # IK precompute so the grasp IPOPT solves below are reported too. dash is None
@@ -2925,6 +2874,19 @@ if __name__ == "__main__":
             step_start = time.time()
             _n_sub = 1   # physics catch-up substeps this iteration (dexpilot --physics)
 
+            # control_phase transition marker: log a phase_enter to events.jsonl whenever
+            # the phase changes, detected here in one place (rather than at each of the ~8
+            # assignment sites) by comparing against the previous iteration's value. This
+            # is what lets the always-on trace below be sliced by phase offline — e.g. find
+            # the GRASP row's `t`, then take pose_trace rows with t >= that. Logged for any
+            # run with --trial-log, independent of the trial state machine.
+            if _trial_events is not None and control_phase != _prev_control_phase:
+                _tid = _trial_state.trial_id if _trial_state is not None else 0
+                _trial_events.log(_tid, data.time, 'phase_enter',
+                                  phase=control_phase, prev=_prev_control_phase,
+                                  prox_idx=int(_prox_idx))
+                _prev_control_phase = control_phase
+
             # Always-on pose recorder: one throttled row per iteration, ALL phases (the
             # trial trace only runs post-lock-in). Phase is reconstructed offline from
             # events.jsonl phase_enter timestamps vs `t` here. Uses last frame's qpos
@@ -2936,9 +2898,31 @@ if __name__ == "__main__":
                 _pose_trace.sample(
                     t=float(data.time),          # sim-time; RESETS to 0 on backspace reset
                     t_wall=float(time.time()),   # wall-clock; monotonic across resets
+                    prox_idx=int(_prox_idx),
+                    control_phase=str(control_phase),  # PLAN/REACH/GRASP — also in events.jsonl
+                    # Back-compat: q_robot/obj_qpos are qpos[:N_ROBOT]/qpos[N_ROBOT:], kept
+                    # as their own keys because test_recommender_on_dexpilot_poses.py reads
+                    # them by name from pose_trace.npz.
                     q_robot=data.qpos[:N_ROBOT].copy(),
                     obj_qpos=data.qpos[N_ROBOT:].copy(),
-                    prox_idx=int(_prox_idx))
+                    # FULL MuJoCo dynamic state, every recorded row, ALL phases. Enough to
+                    # reconstruct and deterministically replay any step offline; slice by
+                    # phase via the phase_enter timestamps in events.jsonl (join on t).
+                    # qpos is the complete state (N_ROBOT robot DOF + object freejoints);
+                    # qvel+act complete the integrator state; qacc/qfrc_* capture the forces.
+                    qpos=data.qpos.copy(),
+                    qvel=data.qvel.copy(),
+                    qacc=data.qacc.copy(),
+                    act=data.act.copy(),
+                    ctrl=data.ctrl.copy(),
+                    qfrc_applied=data.qfrc_applied.copy(),
+                    xfrc_applied=data.xfrc_applied.copy(),
+                    qfrc_actuator=data.qfrc_actuator.copy(),
+                    qfrc_bias=data.qfrc_bias.copy(),
+                    qfrc_constraint=data.qfrc_constraint.copy(),
+                    xpos=data.xpos.copy(),
+                    xquat=data.xquat.copy(),
+                    ncon=int(data.ncon))
 
             # --- contact_aware_teleop: teleop wrist+fingers, NLP recommends contacts.
             # Runs ONLY pre-lock-in; after L it falls through to the shared REACH/GRASP
@@ -4442,102 +4426,6 @@ if __name__ == "__main__":
                     tau_ctrl[:N_ROBOT] += grasp_ctrl.slip_correction_torques(data)
                     _squeeze_diag(data)
 
-                # GRASP-phase diagnostic trace (every step): everything needed to attribute a
-                # slip offline — box pose, per-finger measured normal/tangential force + slip,
-                # commanded |f_c|, jog velocity, squeeze ramp, palm/box z.
-                if _grasp_trace is not None:
-                    _f_c = grasp_ctrl.last_f_c if grasp_ctrl is not None else None
-                    _f_c_W = grasp_ctrl.last_f_c_W if grasp_ctrl is not None else None
-                    _pts_W = grasp_ctrl.last_contacts_W if grasp_ctrl is not None else None
-                    _, _, _tr_norm, _tr_tan = _hand_object_contact_metrics(active_idx)
-                    _act_geom = _actual_contact_geometry(active_idx)
-                    _rec_local_tr = obj_grasp.get('rec_local')
-                    _slip = np.zeros(N_FINGERS)
-                    _norm_ang = np.full(N_FINGERS, np.nan)   # rec-vs-actual normal angle (deg)
-                    _pos_off = np.full(N_FINGERS, np.nan)    # rec-vs-actual contact pos (mm)
-                    # Raw world-frame vectors for the residual-wrench diagnostic
-                    # (tau_res = sum (r_true - r_rec) x f_c). All NaN where unavailable.
-                    _rec_pt = np.full((N_FINGERS, 3), np.nan)   # recommended (grasp-map) contact pt, world
-                    _act_pt = np.full((N_FINGERS, 3), np.nan)   # MuJoCo actual contact pt, world
-                    _rec_nrm = np.full((N_FINGERS, 3), np.nan)  # recommended inward normal, world
-                    _fc_vec = np.full((N_FINGERS, 3), np.nan)   # full commanded force 3-vector, world
-                    for _k, _f in enumerate(FINGER_SET):
-                        if _rec_local_tr is not None:
-                            _pO, _RO = _rec_local_tr[_k]
-                            _bid_tr = obj_grasp['id_body']
-                            _cW = data.xpos[_bid_tr] + data.xmat[_bid_tr].reshape(3, 3) @ _pO
-                            _inW = data.xmat[_bid_tr].reshape(3, 3) @ _RO[:, 0]
-                        else:
-                            _sid_tr = obj_grasp['id_S'][_k]
-                            _cW = data.site_xpos[_sid_tr].copy()
-                            _inW = data.site_xmat[_sid_tr].reshape(3, 3)[:, 0]
-                        _anchor = _cW - _PAD_OFFSET[_f] * _inW
-                        _slip[_k] = float(np.linalg.norm(data.site_xpos[id_C[_k]] - _anchor))
-                        # r_rec: prefer the grasp map's own contact point (what the
-                        # allocator actually used); fall back to the reconstructed _cW.
-                        if _pts_W is not None and _k < len(_pts_W):
-                            _rec_pt[_k] = _pts_W[_k]
-                        else:
-                            _rec_pt[_k] = _cW
-                        _rec_nrm[_k] = _inW
-                        # World-frame commanded force (R_WS @ f_ck), for tau_res = r x f.
-                        if _f_c_W is not None and _k < len(_f_c_W):
-                            _fc_vec[_k] = _f_c_W[_k]
-                        # RECOMMENDED (grasp-map) normal/pos vs MuJoCo ACTUAL contact.
-                        _ag = _act_geom.get(_f)
-                        if _ag is not None:
-                            _p_act, _n_act = _ag
-                            _act_pt[_k] = _p_act
-                            _norm_ang[_k] = float(np.degrees(np.arccos(
-                                np.clip(_inW @ _n_act, -1, 1))))
-                            _pos_off[_k] = float(np.linalg.norm(_cW - _p_act) * 1e3)
-                    _grasp_trace.sample(
-                        t=float(data.time), t_wall=float(time.time()),
-                        squeeze_on=int(bool(squeeze_on)),
-                        ramp=float(min(1.0, _squeeze_steps * model.opt.timestep / SQUEEZE_RAMP_S)),
-                        box_xpos=data.xpos[obj_grasp['id_body']].copy(),
-                        box_xquat=data.xquat[obj_grasp['id_body']].copy(),
-                        palm_z=float(data.xpos[_PALM_BID][2]),
-                        norm_force=np.array([_tr_norm[f] for f in FINGER_SET]),
-                        tan_force=np.array([_tr_tan[f] for f in FINGER_SET]),
-                        fc_cmd=(np.array([float(np.linalg.norm(_f_c[3*k:3*k+3]))
-                                          for k in range(N_FINGERS)])
-                                if _f_c is not None else np.full(N_FINGERS, np.nan)),
-                        slip=_slip,
-                        norm_ang=_norm_ang,   # rec-vs-MuJoCo contact normal angle, deg
-                        pos_off=_pos_off,     # rec-vs-MuJoCo contact position offset, mm
-                        rec_pt=_rec_pt,       # recommended (grasp-map) contact pt, world (N_F,3)
-                        act_pt=_act_pt,       # MuJoCo actual contact pt, world (N_F,3)
-                        rec_normal=_rec_nrm,  # recommended inward normal, world (N_F,3)
-                        fc_vec=_fc_vec,       # full commanded force 3-vector, world (N_F,3)
-                        jog_v=_jog_v.copy(),
-                        q_arm=data.qpos[:7].copy(),
-                        gamma_live=float(gamma_live),
-                        # FULL MuJoCo dynamic state, every step — enough to reconstruct and
-                        # deterministically replay the sim offline (no reliance on the curated
-                        # fields above). qpos+qvel+act is the complete integrator state; qacc,
-                        # ctrl, qfrc_applied/actuator capture the forces driving the step;
-                        # xpos/xquat/xfrc give body kinematics + external wrenches. Full arrays
-                        # (all bodies/DOFs), not just the active grasp, so nothing is lost.
-                        qpos=data.qpos.copy(),
-                        qvel=data.qvel.copy(),
-                        qacc=data.qacc.copy(),
-                        act=data.act.copy(),
-                        ctrl=data.ctrl.copy(),
-                        # tau_applied = the torque this step actually applies (tau_ctrl,
-                        # written into qfrc_applied at line ~4519 just below, then bias-comp
-                        # added). data.qfrc_applied here still holds the PREVIOUS step's value
-                        # — capture tau_ctrl directly so the replay drives the exact forces.
-                        tau_applied=tau_ctrl.copy(),
-                        qfrc_applied_prev=data.qfrc_applied.copy(),
-                        xfrc_applied=data.xfrc_applied.copy(),
-                        qfrc_actuator=data.qfrc_actuator.copy(),
-                        qfrc_bias=data.qfrc_bias.copy(),
-                        qfrc_constraint=data.qfrc_constraint.copy(),
-                        xpos=data.xpos.copy(),
-                        xquat=data.xquat.copy(),
-                        ncon=int(data.ncon))
-
             if GRASP_PROFILE and control_phase == 'GRASP':
                 _gp_acc['torque'] += time.perf_counter() - _t_tq0
             data.qfrc_applied[:] = tau_ctrl
@@ -4674,12 +4562,6 @@ if __name__ == "__main__":
         _pose_n = len(_pose_trace)
         _pose_trace.save(_pose_path)
         print(f"[pose-trace] saved {_pose_path} ({_pose_n} rows)")
-    if _grasp_trace is not None and len(_grasp_trace) > 0:
-        _gt_path = Path('logs') / args.grasp_trace / 'grasp_trace.npz'
-        _gt_path.parent.mkdir(parents=True, exist_ok=True)
-        _gt_n = len(_grasp_trace)
-        _grasp_trace.save(_gt_path)
-        print(f"[grasp-trace] saved {_gt_path} ({_gt_n} rows)")
     if dash is not None:
         dash.close()
     # (retargeting sliders live in the MediaPipe subprocess window; it cleans up
