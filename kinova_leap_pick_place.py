@@ -269,6 +269,15 @@ def make_key_callback(key_queue):
                         # the viewer already mj_resetData'd the shared data from its own
                         # thread; this event lets the control loop re-home its state
                         # machine instead of PD-exploding against the qpos0 arm pose.
+        46:  'next_keyframe',  # . (>) — cycle to the NEXT scene <keyframe> (pose_00, ...)
+        44:  'prev_keyframe',  # , (<) — cycle to the PREVIOUS scene <keyframe>
+                               #     ...and re-home the state machine onto it. NOTE: do NOT use
+                               #     [ / ] here — MuJoCo's viewer hard-binds those to camera
+                               #     cycling (they'd switch to the 'wrist' fixed camera). The
+                               #     passive viewer shares data with this loop, so a GUI keyframe
+                               #     Load is clobbered every frame; loading FROM the loop (here)
+                               #     is the reliable way to test the recommender/jog from each
+                               #     registered box+arm config, and keeps the free camera put.
     }
     def _cb(keycode):
         event = _MAP.get(keycode)
@@ -1228,6 +1237,14 @@ if __name__ == "__main__":
     # unbalanced shove that knocks the object across the table (measured: 35N commanded
     # -> box launched 400mm; with the ramp the contacts form at ~N-level forces first).
     SQUEEZE_RAMP_S = 1.0
+
+    # contact_aware_teleop: after Enter (REACH->GRASP), hold the wrist STILL for this long
+    # (sim time) before arming wrist tracking, so the fingers seat under the ramping squeeze
+    # and establish good bilateral contact BEFORE the arm starts carrying. Starting to track
+    # the hand the instant the squeeze begins moves the palm while the pads are still closing
+    # the ~mm pad gap, so the object gets dragged before it is firmly held. The squeeze ramp
+    # (SQUEEZE_RAMP_S) still runs during this window; this just defers the wrist motion.
+    GRASP_SETTLE_S = 2.0
 
     # Give the RRT the SAME full hand-geom set the IK constrains (_robot_geom_names) plus
     # the floor, instead of only the fingertips — checking just the tips let the palm /
@@ -2292,7 +2309,9 @@ if __name__ == "__main__":
     # machinery. The NLP's gamma seeds the squeeze, re-solved on the committed geometry.
     _CAT_MODE       = (args.mode == 'contact_aware_teleop')
     _REC_INTERVAL_S = 2.0     # fixed re-solve cadence (NLP solve ~0.5-2s, runs in a thread)
-    _REC_NC         = 3       # planner seeds per solve
+    _REC_NC         = 5       # planner seeds per solve (was 3; ~60% per-seed IK-convergence
+                              # -> 5 seeds gives ~99% chance of >=1 converged vs 3 seeds' ~94%.
+                              # No warm-start, so no seed is wasted on a boundary-jammed re-seed.)
     REC_REACH_TOL_MM = 15.0   # lock-in IK residual above which a rec is flagged unreachable
     _rec1_mocap = int(model.body_mocapid[
         mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'rec1_body')])
@@ -2425,29 +2444,40 @@ if __name__ == "__main__":
             _rec_finger_geoms = sorted(
                 g for g in _active_finger_geoms
                 if not ('_ds_' in g or g.endswith('_tip')))   # drop contact tier
-            # NON-ACTIVE fingers (middle/ring) get GROUND-ONLY protection: they don't grasp
-            # (so no object constraint — clearance set to the disable sentinel, which skips
-            # the object test but KEEPS the floor test in the SDF loop), but their curled
-            # links were dipping through the table in the committed recommender q. Proximity
-            # pruning (floor-aware) drops the ones already well clear of the floor, so most
-            # solves add few active constraints. Contact-tier ds/tip excluded like the active
-            # fingers — a non-grasping fingertip has no reason to be near the floor plane the
-            # proximal links don't already cover.
+            # NON-ACTIVE fingers (middle/ring) get an ACTIVE OBJECT constraint in the
+            # recommender: they don't grasp, so unlike the active fingers they must stay OFF
+            # the target — a positive object clearance keeps their curled links (and tips)
+            # out of the box instead of being pressed into it during the squeeze. Previously
+            # these were ground-only (object test disabled), which let the NLP pose mf/rf
+            # against the object; the GRASP-phase PD then held that pose against the box (mf/rf
+            # collision). ALL mf/rf collision geoms are included — including the ds/tip contact
+            # tier, which for a NON-grasping finger has no reason to touch and is exactly the
+            # part that was intruding. The clearance is on the bounding-SPHERE surface (the SDF
+            # models each link as its rbound sphere, which OVER-approximates the true link by
+            # ~1-2cm), so a small +1mm on the sphere leaves the true link ~2-10cm clear
+            # (measured) without shoving the whole hand away. Tuned across the scene keyframes:
+            # +1mm holds 11/11 convergence with 0 mf/rf-box penetration and >=20mm real
+            # clearance; +2mm cost 2 convergences on the reach-hard poses; 0mm let a pose graze
+            # the box at contact. Per-geom proximity pruning (col_prune_margin) drops mf/rf
+            # links far from the box, so a curled finger pointing away adds no constraint — it
+            # only binds when mf/rf actually approach the object.
+            _REC_NONACTIVE_OBJ_CLR = 0.001   # m, on the bounding-sphere surface
             _rec_nonactive_geoms = sorted(
                 g for g in _robot_geom_names
-                if (g.startswith('leap_mf_') or g.startswith('leap_rf_'))
-                and not ('_ds_' in g or g.endswith('_tip')))
+                if g.startswith('leap_mf_') or g.startswith('leap_rf_'))
             _rec_arm_geoms = list(_REC_ARM_GEOMS) + _rec_finger_geoms + _rec_nonactive_geoms
             _rec_obj_clearance = {g: _active_obj_clearance(g) for g in _rec_finger_geoms}
-            _rec_obj_clearance.update({g: ANOBJ_DISABLE for g in _rec_nonactive_geoms})
+            _rec_obj_clearance.update(
+                {g: _REC_NONACTIVE_OBJ_CLR for g in _rec_nonactive_geoms})
             print(f"[rec] recommender collision geoms: {len(_REC_ARM_GEOMS)} palm/wrist + "
                   f"{len(_rec_finger_geoms)} active-finger links + "
-                  f"{len(_rec_nonactive_geoms)} non-active (ground-only) "
-                  f"(tiers: adjacent -10mm, proximal +2mm)")
+                  f"{len(_rec_nonactive_geoms)} non-active (mf/rf, "
+                  f"obj-clearance +{_REC_NONACTIVE_OBJ_CLR*1e3:.0f}mm) "
+                  f"(active tiers: adjacent -10mm, proximal +2mm)")
             cfg = GraspConfig3D(obj_geom=o['name'] + '_geom', obj_body=o['name'],
                                 max_iter=120, arm_geom_names=_rec_arm_geoms,
                                 obj_clearance_by_geom=_rec_obj_clearance,
-                                w_align=10.0, orient_weight=2.0, edge_margin_m=0.015,
+                                w_align=10.0, orient_weight=2.0, edge_margin_m=0.02,
                                 ground_clearance_m=0.010,   # +5mm over col_clearance for
                                                             # curled middle/ring vs the table
                                 wrench_constraint=False, datum_gamma=True,
@@ -2466,18 +2496,16 @@ if __name__ == "__main__":
             # collision/surface geometry; sync qpos before solving.
             planner._planner.data.qpos[:] = data.qpos[:]
             mj.mj_forward(model, planner._planner.data)
-            # Warm-start from the last ACCEPTED contacts for THIS object, so a re-solve on
-            # a static object returns to the same basin instead of a fresh random optimum.
-            _warm = None
-            with _rec_result_lock:
-                _prev = _rec_result.get('candidate')
-                if (_prev is not None and _rec_result.get('obj_idx') == obj_idx
-                        and _prev.get('p1') is not None):
-                    _warm = (_prev['p1'].copy(), _prev['p2'].copy())
+            # NO warm-start. Feeding the prior CONVERGED contacts back as a seed is
+            # counterproductive: a converged grasp sits ON the constraint boundary (surface
+            # + edge-margin + wrench-cone), and starting the interior-point NLP jammed against
+            # those constraints makes it bounce OFF into a WORSE basin (measured: warm seed
+            # from a cost-0.14 solution re-solved to cost 3.48). It also displaced a good fresh
+            # seed, causing the 1/3->0/3 convergence collapse on re-solve. The fixed-RNG fresh
+            # seeds are deterministic and already return to the same basin on a static object.
             _t0 = time.time()
             try:
-                res = planner.solve(q_snap, obj_pos, max_seeds=_REC_NC,
-                                    warm_contacts=_warm)
+                res = planner.solve(q_snap, obj_pos, max_seeds=_REC_NC)
             except Exception:
                 traceback.print_exc()
                 return
@@ -2593,8 +2621,15 @@ if __name__ == "__main__":
               "O=preview constrained IK (warm=recommender-q) | "
               "I=preview constrained IK (warm=DLS) | "
               "N=release | Backspace=reset | Q/Esc=quit")
+    if model.nkey > 0:
+        print(f"[keyframe] {model.nkey} test keyframe(s) loaded — press . / , to cycle "
+              "NEXT / PREV box+arm config (re-homes the state machine onto it).")
 
     control_phase  = 'REACH'
+    # Keyframe cycling (. / , keys): index of the last-loaded scene <keyframe>, and the
+    # deferred load request. -1 so the first . press loads pose_00. See the keyframe handler.
+    _kf_idx        = -1
+    _load_kf_req   = False
     # contact_aware_teleop: True while the operator is teleoping + the NLP recommends
     # contacts (pre-lock-in). Lock-in (L) flips this False and hands off to the shared
     # IK->RRT->GRASP machinery; release (N) flips it back True. Always False otherwise.
@@ -2614,12 +2649,20 @@ if __name__ == "__main__":
     squeeze_on     = False         # GRASP: internal force toggled by Enter
     _squeeze_steps = 0             # sim steps since squeeze-on, drives the force ramp
     grasp_ctrl     = None          # GraspController, built at each REACH→GRASP transition
+    # Set True once the grasp controller executes (REACH→GRASP): suppresses the approach
+    # visualizations (RRT trace + achieved-contact markers) while gripping. Reset on
+    # release/reset so the markers return for the next approach.
+    _grasp_no_ach  = False
     gamma_live     = GAMMA_FALLBACK  # per-object squeeze scale solved at that transition
     q_grasp_hold   = None          # GRASP PD target; arm part integrated by arrow-key jog
     _jog_v         = np.zeros(3)   # slew-rate-limited palm velocity command (world x,y,z)
     # contact_aware_teleop: when True, the GRASP phase carries the object by tracking the
     # wrist (DexPilot) instead of the arrow-key jog. Armed at the REACH->GRASP transition.
     _grasp_wrist_track = False
+    # Sim-time deadline: wrist tracking is armed at the transition but the arm is held still
+    # until data.time reaches this, giving the fingers a GRASP_SETTLE_S window to seat under
+    # the squeeze before carrying. 0.0 = no pending settle (track immediately once armed).
+    _grasp_track_after = 0.0
     _ARM_IK_ITER_SAVE  = 500       # arm IK max_iter to restore after wrist-track carry
     _jog_w         = np.zeros(3)   # slew-limited angular velocity cmd (wrist tracking)
     # Wrist-target cache: the DexPilot arm IK solve (step()) is ~ms and the ROS wrist
@@ -3574,6 +3617,21 @@ if __name__ == "__main__":
                     # the time-jump backstop above) — coalesce, handle after the drain.
                     _reset_req = True
 
+                elif key in ('next_keyframe', 'prev_keyframe'):
+                    # . / , — cycle to the next/previous scene <keyframe> (pose_00, ...) and
+                    # re-home onto it. Reuses the reset teardown (_reset_req) but the reset
+                    # block loads the keyframe qpos instead of Q_BIAS+spawn when _load_kf_req.
+                    # The passive viewer's own keyframe Load is clobbered by this loop every
+                    # frame, so loading from the loop is the only reliable way to test the
+                    # recommender/jog from each registered box+arm config.
+                    if model.nkey > 0:
+                        _step = 1 if key == 'next_keyframe' else -1
+                        _kf_idx = (_kf_idx + _step) % model.nkey
+                        _load_kf_req = True
+                        _reset_req   = True
+                    else:
+                        print("\r\n[keyframe] no <keyframe> defined in the scene XML.")
+
                 elif key == 'enter' and control_phase == 'REACH':
                     control_phase = 'GRASP'
                     squeeze_on = False
@@ -3746,6 +3804,16 @@ if __name__ == "__main__":
                         support_weight=True,
                         pad_offsets=[_PAD_OFFSET[f] for f in FINGER_SET],
                         obj_contact_provider=_grasp_provider)
+                    # Grasp controller is now executing: clear the approach visualizations —
+                    # the RRT path trace (ghost capsules) and the achieved-contact markers
+                    # (rec1/rec2 mocap spheres). They belong to the pre-grasp REACH/approach;
+                    # once we're gripping they're stale clutter over the object. _grasp_no_ach
+                    # keeps the per-step re-pin below from redrawing the contact markers.
+                    with _ghost_markers_lock:
+                        _ghost_markers.clear()
+                    data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
+                    data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
+                    _grasp_no_ach = True
                     q_grasp_hold = obj_grasp['q_target'].copy()
                     # Teleop: apply the squeeze IMMEDIATELY on the first Enter (no need to
                     # press Enter twice) — the ramp (_squeeze_steps/SQUEEZE_RAMP_S) still
@@ -3786,10 +3854,13 @@ if __name__ == "__main__":
                         _ARM_IK_ITER_SAVE = _dexpilot_ctrl._arm._ik.max_iter
                         _dexpilot_ctrl._arm._ik.max_iter = 20
                         _grasp_wrist_track = True
+                        # Hold the wrist still for GRASP_SETTLE_S (sim time) so the fingers
+                        # seat under the ramping squeeze before the arm starts carrying.
+                        _grasp_track_after = data.time + GRASP_SETTLE_S
                         _wrist_tgt   = None    # force a fresh target on the first step
                         _wrist_tgt_t = 0.0
-                        print("[teleop] wrist tracking armed — move your hand to carry "
-                              "the object (fingers/squeeze held).")
+                        print(f"[teleop] grasp settling {GRASP_SETTLE_S:.2f}s — establishing "
+                              "finger contact before wrist tracking starts.")
 
                 elif key == 'enter' and control_phase == 'GRASP':
                     squeeze_on = not squeeze_on
@@ -3809,6 +3880,7 @@ if __name__ == "__main__":
                     _push_squeeze(False, gamma_live)
                     _push_wrench_cone(None, None, None, None)   # clear the cone meshes
                     _grasp_wrist_track = False
+                    _grasp_no_ach = False   # approach markers return for the next grasp
                     _wrist_tgt = None
                     _jog_w[:] = 0.0
                     if _CAT_MODE:
@@ -3967,7 +4039,16 @@ if __name__ == "__main__":
                 if plan_thread is not None:
                     _plan_discard = True   # in-flight IK/RRT started pre-reset: drop it
                 mj.mj_resetData(model, data)
-                data.qpos[:N_ROBOT] = Q_BIAS   # arm/hand home (qpos0 zero = straight up)
+                _kf_loaded_name = None
+                if _load_kf_req:
+                    # K-cycle: load the selected scene <keyframe> (full 30-vec qpos =
+                    # [robot 23 | box 7]) instead of the Q_BIAS home + spawn object pose,
+                    # so the recommender/jog can be tested from that box+arm config.
+                    mj.mj_resetDataKeyframe(model, data, _kf_idx)
+                    _kf_loaded_name = model.key(_kf_idx).name
+                    _load_kf_req = False
+                else:
+                    data.qpos[:N_ROBOT] = Q_BIAS  # arm/hand home (qpos0 zero = straight up)
                 # mj_resetData zeros qvel, but writing the arm to Q_BIAS while the
                 # objects snap back to their (possibly gripper-overlapping) spawn poses
                 # sets up a penetration that the NEXT mj_step resolves with a large
@@ -3982,7 +4063,9 @@ if __name__ == "__main__":
                 control_phase  = 'REACH'
                 active_tgt     = 0
                 active_idx     = 0
-                traj_waypoints = [Q_BIAS.copy()]
+                # Hold the LOADED config (keyframe arm, or Q_BIAS home) as the REACH target
+                # so the arm doesn't immediately drive back to Q_BIAS from a keyframe pose.
+                traj_waypoints = [data.qpos[:N_ROBOT].copy()]
                 traj_wp_idx    = 0
                 traj_wp_step   = 0
                 squeeze_on     = False
@@ -3992,6 +4075,7 @@ if __name__ == "__main__":
                 _jog_v[:]      = 0.0
                 _jog_w[:]      = 0.0
                 _grasp_wrist_track = False
+                _grasp_no_ach  = False   # approach markers return after reset
                 _wrist_tgt     = None
                 if _CAT_MODE and _dexpilot_ctrl is not None:
                     _dexpilot_ctrl._hand_tracking = True   # restore finger retargeting
@@ -4022,10 +4106,19 @@ if __name__ == "__main__":
                     if _dexpilot_ctrl is not None:
                         _dexpilot_ctrl.stop()
                         _dexpilot_ctrl.init_home(data)   # re-anchor home to the reset pose
-                print("\r\n[Control] RESET — arm home, objects at spawn poses; cached "
-                      "IK kept (auto re-solved if stale on next selection)."
-                      + ("  Tracking FROZEN — press 8 to set the offset."
-                         if _CAT_MODE and _dexpilot_ctrl is not None else ""))
+                if _kf_loaded_name is not None:
+                    _bid_kf = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'obj_red_box')
+                    print(f"\r\n[Control] KEYFRAME {_kf_loaded_name} "
+                          f"({_kf_idx + 1}/{model.nkey}) loaded — box at "
+                          f"{np.array2string(data.xpos[_bid_kf], precision=3)}, arm+hand at "
+                          "the logged config; cached IK kept."
+                          + ("  Tracking FROZEN — press 8 to set the offset."
+                             if _CAT_MODE and _dexpilot_ctrl is not None else ""))
+                else:
+                    print("\r\n[Control] RESET — arm home, objects at spawn poses; cached "
+                          "IK kept (auto re-solved if stale on next selection)."
+                          + ("  Tracking FROZEN — press 8 to set the offset."
+                             if _CAT_MODE and _dexpilot_ctrl is not None else ""))
                 # Render this frame WITHOUT mj_step: stepping now would resolve any
                 # residual arm/object penetration from the teleport with a contact
                 # impulse, re-injecting the very velocity mj_resetData just cleared.
@@ -4137,7 +4230,25 @@ if __name__ == "__main__":
                 # guarantee. The site tracked is pinch_site (teleop) / leap_palm (jog).
                 _t_track0 = time.perf_counter() if GRASP_PROFILE else 0.0
                 _dv_max   = np.array(NCF_ACCEL_BUDGET_XYZ) * model.opt.timestep
-                if _grasp_wrist_track:
+                if _grasp_wrist_track and data.time < _grasp_track_after:
+                    # Settle window: tracking is armed but the arm holds STILL so the fingers
+                    # seat under the ramping squeeze first. Keep the DexPilot target fresh (so
+                    # tracking starts from the current hand pose without a jump when the window
+                    # ends) but command zero wrist velocity. The finger squeeze still ramps.
+                    _now = time.time()
+                    if (_now - _wrist_tgt_t >= WRIST_TGT_REFRESH_S
+                            and not (WRIST_NO_REFRESH and _wrist_tgt is not None)):
+                        _dexpilot_ctrl.spin()
+                        _dexpilot_ctrl.step(model, data)
+                        _tf = _dexpilot_ctrl.target_frame()
+                        if _tf is not None and _tf[1] is not None:
+                            _wrist_tgt = (np.asarray(_tf[0]).copy(),
+                                          np.asarray(_tf[1]).copy())
+                        _wrist_tgt_t = _now
+                    _jog_v += np.clip(-_jog_v, -_dv_max, _dv_max)   # ramp velocity to zero
+                    _jog_w += np.clip(-_jog_w, -_dv_max, _dv_max)
+                    _use_site = True
+                elif _grasp_wrist_track:
                     # Refresh the wrist TARGET pose (position + full orientation) at camera
                     # rate only — the arm IK solve inside step() is far too costly to run
                     # every 1ms sim step. Between refreshes, keep tracking the cached
@@ -4232,7 +4343,9 @@ if __name__ == "__main__":
                 # internal-force torques added below.
                 kp_eff, kd_eff = grasp_ctrl.effective_gains()
                 tau_ctrl[:N_ROBOT] = (kp_eff * (q_grasp_hold - data.qpos[:N_ROBOT])
-                                      + kd_eff * (np.r_[qdot_jog, np.zeros(16)] - data.qvel[:N_ROBOT]))
+    +                    kd_eff * (np.r_[qdot_jog, np.zeros(16)] - data.qvel[:N_ROBOT]))
+  
+                                      
                 if squeeze_on:
                     _squeeze_steps += 1
                     _ramp = min(1.0, _squeeze_steps * model.opt.timestep / SQUEEZE_RAMP_S)
@@ -4403,7 +4516,7 @@ if __name__ == "__main__":
             # Teleop: keep the achieved-contact markers pinned to the object as it
             # moves (jog during GRASP) by re-expressing the stored object-local
             # achieved contacts in the world. Hidden until a lock-in plan succeeds.
-            if _CAT_MODE and not _teleop_active:
+            if _CAT_MODE and not _teleop_active and not _grasp_no_ach:
                 _ach_O = objects[active_idx].get('rec_achieved_O')
                 if _ach_O is not None:
                     _bid_m = objects[active_idx]['id_body']
@@ -4430,7 +4543,8 @@ if __name__ == "__main__":
                     mj.mjv_connector(scn.geoms[scn.ngeom], mj.mjtGeom.mjGEOM_CAPSULE,
                                       0.004, p0, p1)
                     scn.ngeom += 1
-                if active_tgt > 0 and _ik_markers_by_obj[active_idx] is not None:
+                if (active_tgt > 0 and not _grasp_no_ach
+                        and _ik_markers_by_obj[active_idx] is not None):
                     for positions, rgba in _ik_markers_by_obj[active_idx]:
                         for pos in positions:
                             if scn.ngeom >= scn.maxgeom:

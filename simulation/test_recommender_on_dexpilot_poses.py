@@ -96,19 +96,22 @@ def build_live_config(model, accel_budget=None, ang_budget=None, edge_margin_m=0
                            if any(g.startswith(f'leap_{c}_') for c in FINGER_CODES_ACTIVE)}
     rec_finger_geoms = sorted(g for g in active_finger_geoms
                               if not ('_ds_' in g or g.endswith('_tip')))
-    # Non-active fingers (middle/ring): GROUND-ONLY protection (disable object constraint via
-    # the sentinel; the floor test still applies). Matches _get_cat_planner.
+    # Non-active fingers (middle/ring): ACTIVE OBJECT constraint at +1mm on the bounding-
+    # sphere surface (they don't grasp, so they must stay OFF the target — a positive clearance
+    # keeps their curled links/tips out of the box instead of being pressed in during the
+    # squeeze). ALL mf/rf collision geoms included, incl. the ds/tip contact tier. The floor
+    # test still applies. Matches _get_cat_planner (_REC_NONACTIVE_OBJ_CLR).
+    REC_NONACTIVE_OBJ_CLR = 0.001
     rec_nonactive_geoms = sorted(
         g for g in robot_geoms
-        if (g.startswith('leap_mf_') or g.startswith('leap_rf_'))
-        and not ('_ds_' in g or g.endswith('_tip')))
+        if g.startswith('leap_mf_') or g.startswith('leap_rf_'))
     arm_geom_names = list(rec_arm_geoms) + rec_finger_geoms + rec_nonactive_geoms
     obj_clearance = {g: active_obj_clearance(g) for g in rec_finger_geoms}
-    obj_clearance.update({g: ANOBJ_DISABLE for g in rec_nonactive_geoms})
+    obj_clearance.update({g: REC_NONACTIVE_OBJ_CLR for g in rec_nonactive_geoms})
 
     print(f"[cfg] recommender collision geoms: {len(rec_arm_geoms)} palm/wrist + "
           f"{len(rec_finger_geoms)} active + {len(rec_nonactive_geoms)} non-active "
-          f"(ground-only) = {len(arm_geom_names)} total")
+          f"(mf/rf, obj +{REC_NONACTIVE_OBJ_CLR*1e3:.0f}mm) = {len(arm_geom_names)} total")
 
     cfg = GraspConfig3D(
         obj_geom=OBJ_GEOM, obj_body=OBJ_NAME,

@@ -307,7 +307,15 @@ def _geom_normal_np(point, geom_type: int, center, mat, size) -> np.ndarray:
     R = np.asarray(mat).reshape(3, 3)
     p_l = R.T @ (p - c)
     if geom_type == 6:   # BOX
-        return _box_surface_normal_3d(p, c, size[0], size[1], size[2])
+        # Select the nearest face and its normal in the OBJECT-LOCAL frame (p_l, centered
+        # at the origin), then rotate the local normal back to world (R @ n_l) — same as
+        # the sphere/cylinder branches. Passing the WORLD point/center picks the face in
+        # world axes and returns a world-axis normal, which is only correct for an
+        # axis-aligned box (R=I); for a rotated box it is wrong by the box's rotation
+        # (a 45deg-yawed box gave a full 45deg normal error), breaking the grasp-axis
+        # alignment term on non-world-aligned objects.
+        n_l = _box_surface_normal_3d(p_l, np.zeros(3), size[0], size[1], size[2])
+        return R @ n_l
     elif geom_type == 2:  # SPHERE
         n_l = p_l / (np.linalg.norm(p_l) + 1e-12)
         return R @ n_l
@@ -2474,11 +2482,14 @@ class MultiStartGraspPlanner3D:
             f"[seed_gen] {len(seeds)} seeds in {(time.perf_counter()-_t0)*1e3:.1f}ms "
             f"({attempts} attempts, {rejected} rejected)")
 
-        # Warm-start seed from the prior accepted contacts (project onto the CURRENT
-        # surface, recompute normals) — tried first so a re-solve on a static object
-        # returns to the same basin instead of a fresh random local optimum. Only used
-        # if both reconstructed contacts are reachable; drops one random seed to keep
-        # the total at n_seeds.
+        # DEPRECATED — the live caller no longer passes warm_contacts (kept only for API
+        # compatibility). Warm-starting from a prior CONVERGED grasp is counterproductive: the
+        # solution sits ON the constraint boundary (surface + edge-margin + wrench-cone), so
+        # seeding the interior-point NLP jammed against those constraints bounces it into a
+        # WORSE basin (measured: a cost-0.14 solution warm-started to cost 3.48), and it
+        # displaced a good fresh seed, collapsing convergence (1/3 -> 0/3) on re-solve. Fresh
+        # fixed-RNG seeds are deterministic and already return to the same basin on a static
+        # object. Do NOT re-enable without re-checking that regression.
         if warm_contacts is not None:
             try:
                 _wp1 = _project_to_surface_np(np.asarray(warm_contacts[0], float),
