@@ -573,10 +573,17 @@ if __name__ == "__main__":
     if args.trial_log == '':
         args.trial_log = f'{args.mode}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
         print(f"[trial-log] no RUN_DIR given — auto-named logs/{args.trial_log}/")
-    if args.trial_log and args.mode not in ('dexpilot', 'contact_aware_teleop'):
-        _arg_parser.error("--trial-log only supports --mode dexpilot or "
-                          "contact_aware_teleop (the two methods with a defined "
-                          "attempt trigger in trial_logger.py).")
+    # --trial-log has two independent halves: (a) the always-on full-state pose trace +
+    # phase_enter markers (works in ANY mode — pure logging), and (b) the trial success
+    # state machine (attempt trigger + lift/dwell detection), which needs a per-method
+    # attempt trigger defined in trial_logger.py — only dexpilot / contact_aware_teleop
+    # have one. So enable logging in every mode; skip the state machine where there's no
+    # trigger (contact_aware_autonomous). This lets an AUTONOMOUS run be logged for a
+    # working-baseline comparison against the teleop trace, same schema.
+    _trial_sm_supported = args.mode in ('dexpilot', 'contact_aware_teleop')
+    if args.trial_log and not _trial_sm_supported:
+        print(f"[trial-log] mode={args.mode}: logging pose_trace + phase markers only "
+              "(no trial success state machine — no attempt trigger for this mode).")
 
     model = mj.MjModel.from_xml_path('models/scene_pick_place.xml')
     data  = mj.MjData(model)
@@ -842,14 +849,18 @@ if __name__ == "__main__":
             _trial_rest_hh[_oi] = rest_half_height(int(model.geom_type[_gid]),
                                                     model.geom_size[_gid])
             _trial_dofadr[_oi] = int(model.jnt_dofadr[model.body_jntadr[_o['id_body']]])
+        # EventLogger drives BOTH streams (events.jsonl phase markers + the pose trace's
+        # correlated timestamps), so it's created in every mode. The TrialRunner + attempt
+        # trigger (the success state machine) only exist where a trigger is defined.
         _trial_events = EventLogger(Path('logs') / args.trial_log)
-        _trial_runner = TrialRunner(_trial_events, Path('logs') / args.trial_log)
-        if args.mode == 'dexpilot':
-            _dp_trigger = DexPilotAttemptTrigger()
-        else:
-            _cat_trigger = ContactAwareAttemptTrigger()
-        print(f"[trial-log] enabled -> logs/{args.trial_log}/  "
-              f"(mode={args.mode})")
+        if _trial_sm_supported:
+            _trial_runner = TrialRunner(_trial_events, Path('logs') / args.trial_log)
+            if args.mode == 'dexpilot':
+                _dp_trigger = DexPilotAttemptTrigger()
+            else:
+                _cat_trigger = ContactAwareAttemptTrigger()
+        print(f"[trial-log] enabled -> logs/{args.trial_log}/  (mode={args.mode}"
+              f"{'' if _trial_sm_supported else ', logging-only'})")
 
     # Always-on pose recorder (independent of trials/phases): one row per loop iteration
     # capturing the full robot+object qpos and wall/sim time, saved to
