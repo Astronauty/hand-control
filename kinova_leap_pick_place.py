@@ -291,7 +291,7 @@ _RANDOMIZE_OBJ_INFO = [
     # (body_name, geom_name, base_rgb) — pure R/G/B, no colour jitter
     ('obj_red_box',        'obj_red_box_geom',        [1.0, 0.0, 0.0]),
     ('obj_box_lowmu',      'obj_box_lowmu_geom',      [0.85, 0.55, 0.15]),
-    ('obj_box_light',      'obj_box_light_geom',      [0.85, 0.15, 0.55]),
+    ('obj_box_heavy',      'obj_box_heavy_geom',      [0.55, 0.15, 0.55]),
     ('obj_red_sphere',     'obj_red_sphere_geom',     [1.0, 0.0, 0.0]),
     ('obj_blue_cylinder',  'obj_blue_cylinder_geom',  [0.0, 0.0, 1.0]),
     ('obj_blue_capsule',   'obj_blue_capsule_geom',   [0.0, 0.0, 1.0]),
@@ -516,7 +516,7 @@ if __name__ == "__main__":
              "others are deleted from the spec before compilation (MjSpec.delete), so the "
              "scene contains exactly one target. Choices are the obj_* body names, e.g. "
              "obj_red_box (Object 1, baseline), obj_box_lowmu (Object 2, 0.6x friction), "
-             "obj_box_light (Object 3, 0.6x mass). Run dir = one object, so trial logs "
+             "obj_box_heavy (Object 3, 1.4x mass). Run dir = one object, so trial logs "
              "and parse_trials_tables.py pool cleanly per condition.")
     args = _arg_parser.parse_args()
     # In-code defaults for behaviours that used to be always-True CLI flags. These
@@ -699,6 +699,17 @@ if __name__ == "__main__":
     # JOG_VEL=0.10 m/s the worst-case rate is ~JOG_VEL/(2*JOG_LAM_MAX)=1.0 rad/s.
     JOG_SING_EPS    = 0.02  # rad·m onset of damping (raise = damp earlier/more conservative)
     JOG_LAM_MAX     = 0.05  # peak damping (raise = gentler but sloppier near singularities)
+    # BASE damping that is ALWAYS present, even away from singularities. The ramp above
+    # drives lam2 to 0 when sigma_min >= JOG_SING_EPS and only to JOG_LAM_MAX**2 (=0.0025)
+    # at a true singularity — nowhere near enough there: at sigma_min==0 (e.g. the Gen3
+    # all-zeros straight-up pose the viewer's built-in Backspace reset snaps to, an exact
+    # pinch-site Jacobian singularity), qdot = J^T (JJ^T + lam2 I)^-1 v amplifies by
+    # ~1/lam2 = 400, sending arm joints to tens of rad in one step and exploding mj_step
+    # (observed qacc ~1e9, ncon ~300 post-reset). A base damping bounds the peak joint
+    # rate at ~JOG_VEL/(2*sqrt(JOG_LAM_MIN)) regardless of conditioning; JOG_QDOT_MAX is a
+    # final hard clamp so no single frame can ever integrate a runaway solve.
+    JOG_LAM_MIN     = 0.02  # rad·m base DLS damping (peak arm rate ~0.2/(2*sqrt(0.02))≈0.7 rad/s)
+    JOG_QDOT_MAX    = 2.0   # rad/s hard cap on the mapped arm joint rate (safety backstop)
     # contact_aware_teleop post-grasp wrist tracking: P-gain from wrist pose error to a
     # Cartesian velocity command (1/s). The command is then slew-limited to the NCF accel
     # budget and DLS-mapped to joint rates, so this only sets how briskly the wrist closes
@@ -2991,11 +3002,20 @@ if __name__ == "__main__":
             mj.mj_jacSite(model, data, Jp, Jr, _PINCH_SID)
             J6 = np.vstack([Jp[:, :7], Jr[:, :7]])
             v6 = np.array([jog_v[0], jog_v[1], jog_v[2], jog_w[0], jog_w[1], jog_w[2]])
-            # Singularity-robust DLS (same damping schedule as the GRASP jog).
+            # Singularity-robust DLS (same damping schedule as the GRASP jog), but with a
+            # base damping FLOOR so a true singularity (sigma_min→0) can't blow up: the
+            # ramp adds up to JOG_LAM_MAX**2 near singular, JOG_LAM_MIN is always present.
             sigma_min = np.linalg.svd(J6, compute_uv=False)[-1]
-            lam2 = (0.0 if sigma_min >= JOG_SING_EPS
-                    else (1.0 - (sigma_min / JOG_SING_EPS) ** 2) * JOG_LAM_MAX ** 2)
+            lam2_ramp = (0.0 if sigma_min >= JOG_SING_EPS
+                         else (1.0 - (sigma_min / JOG_SING_EPS) ** 2) * JOG_LAM_MAX ** 2)
+            lam2 = JOG_LAM_MIN + lam2_ramp
             qdot_arm = J6.T @ np.linalg.solve(J6 @ J6.T + lam2 * np.eye(6), v6)
+            # Final hard clamp: even a well-damped solve at a pathological config shouldn't
+            # integrate more than JOG_QDOT_MAX rad/s into any joint. Scales the whole vector
+            # so the wrist direction is preserved, only the magnitude is capped.
+            _qdmax = np.abs(qdot_arm).max()
+            if _qdmax > JOG_QDOT_MAX:
+                qdot_arm *= JOG_QDOT_MAX / _qdmax
         return qdot_arm, jog_v, jog_w
 
     _ik_vis_mode   = None          # None | 'grasp': freeze physics to show IK config
@@ -4655,6 +4675,14 @@ if __name__ == "__main__":
                         _teleop_wrist_tgt = None
                         _teleop_jog_v[:] = 0.0
                         _teleop_jog_w[:] = 0.0
+                        # Zero the arm's PHYSICS velocity too. The GRASP carry injected a
+                        # commanded rate into data.qvel[:7] every substep; without this, that
+                        # residual velocity persists into the first REACH mj_step and — with
+                        # the arm lightly damped for teleop — integrates into a lurch (a
+                        # blow-up trigger observed on release). The control-state integrators
+                        # above are re-seeded from the live pose next frame, so a clean qvel
+                        # start is consistent with them.
+                        data.qvel[:7] = 0.0
                         _teleop_damping_zeroed = False   # re-zero arm damping for teleop drive
                         _rec_vis       = False
                         _rec_ik_mode   = None
