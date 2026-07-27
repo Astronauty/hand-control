@@ -12,6 +12,9 @@ Controls (while the window is focused):
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import cv2
 
@@ -241,6 +244,129 @@ class SkeletonViewer:
             cv2.destroyWindow(self._name)
         except cv2.error:
             pass
+
+
+class ThreadedSkeletonViewer:
+    """Runs the OpenCV GUI windows (3D hand skeleton, and optionally the camera-
+    preview grid) on ONE dedicated daemon thread, so the cv2 render (imshow +
+    waitKey — measured 9-20 ms/draw under software GL) never stalls the caller's
+    control loop.
+
+    Why one thread for BOTH windows: OpenCV here is built on the Qt5 HighGUI
+    backend, which requires ALL GUI calls (namedWindow / imshow / waitKey / mouse
+    callbacks) to run on a SINGLE thread. Rendering the skeleton on a worker while
+    the camera grid rendered on the control thread would be two Qt GUI threads —
+    warnings, corruption, or a crash. This owner creates and pumps every window on
+    its own thread; the control thread only push()es data (non-blocking).
+
+    The control thread keeps ownership of the rclpy spin that FILLS the camera
+    previews (ROS must be pumped where it was created); it just hands the latest
+    preview dict here via push_camera_previews(). draw_hz caps the render rate (the
+    fused hand + previews refresh at ~15-20 Hz, so faster shows nothing new).
+
+    Mouse orbit / keys keep working because their callbacks fire during THIS
+    thread's waitKey. Drop-in: replace inline `viewer.show(pts, info)` with
+    `viewer.push(pts, info)`; call close() at shutdown.
+    """
+
+    def __init__(self, name: str = "teleop hand skeleton", draw_hz: float = 20.0,
+                 camera_names: list | None = None,
+                 camera_window_name: str = "teleop camera feeds",
+                 **viewer_kwargs):
+        self._name = name
+        self._viewer_kwargs = viewer_kwargs
+        self._cam_names = camera_names            # None -> no camera grid window
+        self._cam_window_name = camera_window_name
+        self._period = 1.0 / max(draw_hz, 1e-3)
+        self._lock = threading.Lock()
+        self._latest = None            # (pts_world_copy, info) or None
+        self._have_new = False
+        self._cam_previews = {}        # name -> latest BGR frame (control thread writes)
+        self._have_new_cam = False
+        self._stop = threading.Event()
+        self._closed_by_user = threading.Event()   # set if the user hit q/ESC in a window
+        self._thread = threading.Thread(target=self._run, name="cv-gui-viewer",
+                                        daemon=True)
+        self._thread.start()
+
+    def push(self, pts_world, info: str = "") -> None:
+        """Hand the latest hand points to the render thread. Non-blocking; copies
+        the array so the render thread never races the caller's buffer."""
+        pts = None if pts_world is None else np.asarray(pts_world, float).copy()
+        with self._lock:
+            self._latest = (pts, info)
+            self._have_new = True
+
+    def push_camera_previews(self, previews: dict) -> None:
+        """Hand the latest per-camera preview frames to the render thread. Shallow
+        copy of the dict (frames are treated read-only downstream). No-op if this
+        viewer has no camera grid. Non-blocking."""
+        if self._cam_names is None or not previews:
+            return
+        with self._lock:
+            self._cam_previews = dict(previews)
+            self._have_new_cam = True
+
+    @property
+    def closed_by_user(self) -> bool:
+        """True once the user pressed q/ESC in a viewer window."""
+        return self._closed_by_user.is_set()
+
+    def _run(self) -> None:
+        # Create every window on THIS thread (Qt HighGUI requirement). A failure
+        # here (no display, cv2 built without GUI) must not kill teleop — log & exit.
+        try:
+            viewer = SkeletonViewer(name=self._name, **self._viewer_kwargs)
+        except Exception as e:   # noqa: BLE001
+            print(f"[skeleton] viewer thread failed to open a window ({e!r}); "
+                  "skeleton view disabled (teleop unaffected).")
+            return
+        cam_grid = None
+        if self._cam_names is not None:
+            try:
+                cam_grid = CameraGridWindow(self._cam_names, name=self._cam_window_name)
+            except Exception as e:   # noqa: BLE001
+                print(f"[skeleton] camera grid failed to open ({e!r}); "
+                      "camera views disabled (teleop unaffected).")
+                cam_grid = None
+        last = 0.0
+        cur_pts, cur_info = None, ""
+        cur_cams = {}
+        while not self._stop.is_set():
+            now = time.monotonic()
+            if now - last < self._period:
+                # Pump the skeleton window's key/mouse handling cheaply between
+                # refreshes so orbit stays responsive (one waitKey drives all
+                # Qt windows). CameraGridWindow.show() also calls waitKey, but we
+                # only render it on the refresh tick below.
+                if viewer._handle_key(cv2.waitKey(1) & 0xFF) is False:  # noqa: SLF001
+                    self._closed_by_user.set()
+                    break
+                time.sleep(min(self._period - (now - last), 0.005))
+                continue
+            last = now
+            with self._lock:
+                if self._have_new:
+                    cur_pts, cur_info = self._latest
+                    self._have_new = False
+                if self._have_new_cam:
+                    cur_cams = self._cam_previews
+                    self._have_new_cam = False
+            if viewer.show(cur_pts, cur_info) is False:
+                self._closed_by_user.set()
+                break
+            if cam_grid is not None and cur_cams:
+                if cam_grid.show(cur_cams) is False:
+                    self._closed_by_user.set()
+                    break
+        viewer.close()
+        if cam_grid is not None:
+            cam_grid.close()
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
 
 
 class CameraGridWindow:

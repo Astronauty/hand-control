@@ -2169,47 +2169,45 @@ if __name__ == "__main__":
     # positions can't be drawn here (calib lives in the fusion node, not the message),
     # and the camera-preview grid needs the /hand/cam_*/preview topics — use
     # run_multicam.py --show for those. Drawn once per frame from both teleop branches.
-    _skel_viewer = None
-    if args.skeleton_view and args.mode in _teleop_modes:
-        sys.path.insert(0, __file__.rsplit('/', 1)[0] + '/teleop')
-        from skeleton_viewer import SkeletonViewer   # noqa: E402
-        _skel_viewer = SkeletonViewer(name="teleop hand skeleton")
-        print("[teleop] skeleton view on — orbit with mouse, r reset, z flip up.")
+    # OFF-THREAD GUI: the cv2 render (imshow + waitKey) measured 9-20 ms/draw for the
+    # skeleton and ~22-30 ms/iter for the camera grid under software GL. Run inline they
+    # dropped the pre-lock-in control loop from ~185 Hz to ~30-50 Hz (TELEOP_PROFILE) and
+    # made the wrist tracking feel laggy vs GRASP (which draws neither). Both windows now
+    # live on ONE dedicated GUI thread (Qt5 HighGUI requires a single GUI thread); the
+    # control loop only push()es data (non-blocking), so the render cost never touches it.
+    _cam_views_on = bool(args.camera_views and args.multicam
+                         and args.mode in _teleop_modes)
+    _cam_names = ([s.split(':')[0] for s in args.multicam] if _cam_views_on else None)
 
-    # Wall-clock of the last skeleton draw, for throttling (list = mutable closure cell).
-    _skel_last_draw = [0.0]
-    SKEL_DRAW_HZ = 30.0   # the fused hand data only updates at ~20 Hz; drawing the
-                          # separate GLFW window every ~2ms sim iter (~110 Hz) cost
-                          # ~5ms/iter (the bulk of spin_draw) for no new information.
-    # Same treatment for the camera-views grid: decoding+tiling+rendering all 3 camera
-    # JPEG previews via OpenCV every iteration measured ~22-30ms/iter (TELEOP_PROFILE),
-    # which alone dropped the pre-lock-in control loop from ~500 Hz to ~30 Hz and made
-    # the wrist tracking feel laggy vs GRASP (which never draws these). The previews are
-    # published at only ~15 Hz upstream (--preview-hz 15.0), so drawing faster shows
-    # nothing new — throttle to CAM_VIEWS_DRAW_HZ so the control loop runs full-rate.
-    _cam_views_last_draw = [0.0]
-    CAM_VIEWS_DRAW_HZ = 15.0
+    _skel_viewer = None
+    if (args.skeleton_view or _cam_views_on) and args.mode in _teleop_modes:
+        sys.path.insert(0, __file__.rsplit('/', 1)[0] + '/teleop')
+        from skeleton_viewer import ThreadedSkeletonViewer   # noqa: E402
+        # The threaded viewer owns BOTH the skeleton and (if enabled) the camera grid.
+        _skel_viewer = ThreadedSkeletonViewer(
+            name="teleop hand skeleton", draw_hz=20.0,
+            camera_names=_cam_names, camera_window_name="teleop camera feeds")
+        print("[teleop] skeleton view on (off-thread) — orbit with mouse, r reset, z flip up."
+              + (f"  camera feeds tiled: {_cam_names}." if _cam_names else ""))
 
     def _draw_skeleton():
-        """Feed the latest ABSOLUTE world-frame hand skeleton to the viewer.
+        """PUSH the latest ABSOLUTE world-frame hand skeleton to the off-thread viewer.
 
         The /hand/joint_angles world-landmark block (raw[57:120]) is WRIST-RELATIVE
         (world_lm = pts - pts[wrist] in the fusion node), so drawing it alone pins
         the wrist at the origin — the hand articulates but never translates, which
         is NOT what the fusion node's own viewer shows. Re-add the absolute wrist
         position (raw[0:3], the triangulated wrist in the shared world frame) to
-        recover the true world pose the multicam viewer draws. Draws empty until a
-        hand is tracked; no-op if the viewer isn't enabled.
+        recover the true world pose the multicam viewer draws. No-op if the viewer
+        isn't enabled.
 
-        Throttled to SKEL_DRAW_HZ: the GLFW render is ~5ms and the source data only
-        refreshes at camera rate (~20 Hz), so redrawing every sim iteration just burns
-        wall-time (inflating the real-time catch-up deficit) with nothing new to show."""
+        This is now a NON-BLOCKING push: the ThreadedSkeletonViewer owns the cv2
+        window on its own thread and renders at its own rate, so the ~9-20 ms render
+        never stalls the control loop (the whole point — see its docstring). No
+        throttle needed here; the viewer thread paces itself and only the freshest
+        pushed points are drawn."""
         if _skel_viewer is None:
             return
-        _now = time.time()
-        if _now - _skel_last_draw[0] < 1.0 / SKEL_DRAW_HZ:
-            return
-        _skel_last_draw[0] = _now
         raw = _dexpilot_ctrl.raw_msg
         pts = None
         n_lm = 0
@@ -2218,7 +2216,7 @@ if __name__ == "__main__":
             wrist_abs = np.asarray(raw[0:3], float)      # absolute wrist (world frame)
             pts = wrist_rel + wrist_abs                  # wrist-relative -> absolute
             n_lm = 21
-        _skel_viewer.show(pts, f"world landmarks: {n_lm}/21  "
+        _skel_viewer.push(pts, f"world landmarks: {n_lm}/21  "
                                f"wrist=({raw[0]:+.2f},{raw[1]:+.2f},{raw[2]:+.2f})m"
                                if pts is not None else "waiting for hand…")
 
@@ -2227,19 +2225,20 @@ if __name__ == "__main__":
     # frame + landmark overlay, tiled. The landmark nodes already publish a throttled
     # JPEG preview to /hand/cam_<name>/preview (independent of --show), so we just
     # subscribe here on our OWN small rclpy node (kept separate from the shared
-    # DexPilot subscriber) and decode into a CameraGridWindow. Camera names come from
-    # the --multicam specs (strip :INDEX[:WxH]). Drawn once per frame like _draw_skeleton.
-    _cam_grid       = None
+    # DexPilot subscriber) and decode the frames. The tiling+imshow is done by the
+    # off-thread viewer (ThreadedSkeletonViewer owns the CameraGridWindow). Camera names
+    # come from the --multicam specs (strip :INDEX[:WxH]).
+    # rclpy subscription STAYS on the control thread (ROS must be pumped where it was
+    # created); the decoded frames go into _cam_previews, which _draw_camera_views()
+    # hands to the off-thread viewer for rendering. The heavy imshow/tiling now happens
+    # on the GUI thread (see ThreadedSkeletonViewer), not here.
     _cam_grid_node  = None
-    _cam_previews   = {}      # name -> latest decoded BGR frame
-    if args.camera_views and args.multicam and args.mode in _teleop_modes:
+    _cam_previews   = {}      # name -> latest decoded BGR frame (control thread writes)
+    if _cam_views_on:
         import rclpy as _rclpy                             # noqa: E402
         from rclpy.node import Node as _RclNode            # noqa: E402
         from sensor_msgs.msg import CompressedImage as _CompressedImage  # noqa: E402
-        sys.path.insert(0, __file__.rsplit('/', 1)[0] + '/teleop')
-        from skeleton_viewer import CameraGridWindow       # noqa: E402
         from hand_message import sensor_qos                # noqa: E402
-        _cam_names = [s.split(':')[0] for s in args.multicam]
         # rclpy is already init()'d by the DexPilot ROSInterface; just add a node.
         _cam_grid_node = _RclNode("teleop_camera_grid")
 
@@ -2257,27 +2256,20 @@ if __name__ == "__main__":
             _cam_grid_node.create_subscription(
                 _CompressedImage, f"/hand/cam_{_nm}/preview", _mk_preview_cb(_nm),
                 sensor_qos())
-        _cam_grid = CameraGridWindow(_cam_names, name="teleop camera feeds")
         print(f"[teleop] camera feeds on — tiling {_cam_names} "
-              f"from /hand/cam_<name>/preview.")
+              f"from /hand/cam_<name>/preview (rendered off-thread).")
 
     def _draw_camera_views():
-        """Spin the preview subscriptions and tile the latest per-camera frames.
-        No-op unless --camera-views is on. Mirrors the fusion node's camera grid.
-
-        Throttled to CAM_VIEWS_DRAW_HZ: the OpenCV decode+tile+render of all cameras is
-        the single biggest per-iteration cost (~22-30ms, measured), and the previews
-        only refresh at ~15 Hz upstream — so running it every sim iteration crushed the
-        control-loop rate for no new frames. Gate it to the preview rate."""
-        if _cam_grid is None:
+        """Drain the preview subscriptions (cheap, control thread) and hand the latest
+        frames to the off-thread viewer to tile+render. No-op unless --camera-views is on.
+        The expensive decode already happened in the ROS callback; the imshow/tiling is
+        done on the GUI thread, so this call is just a spin_once + a non-blocking push."""
+        if _cam_grid_node is None:
             return
-        _now = time.time()
-        if _now - _cam_views_last_draw[0] < 1.0 / CAM_VIEWS_DRAW_HZ:
-            return
-        _cam_views_last_draw[0] = _now
         import rclpy as _rclpy
         _rclpy.spin_once(_cam_grid_node, timeout_sec=0.0)   # drain pending previews
-        _cam_grid.show(_cam_previews)
+        if _skel_viewer is not None:
+            _skel_viewer.push_camera_previews(_cam_previews)
 
     _pipeline_dead_warned = [False]
 
@@ -2702,6 +2694,14 @@ if __name__ == "__main__":
     # target; None until the first solve lands.
     _teleop_q      = None
     _teleop_step_t = 0.0           # sim-time (data.time) of the last pre-lock-in step()
+    # Throttle the ROS polls that feed the (camera-rate) hand + preview streams. Both ran
+    # every control iteration (measured spin()~1ms, camera spin_once~0.7ms — TELEOP_PROFILE)
+    # but the data only refreshes at ~15-30 Hz, so polling faster just burns control-loop
+    # time. Gate to ~60 Hz sim-time (faster than the 30 Hz step()/preview consumers so the
+    # buffers are always fresh when read). Wall-clock last-poll cells (mutable for closures).
+    TELEOP_SPIN_HZ = 60.0
+    _teleop_spin_t = 0.0           # sim-time (data.time) of the last _dexpilot_ctrl.spin()
+    _teleop_cam_t  = 0.0           # sim-time (data.time) of the last camera-preview poll
     # Pre-lock-in arm drive matches the GRASP carry: instead of slamming the raw IK joint
     # solution into the stiff PD (a 30 Hz staircase -> jitter, plus 7-DOF null-space branch
     # flips), track the DexPilot wrist TARGET FRAME with a slew-limited resolved-rate loop
@@ -2759,7 +2759,7 @@ if __name__ == "__main__":
         print("[teleop] TELE_AUTO_JOG=1 — GRASP uses the autonomous arrow-key jog "
               "(no wrist tracking). Drive the lift with arrow keys.")
     _gp_acc = {'track': 0.0, 'refresh': 0.0, 'spin': 0.0, 'step_ik': 0.0,
-               'torque': 0.0, 'step': 0.0, 'n': 0}
+               'torque': 0.0, 'step': 0.0, 'viz': 0.0, 'n': 0}
     _gp_last = time.time()
     # Pre-lock-in teleop drive profiler (opt-in via TELEOP_PROFILE=1). Symmetric to
     # GRASP_PROFILE: accumulates per-iteration wall-time by SECTION and prints a
@@ -3105,13 +3105,22 @@ if __name__ == "__main__":
                 if not _teleop_damping_zeroed:
                     model.dof_damping[:7] = _ARM_DAMPING_DEFAULT
                     _teleop_damping_zeroed = True
-                _dexpilot_ctrl.spin()
+                # Throttle the ROS hand poll to ~60 Hz sim-time (data is camera-rate; polling
+                # every 1 ms iteration cost ~1 ms/iter for nothing new). step() reads raw_msg
+                # at its own ~30 Hz gate, so a 60 Hz spin keeps it fresh.
+                _now = data.time
+                if _now - _teleop_spin_t >= 1.0 / TELEOP_SPIN_HZ:
+                    _dexpilot_ctrl.spin()
+                    _teleop_spin_t = _now
                 if TELEOP_PROFILE:
                     _t = time.perf_counter(); _tp_acc['spin'] += _t - _tp_s; _tp_s = _t
                 _draw_skeleton()   # fused-hand overlay (no-op unless --skeleton-view)
                 if TELEOP_PROFILE:
                     _t = time.perf_counter(); _tp_acc['skel'] += _t - _tp_s; _tp_s = _t
-                _draw_camera_views()   # per-camera feed grid (no-op unless --camera-views)
+                # Camera-preview poll: same ~60 Hz throttle (previews arrive at ~15 Hz).
+                if _now - _teleop_cam_t >= 1.0 / TELEOP_SPIN_HZ:
+                    _draw_camera_views()   # per-camera feed grid (no-op unless --camera-views)
+                    _teleop_cam_t = _now
                 _check_pipeline_alive()  # warn if the multicam child died
                 if _tune_retarget:
                     _dexpilot_ctrl.poll_retarget_config()  # hot-reload retarget_config.json edits
@@ -3165,6 +3174,9 @@ if __name__ == "__main__":
                         _teleop_wrist_tgt = None         # drop the stale wrist target frame
                         _teleop_jog_v[:] = 0.0           # zero the slew-limited velocity ramps
                         _teleop_jog_w[:] = 0.0
+                        # data.time just reset to ~0; zero the sim-time poll gates too, else a
+                        # large stale timestamp blocks spin()/cam polls until sim catches back up.
+                        _teleop_spin_t = _teleop_cam_t = _teleop_step_t = 0.0
                         _rec_vis        = False
                         _rec_ik_mode    = None
                         _rec_last_solve = 0.0
@@ -3399,6 +3411,14 @@ if __name__ == "__main__":
                             _err = _dp_target - data.qpos[:N_ROBOT]
                             tau_ctrl[:7]        = (_dp_Kp_arm * _err[:7]
                                                    + _ARM_DAMPING_TRACK * (_qdot_arm - data.qvel[:7]))
+                            # Fingers stay PD-driven with real dynamics (NOT kinematically
+                            # pinned): a pinned finger can't respond to contact/friction, which
+                            # breaks grasping — and grasping with this same DexPilot tracking is
+                            # the goal, so the fingers must be force-controlled all the way from
+                            # approach into the grip (exactly like the GRASP carry). The PD also
+                            # low-passes the 30 Hz retarget staircase, so the fingers move
+                            # smoothly. The finger->wrist reaction this reintroduces is small in
+                            # free-space approach and is DESIRED once contact forms.
                             tau_ctrl[7:N_ROBOT] = Kp[7:] * _err[7:]
                             data.qfrc_applied[:] = tau_ctrl
                             data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
@@ -4566,6 +4586,13 @@ if __name__ == "__main__":
                     # Re-zero the arm damping on the next teleop iteration (this handler
                     # just restored TRACK above; the pre-lock-in drive wants it zeroed).
                     _teleop_damping_zeroed = False
+                    # Re-seed the drive + zero the sim-time poll gates (data.time reset to ~0).
+                    _teleop_q = None
+                    _teleop_arm_hold = None
+                    _teleop_wrist_tgt = None
+                    _teleop_jog_v[:] = 0.0
+                    _teleop_jog_w[:] = 0.0
+                    _teleop_spin_t = _teleop_cam_t = _teleop_step_t = 0.0
                     _rec_vis        = False
                     _rec_ik_mode    = None
                     _rec_last_solve = 0.0
@@ -4879,16 +4906,19 @@ if __name__ == "__main__":
                 _gp_acc['n'] += 1
                 if time.time() - _gp_last >= 1.0:
                     _n = max(_gp_acc['n'], 1)
-                    print(f"\r\n[grasp-profile] {_gp_acc['n']} steps/s | per-step ms: "
+                    print(f"\r\n[grasp-profile] {_gp_acc['n']} steps/s "
+                          f"(control-update rate = {_gp_acc['n']} Hz, 1 substep/iter) "
+                          f"| per-step ms: "
                           f"track={_gp_acc['track']/_n*1e3:.3f} "
                           f"(refresh={_gp_acc['refresh']/_n*1e3:.3f}: "
                           f"spin={_gp_acc['spin']/_n*1e3:.3f} "
                           f"step_ik={_gp_acc['step_ik']/_n*1e3:.3f}) "
                           f"torque={_gp_acc['torque']/_n*1e3:.3f} "
                           f"step={_gp_acc['step']/_n*1e3:.3f} "
+                          f"viz_sync={_gp_acc['viz']/_n*1e3:.3f} "
                           f"hand_track={_dexpilot_ctrl._hand_tracking if _dexpilot_ctrl else '?'}")
                     _gp_acc = {'track': 0.0, 'refresh': 0.0, 'spin': 0.0, 'step_ik': 0.0,
-                               'torque': 0.0, 'step': 0.0, 'n': 0}
+                               'torque': 0.0, 'step': 0.0, 'viz': 0.0, 'n': 0}
                     _gp_last = time.time()
 
             # --- Trial benchmarking (--trial-log): detectors + trace, every real
@@ -5000,7 +5030,10 @@ if __name__ == "__main__":
                 _draw_bspheres(scn)
                 _draw_active_marker(scn)
 
+            _t_viz0 = time.perf_counter() if GRASP_PROFILE else 0.0
             viewer.sync()
+            if GRASP_PROFILE and control_phase == 'GRASP':
+                _gp_acc['viz'] += time.perf_counter() - _t_viz0
             time.sleep(max(0, model.opt.timestep - (time.time() - step_start)))
 
     _kb_listener.stop()
@@ -5017,9 +5050,7 @@ if __name__ == "__main__":
     if _dexpilot_ctrl is not None:
         _dexpilot_ctrl.shutdown()
     if _skel_viewer is not None:
-        _skel_viewer.close()
-    if _cam_grid is not None:
-        _cam_grid.close()
+        _skel_viewer.close()   # closes BOTH the skeleton and camera-grid windows (its thread)
     if _cam_grid_node is not None:
         try:
             _cam_grid_node.destroy_node()
