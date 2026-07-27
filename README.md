@@ -85,6 +85,41 @@ python kinova_leap_pick_place.py --mode dexpilot \
 
 ---
 
+### Trial logging & replay
+
+Add `--trial-log` to a `dexpilot` or `contact_aware_teleop` run to record it under `logs/<run>/`:
+
+```bash
+python kinova_leap_pick_place.py --mode contact_aware_teleop --trial-log          # auto-named logs/<mode>_<timestamp>/
+python kinova_leap_pick_place.py --mode contact_aware_teleop --trial-log my_run   # named logs/my_run/
+```
+
+Each run directory holds three correlated streams (see [`trial_logger.py`](trial_logger.py) for the full state machine):
+
+- `events.jsonl` — sparse per-trial/phase/attempt event stream (trial_start, phase_enter, attempt_start/result, pick_confirmed, drop, arrival, contact_violation, trial_end), each carrying `trial_id` + sim-time `t` so it joins against the traces by time.
+- `pose_trace.npz` — an always-on ~50 Hz **full-state** trace across all phases: the complete MuJoCo state (`qpos`/`qvel`/`act`/`ctrl` + force channels), body poses, and per-finger contact forces.
+- `trial_<id>_<method>_<object>_<outcome>.npz` — per-`mj_step` trial trace (fingertip pos/force, object pose/vel), one per trial.
+
+A new trial starts on each target selection (`Ctrl+<digit>`; dexpilot: pressing `8`) and ends on arrival at the matching place site, a 60 s timeout, or an abandoned mid-trial target switch.
+
+#### Replaying a logged run
+
+[`replay_pose_trace.py`](replay_pose_trace.py) ingests a run directory and **kinematically replays** it in the MuJoCo viewer — for each recorded row it writes the logged full `qpos` and calls `mj_forward` (no `mj_step`, no controllers, no operator input), reproducing exactly what the arm/hand/object did against the fixed `models/scene_pick_place.xml` scene. `events.jsonl` is joined in as a printed timeline overlay.
+
+```bash
+python replay_pose_trace.py logs/<run>                    # real-time viewer
+python replay_pose_trace.py logs/<run> --fps 20           # slower
+python replay_pose_trace.py logs/<run> --phase APPROACH   # isolate one phase (APPROACH/PICK/TRANSPORT/PLACE)
+python replay_pose_trace.py logs/<run> --start 30         # skip to sim-time 30 s
+python replay_pose_trace.py logs/<run> --dump frames/     # headless: render PNGs (+ the ffmpeg encode line)
+```
+
+Playback defaults to `--pace index` (a constant `--fps` row rate, default 50), because the kinematic RRT-reach phase advances `data.time` very little — its motion is compressed into a short sim-time span, so `--pace sim` (true physics rate) would whoosh past the approach. Index pacing plays every row at a visible, controllable cadence. `--speed` scales whichever clock is active; `--loop` repeats.
+
+This is *kinematic* replay — it re-plays the recorded state, it does not re-simulate physics or re-run the operator's live teleop.
+
+---
+
 ### CLI flags
 
 | Flag | Default | Description |
@@ -93,6 +128,7 @@ python kinova_leap_pick_place.py --mode dexpilot \
 | `--ik-solver {sqp,ipopt}` | `sqp` | IK solver backend (see below). |
 | `--dashboard` | off | Launch a live pyqtgraph metrics dashboard (separate process): planning mode, proximity-based active object, scrolling fingertip→object distances, net hand→object wrench, per-finger contact normal forces, a combined RRT+IK planner solution log, and — in `contact_aware_teleop` — a **grasp-recommender panel** with per-solve statistics (status, seeds converged, solve time, γ_min, wrench feasibility, IK error) plus a rolling session summary. |
 | `--viz-only` | off | Debug mode: disables arm/hand collision physics and never calls `mj_step`. REACH and GRASP phases hold their IK solution kinematically so you can inspect the IK/RRT result without dynamics interference. |
+| `--trial-log [RUN_DIR]` | off | *(dexpilot / contact_aware_teleop)* Record the run under `logs/<RUN_DIR>/` (auto-named `<mode>_<timestamp>` if omitted): `events.jsonl` + `pose_trace.npz` + per-trial `.npz`. Replay with [`replay_pose_trace.py`](replay_pose_trace.py). See [Trial logging & replay](#trial-logging--replay). |
 | `--seed N` | none | RNG seed for object randomization — the same seed reproduces the same layout (positions and sizes). Default: fresh entropy every run. Ignored with `--no-randomize`. |
 | `--no-randomize` | off | Skip object randomization entirely: objects keep the positions, sizes, and colors authored in `models/scene_pick_place.xml`. |
 | `--camera N` | auto | *(teleop modes only)* Camera index forwarded to the built-in single-camera MediaPipe publisher. Defaults to auto-select (prefers external/USB camera at index ≥ 1). Run `python ui/mediapipe_joint_angles.py --list-cameras` to see available indices. |
