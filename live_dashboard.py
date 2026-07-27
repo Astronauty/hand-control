@@ -40,9 +40,12 @@ Message protocol (plain dicts put on the queue):
         'ik_thumb_mm': float|None, 'ik_index_mm': float|None,
         'n_converged': int, 'n_seeds': int}
     {'type': 'rec_status',                            # live recommender ACTIVITY, not the
-        'state': str, 'object': str|None}             #   result. state in {solving, waiting,
-                                                      #   preview, unsupported, held};
-                                                      #   change-gated (one msg per transition).
+        'state': str, 'object': str|None,             #   result. state in {solving, waiting,
+        'fresh': bool|None}                           #   preview, unsupported, held}. fresh:
+                                                      #   True=shown rec valid for the object's
+                                                      #   live pose, False=STALE (box moved),
+                                                      #   None=no candidate. change-gated
+                                                      #   (one msg per (state,object,fresh)).
     {'type': 'tip_err',                               # per-stage tip-error attribution
         'object': str, 'fingers': [str],              #   (contact_aware_teleop lock-in);
         'nlp': [float]|None,                          #   overwrites a fixed readout.
@@ -425,6 +428,17 @@ def _run(queue, fingers, horizon_s, dt_hint):
                                     _RECST_OFF_STYLE),
                 }
                 _txt, _sty = _RECST_TXT.get(st, (f"recommender: {st}", _RECST_OFF_STYLE))
+                # Freshness badge: is the currently-shown grasp rec valid for the object's
+                # CURRENT pose? True=fresh (markers match the box), False=STALE (box moved
+                # since the rec was solved; a re-solve is pending), None=no candidate to judge.
+                # A STALE badge overrides the colour to the warn hue so it stands out even
+                # while the line otherwise reads 'planning'/'waiting'.
+                _fresh = msg.get('fresh')
+                if _fresh is True:
+                    _txt += "   — rec FRESH"
+                elif _fresh is False:
+                    _txt += "   — rec STALE (box moved)"
+                    _sty = _RECST_HOLD_STYLE
                 rec_state_lbl.setText(_txt)
                 rec_state_lbl.setStyleSheet(_sty)
             elif mt == 'squeeze':
