@@ -39,6 +39,10 @@ Message protocol (plain dicts put on the queue):
         'gamma_min': float|None, 'wrench_feasible': bool,     #   one per completed solve.
         'ik_thumb_mm': float|None, 'ik_index_mm': float|None,
         'n_converged': int, 'n_seeds': int}
+    {'type': 'rec_status',                            # live recommender ACTIVITY, not the
+        'state': str, 'object': str|None}             #   result. state in {solving, waiting,
+                                                      #   preview, unsupported, held};
+                                                      #   change-gated (one msg per transition).
     {'type': 'tip_err',                               # per-stage tip-error attribution
         'object': str, 'fingers': [str],              #   (contact_aware_teleop lock-in);
         'nlp': [float]|None,                          #   overwrites a fixed readout.
@@ -99,6 +103,15 @@ def _run(queue, fingers, horizon_s, dt_hint):
     mode_lbl.setStyleSheet("font-size: 30px; font-weight: bold;")
     target_lbl = QtWidgets.QLabel("target: —")
     target_lbl.setStyleSheet("font-size: 12px; color: #999999;")
+    # Live recommender activity (contact_aware_teleop), shown directly under the mode so
+    # 'Approach' says whether the NLP is actually planning. Fed by 'rec_status' messages.
+    # Green pulse while solving, amber if paused/held, grey/neutral when waiting or off.
+    _RECST_SOLVE_STYLE = "font-size: 13px; font-weight: bold; color: #55cc88;"
+    _RECST_WAIT_STYLE  = "font-size: 13px; color: #7799cc;"
+    _RECST_HOLD_STYLE  = "font-size: 13px; color: #ff9944;"
+    _RECST_OFF_STYLE   = "font-size: 13px; color: #777777;"
+    rec_state_lbl = QtWidgets.QLabel("recommender: —")
+    rec_state_lbl.setStyleSheet(_RECST_OFF_STYLE)
     active_obj_lbl = QtWidgets.QLabel("active object: —")
     active_obj_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #55cc88;")
     _SQUEEZE_OFF_STYLE = "font-size: 16px; font-weight: bold; color: #777777;"
@@ -116,6 +129,7 @@ def _run(queue, fingers, horizon_s, dt_hint):
     mode_box = QtWidgets.QVBoxLayout()
     mode_box.addWidget(mode_lbl)
     mode_box.addWidget(target_lbl)
+    mode_box.addWidget(rec_state_lbl)
     # Trial countdown: TRIAL_TIMEOUT_S minus elapsed sim-time, fed by 'trial_time'
     # messages. Neutral until a trial is active; amber under 10 s, red under 3 s.
     _TIME_IDLE_STYLE = "font-size: 30px; font-weight: bold; color: #777777;"
@@ -392,6 +406,27 @@ def _run(queue, fingers, horizon_s, dt_hint):
                 target_lbl.setText(f"target: {msg.get('target', '—')}")
             elif mt == 'active_obj':
                 active_obj_lbl.setText(f"active object: {msg.get('name', '—')}")
+            elif mt == 'rec_status':
+                # Live recommender activity (change-gated on the sim side). Distinguishes
+                # 'actively planning' from a paused/held/stalled recommender so a grasp
+                # that never re-arms after release is visible at a glance.
+                st  = msg.get('state', '—')
+                obj = msg.get('object')
+                _obj_sfx = f"  ({obj})" if obj else ""
+                _RECST_TXT = {
+                    'solving':     ("recommender: ● planning" + _obj_sfx, _RECST_SOLVE_STYLE),
+                    'waiting':     ("recommender: waiting for next solve" + _obj_sfx,
+                                    _RECST_WAIT_STYLE),
+                    'preview':     ("recommender: paused (preview held)" + _obj_sfx,
+                                    _RECST_HOLD_STYLE),
+                    'unsupported': ("recommender: off (object unsupported)" + _obj_sfx,
+                                    _RECST_OFF_STYLE),
+                    'held':        ("recommender: idle (grasp committed)" + _obj_sfx,
+                                    _RECST_OFF_STYLE),
+                }
+                _txt, _sty = _RECST_TXT.get(st, (f"recommender: {st}", _RECST_OFF_STYLE))
+                rec_state_lbl.setText(_txt)
+                rec_state_lbl.setStyleSheet(_sty)
             elif mt == 'squeeze':
                 if msg.get('on'):
                     squeeze_lbl.setText(

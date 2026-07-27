@@ -870,7 +870,8 @@ if __name__ == "__main__":
     _pose_trace   = TraceBuffer() if args.trial_log else None
     _pose_last_t  = -1.0
     _POSE_DT      = 0.02   # s sim-time between recorded pose rows (~50 Hz)
-    _prev_control_phase = None   # last-seen control_phase, for phase_enter transition logging
+    _prev_control_phase = None   # last-seen standardized (phase, approach_sub) tuple,
+                                 # for phase_enter transition logging (None until first log)
 
     # obj_<color>_<shape> -> place_<color>_site, by matching the color token common to
     # both names (scene_pick_place.xml's naming convention — see place_red/blue/green/
@@ -1196,7 +1197,7 @@ if __name__ == "__main__":
     # REACH), and full force while a finger is still closing that gap arrives as an
     # unbalanced shove that knocks the object across the table (measured: 35N commanded
     # -> box launched 400mm; with the ramp the contacts form at ~N-level forces first).
-    SQUEEZE_RAMP_S = 1.0
+    SQUEEZE_RAMP_S = 0.1
 
     # contact_aware_teleop: after Enter (REACH->GRASP), hold the wrist STILL for this long
     # (sim time) before arming wrist tracking, so the fingers seat under the ramping squeeze
@@ -1204,7 +1205,16 @@ if __name__ == "__main__":
     # the hand the instant the squeeze begins moves the palm while the pads are still closing
     # the ~mm pad gap, so the object gets dragged before it is firmly held. The squeeze ramp
     # (SQUEEZE_RAMP_S) still runs during this window; this just defers the wrist motion.
-    GRASP_SETTLE_S = 2.0
+    GRASP_SETTLE_S = 0.2
+
+    # contact_aware_teleop: after the single Enter enters GRASP posture (squeeze OFF, pads
+    # closing the ~mm gap), wait this long (sim time) before AUTO-applying the squeeze —
+    # so 'Enter' commits the whole grasp (posture -> squeeze) with one press instead of
+    # two. The delay lets the pads seat first; squeezing on the entry frame drove the
+    # fingers into an unseated ~4-6mm gap and spiked the thumb to ~85N (see the REACH->
+    # GRASP handler). The operator can still press Enter during the wait to squeeze
+    # immediately, or N to abort — either cancels the pending auto-squeeze.
+    SEAT_SETTLE_S = 0.1
 
     # Give the RRT the SAME full hand-geom set the IK constrains (_robot_geom_names) plus
     # the floor, instead of only the fingertips — checking just the tips let the palm /
@@ -2171,6 +2181,14 @@ if __name__ == "__main__":
     SKEL_DRAW_HZ = 30.0   # the fused hand data only updates at ~20 Hz; drawing the
                           # separate GLFW window every ~2ms sim iter (~110 Hz) cost
                           # ~5ms/iter (the bulk of spin_draw) for no new information.
+    # Same treatment for the camera-views grid: decoding+tiling+rendering all 3 camera
+    # JPEG previews via OpenCV every iteration measured ~22-30ms/iter (TELEOP_PROFILE),
+    # which alone dropped the pre-lock-in control loop from ~500 Hz to ~30 Hz and made
+    # the wrist tracking feel laggy vs GRASP (which never draws these). The previews are
+    # published at only ~15 Hz upstream (--preview-hz 15.0), so drawing faster shows
+    # nothing new — throttle to CAM_VIEWS_DRAW_HZ so the control loop runs full-rate.
+    _cam_views_last_draw = [0.0]
+    CAM_VIEWS_DRAW_HZ = 15.0
 
     def _draw_skeleton():
         """Feed the latest ABSOLUTE world-frame hand skeleton to the viewer.
@@ -2245,9 +2263,18 @@ if __name__ == "__main__":
 
     def _draw_camera_views():
         """Spin the preview subscriptions and tile the latest per-camera frames.
-        No-op unless --camera-views is on. Mirrors the fusion node's camera grid."""
+        No-op unless --camera-views is on. Mirrors the fusion node's camera grid.
+
+        Throttled to CAM_VIEWS_DRAW_HZ: the OpenCV decode+tile+render of all cameras is
+        the single biggest per-iteration cost (~22-30ms, measured), and the previews
+        only refresh at ~15 Hz upstream — so running it every sim iteration crushed the
+        control-loop rate for no new frames. Gate it to the preview rate."""
         if _cam_grid is None:
             return
+        _now = time.time()
+        if _now - _cam_views_last_draw[0] < 1.0 / CAM_VIEWS_DRAW_HZ:
+            return
+        _cam_views_last_draw[0] = _now
         import rclpy as _rclpy
         _rclpy.spin_once(_cam_grid_node, timeout_sec=0.0)   # drain pending previews
         _cam_grid.show(_cam_previews)
@@ -2629,6 +2656,11 @@ if __name__ == "__main__":
     # until data.time reaches this, giving the fingers a GRASP_SETTLE_S window to seat under
     # the squeeze before carrying. 0.0 = no pending settle (track immediately once armed).
     _grasp_track_after = 0.0
+    # contact_aware_teleop single-Enter grasp: sim-time at which to AUTO-apply the squeeze
+    # after entering GRASP posture (see SEAT_SETTLE_S). None = nothing pending (no auto-
+    # squeeze scheduled, or already fired/cancelled). Fires a synthetic 'enter' into the
+    # key queue so it flows through the exact same squeeze handler as a manual 2nd Enter.
+    _auto_squeeze_at = None
     # One-shot latch: log the wrist pose ERROR at the instant tracking actually starts
     # carrying (settle window ends). A large step here means the DexPilot target diverged
     # from where the arm settled, so tracking begins with a shove the soft grasp must
@@ -2662,6 +2694,30 @@ if __name__ == "__main__":
     _wrist_off_p   = None          # (3,) position offset  p_cur - p_tgt  at arm time
     _wrist_off_R   = None          # (3,3) rotation offset R_cur @ R_tgt.T at arm time
     WRIST_TGT_REFRESH_S = 0.033    # ~30 Hz of SIM-time between refreshes (see _wrist_tgt_t)
+    # Pre-lock-in teleop drive: cache of the last step() joint target + the sim-time of that
+    # refresh, so the wrist is refreshed on the SAME sim-time cadence GRASP uses (not every
+    # loop iteration). The hand data only arrives at camera rate (~30 Hz) anyway, so solving
+    # every 1 ms sim step just burns real-time and makes the loop lag a fast hand. Between
+    # refreshes the cached target (a setpoint) is re-applied. _teleop_q is the full 23-DOF
+    # target; None until the first solve lands.
+    _teleop_q      = None
+    _teleop_step_t = 0.0           # sim-time (data.time) of the last pre-lock-in step()
+    # Pre-lock-in arm drive matches the GRASP carry: instead of slamming the raw IK joint
+    # solution into the stiff PD (a 30 Hz staircase -> jitter, plus 7-DOF null-space branch
+    # flips), track the DexPilot wrist TARGET FRAME with a slew-limited resolved-rate loop
+    # (Cartesian velocity from pinch_site pose error -> speed cap -> accel slew -> DLS ->
+    # integrate an arm-hold pose). The staircase target is absorbed by the velocity/accel
+    # limits, so the drive is continuous regardless of the 30 Hz refresh. Fingers still come
+    # straight from step()'s retargeted hand joints (frozen-config concern doesn't apply
+    # pre-lock-in). None until the first solved target frame arms the loop.
+    _teleop_arm_hold = None        # (7,) integrated arm PD target (world-tracked)
+    _teleop_jog_v    = np.zeros(3) # slew-limited linear wrist velocity cmd (world)
+    _teleop_jog_w    = np.zeros(3) # slew-limited angular wrist velocity cmd (world)
+    _teleop_wrist_tgt = None       # cached (p_tgt, R_tgt) from the throttled step()
+    # Pre-lock-in runs the arm ZERO-damped (like the GRASP carry) so the velocity injection
+    # below isn't bled off by damping. False until set on entering teleop-active; lock-in
+    # restores the heavy tracking damping and clears this so a later release re-applies it.
+    _teleop_damping_zeroed = False
     # GRASP-branch per-step timing (opt-in via GRASP_PROFILE): accumulates wall-time of
     # the wrist-track compute, torque compute, and mj_step, printing a breakdown once/sec.
     GRASP_PROFILE = os.environ.get('GRASP_PROFILE', '0') == '1'
@@ -2705,6 +2761,23 @@ if __name__ == "__main__":
     _gp_acc = {'track': 0.0, 'refresh': 0.0, 'spin': 0.0, 'step_ik': 0.0,
                'torque': 0.0, 'step': 0.0, 'n': 0}
     _gp_last = time.time()
+    # Pre-lock-in teleop drive profiler (opt-in via TELEOP_PROFILE=1). Symmetric to
+    # GRASP_PROFILE: accumulates per-iteration wall-time by SECTION and prints a
+    # breakdown + the effective control-update rate (loop Hz) once/sec. The point is
+    # to compare the pre-lock-in loop rate against the GRASP loop rate — the velocity
+    # command is recomputed only ONCE per loop iteration and held across all _n_sub
+    # substeps, so the effective tracking-update rate IS the loop iteration rate. If
+    # the pre-lock-in loop runs slower (heavier per-iteration: skeleton/camera-views/
+    # recommender scan/dashboard), tracking updates less often -> feels laggier even
+    # with an identical control law. The breakdown shows WHICH section eats the time.
+    TELEOP_PROFILE = os.environ.get('TELEOP_PROFILE', '0') == '1'
+    _tp_acc = {'spin': 0.0, 'skel': 0.0, 'camviews': 0.0, 'keys': 0.0, 'drive': 0.0,
+               'step_ik': 0.0, 'recommender': 0.0, 'dash': 0.0, 'viz_sync': 0.0,
+               'iter': 0.0, 'nsub': 0, 'n': 0}
+    _tp_last = time.time()
+    if TELEOP_PROFILE:
+        print("[teleop] TELEOP_PROFILE=1 — per-iteration pre-lock-in timing breakdown "
+              "+ effective control-loop Hz printed once/sec.")
     _PALM_BID      = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'leap_palm')
     _PINCH_SID     = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'pinch_site')
     _ik_vis_mode   = None          # None | 'grasp': freeze physics to show IK config
@@ -2755,7 +2828,27 @@ if __name__ == "__main__":
     DASH_PUSH_EVERY = 3            # push streaming metrics every N loop iterations
     _dash_last_mode = None
     _dash_last_prox = None
+    _dash_last_rec_state = None    # last 'rec_status' string pushed (change-gated)
     _prox_idx       = 0
+
+    def _push_rec_status(state, obj=None):
+        """Push the recommender's live activity to the dashboard, change-gated so we
+        only emit on a state transition. `state` is a short machine tag:
+          'solving'    — an NLP solve thread is running RIGHT NOW for `obj`
+          'waiting'    — teleop active, will fire on the next interval tick
+          'preview'    — a P/O/I preview is holding the robot; solves paused
+          'unsupported'— nearest object has no recommender support
+          'held'       — not recommending (grasp locked in / carrying / not teleop)
+        The dashboard maps these to a coloured 'recommender:' line under the mode.
+        (Module-level script — everything runs under `if __name__ == '__main__'` — so the
+        change-gate state is a module global, rebound via `global`, not `nonlocal`.)"""
+        global _dash_last_rec_state
+        key = (state, obj)
+        if key == _dash_last_rec_state:
+            return
+        _dash_last_rec_state = key
+        if dash is not None:
+            dash.push({'type': 'rec_status', 'state': state, 'object': obj})
 
     def _on_press(key):
         try:
@@ -2902,18 +2995,37 @@ if __name__ == "__main__":
             step_start = time.time()
             _n_sub = 1   # physics catch-up substeps this iteration (dexpilot --physics)
 
-            # control_phase transition marker: log a phase_enter to events.jsonl whenever
-            # the phase changes, detected here in one place (rather than at each of the ~8
-            # assignment sites) by comparing against the previous iteration's value. This
-            # is what lets the always-on trace below be sliced by phase offline — e.g. find
-            # the GRASP row's `t`, then take pose_trace rows with t >= that. Logged for any
-            # run with --trial-log, independent of the trial state machine.
-            if _trial_events is not None and control_phase != _prev_control_phase:
-                _tid = _trial_state.trial_id if _trial_state is not None else 0
-                _trial_events.log(_tid, data.time, 'phase_enter',
-                                  phase=control_phase, prev=_prev_control_phase,
-                                  prox_idx=int(_prox_idx))
-                _prev_control_phase = control_phase
+            # Standardized phase marker: log a phase_enter to events.jsonl whenever the
+            # STANDARDIZED (phase, approach_sub) changes, detected here in one place
+            # (rather than at each of the ~8 control-state assignment sites) by comparing
+            # against the previous iteration's value. TrialPhase.from_control maps the
+            # control loop's finer states (pre-lock-in teleop, 'PLAN'/'REACH'/'GRASP')
+            # onto the one logged vocabulary — APPROACH(teleop|planning) → PICK — so the
+            # trace slices by phase offline in that vocabulary (find the PICK row's `t`,
+            # take pose_trace rows with t >= that). Logged for any run with --trial-log,
+            # independent of the trial state machine.
+            #
+            # This site owns only the APPROACH↔PICK boundary. PICK→TRANSPORT→PLACE are
+            # owned by the success state machine (TrialRunner.set_phase), so once the
+            # trial's own phase has advanced past PICK we suppress this marker to avoid
+            # re-logging PICK on top of TRANSPORT (control_phase stays 'GRASP' throughout).
+            if _trial_events is not None:
+                _std_phase, _approach_sub = TrialPhase.from_control(
+                    control_phase, _CAT_MODE and _teleop_active)
+                _sm_past_pick = (_trial_state is not None
+                                 and _trial_state.phase in (TrialPhase.TRANSPORT,
+                                                            TrialPhase.PLACE))
+                _std_key = (_std_phase, _approach_sub)
+                if _std_key != _prev_control_phase and not _sm_past_pick:
+                    _tid = _trial_state.trial_id if _trial_state is not None else 0
+                    _prev_std, _prev_sub = (_prev_control_phase
+                                            if _prev_control_phase is not None
+                                            else (None, None))
+                    _trial_events.log(_tid, data.time, 'phase_enter',
+                                      phase=_std_phase, approach_sub=_approach_sub,
+                                      prev=_prev_std, prev_sub=_prev_sub,
+                                      prox_idx=int(_prox_idx))
+                    _prev_control_phase = _std_key
 
             # Always-on pose recorder: one throttled row per iteration, ALL phases (the
             # trial trace only runs post-lock-in). Phase is reconstructed offline from
@@ -2929,6 +3041,16 @@ if __name__ == "__main__":
                 # auto-vs-teleop normal-force comparison reads straight off the trace.
                 _pt_fnet, _pt_taunet, _pt_norm, _pt_tan = \
                     _hand_object_contact_metrics(_prox_idx)
+                # Standardized phase for this trace row: the success machine owns
+                # TRANSPORT/PLACE (its phase advances past PICK on lift/arrival), so honor
+                # that when present; otherwise classify the control state (APPROACH/PICK).
+                if (_trial_state is not None
+                        and _trial_state.phase in (TrialPhase.TRANSPORT,
+                                                    TrialPhase.PLACE)):
+                    _pt_phase, _pt_sub = _trial_state.phase, None
+                else:
+                    _pt_phase, _pt_sub = TrialPhase.from_control(
+                        control_phase, _CAT_MODE and _teleop_active)
                 _pose_trace.sample(
                     norm_force=np.array([_pt_norm[f] for f in FINGER_SET]),
                     tan_force=np.array([_pt_tan[f] for f in FINGER_SET]),
@@ -2937,7 +3059,14 @@ if __name__ == "__main__":
                     t=float(data.time),          # sim-time; RESETS to 0 on backspace reset
                     t_wall=float(time.time()),   # wall-clock; monotonic across resets
                     prox_idx=int(_prox_idx),
-                    control_phase=str(control_phase),  # PLAN/REACH/GRASP — also in events.jsonl
+                    control_phase=str(control_phase),  # raw control state (PLAN/REACH/GRASP)
+                    # Standardized phase vocabulary (matches events.jsonl phase_enter):
+                    # APPROACH/PICK from from_control, or the trial machine's own phase once
+                    # it has advanced past PICK (TRANSPORT/PLACE). approach_sub is the
+                    # teleop|planning sub-label, None outside APPROACH. Slice the trace by
+                    # `phase` directly instead of reconstructing it from control_phase.
+                    phase=str(_pt_phase),
+                    approach_sub=('' if _pt_sub is None else str(_pt_sub)),
                     # Back-compat: q_robot/obj_qpos are qpos[:N_ROBOT]/qpos[N_ROBOT:], kept
                     # as their own keys because test_recommender_on_dexpilot_poses.py reads
                     # them by name from pose_trace.npz.
@@ -2966,12 +3095,28 @@ if __name__ == "__main__":
             # Runs ONLY pre-lock-in; after L it falls through to the shared REACH/GRASP
             # machinery below (like autonomous mode) with recommended contacts. ---
             if _CAT_MODE and _teleop_active:
+                _tp_t0 = time.perf_counter() if TELEOP_PROFILE else 0.0
+                _tp_s  = _tp_t0
+                # Zero the arm damping for the pre-lock-in wrist tracking, matching the
+                # GRASP carry (which zeros it on squeeze). The velocity injection in the
+                # drive block relies on this — heavy damping would bleed the injected rate
+                # back down within the step, leaving the arm lagging. One-shot per teleop
+                # entry; lock-in restores _ARM_DAMPING_TRACK and clears the flag.
+                if not _teleop_damping_zeroed:
+                    model.dof_damping[:7] = _ARM_DAMPING_DEFAULT
+                    _teleop_damping_zeroed = True
                 _dexpilot_ctrl.spin()
+                if TELEOP_PROFILE:
+                    _t = time.perf_counter(); _tp_acc['spin'] += _t - _tp_s; _tp_s = _t
                 _draw_skeleton()   # fused-hand overlay (no-op unless --skeleton-view)
+                if TELEOP_PROFILE:
+                    _t = time.perf_counter(); _tp_acc['skel'] += _t - _tp_s; _tp_s = _t
                 _draw_camera_views()   # per-camera feed grid (no-op unless --camera-views)
                 _check_pipeline_alive()  # warn if the multicam child died
                 if _tune_retarget:
                     _dexpilot_ctrl.poll_retarget_config()  # hot-reload retarget_config.json edits
+                if TELEOP_PROFILE:
+                    _t = time.perf_counter(); _tp_acc['camviews'] += _t - _tp_s; _tp_s = _t
 
                 # Drain keys — quit, teleop start, lock-in, and the 3 debug previews:
                 #   P  recommender's raw q (unconstrained)
@@ -3015,6 +3160,11 @@ if __name__ == "__main__":
                         _dp_target = _Q_BIAS_DP.copy()   # physics hold target back to home
                         _dexpilot_ctrl.stop()            # freeze — no tracking until press-8
                         _dexpilot_ctrl.init_home(data)   # re-anchor home to the reset pose
+                        _teleop_q = None                 # drop the cached drive target (stale post-reset)
+                        _teleop_arm_hold = None          # re-seed the arm hold at the reset pose
+                        _teleop_wrist_tgt = None         # drop the stale wrist target frame
+                        _teleop_jog_v[:] = 0.0           # zero the slew-limited velocity ramps
+                        _teleop_jog_w[:] = 0.0
                         _rec_vis        = False
                         _rec_ik_mode    = None
                         _rec_last_solve = 0.0
@@ -3073,6 +3223,8 @@ if __name__ == "__main__":
                               f"{'ON — solving ...' if _rec_ik_mode == _slot else 'off'}")
                 if not running:
                     continue
+                if TELEOP_PROFILE:
+                    _t = time.perf_counter(); _tp_acc['keys'] += _t - _tp_s; _tp_s = _t
 
                 # Proximity object (min average fingertip->object signed distance).
                 # Computed BEFORE the drive block so the rec-vis preview and the markers
@@ -3138,36 +3290,145 @@ if __name__ == "__main__":
                     data.qvel[:N_ROBOT] = 0.0
                     mj.mj_forward(model, data)
                 else:
-                    # Drive wrist (arm IK) + fingers (MediaPipe). Same dual-strategy
-                    # split as dexpilot mode (see the --physics branch there for the
-                    # full rationale): kinematic qpos overwrite by default, or —
-                    # with --physics — spring-only PD torque + mj_step catch-up so
-                    # the hand/arm actually collide with objects and the environment
-                    # instead of teleporting through them.
-                    q_teleop = _dexpilot_ctrl.step(model, data)
+                    # Drive the ARM by tracking the DexPilot wrist target with the SAME
+                    # slew-limited resolved-rate loop the GRASP carry uses, and the FINGERS
+                    # from the retargeted hand joints. Feeding the raw IK joint solution
+                    # straight into the stiff (~16 Hz) PD made the wrist jumpy once the target
+                    # refresh was throttled to 30 Hz: the PD fully settles onto each 33 ms
+                    # staircase step (and onto 7-DOF null-space branch flips between solves).
+                    # GRASP never showed this because it commands a Cartesian VELOCITY from
+                    # pinch_site pose error, caps the speed, and slew-limits the acceleration —
+                    # so a 30 Hz (or any-rate) staircase target is absorbed into a continuous
+                    # ramp. Replicate that here; the branch-flip immunity is a free bonus (we
+                    # integrate joint rates from the current pose, never re-solving IK joints).
+                    #
+                    # step() is still throttled to ~30 Hz sim-time — it only refreshes the
+                    # target FRAME (position + orientation) and the finger joints, both of
+                    # which are camera-rate anyway. The velocity loop below runs every
+                    # iteration off the cached target, so the arm motion stays smooth.
+                    _now = data.time   # sim-time gate — NOT wall-clock (matches _wrist_tgt_t)
+                    if (_teleop_q is None
+                            or (_now - _teleop_step_t) >= WRIST_TGT_REFRESH_S):
+                        _tp_ik0 = time.perf_counter() if TELEOP_PROFILE else 0.0
+                        _q_step = _dexpilot_ctrl.step(model, data)
+                        if _q_step is not None:
+                            _teleop_q = _q_step
+                            _tf = _dexpilot_ctrl.target_frame()
+                            if _tf is not None and _tf[1] is not None:
+                                _teleop_wrist_tgt = (np.asarray(_tf[0]).copy(),
+                                                     np.asarray(_tf[1]).copy())
+                        _teleop_step_t = _now
+                        if TELEOP_PROFILE:
+                            _tp_acc['step_ik'] += time.perf_counter() - _tp_ik0
+
+                    # Resolved-rate wrist tracking toward the cached target (every iteration).
+                    _dv_max = np.array(NCF_ACCEL_BUDGET_XYZ) * model.opt.timestep
+                    if _teleop_arm_hold is None:
+                        _teleop_arm_hold = data.qpos[:7].copy()   # seed at the live arm pose
+                    if _teleop_wrist_tgt is not None:
+                        _p_cur = data.site_xpos[_PINCH_SID]
+                        _R_cur = data.site_xmat[_PINCH_SID].reshape(3, 3)
+                        _p_tgt, _R_tgt = _teleop_wrist_tgt
+                        # Absolute tracking (no relative datum): the DexPilot target already
+                        # folds in the press-8 home offset, so the arm tracks it directly.
+                        _v_lin = WRIST_TRACK_GAIN * (_p_tgt - _p_cur)
+                        _R_err = _R_tgt @ _R_cur.T
+                        _ang   = np.array([_R_err[2, 1] - _R_err[1, 2],
+                                           _R_err[0, 2] - _R_err[2, 0],
+                                           _R_err[1, 0] - _R_err[0, 1]]) * 0.5
+                        if not WRIST_TRACK_ORI:
+                            _v_ang = np.zeros(3)
+                        else:
+                            _v_ang = (WRIST_TRACK_GAIN * WRIST_ANG_GAIN_SCALE) * _ang
+                    else:
+                        _v_lin = np.zeros(3)
+                        _v_ang = np.zeros(3)
+                    _v_lin = np.clip(_v_lin, -JOG_VEL, JOG_VEL)          # cap peak speed
+                    _teleop_jog_v += np.clip(_v_lin - _teleop_jog_v, -_dv_max, _dv_max)
+                    _teleop_jog_w += np.clip(_v_ang - _teleop_jog_w, -_dv_max, _dv_max)
+
+                    # Resolve the slew-limited wrist velocity to arm joint rates (DLS).
+                    _qdot_arm = np.zeros(7)
+                    if np.any(_teleop_jog_v) or np.any(_teleop_jog_w):
+                        _Jp = np.zeros((3, model.nv))
+                        _Jr = np.zeros((3, model.nv))
+                        mj.mj_jacSite(model, data, _Jp, _Jr, _PINCH_SID)
+                        _J6 = np.vstack([_Jp[:, :7], _Jr[:, :7]])
+                        _v6 = np.array([_teleop_jog_v[0], _teleop_jog_v[1], _teleop_jog_v[2],
+                                        _teleop_jog_w[0], _teleop_jog_w[1], _teleop_jog_w[2]])
+                        # Singularity-robust DLS (same damping schedule as the GRASP jog).
+                        _sigma_min = np.linalg.svd(_J6, compute_uv=False)[-1]
+                        _lam2 = (0.0 if _sigma_min >= JOG_SING_EPS
+                                 else (1.0 - (_sigma_min / JOG_SING_EPS) ** 2) * JOG_LAM_MAX ** 2)
+                        _qdot_arm = _J6.T @ np.linalg.solve(
+                            _J6 @ _J6.T + _lam2 * np.eye(6), _v6)
+
+                    _hand_tgt = (_teleop_q[7:] if _teleop_q is not None
+                                 else _Q_BIAS_DP[7:])
+                    _dp_target[7:N_ROBOT] = _hand_tgt
                     if args.physics:
-                        if q_teleop is not None:
-                            _dp_target = q_teleop
                         _elapsed = time.time() - step_start
                         _n_sub = int(np.clip(round(_elapsed / model.opt.timestep),
                                              1, _DP_MAX_SUBSTEPS))
                         for _ in range(_n_sub):
+                            # Match the GRASP carry EXACTLY — the fix for "still slightly slow".
+                            # A feedforward TORQUE only cancels the damping; the arm velocity
+                            # still has to build up through inertia (a first-order lag), so it
+                            # lagged a step behind GRASP. GRASP instead INJECTS the commanded
+                            # rate straight into the velocity STATE (data.qvel[:7] = qdot) each
+                            # step, so the integrator advances qpos by qdot*dt immediately —
+                            # open-loop velocity, no build-up lag. Do the same here: advance the
+                            # integrated hold and set qvel[:7] in lockstep so the position PD
+                            # sees ~zero error and only trims residual. Fingers are LEFT ALONE
+                            # (unlike GRASP, which zeros all qvel and freezes them) — they are
+                            # live-retargeted here and need their own dynamics; only the 7 arm
+                            # DOFs are velocity-injected. _qdot_arm is constant across this
+                            # iteration's substeps (re-solved next iteration from fresh error).
+                            # Match the GRASP carry byte-for-byte: inject the commanded rate
+                            # into the velocity STATE, advance the position hold in lockstep,
+                            # then a position PD trims residual. With qvel set to _qdot_arm and
+                            # the hold advanced by _qdot_arm*dt, the position error stays ~0, so
+                            # the arm rides the commanded velocity directly (no build-up lag,
+                            # no damping to bleed it — the arm is zero-damped here like GRASP
+                            # on squeeze). The kd term evaluates against the just-injected qvel
+                            # (=0, exactly as GRASP), present only to damp any residual.
+                            _teleop_arm_hold += _qdot_arm * model.opt.timestep
+                            _dp_target[:7] = _teleop_arm_hold
+                            data.qvel[:7] = _qdot_arm   # velocity injection (as the GRASP carry)
                             tau_ctrl[:] = 0.0
                             _err = _dp_target - data.qpos[:N_ROBOT]
-                            tau_ctrl[:7]        = _dp_Kp_arm * _err[:7]
+                            tau_ctrl[:7]        = (_dp_Kp_arm * _err[:7]
+                                                   + _ARM_DAMPING_TRACK * (_qdot_arm - data.qvel[:7]))
                             tau_ctrl[7:N_ROBOT] = Kp[7:] * _err[7:]
                             data.qfrc_applied[:] = tau_ctrl
                             data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
                             mj.mj_step(model, data)
-                    elif q_teleop is not None:
-                        data.qpos[:N_ROBOT] = q_teleop
+                    else:
+                        _teleop_arm_hold += _qdot_arm * model.opt.timestep
+                        _dp_target[:7] = _teleop_arm_hold
+                        data.qpos[:N_ROBOT] = _dp_target
                         data.qvel[:N_ROBOT] = 0.0
                         mj.mj_forward(model, data)
+                    if TELEOP_PROFILE:
+                        _t = time.perf_counter(); _tp_acc['drive'] += _t - _tp_s; _tp_s = _t
+                        _tp_acc['nsub'] += (_n_sub if args.physics else 1)
 
                 # Fixed-interval background NLP recommend for the nearest SUPPORTED obj.
                 # Skip while previewing so the held pose isn't fed back as a solve seed.
                 _supported = objects[_prox_idx]['name'] in _CAT_SUPPORTED
                 _rec_idle  = (_rec_thread is None) or (not _rec_thread.is_alive())
+                _previewing = _rec_vis or (_rec_ik_mode is not None)
+                # Dashboard: report the recommender's live activity so a stalled/paused
+                # recommender (e.g. after an Enter release that didn't re-arm) is visible
+                # instead of silently showing the last stale grasp_rec result.
+                if not _supported:
+                    _push_rec_status('unsupported', objects[_prox_idx]['name'])
+                elif _previewing:
+                    _push_rec_status('preview', objects[_prox_idx]['name'])
+                elif not _rec_idle:
+                    _push_rec_status('solving', objects[_prox_idx]['name'])
+                else:
+                    _push_rec_status('waiting', objects[_prox_idx]['name'])
                 if (_supported and _rec_idle and not _rec_vis
                         and _rec_ik_mode is None
                         and (time.time() - _rec_last_solve) >= _REC_INTERVAL_S):
@@ -3190,6 +3451,7 @@ if __name__ == "__main__":
                     _obj_pos = data.xpos[objects[_prox_idx]['id_body']].copy()
                     _rec_thread = _fire_recommender(_prox_idx, _q_snap, _obj_pos)
                     _rec_last_solve = time.time()
+                    _push_rec_status('solving', objects[_prox_idx]['name'])
 
                 # Markers: the recommender's ideal contacts p1/p2.
                 if _cand is not None:
@@ -3244,6 +3506,12 @@ if __name__ == "__main__":
                         active_idx = _prox_idx
                         active_tgt = _prox_idx + 1        # targets[0] is home
                         _teleop_active = False
+                        # Restore the heavy TRACKING damping for the PLAN/REACH/GRASP holds
+                        # (pre-lock-in ran with zero damping to match the GRASP carry's
+                        # velocity injection — see the drive block). GRASP re-zeros it itself
+                        # on squeeze; this covers the PLAN/REACH position holds in between.
+                        model.dof_damping[:7] = _ARM_DAMPING_TRACK
+                        _teleop_damping_zeroed = False   # re-zero on the next teleop entry
                         data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
                         data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
                         q_start = data.qpos[:N_ROBOT].copy()
@@ -3261,6 +3529,9 @@ if __name__ == "__main__":
                         plan_thread.start()
                         print(f"[teleop] LOCK-IN {objects[active_idx]['name']} — "
                               f"solving IK + RRT to recommended contacts ...")
+
+                if TELEOP_PROFILE:
+                    _t = time.perf_counter(); _tp_acc['recommender'] += _t - _tp_s; _tp_s = _t
 
                 # --- Dashboard streams (same panels as autonomous mode) ---
                 if dash is not None:
@@ -3287,6 +3558,8 @@ if __name__ == "__main__":
                                    'f': _f_net.tolist(), 'tau': _tau_net.tolist()})
                         dash.push({'type': 'normals', 't': _t, 'n': _normals})
                 _dash_i += 1
+                if TELEOP_PROFILE:
+                    _t = time.perf_counter(); _tp_acc['dash'] += _t - _tp_s; _tp_s = _t
 
                 # Viz: recommendation markers already set; render one kinematic frame.
                 if viewer.user_scn is not None:
@@ -3294,6 +3567,30 @@ if __name__ == "__main__":
                     _draw_active_marker(viewer.user_scn)
                     _draw_bspheres(viewer.user_scn)   # 7-toggle: IK collision spheres
                 viewer.sync()
+                if TELEOP_PROFILE:
+                    _t = time.perf_counter()
+                    _tp_acc['viz_sync'] += _t - _tp_s
+                    _tp_acc['iter'] += _t - _tp_t0   # total compute (excludes the sleep below)
+                    _tp_acc['n'] += 1
+                    if time.time() - _tp_last >= 1.0:
+                        _n = max(_tp_acc['n'], 1)
+                        _hz = _tp_acc['n'] / max(time.time() - _tp_last, 1e-9)
+                        _ff = lambda k: _tp_acc[k] / _n * 1e3   # noqa: E731 — per-iter ms
+                        print(f"\r\n[teleop-profile] {_tp_acc['n']} iters/s "
+                              f"(control-update rate = {_hz:.0f} Hz)  |  "
+                              f"avg substeps/iter={_tp_acc['nsub']/_n:.1f}  |  "
+                              f"per-iter ms: spin={_ff('spin'):.2f} "
+                              f"skel={_ff('skel'):.2f} camviews={_ff('camviews'):.2f} "
+                              f"keys={_ff('keys'):.2f} drive={_ff('drive'):.2f} "
+                              f"(step_ik={_ff('step_ik'):.2f}) "
+                              f"recommender={_ff('recommender'):.2f} dash={_ff('dash'):.2f} "
+                              f"viz_sync={_ff('viz_sync'):.2f}  ||  "
+                              f"TOTAL compute={_ff('iter'):.2f} ms/iter")
+                        _tp_acc = {'spin': 0.0, 'skel': 0.0, 'camviews': 0.0, 'keys': 0.0,
+                                   'drive': 0.0, 'step_ik': 0.0, 'recommender': 0.0,
+                                   'dash': 0.0, 'viz_sync': 0.0, 'iter': 0.0,
+                                   'nsub': 0, 'n': 0}
+                        _tp_last = time.time()
                 # Pace to real time. In --physics we advanced _n_sub timesteps this
                 # iteration (see the dexpilot --physics branch above for why), so the
                 # wall-clock budget scales with that instead of a single timestep.
@@ -3625,6 +3922,11 @@ if __name__ == "__main__":
                     dash.push({'type': 'mode', 'mode': _mode,
                                'target': targets[active_tgt]['label']})
                     _dash_last_mode = (_mode, active_tgt)
+                # CAT mode past lock-in: the recommender is intentionally not running
+                # (grasp committed / carrying). Report 'held' so the recommender line
+                # doesn't linger on the last pre-lock-in state.
+                if _CAT_MODE:
+                    _push_rec_status('held', objects[_prox_idx]['name'])
                 if _prox_idx != _dash_last_prox:
                     dash.push({'type': 'active_obj', 'name': objects[_prox_idx]['name']})
                     _dash_last_prox = _prox_idx
@@ -3688,6 +3990,19 @@ if __name__ == "__main__":
                     traj_wp_idx    = 0
                     traj_wp_step   = 0
                     control_phase  = 'REACH'
+
+            # --- Auto-squeeze (single-Enter grasp): once the post-GRASP seat window has
+            # elapsed, inject a synthetic 'enter' so the squeeze fires through the same
+            # handler as a manual 2nd Enter. Only while still in GRASP with squeeze off —
+            # if the operator squeezed manually, released, or reselected during the wait,
+            # those paths already cleared _auto_squeeze_at, so this is a no-op. Injecting
+            # (rather than calling the squeeze logic inline) keeps ONE code path for the
+            # squeeze and its many side effects (arm damping, wrist-track arming, ...). ---
+            if (_auto_squeeze_at is not None and data.time >= _auto_squeeze_at
+                    and control_phase == 'GRASP' and not squeeze_on):
+                keys.put('enter')
+            if _auto_squeeze_at is not None and data.time >= _auto_squeeze_at:
+                _auto_squeeze_at = None   # one-shot: fired or window passed
 
             # --- Process key events ---
             _reset_req = False
@@ -3920,16 +4235,51 @@ if __name__ == "__main__":
                     # cone is GAMMA_SAFETY_FACTOR times larger and the live trace sits
                     # well inside it.)
                     _push_wrench_cone(gamma_live, _p_O, _R_in, _mu)
-                    print(f"\r\n[Control] → GRASP  ({targets[active_tgt]['label']})  "
-                          f"|  Enter: toggle squeeze (gamma={gamma_live:.1f})  |  N: release")
+                    # Single-Enter grasp (contact_aware_teleop): schedule the squeeze to
+                    # auto-apply after SEAT_SETTLE_S, so this one Enter commits the whole
+                    # grasp (posture now -> squeeze once the pads seat). The pre-fire site
+                    # before the key drain injects a synthetic 'enter' at that time, going
+                    # through the same handler as a manual 2nd Enter. TELE_AUTO_JOG keeps
+                    # the two-Enter arrow-key jog flow (no auto-squeeze). A manual Enter or
+                    # N during the wait cancels it (both clear _auto_squeeze_at below).
+                    if _CAT_MODE and not TELE_AUTO_JOG:
+                        _auto_squeeze_at = data.time + SEAT_SETTLE_S
+                        print(f"\r\n[Control] → GRASP  ({targets[active_tgt]['label']})  "
+                              f"|  auto-squeeze in {SEAT_SETTLE_S:.1f}s "
+                              f"(gamma={gamma_live:.1f})  |  Enter: squeeze now  |  N: release")
+                    else:
+                        _auto_squeeze_at = None
+                        print(f"\r\n[Control] → GRASP  ({targets[active_tgt]['label']})  "
+                              f"|  Enter: toggle squeeze (gamma={gamma_live:.1f})  |  N: release")
+
+                elif key == 'enter' and control_phase == 'GRASP' and squeeze_on and _CAT_MODE:
+                    # contact_aware_teleop: the object is gripped (squeeze ON) and the operator
+                    # pressed Enter to DROP it — Enter now fully releases (open fingers, drop,
+                    # back to REACH, re-arm the recommender) instead of merely toggling the
+                    # squeeze force off. Route it through the existing 'release' teardown so
+                    # there is ONE drop path: inject a synthetic 'release' key exactly as the
+                    # auto-squeeze injects a synthetic 'enter'. Pressing N is identical. Scoped
+                    # to _CAT_MODE so autonomous keeps its Enter = squeeze-toggle (the arrow-key
+                    # jog flow still relies on toggling the squeeze off/on in place).
+                    _auto_squeeze_at = None
+                    keys.put('release')
 
                 elif key == 'enter' and control_phase == 'GRASP':
+                    # Squeeze OFF -> ON (the 2nd Enter of the two-Enter grasp, or the synthetic
+                    # 'enter' from the auto-squeeze); in autonomous it also toggles ON<->off in
+                    # place. In _CAT_MODE the branch above turns the next Enter (once squeezed)
+                    # into a release/drop instead. Clear any pending auto-squeeze so a manual
+                    # Enter during the seat window isn't toggled back off by a late auto-fire
+                    # (the injection site also clears it on fire).
+                    _auto_squeeze_at = None
                     squeeze_on = not squeeze_on
                     _squeeze_steps = 0   # restart the force ramp on every toggle-on
                     grasp_ctrl.set_squeeze(squeeze_on)
                     _push_squeeze(squeeze_on, gamma_live)
                     print(f"\r\n[Control] squeeze {'ON' if squeeze_on else 'off'}  "
-                          f"(gamma={gamma_live:.1f}, ~{gamma_live/np.sqrt(2):.2f} N/contact)")
+                          f"(gamma={gamma_live:.1f}, ~{gamma_live/np.sqrt(2):.2f} N/contact)"
+                          + ("  |  Enter or N: drop & re-arm recommender"
+                             if _CAT_MODE and squeeze_on else ""))
 
                     # TEST (match autonomous grasp physics): zero the arm joint damping
                     # while the grasp is squeezed. Teleop sets dof_damping[:7] to heavy
@@ -3985,6 +4335,7 @@ if __name__ == "__main__":
                     # (possibly jogged) grasp arm config q_grasp_hold — snapping back
                     # to the original IK pose would drag the object with it.
                     squeeze_on     = False
+                    _auto_squeeze_at = None   # cancel a pending auto-squeeze (released first)
                     grasp_ctrl.set_squeeze(False)
                     _push_squeeze(False, gamma_live)
                     _push_wrench_cone(None, None, None, None)   # clear the cone meshes
@@ -4002,6 +4353,14 @@ if __name__ == "__main__":
                         # the committed contacts so the next lock-in re-solves fresh.
                         objects[active_idx].pop('rec_local', None)
                         _teleop_active = True
+                        # Re-seed the pre-lock-in arm drive at the released pose so the
+                        # velocity loop ramps smoothly toward the operator's hand (slew-
+                        # limited) instead of inheriting the grasp-carry integrator state.
+                        _teleop_arm_hold = None
+                        _teleop_wrist_tgt = None
+                        _teleop_jog_v[:] = 0.0
+                        _teleop_jog_w[:] = 0.0
+                        _teleop_damping_zeroed = False   # re-zero arm damping for teleop drive
                         _rec_vis       = False
                         _rec_ik_mode   = None
                         active_tgt     = 0
@@ -4179,6 +4538,7 @@ if __name__ == "__main__":
                 traj_wp_idx    = 0
                 traj_wp_step   = 0
                 squeeze_on     = False
+                _auto_squeeze_at = None   # cancel any pending auto-squeeze on reset
                 grasp_ctrl     = None
                 gamma_live     = GAMMA_FALLBACK
                 q_grasp_hold   = None
@@ -4203,6 +4563,9 @@ if __name__ == "__main__":
                     for _o in objects:
                         _o.pop('rec_local', None)
                     _teleop_active  = True
+                    # Re-zero the arm damping on the next teleop iteration (this handler
+                    # just restored TRACK above; the pre-lock-in drive wants it zeroed).
+                    _teleop_damping_zeroed = False
                     _rec_vis        = False
                     _rec_ik_mode    = None
                     _rec_last_solve = 0.0
@@ -4538,7 +4901,13 @@ if __name__ == "__main__":
                 _tid  = _trial_state.trial_id
                 _tnow = data.time
                 if control_phase in ('PLAN', 'REACH'):
-                    _trial_runner.set_phase(_trial_state, _tnow, control_phase)
+                    # Standardized phase: PLAN/REACH both classify as APPROACH/planning.
+                    # set_phase logs a phase_enter only on an actual change, so this stays
+                    # a single APPROACH marker across the whole plan+replay span (the
+                    # teleop→planning sub-label transition is emitted by the marker site
+                    # above; here we keep the trial machine's own `phase` standardized).
+                    _std_phase, _ = TrialPhase.from_control(control_phase, False)
+                    _trial_runner.set_phase(_trial_state, _tnow, _std_phase)
                     _trial_runner.step_approach(
                         _trial_state, _tnow, data.contact[:data.ncon],
                         _HAND_GIDS, obj['id_geom'])

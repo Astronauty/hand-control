@@ -20,6 +20,8 @@ Typical usage inside a MuJoCo viewer loop:
 """
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import mujoco as mj
 
@@ -77,6 +79,26 @@ class DexPilotController:
         self._q_hand_prev: np.ndarray | None = None
         self._active = False   # gated: tracking starts only after start()
 
+        # --- Off-thread finger retargeting -------------------------------------
+        # The DexPilot finger solve is a ~40 ms scipy SLSQP (see DexPilotRetargeter.
+        # retarget); running it inline in step() every teleop loop iteration stalled
+        # the pre-lock-in loop to ~25 Hz (the "laggy wrist when the recommender is
+        # running" report — the NLP was NOT the cause). Mirror the arm IK's async
+        # pattern: a daemon worker owns the SLSQP and solves from the LATEST posted
+        # landmarks; step() posts the new landmarks and returns the most recently
+        # solved q_hand (one-frame latency, standard for async retargeting). All
+        # shared state below is guarded by _hand_lock; _hand_evt wakes the worker.
+        # EMA smoothing stays on the control thread (against the last RETURNED q_hand)
+        # so it's independent of solve cadence.
+        self._hand_lock    = threading.Lock()
+        self._hand_evt     = threading.Event()
+        self._hand_pending: np.ndarray | None = None      # world_lm (21,3) to solve
+        self._hand_result:  np.ndarray | None = None       # latest raw solved q_hand (16,)
+        self._hand_stop    = threading.Event()
+        self._hand_thread  = threading.Thread(
+            target=self._hand_worker, name="dexpilot-finger-retarget", daemon=True)
+        self._hand_thread.start()
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -94,6 +116,10 @@ class DexPilotController:
 
     def shutdown(self) -> None:
         self._arm.close()   # stop the background IK worker thread
+        self._hand_stop.set()          # stop the finger-retarget worker thread
+        self._hand_evt.set()           # unblock its wait so it sees the stop flag
+        if self._hand_thread.is_alive():
+            self._hand_thread.join(timeout=1.0)
         self._ros.shutdown()
 
     # ------------------------------------------------------------------
@@ -132,6 +158,11 @@ class DexPilotController:
         self._arm.request_orientation_calib()
         self._retarg.reset()
         self._q_hand_prev = None
+        # Drop any stale pre-reset finger solve so tracking re-zeros cleanly (the
+        # worker re-solves from the next posted landmarks).
+        with self._hand_lock:
+            self._hand_pending = None
+            self._hand_result = None
         self._active = True
 
     def stop(self) -> None:
@@ -170,12 +201,27 @@ class DexPilotController:
 
         # --- Hand retargeting (16 DOF) — world landmarks (see note above) ---
         if self._hand_tracking:
-            q_hand = self._retarg.retarget(world_lm)
-            # EMA smoothing on hand joints
-            if self._q_hand_prev is not None:
-                q_hand = (self._hand_alpha * q_hand
-                          + (1.0 - self._hand_alpha) * self._q_hand_prev)
-            self._q_hand_prev = q_hand.copy()
+            # Post the latest landmarks to the finger worker (owns the SLSQP) and
+            # take the most recently solved q_hand WITHOUT blocking — the ~40 ms solve
+            # runs off-thread so step() stays cheap. One-frame latency; until the
+            # worker has produced its first solution, hold the open bias pose.
+            with self._hand_lock:
+                self._hand_pending = world_lm
+                q_solved = (None if self._hand_result is None
+                            else self._hand_result.copy())
+            self._hand_evt.set()
+            if q_solved is None:
+                q_hand = (self._hand_bias if self._q_hand_prev is None
+                          else self._q_hand_prev)
+            else:
+                # EMA smoothing on hand joints (on the control thread, against the
+                # last RETURNED q_hand — independent of the worker's solve cadence).
+                if self._q_hand_prev is not None:
+                    q_hand = (self._hand_alpha * q_solved
+                              + (1.0 - self._hand_alpha) * self._q_hand_prev)
+                else:
+                    q_hand = q_solved
+                self._q_hand_prev = q_hand.copy()
         else:
             # Hold a fixed OPEN hand (bias pose) — no finger curling.
             q_hand = self._hand_bias
@@ -220,6 +266,33 @@ class DexPilotController:
         if q_arm is None:
             return None
         return np.concatenate([q_arm, q_hand])
+
+    def _hand_worker(self) -> None:
+        """Background loop: retarget fingers from the latest posted landmarks, forever.
+
+        Blocks on _hand_evt until step() posts world landmarks, then runs the SLSQP
+        retarget and publishes q_hand under _hand_lock. Only ever solves the MOST
+        RECENT landmarks — if several arrive while one solve is in flight, the stale
+        ones are skipped (always chase the freshest hand pose, never a backlog).
+        Exits when _hand_stop is set (see shutdown()). A bad solve is swallowed so a
+        single failure can't kill the worker."""
+        while not self._hand_stop.is_set():
+            # Wait for landmarks; time out periodically so a set _hand_stop is noticed.
+            if not self._hand_evt.wait(timeout=0.1):
+                continue
+            self._hand_evt.clear()
+            with self._hand_lock:
+                world_lm = self._hand_pending
+                self._hand_pending = None
+            if world_lm is None:
+                continue
+            try:
+                q = self._retarg.retarget(world_lm)
+            except Exception as e:   # noqa: BLE001 — a bad solve must not kill the worker
+                print(f"[hand] finger retarget worker error (skipping): {e!r}")
+                continue
+            with self._hand_lock:
+                self._hand_result = q.copy()
 
     @property
     def retargeter(self) -> DexPilotRetargeter:
