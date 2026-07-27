@@ -946,19 +946,30 @@ if __name__ == "__main__":
     _prev_control_phase = None   # last-seen standardized (phase, approach_sub) tuple,
                                  # for phase_enter transition logging (None until first log)
 
-    # obj_<color>_<shape> -> place_<color>_site, by matching the color token common to
-    # both names (scene_pick_place.xml's naming convention — see place_red/blue/green/
-    # yellow_site). Built once here rather than per-step string parsing in the hot loop.
+    # Map each object to the place site whose footprint arrival is scored against. Legacy
+    # convention: obj_<color>_<shape> -> place_<color>_site (matched by the shared color
+    # token). But the object-sweep bodies (obj_box_lowmu/heavy) carry no color token, and
+    # --object spawns exactly ONE object per run against the single remaining place area —
+    # so fall back to a shared default site (place_red_site) whenever no color matches.
+    # Without this fallback the lookup returned -1, place_xy_offset was passed as None, and
+    # the TRANSPORT arrival check could never fire (observed: obj_box_heavy carried into the
+    # place area but no 'arrival'/success logged). Built once here, not per-step in the loop.
     _PLACE_COLORS = ('red', 'blue', 'green', 'yellow')
+    _DEFAULT_PLACE_SITE = 'place_red_site'   # single shared place area (see scene XML)
     _trial_place_sid = {}
     if args.trial_log:
+        _default_sid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, _DEFAULT_PLACE_SITE)
         for _oi, _o in enumerate(objects):
             _color = next((c for c in _PLACE_COLORS if c in _o['name']), None)
             _sid = (mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, f'place_{_color}_site')
                     if _color else -1)
             if _sid < 0:
-                print(f"[trial-log] WARNING: no place_<color>_site match for "
-                      f"'{_o['name']}' — arrival can never be detected for this object.")
+                _sid = _default_sid   # no per-color site → shared place area
+            if _sid < 0:
+                # Only a real misconfiguration reaches here (the default site is missing
+                # from the compiled model), not merely a colorless object name.
+                print(f"[trial-log] WARNING: place site '{_DEFAULT_PLACE_SITE}' not found "
+                      f"in the scene — arrival can never be detected for '{_o['name']}'.")
             _trial_place_sid[_oi] = _sid
 
     def _hand_object_contact_metrics(obj_idx):
