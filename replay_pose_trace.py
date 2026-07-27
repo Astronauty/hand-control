@@ -52,6 +52,62 @@ def _resolve_paths(target: Path):
     return npz, (events if events.exists() else None), label
 
 
+def _logged_object_names(events_path: Path | None) -> list[str] | None:
+    """The distinct target-object body names recorded across this run's trial_start events,
+    in first-seen order. Returns None if there is no events.jsonl or no trial_start carries
+    an 'object' field (older logs) — the caller then falls back to the full scene.
+
+    This is what lets replay rebuild the SAME pruned model the run used: kinova_leap_pick_place
+    spawns a single --object body by DELETING the other sweep objects from the MjSpec before
+    compile, so the recorded qpos width matches only that pruned model, not the full scene XML."""
+    if events_path is None:
+        return None
+    names: list[str] = []
+    try:
+        with open(events_path, encoding='utf-8') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get('event') == 'trial_start':
+                    obj = row.get('object')
+                    if obj and obj not in names:
+                        names.append(obj)
+    except OSError:
+        return None
+    return names or None
+
+
+# Object bodies subject to the --object spawn prune, mirroring the loader in
+# kinova_leap_pick_place.py (baseline obj_red_box + the obj_box_* sweep siblings). Any
+# body NOT in this family is always kept; a swept body is kept only if the log used it.
+def _is_sweep_body(name: str) -> bool:
+    return name == 'obj_red_box' or name.startswith('obj_box_')
+
+
+def _build_replay_model(scene_path: Path, keep_objects: list[str] | None):
+    """Rebuild the model the run was logged against. If keep_objects is a non-empty list of
+    sweep-object body names, load the scene as an MjSpec and delete every OTHER sweep body
+    (plus the single-object test keyframes, which otherwise corrupt the registry on a body
+    delete) before compiling — reproducing the run's pruned nq. Otherwise (no object info),
+    compile the scene unchanged. Returns the compiled MjModel."""
+    if not keep_objects:
+        return mj.MjModel.from_xml_path(str(scene_path))
+    spec = mj.MjSpec.from_file(str(scene_path))
+    keep = set(keep_objects)
+    to_delete = [b for b in spec.bodies if _is_sweep_body(b.name) and b.name not in keep]
+    if to_delete:
+        for k in list(spec.keys):     # keyframes are single-object; drop before body deletes
+            spec.delete(k)
+        for b in to_delete:
+            spec.delete(b)
+    return spec.compile()
+
+
 def _load_trace(npz_path: Path) -> dict:
     d = np.load(npz_path, allow_pickle=True)
     trace = {k: d[k] for k in d.files}
@@ -149,13 +205,22 @@ def main():
     trace = _load_trace(npz_path)
     n_rows = len(trace['t'])
 
-    model = mj.MjModel.from_xml_path(str(scene_path))
+    # Rebuild the model the run was logged against. The run may have spawned a single
+    # --object body (the others deleted from the MjSpec before compile), so the raw scene
+    # XML (all sweep objects present) has a larger nq than the recorded qpos. Read the
+    # object name(s) from events.jsonl and reproduce the same prune.
+    keep_objects = _logged_object_names(events_path)
+    model = _build_replay_model(scene_path, keep_objects)
     data = mj.MjData(model)
 
     qpos = np.asarray(trace['qpos'])
     if qpos.shape[1] != model.nq:
-        sys.exit(f"qpos width {qpos.shape[1]} != model.nq {model.nq} — the scene XML has "
-                 f"changed since this run was logged; replay would be misaligned")
+        kept = ', '.join(keep_objects) if keep_objects else '(none logged — full scene)'
+        sys.exit(f"qpos width {qpos.shape[1]} != model.nq {model.nq} after rebuilding the "
+                 f"model for logged object(s) [{kept}]. The scene XML's robot/object layout "
+                 f"has changed since this run was logged (e.g. a body added/removed, or "
+                 f"geometry edited), so replay would be misaligned. Check out the "
+                 f"scene_pick_place.xml revision from the run's date to replay it.")
 
     t_sim = np.asarray(trace['t'], dtype=float)
     phase_arr = trace.get('phase')
