@@ -1188,7 +1188,7 @@ if __name__ == "__main__":
     # robustly across gamma x3-x10 — the fix is finger STIFFNESS, not squeeze force (29N/
     # contact already far exceeds the 0.25kg box's weight). 5.0 is stiff enough to hold the
     # shear while still soft enough to let the internal force deliver the normal squeeze.
-    SQUEEZE_PD_SCALE = 5.0
+    SQUEEZE_PD_SCALE = 10.0
 
     # Ramp the squeeze force 0->GAMMA over this many seconds of sim time after each
     # squeeze-on. The internal force pair only cancels once BOTH contacts exist; at
@@ -2437,7 +2437,7 @@ if __name__ == "__main__":
             cfg = GraspConfig3D(obj_geom=o['name'] + '_geom', obj_body=o['name'],
                                 max_iter=120, arm_geom_names=_rec_arm_geoms,
                                 obj_clearance_by_geom=_rec_obj_clearance,
-                                w_align=10.0, orient_weight=2.0, edge_margin_m=0.02,
+                                w_align=10.0, orient_weight=2.0, edge_margin_m=0.03,
                                 ground_clearance_m=0.010,   # +5mm over col_clearance for
                                                             # curled middle/ring vs the table
                                 wrench_constraint=False, datum_gamma=True,
@@ -2906,7 +2906,17 @@ if __name__ == "__main__":
             if _pose_trace is not None and (data.time < _pose_last_t
                                             or (data.time - _pose_last_t) >= _POSE_DT):
                 _pose_last_t = data.time
+                # Per-finger measured contact force vs the active object — the SAME
+                # measurement the dashboard's normal-force plot uses (_hand_object_contact_
+                # metrics -> dash 'normals'/'wrench'). Logged in FINGER_SET order so an
+                # auto-vs-teleop normal-force comparison reads straight off the trace.
+                _pt_fnet, _pt_taunet, _pt_norm, _pt_tan = \
+                    _hand_object_contact_metrics(_prox_idx)
                 _pose_trace.sample(
+                    norm_force=np.array([_pt_norm[f] for f in FINGER_SET]),
+                    tan_force=np.array([_pt_tan[f] for f in FINGER_SET]),
+                    f_net=np.asarray(_pt_fnet).copy(),      # net contact force on object (world, N)
+                    tau_net=np.asarray(_pt_taunet).copy(),  # net contact torque on object
                     t=float(data.time),          # sim-time; RESETS to 0 on backspace reset
                     t_wall=float(time.time()),   # wall-clock; monotonic across resets
                     prox_idx=int(_prox_idx),
