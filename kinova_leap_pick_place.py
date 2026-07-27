@@ -726,7 +726,7 @@ if __name__ == "__main__":
     object_defs = [
         ({'index': 'obj_red_box_c2',        'thumb': 'obj_red_box_c1'},        'obj_red_box'),
         ({'index': 'obj_box_lowmu_c2',      'thumb': 'obj_box_lowmu_c1'},      'obj_box_lowmu'),
-        ({'index': 'obj_box_light_c2',      'thumb': 'obj_box_light_c1'},      'obj_box_light'),
+        ({'index': 'obj_box_heavy_c2',      'thumb': 'obj_box_heavy_c1'},      'obj_box_heavy'),
         ({'index': 'obj_red_sphere_c2',     'thumb': 'obj_red_sphere_c1'},     'obj_red_sphere'),
         ({'index': 'obj_blue_cylinder_c2',  'thumb': 'obj_blue_cylinder_c1'},  'obj_blue_cylinder'),
         ({'index': 'obj_blue_capsule_c2',   'thumb': 'obj_blue_capsule_c1'},   'obj_blue_capsule'),
@@ -1019,12 +1019,14 @@ if __name__ == "__main__":
             return
         if state is None or state.outcome is not None:
             dash.push({'type': 'trial_time', 'remaining': None,
-                       'elapsed': None, 'trial_id': None})
+                       'elapsed': None, 'elapsed_wall': None, 'trial_id': None})
             return
-        elapsed = t_now - state.t_start
+        elapsed = t_now - state.t_start                       # sim-time (drives the timeout)
+        elapsed_wall = time.time() - state.t_start_wall       # operator's real elapsed time
         dash.push({'type': 'trial_time',
-                   'remaining': TRIAL_TIMEOUT_S - elapsed,
-                   'elapsed': elapsed,
+                   'remaining': TRIAL_TIMEOUT_S - elapsed,     # sim-time budget countdown
+                   'elapsed': elapsed,                         # sim-time elapsed (reference)
+                   'elapsed_wall': elapsed_wall,              # WALL elapsed — the experiment clock
                    'trial_id': state.trial_id})
 
     def _push_ipopt(obj_name, dls_ms=None, ipopt_ms=None):
@@ -1415,8 +1417,9 @@ if __name__ == "__main__":
             # plan_thread, which must never touch live `data` concurrently with the
             # main thread's mj_step — sim-time correlation isn't needed for a
             # diagnostic solver-timing entry.
-            _trial_events.log_solve(_trial_state.trial_id, time.time(), 'rrt',
-                                    plan_time * 1e3, object=obj_target['name'],
+            _trial_events.log_solve(_trial_state.trial_id, 'rrt',
+                                    plan_time * 1e3, t_wall=time.time(),
+                                    object=obj_target['name'],
                                     n_waypoints=len(path), fallback=fallback)
         _plan_result['waypoints'] = path
         _update_ghost_markers(path)
@@ -1467,10 +1470,10 @@ if __name__ == "__main__":
                     dls_ms=dls_grasp_ms, ipopt_ms=ipopt_grasp_ms)
         if _trial_events is not None and _trial_state is not None:
             _now_wc = time.time()
-            _trial_events.log_solve(_trial_state.trial_id, _now_wc, 'ik_dls',
-                                    dls_grasp_ms, object=obj['name'])
-            _trial_events.log_solve(_trial_state.trial_id, _now_wc, 'ik_ipopt',
-                                    ipopt_grasp_ms, object=obj['name'])
+            _trial_events.log_solve(_trial_state.trial_id, 'ik_dls',
+                                    dls_grasp_ms, t_wall=_now_wc, object=obj['name'])
+            _trial_events.log_solve(_trial_state.trial_id, 'ik_ipopt',
+                                    ipopt_grasp_ms, t_wall=_now_wc, object=obj['name'])
 
         total_ms = dls_grasp_ms + ipopt_grasp_ms
         print(f"\r\n[IK] obj{obj_idx+1}: grasp DLS {dls_grasp_ms:.0f}ms + SQP {ipopt_grasp_ms:.0f}ms"
@@ -2454,7 +2457,7 @@ if __name__ == "__main__":
 
     # Objects the NLP recommender supports (box-like first, per the plan). The planner
     # is shape-aware but validated on boxes; extend this set as other shapes are proven.
-    _CAT_SUPPORTED = {'obj_red_box', 'obj_green_box', 'obj_box_lowmu', 'obj_box_light'}
+    _CAT_SUPPORTED = {'obj_red_box', 'obj_green_box', 'obj_box_lowmu', 'obj_box_heavy'}
 
     # Actuated-joint qpos indices (planner.solve wants q_ref as the nu-length actuated
     # vector, in actuator order) — same as GraspPlanner3D._act_idx.
@@ -2678,8 +2681,9 @@ if __name__ == "__main__":
                                      and _trial_state.outcome is None
                                      and _trial_state.object_name == objects[obj_idx]['name'])
                                  else 0)
-                _trial_events.log_solve(_rec_trial_id, time.time(), 'grasp_rec',
-                                        _solve_ms, object=objects[obj_idx]['name'],
+                _trial_events.log_solve(_rec_trial_id, 'grasp_rec',
+                                        _solve_ms, t_wall=time.time(),
+                                        object=objects[obj_idx]['name'],
                                         status=res.get('status'),
                                         n_seeds=len(res.get('all_results') or [res]))
         t = threading.Thread(target=_run, daemon=True, name='cat-recommender')

@@ -20,10 +20,12 @@ Message protocol (plain dicts put on the queue):
                         'min_slack_mm': float|None,
                         'dls_ms': float|None, 'ipopt_ms': float|None}
     {'type': 'trial_time',                            # trial countdown, pushed each
-                        'remaining': float|None,      #   frame; None clears the timer
-                        'elapsed': float|None,        #   (no active trial). remaining =
-                        'trial_id': int|None}         #   TRIAL_TIMEOUT_S - elapsed sim-time
+                        'remaining': float|None,      #   frame; None clears the timer (no
+                        'elapsed': float|None,        #   active trial). remaining =
+                        'elapsed_wall': float|None,   #   TRIAL_TIMEOUT_S - elapsed sim-time;
+                        'trial_id': int|None}         #   elapsed_wall = operator real time
     {'type': 'event',   'trial_id': int, 't': float,  # mirror of one events.jsonl row;
+                        't_wall': float,              #   t=sim-time, t_wall=wall-clock;
                         'event': str, ...}            #   teed by EventLogger.log(). Extra
                         #   event-specific fields pass through and render inline. Panel is
                         #   cleared on 'trial_start' (scoped to the current trial).
@@ -385,8 +387,19 @@ def _run(queue, fingers, horizon_s, dt_hint):
                         _TIME_CRIT_STYLE if rem < 3.0
                         else _TIME_WARN_STYLE if rem < 10.0
                         else _TIME_OK_STYLE)
-                    el = msg.get('elapsed')
-                    el_s = "" if el is None else f"   elapsed {float(el):0.1f}s"
+                    # Show WALL-clock elapsed (the operator's real time, and the clock the
+                    # logged completion time is measured in). Sim-time elapsed is appended
+                    # in parentheses for reference since it drives the timeout countdown.
+                    elw = msg.get('elapsed_wall')
+                    el  = msg.get('elapsed')
+                    if elw is not None:
+                        el_s = f"   elapsed {float(elw):0.1f}s"
+                        if el is not None:
+                            el_s += f" (sim {float(el):0.1f}s)"
+                    elif el is not None:
+                        el_s = f"   elapsed {float(el):0.1f}s"
+                    else:
+                        el_s = ""
                     time_sub_lbl.setText(
                         f"trial {tid} — remaining{el_s}" if tid is not None
                         else f"remaining{el_s}")

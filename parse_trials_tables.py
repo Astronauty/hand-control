@@ -11,7 +11,9 @@ two LaTeX tables:
 WHAT IS AND ISN'T COMPUTABLE FROM THE CURRENT LOGS
 --------------------------------------------------
 Directly from events.jsonl:
-  * completion time     — trial_end.duration_s
+  * completion time     — trial_end.duration_s (WALL-CLOCK: the operator's real elapsed
+                          time. Sim runs slower than real-time, so the sim-time span is
+                          logged separately as duration_sim_s and is NOT what's reported.)
   * successful pick     — a 'pick_confirmed' event exists for the trial (the object was
                           held > LIFT_HEIGHT_M above rest continuously for DWELL_S ≥ the
                           pick-dwell threshold; that IS the "lifted clear for ≥X s" test).

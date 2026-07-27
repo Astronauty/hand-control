@@ -127,24 +127,43 @@ class EventLogger:
         # is non-blocking and drops on a full queue, so it can never stall logging.
         self._dashboard = dashboard
 
-    def log(self, trial_id: int, t: float, event: str, **fields):
+    def log(self, trial_id: int, t: float, event: str, t_wall: float | None = None,
+            **fields):
         # Drop None-valued fields so optional annotations (e.g. approach_sub, which is
         # None outside APPROACH; prev/prev_sub on the first marker) neither clutter the
         # JSONL nor render as literal "key=None" in the dashboard's inline event log.
         fields = {k: v for k, v in fields.items() if v is not None}
-        row = {'trial_id': trial_id, 't': round(float(t), 6), 'event': event, **fields}
+        # Every event carries BOTH clocks: `t` is sim-time (data.time) for joining against
+        # the pose trace and for the physics-coupled state machine; `t_wall` is wall-clock
+        # (time.time()), the operator's real elapsed time — the clock the experiment
+        # metrics (durations) and the dashboard use, since sim runs slower than real-time.
+        # t_wall defaults to now() when the caller doesn't supply one, which is correct for
+        # main-thread events; solve events on background threads pass their own captured
+        # wall time (and a sim-time t) explicitly.
+        if t_wall is None:
+            t_wall = time.time()
+        row = {'trial_id': trial_id, 't': round(float(t), 6),
+               't_wall': round(float(t_wall), 6), 'event': event, **fields}
         self._fh.write(json.dumps(row, default=_json_default) + '\n')
         self._fh.flush()   # trials are minutes apart; flush cost is negligible
         if self._dashboard is not None:
             self._dashboard.push({'type': 'event', **row})
 
-    def log_solve(self, trial_id: int, t: float, component: str, ms: float, **extra):
+    def log_solve(self, trial_id: int, component: str, ms: float,
+                  t: float = 0.0, t_wall: float | None = None, **extra):
         """component: 'rrt' | 'ik_dls' | 'ik_ipopt' | 'grasp_rec'. extra: whatever
         solve-specific fields the call site already has (status, n_waypoints,
         gamma_min, ...) — passed through as-is, same pattern as the existing
-        dash.push(...) calls this wraps."""
-        self.log(trial_id, t, 'solve', component=component, ms=round(float(ms), 3),
-                  **extra)
+        dash.push(...) calls this wraps.
+
+        Solves run on BACKGROUND threads where data.time (sim-time) is not meaningfully
+        readable, so `t` (sim-time) defaults to 0.0 and the real timestamp goes in
+        t_wall (defaulting to now()). This keeps the invariant that `t` is always sim-time
+        and `t_wall` is always wall-clock — previously solves put wall-clock in `t`,
+        breaking joins against the sim-time trace. `ms` is a measured duration, unaffected.
+        Pass an explicit sim-time `t` if the call site has a valid data.time snapshot."""
+        self.log(trial_id, t, 'solve', t_wall=t_wall, component=component,
+                 ms=round(float(ms), 3), **extra)
 
     def close(self):
         self._fh.close()
@@ -351,7 +370,11 @@ class TrialState:
     trial_id: int
     method: str            # 'dexpilot' | 'contact_aware_teleop'
     object_name: str
-    t_start: float
+    t_start: float                     # sim-time (data.time) at trial start
+    t_start_wall: float = 0.0          # wall-clock (time.time()) at trial start — the
+                                        # clock the reported completion time is measured in
+                                        # (sim runs slower than real-time; the operator's
+                                        # real elapsed time is what the experiment reports)
     phase: str = TrialPhase.APPROACH   # trials start at lock-in (control 'PLAN'), which
                                         # is APPROACH/planning; advances to PICK when the
                                         # operator commits the grasp (control 'GRASP')
@@ -402,10 +425,11 @@ class TrialRunner:
         with object_props_from_model() at the call site; None keeps the old schema."""
         self.contact_counter.reset()
         self.trace = TraceBuffer()
+        t_start_wall = time.time()   # experiment clock anchor (see TrialState.t_start_wall)
         state = TrialState(trial_id=trial_id, method=method, object_name=object_name,
-                            t_start=t_now)
-        self.events.log(trial_id, t_now, 'trial_start', method=method,
-                         object=object_name, **(props or {}))
+                            t_start=t_now, t_start_wall=t_start_wall)
+        self.events.log(trial_id, t_now, 'trial_start', t_wall=t_start_wall,
+                         method=method, object=object_name, **(props or {}))
         # No phase_enter here: a trial starts at lock-in (control 'PLAN') → APPROACH,
         # and the caller's marker site already emits that transition from control_phase
         # (teleop→planning→PICK). TrialState.phase defaults to APPROACH to match, so the
@@ -431,11 +455,19 @@ class TrialRunner:
         state.t_end = t_now
         if state.outcome is None:
             state.outcome = TrialOutcome.TIMEOUT
-        self.events.log(state.trial_id, t_now, 'trial_end', outcome=state.outcome,
+        # Completion time is reported in WALL-CLOCK — the operator's real elapsed time,
+        # the experiment's metric of interest. Sim runs slower than real-time, so the
+        # sim-time span (duration_sim_s, kept for reference / trace joins) understates it.
+        # Wall clock is monotonic across sim resets, so no clamp is needed here.
+        t_end_wall = time.time()
+        duration_wall_s = max(0.0, t_end_wall - state.t_start_wall)
+        self.events.log(state.trial_id, t_now, 'trial_end', t_wall=t_end_wall,
+                         outcome=state.outcome,
                          n_inadvertent_contacts=state.n_inadvertent_contacts,
                          n_drops=state.n_drops, n_attempts=state.attempt_id,
                          max_slip_mm=state.max_slip_mm,
-                         duration_s=round(t_now - state.t_start, 3))
+                         duration_s=round(duration_wall_s, 3),
+                         duration_sim_s=round(t_now - state.t_start, 3))
         trace_path = self.trace_dir / f'{self._trace_filename(state)}.npz'
         self.trace.save(trace_path)
 
