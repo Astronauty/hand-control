@@ -923,7 +923,15 @@ if __name__ == "__main__":
     # events.jsonl. Throttled to ~50 Hz sim-time so the file stays small.
     _pose_trace   = TraceBuffer() if args.trial_log else None
     _pose_last_t  = -1.0
+    _pose_last_wall = -1.0
     _POSE_DT      = 0.02   # s sim-time between recorded pose rows (~50 Hz)
+    # Wall-clock fallback for the sampler gate: the RRT kinematic waypoint replay (REACH)
+    # advances qpos with mj_forward only — NO mj_step — so data.time is FROZEN across the
+    # whole sweep. A sim-time-only throttle then records ~1 row for the entire reach, and
+    # replay teleports through it. Gating on wall-time OR sim-time keeps those frozen-time
+    # phases sampled at ~50 Hz so the reach plays out smoothly. (Slightly denser than 50 Hz
+    # sim-rows during normal physics, since wall can tick between sim steps — negligible.)
+    _POSE_DT_WALL = 0.02
     _prev_control_phase = None   # last-seen standardized (phase, approach_sub) tuple,
                                  # for phase_enter transition logging (None until first log)
 
@@ -2532,6 +2540,16 @@ if __name__ == "__main__":
             cfg = GraspConfig3D(obj_geom=o['name'] + '_geom', obj_body=o['name'],
                                 max_iter=120, arm_geom_names=_rec_arm_geoms,
                                 obj_clearance_by_geom=_rec_obj_clearance,
+                                # w_ik 0.70 -> 5.0: the keyframe convergence sweep
+                                # (simulation/sweep_keyframe_convergence.py) showed the baseline
+                                # alignment:reachability ratio (~14:1) starved the IK term, so
+                                # most seeds stalled with a large tip residual and exited
+                                # non-converged. w_ik=5.0 lifts seed convergence 56%->94%, NLP
+                                # 9/10->10/10 keyframes, holds 10/10 wrench-feasible, and ~halves
+                                # solve time (fewer wasted seeds). w_align=10 still keeps contacts
+                                # antipodal (opposition stayed 180deg). Keep orient_weight=2.0 —
+                                # zeroing it gained a little speed but lost one WF grasp.
+                                w_ik=5.0,
                                 w_align=10.0, orient_weight=2.0, edge_margin_m=0.03,
                                 ground_clearance_m=0.010,   # +5mm over col_clearance for
                                                             # curled middle/ring vs the table
@@ -3239,9 +3257,13 @@ if __name__ == "__main__":
             # events.jsonl phase_enter timestamps vs `t` here. Uses last frame's qpos
             # (one-frame lag is immaterial for a warmstart snapshot).
             # (data.time < _pose_last_t marks a reset — sample immediately and re-anchor.)
+            _pose_wall_now = time.time()
             if _pose_trace is not None and (data.time < _pose_last_t
-                                            or (data.time - _pose_last_t) >= _POSE_DT):
+                                            or (data.time - _pose_last_t) >= _POSE_DT
+                                            or (_pose_wall_now - _pose_last_wall)
+                                                >= _POSE_DT_WALL):
                 _pose_last_t = data.time
+                _pose_last_wall = _pose_wall_now
                 # Per-finger measured contact force vs the active object — the SAME
                 # measurement the dashboard's normal-force plot uses (_hand_object_contact_
                 # metrics -> dash 'normals'/'wrench'). Logged in FINGER_SET order so an
