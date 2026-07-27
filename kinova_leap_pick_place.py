@@ -2096,7 +2096,13 @@ if __name__ == "__main__":
             _I_arm = np.clip(np.diag(_Mfull)[:7], 1e-3, None)   # per-arm-joint inertia
             _WN = 100.0                                          # rad/s (~3 Hz) target
             _dp_Kp_arm = _I_arm * _WN**2
+            # TEST (matches autonomous): save the compiled DEFAULT arm damping (0 in the
+            # XML — the value autonomous holds the grasp at) BEFORE the tracking override,
+            # then save the heavy TRACKING damping after. GRASP-entry swaps to the default
+            # (auto-identical grasp physics) and restores the tracking value on release.
+            _ARM_DAMPING_DEFAULT = model.dof_damping[:7].copy()
             model.dof_damping[:7] = 2.0 * _I_arm * _WN          # critical, implicit
+            _ARM_DAMPING_TRACK = model.dof_damping[:7].copy()
             print(f"[dexpilot] --physics: PD-torque drive + mj_step (collisions ON). "
                   f"arm Kp={np.round(_dp_Kp_arm,0)} (inertia-scaled ~3Hz), "
                   f"dof_damping={np.round(model.dof_damping[:7],1)} (critical, implicit).")
@@ -2685,6 +2691,17 @@ if __name__ == "__main__":
     elif WRIST_ANG_GAIN_SCALE != 1.0:
         print(f"[teleop] WRIST_ANG_GAIN_SCALE={WRIST_ANG_GAIN_SCALE:.3g} — "
               "angular tracking gain scaled independently of position.")
+    # Debug/control experiment: TELE_AUTO_JOG=1 makes teleop's GRASP phase use the
+    # AUTONOMOUS carry path — the arrow-key jog (world-frame palm velocity, orientation
+    # held) instead of DexPilot wrist tracking. Everything upstream (recommender grasp,
+    # RRT, lock-in, contact provider, squeeze) stays teleop's; only the GRASP-phase carry
+    # source changes. Isolates whether the wrist-tracking CONTROL is the failure vs the
+    # grasp/sim physics: if the grip holds under arrow-key jog here exactly as it does in
+    # autonomous, the sim/grasp is fine and the wrist-track control is the culprit.
+    TELE_AUTO_JOG = os.environ.get('TELE_AUTO_JOG', '0') == '1'
+    if TELE_AUTO_JOG:
+        print("[teleop] TELE_AUTO_JOG=1 — GRASP uses the autonomous arrow-key jog "
+              "(no wrist tracking). Drive the lift with arrow keys.")
     _gp_acc = {'track': 0.0, 'refresh': 0.0, 'spin': 0.0, 'step_ik': 0.0,
                'torque': 0.0, 'step': 0.0, 'n': 0}
     _gp_last = time.time()
@@ -3154,7 +3171,22 @@ if __name__ == "__main__":
                 if (_supported and _rec_idle and not _rec_vis
                         and _rec_ik_mode is None
                         and (time.time() - _rec_last_solve) >= _REC_INTERVAL_S):
-                    _q_snap = np.array([data.qpos[i] for i in _cat_act_idx])
+                    # Feed the recommender the SAME clean reference pose (q_ref) that
+                    # autonomous uses — the home Q_BIAS (HOME_ARM + open/tucked fingers) —
+                    # NOT the operator's live teleoped pose. q_ref shapes the solve two ways:
+                    #   (1) reg_arm_toward_current pulls the ARM toward q_ref[:7]; the live
+                    #       operator arm made the solver reach the contacts with a wrist
+                    #       orientation that tilted the pads off-flush (measured pad-normal
+                    #       misalign 13.6/9.1deg vs auto's 6.5/2.7 -> point contacts that
+                    #       can't resist twist -> the teleop grasp tumbled where auto held).
+                    #   (2) _assign_seed_by_finger (grasp_planner_3d) labels each seed's
+                    #       thumb/index contact by FK'ing q_ref's FINGER joints to the live
+                    #       fingertip sites — so the operator's live finger curl also steered
+                    #       which face each finger grips, from the very first solve (why tele
+                    #       solved differently even with tracking never enabled).
+                    # Autonomous has no hand tracking, so its q_ref is the home Q_BIAS.
+                    # Matching it here makes teleop's recommended grasp identical to auto's.
+                    _q_snap = np.array([Q_BIAS[i] for i in _cat_act_idx])
                     _obj_pos = data.xpos[objects[_prox_idx]['id_body']].copy()
                     _rec_thread = _fire_recommender(_prox_idx, _q_snap, _obj_pos)
                     _rec_last_solve = time.time()
@@ -3865,11 +3897,19 @@ if __name__ == "__main__":
                     data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
                     _grasp_no_ach = True
                     q_grasp_hold = obj_grasp['q_target'].copy()
-                    # Teleop: apply the squeeze IMMEDIATELY on the first Enter (no need to
-                    # press Enter twice) — the ramp (_squeeze_steps/SQUEEZE_RAMP_S) still
-                    # eases the force in so it's not a shove. Autonomous keeps the explicit
-                    # toggle so you can inspect the pregrasp before committing force.
-                    squeeze_on = bool(_CAT_MODE)
+                    # Enter the grasp with the squeeze OFF in EVERY mode — the operator
+                    # (teleop) or the arrow-key jog flow (autonomous) toggles it on with a
+                    # second Enter (the `elif control_phase == 'GRASP'` branch below).
+                    # Teleop USED to auto-squeeze here (squeeze_on = bool(_CAT_MODE)), but
+                    # that fired the internal-force squeeze while the pads were still 4-6mm
+                    # OFF the box, driving the fingers into the gap and impacting the object
+                    # (measured: thumb spiked to ~85N on the FIRST grasp frame, grossly
+                    # asymmetric vs the index, seeding the tilt that tumbled the box). The
+                    # SQUEEZE_RAMP_S ramp does NOT prevent this — it scales the commanded
+                    # force, not the impact of an unseated pad arriving under squeeze.
+                    # Autonomous never hit this because it enters squeeze-off with the pads
+                    # already seated, then ramps from a true 0N. Matching that here.
+                    squeeze_on = False
                     _squeeze_steps = 0
                     grasp_ctrl.set_squeeze(squeeze_on)
                     _push_squeeze(squeeze_on, gamma_live)
@@ -3883,13 +3923,35 @@ if __name__ == "__main__":
                     print(f"\r\n[Control] → GRASP  ({targets[active_tgt]['label']})  "
                           f"|  Enter: toggle squeeze (gamma={gamma_live:.1f})  |  N: release")
 
-                    # contact_aware_teleop: after grasp, the WRIST follows your hand
-                    # (position + orientation, like the approach) while the fingers and
-                    # squeeze stay frozen. Re-zero DexPilot to the current robot/hand
-                    # pose (== press-8 recalibration) so tracking starts jerk-free. The
-                    # arm PD target (q_grasp_hold[:7]) then slew-tracks the wrist target
-                    # in the GRASP branch below. Autonomous mode keeps the arrow-key jog.
+                elif key == 'enter' and control_phase == 'GRASP':
+                    squeeze_on = not squeeze_on
+                    _squeeze_steps = 0   # restart the force ramp on every toggle-on
+                    grasp_ctrl.set_squeeze(squeeze_on)
+                    _push_squeeze(squeeze_on, gamma_live)
+                    print(f"\r\n[Control] squeeze {'ON' if squeeze_on else 'off'}  "
+                          f"(gamma={gamma_live:.1f}, ~{gamma_live/np.sqrt(2):.2f} N/contact)")
+
+                    # TEST (match autonomous grasp physics): zero the arm joint damping
+                    # while the grasp is squeezed. Teleop sets dof_damping[:7] to heavy
+                    # critical damping for wrist tracking; autonomous never sets it (stays
+                    # 0), so its arm holds the grasp undamped. This makes the teleop GRASP
+                    # hold byte-identical to auto in model state. Restored (to the tracking
+                    # damping) on squeeze-off; also restored on release/reset below.
                     if _CAT_MODE:
+                        model.dof_damping[:7] = (
+                            _ARM_DAMPING_DEFAULT if squeeze_on else _ARM_DAMPING_TRACK)
+
+                    # contact_aware_teleop: arm the WRIST-tracking carry when the squeeze is
+                    # turned ON (the 2nd Enter), NOT at GRASP entry — so the grip forms on
+                    # seated pads first, exactly like autonomous's two-Enter flow. The wrist
+                    # then follows your hand (position + orientation) while the fingers/squeeze
+                    # stay frozen. Re-zero DexPilot to the current robot/hand pose (== press-8
+                    # recalibration) so tracking starts jerk-free; the arm PD target
+                    # (q_grasp_hold[:7]) slew-tracks the wrist target in the GRASP branch below.
+                    # Turning squeeze back OFF disarms tracking (the arm holds still again).
+                    # TELE_AUTO_JOG forces the autonomous arrow-key jog path instead: leave
+                    # _grasp_wrist_track False so the GRASP branch falls through to the jog.
+                    if _CAT_MODE and squeeze_on and not TELE_AUTO_JOG:
                         _dexpilot_ctrl.start(data)
                         # Disable finger retargeting (the ~40ms scipy SLSQP solve) for
                         # the carry: the fingers are frozen at the grasp config, so we
@@ -3914,14 +3976,8 @@ if __name__ == "__main__":
                         _wrist_tgt_t = 0.0
                         print(f"[teleop] grasp settling {GRASP_SETTLE_S:.2f}s — establishing "
                               "finger contact before wrist tracking starts.")
-
-                elif key == 'enter' and control_phase == 'GRASP':
-                    squeeze_on = not squeeze_on
-                    _squeeze_steps = 0   # restart the force ramp on every toggle-on
-                    grasp_ctrl.set_squeeze(squeeze_on)
-                    _push_squeeze(squeeze_on, gamma_live)
-                    print(f"\r\n[Control] squeeze {'ON' if squeeze_on else 'off'}  "
-                          f"(gamma={gamma_live:.1f}, ~{gamma_live/np.sqrt(2):.2f} N/contact)")
+                    elif _CAT_MODE and not squeeze_on:
+                        _grasp_wrist_track = False   # squeeze off -> stop carrying, hold still
 
                 elif key == 'release' and control_phase == 'GRASP':
                     # Release: no pregrasp config exists anymore, so open the active
@@ -3939,6 +3995,7 @@ if __name__ == "__main__":
                     if _CAT_MODE:
                         _dexpilot_ctrl._hand_tracking = True   # restore finger retargeting
                         _dexpilot_ctrl._arm._ik.max_iter = _ARM_IK_ITER_SAVE
+                        model.dof_damping[:7] = _ARM_DAMPING_TRACK  # restore tracking damping (TEST)
                     if _CAT_MODE:
                         # Teleop: hand control back to the operator (all 23 DOFs are
                         # teleoped), drop the object, and re-arm the recommender. Clear
@@ -4133,6 +4190,7 @@ if __name__ == "__main__":
                 if _CAT_MODE and _dexpilot_ctrl is not None:
                     _dexpilot_ctrl._hand_tracking = True   # restore finger retargeting
                     _dexpilot_ctrl._arm._ik.max_iter = _ARM_IK_ITER_SAVE
+                    model.dof_damping[:7] = _ARM_DAMPING_TRACK  # restore tracking damping (TEST)
                 _ik_vis_mode   = None
                 tau_ctrl       = np.zeros(model.nv)
                 _last_sim_time = 0.0

@@ -95,6 +95,13 @@ def main():
     ap.add_argument('--jog-vel', type=float, default=0.2,
                     help='lift speed (m/s); lower = slower lift (live "pick up" is gradual, '
                          'which gives the capped slip-correction time to drift)')
+    ap.add_argument('--replay-grasp', type=str, default=None,
+                    help='Path to an npz with q_target (23,) + box_qpos (7,) captured from a '
+                         'FAILING live teleop grasp. Skips the recommender and commits THAT '
+                         'exact grasp pose + object pose, then squeeze+lifts. If it HOLDS here '
+                         'but failed in the live teleop pipeline, the grasp is fine and the '
+                         'live execution differs. rec_local contact frames are derived from '
+                         'where the loaded fingertips actually sit on the box.')
     ap.add_argument('--slip-kp', type=float, default=200.0,
                     help='slip_correction spring stiffness (live default 200)')
     ap.add_argument('--slip-fmax', type=float, default=10.0,
@@ -189,6 +196,41 @@ def main():
         t2 = np.cross(n_in, t1)
         R_W = np.column_stack([n_in, t1, t2])
         rec_local.append((R_WO.T @ (p_rec - p_WoO), R_WO.T @ R_W))
+
+    # ── 1'. REPLAY a captured failing teleop grasp (override recommender output) ──
+    # Load the exact committed q_target + box pose from a live teleop failure. Derive the
+    # contact frames from where the LOADED fingertips actually touch the box (the real grasp
+    # geometry), so the squeeze acts on the same contacts the live grasp had. If this HOLDS,
+    # the grasp is sound and the live pipeline is what breaks it.
+    if args.replay_grasp is not None:
+        _rg = np.load(args.replay_grasp)
+        q_grasp = q_ref.copy()
+        q_grasp[:23] = _rg['q_target'][:23]
+        obj_qpos0 = _rg['box_qpos'][:7].copy()
+        d0.qpos[N_ROBOT:N_ROBOT + 7] = obj_qpos0
+        # Re-derive the contact points: place the robot at q_grasp + box at box_qpos, read
+        # each fingertip SITE's nearest point on the box surface as the contact.
+        _dr = mj.MjData(model)
+        _dr.qpos[:23] = q_grasp[:23]
+        _dr.qpos[N_ROBOT:N_ROBOT + 7] = obj_qpos0
+        mj.mj_forward(model, _dr)
+        obj_c = _dr.geom_xpos[obj_gid].copy(); obj_R = _dr.geom_xmat[obj_gid].reshape(3, 3).copy()
+        p_WoO = _dr.xpos[obj_bid].copy(); R_WO = _dr.xmat[obj_bid].reshape(3, 3).copy()
+        # index -> id_C[0], thumb -> id_C[1]; use the ds_tip sites (the grasp contact sites).
+        _sid = {'index': mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'leap_if_ds_tip'),
+                'thumb': mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, 'leap_th_ds_tip')}
+        rec_local = []
+        for fname in ('index', 'thumb'):            # id_C order [index, thumb]
+            p_tip = _dr.site_xpos[_sid[fname]].copy()
+            n_out = _geom_normal_np(p_tip, obj_gt, obj_c, obj_R, obj_sz)
+            n_in = -n_out
+            a = np.array([0, 0, 1.0]) if abs(n_in[2]) < 0.9 else np.array([1.0, 0, 0])
+            t1 = np.cross(n_in, a); t1 /= np.linalg.norm(t1) + 1e-12
+            t2 = np.cross(n_in, t1)
+            R_W = np.column_stack([n_in, t1, t2])
+            rec_local.append((R_WO.T @ (p_tip - p_WoO), R_WO.T @ R_W))
+        print(f"[replay] loaded failing teleop grasp from {args.replay_grasp.split('/')[-1]}: "
+              f"q_target arm={np.round(q_grasp[:7],2)}")
 
     # ── 2. Approach: plan the REAL RRT to q_grasp and replay it (matches live) ───
     # The live pipeline reaches the grasp via a collision-free RRT path — NOT a straight-line
