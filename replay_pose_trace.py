@@ -62,7 +62,13 @@ def _logged_object_names(events_path: Path | None) -> list[str] | None:
     compile, so the recorded qpos width matches only that pruned model, not the full scene XML."""
     if events_path is None:
         return None
-    names: list[str] = []
+    # trial_start is the authoritative target list, but a run that never started a formal
+    # trial (operator never pressed lock-in) still records a pose trace AND grasp-recommender
+    # 'solve' events, which also carry the active object name. Collect trial_start objects
+    # first (in order), then any other event's object as a fallback, so such runs stay
+    # replayable. Both resolve to the SAME pruned model as long as the run used one object.
+    trial_objs: list[str] = []
+    other_objs: list[str] = []
     try:
         with open(events_path, encoding='utf-8') as fh:
             for line in fh:
@@ -73,13 +79,19 @@ def _logged_object_names(events_path: Path | None) -> list[str] | None:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                obj = row.get('object')
+                if not obj:
+                    continue
                 if row.get('event') == 'trial_start':
-                    obj = row.get('object')
-                    if obj and obj not in names:
-                        names.append(obj)
+                    if obj not in trial_objs:
+                        trial_objs.append(obj)
+                elif obj not in other_objs:
+                    other_objs.append(obj)
     except OSError:
         return None
-    return names or None
+    if trial_objs:
+        return trial_objs
+    return other_objs or None
 
 
 # Object bodies subject to the --object spawn prune, mirroring the loader in
