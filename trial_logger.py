@@ -26,11 +26,12 @@ State machine (settled spec — see conversation record, not re-derived here):
              holds LIFT_HEIGHT_M above its rest height continuously for DWELL_S. A dip
              below threshold before DWELL_S elapses resets the dwell timer WITHOUT
              ending the attempt, as long as the trigger condition is still active.
-  Transport: entered at pick_confirmed, reusing LIFT_HEIGHT_M as the same boundary.
-             Falling back below it counts a drop (phase reverts to Pick, awaiting the
-             next trigger edge for a new attempt). Arrival = object XY within the
-             place-site marker footprint AND |v| < ARRIVAL_SPEED_M_S while still above
-             the height threshold -> trial success.
+  Transport: entered at pick_confirmed. Arrival is a SET-IN-PLACE check: object XY within
+             the place-site marker footprint AND |v| < ARRIVAL_SPEED_M_S (settled), whether
+             held clear over the target or set down into it -> trial success. Falling below
+             LIFT_HEIGHT_M *outside* the footprint counts a drop (phase reverts to Pick,
+             awaiting the next trigger edge); falling below it *inside* the footprint is a
+             placement in progress (stay in Transport until it settles), not a drop.
 """
 import json
 import time
@@ -533,6 +534,12 @@ class TrialRunner:
                          relevant (e.g. still in GRASP, not TRANSPORT).
         object_speed:    object linear speed (m/s), for the arrival settle check.
 
+        Arrival is a SET-IN-PLACE check: success once the object is inside the place
+        footprint and settled (speed < ARRIVAL_SPEED_M_S), whether it is held clear over
+        the target OR set down into it. A descent below LIFT_HEIGHT_M inside the footprint
+        is treated as a placement-in-progress (stay in TRANSPORT until it settles), NOT a
+        drop; only a descent outside the footprint counts a drop and reverts to PICK.
+
         Returns True if the trial reached arrival (success) this step.
         """
         if state.phase not in (TrialPhase.PICK, TrialPhase.TRANSPORT):
@@ -572,18 +579,37 @@ class TrialRunner:
                     state.dwell_t0 = None   # reset dwell, SAME attempt continues
 
         elif state.phase == TrialPhase.TRANSPORT:
-            if (place_xy_offset is not None and object_speed is not None
-                    and place_xy_offset <= place_marker_half_extent
-                    and object_speed < ARRIVAL_SPEED_M_S):
+            # SET-IN-PLACE arrival. Two success paths, both requiring the object be inside
+            # the place footprint and settled (speed < ARRIVAL_SPEED_M_S):
+            #   (a) held-clear hover: settled while still lifted (height > LIFT_HEIGHT_M) —
+            #       the operator hovers the object over the target and holds it still.
+            #   (b) set down in target: the object is lowered/released INTO the target and
+            #       comes to rest there (height <= LIFT_HEIGHT_M). This is how a human
+            #       actually places — carry over, set down, let go — and is why teleop runs
+            #       that clearly placed the box never scored under the old held-clear-only
+            #       rule (the object was still moving whenever it was above the threshold,
+            #       and the moment it descended it was counted as a drop instead).
+            # A descent to/below the threshold OUTSIDE the footprint is still a drop.
+            in_place = (place_xy_offset is not None
+                        and place_xy_offset <= place_marker_half_extent)
+            settled = (object_speed is not None and object_speed < ARRIVAL_SPEED_M_S)
+            if in_place and settled:
                 self.set_phase(state, t_now, TrialPhase.PLACE)   # object placed → finish
                 self.events.log(state.trial_id, t_now, 'arrival',
                                  attempt=state.attempt_id,
-                                 xy_offset_m=round(place_xy_offset, 4))
+                                 xy_offset_m=round(place_xy_offset, 4),
+                                 set_down=bool(height_above_rest <= LIFT_HEIGHT_M))
                 state.outcome = TrialOutcome.SUCCESS
                 return True
 
-
             if height_above_rest <= LIFT_HEIGHT_M:
+                # Descended out of the carry. If it came down INSIDE the footprint we do
+                # NOT count a drop or revert to PICK — it is a placement in progress that
+                # just hasn't settled yet (still moving as it's released); stay in TRANSPORT
+                # so the settled-in-place check above fires once it comes to rest. Only a
+                # descent OUTSIDE the footprint is a genuine drop.
+                if in_place:
+                    return False
                 state.n_drops += 1
                 self.events.log(state.trial_id, t_now, 'drop', count=state.n_drops)
                 state.attempt_active = False
