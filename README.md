@@ -28,7 +28,25 @@ sudo apt-get install libxcb-cursor0
 
 ## Kinova Gen3 + LEAP Hand Pick-and-Place
 
-**Scene:** `models/scene_pick_place.xml` — 7-DOF Gen3 arm + 16-DOF LEAP hand, 6 randomised pickable objects.
+**Scene:** `models/scene_pick_place.xml` — 7-DOF Gen3 arm + 16-DOF LEAP hand, plus a set of pickable objects (see [Object sweep](#object-sweep)).
+
+### Object sweep
+
+The scene defines several pickable object bodies, but each run spawns exactly **one**, chosen with `--object <body>`. All variants are authored in `models/scene_pick_place.xml`; at load time the non-selected ones are **deleted from the `MjSpec` before compilation** (not parked off-scene), so the compiled model contains a single target — no stray geoms in the proximity/collision checks, and `nq` stays fixed so per-object logs pool cleanly. This makes a run directory correspond to exactly one object condition.
+
+The current sweep holds three cubes of **identical geometry** (4 cm half-extent box), varying **one physical property each** relative to the baseline so friction and mass can be studied independently:
+
+| `--object` | Role | Mass | μ (sliding) | I_zz | Notes |
+|---|---|---|---|---|---|
+| `obj_red_box` | Object 1 (baseline) | 250 g | 2.00 | 2667 g·cm² | Default |
+| `obj_box_lowmu` | Object 2 (lower friction) | 250 g | **1.20** | 2667 g·cm² | 0.6× μ, same mass |
+| `obj_box_light` | Object 3 (lighter) | **150 g** | 2.00 | **1600 g·cm²** | 0.6× mass, same μ |
+
+`condim=6` and the torsional/rolling friction terms are held fixed across all three, so μ and mass are the only variables. `I_zz` is MuJoCo's principal moment about the vertical axis, computed from the mesh+mass under uniform density. To add a condition, copy one of the `obj_box_*` bodies in the scene XML (keep the shared `obj_box_` name prefix so the loader picks it up), register it in the `object_defs` list in `kinova_leap_pick_place.py`, and it becomes selectable via `--object`.
+
+Each object's actual simulated mass / μ / I_zz is stamped onto the `trial_start` event in the log (see [Trial logging & replay](#trial-logging--replay)), and [`parse_trials_tables.py`](parse_trials_tables.py) auto-fills the object-properties table and keys the completion-time and success tables on the object name.
+
+> **Note:** the scene's autonomous-mode test `<keyframe>` poses are dropped whenever `--object` prunes any body (they are sized for the single-object baseline and are only used by the autonomous replay path, not the trial/teleop pipeline).
 
 `models/kinova_leap.xml` (torque-control, used above) and `models/kinova_leap_pos.xml` (position-servo, used by `kinova_leap_rrt_pos_test.py`) are generated, not hand-written — they merge the Gen3 arm and LEAP hand specs from `mujoco_menagerie/` via MuJoCo's `MjSpec` API. Regenerate them after updating either menagerie submodule or the mount pose/fingertip-site config in the script:
 
@@ -92,11 +110,15 @@ Add `--trial-log` to a `dexpilot` or `contact_aware_teleop` run to record it und
 ```bash
 python kinova_leap_pick_place.py --mode contact_aware_teleop --trial-log          # auto-named logs/<mode>_<timestamp>/
 python kinova_leap_pick_place.py --mode contact_aware_teleop --trial-log my_run   # named logs/my_run/
+
+# one object per run for a friction/mass sweep (see Object sweep above):
+python kinova_leap_pick_place.py --mode dexpilot --trial-log --object obj_box_lowmu
+python kinova_leap_pick_place.py --mode dexpilot --trial-log --object obj_box_light
 ```
 
 Each run directory holds three correlated streams (see [`trial_logger.py`](trial_logger.py) for the full state machine):
 
-- `events.jsonl` — sparse per-trial/phase/attempt event stream (trial_start, phase_enter, attempt_start/result, pick_confirmed, drop, arrival, contact_violation, trial_end), each carrying `trial_id` + sim-time `t` so it joins against the traces by time.
+- `events.jsonl` — sparse per-trial/phase/attempt event stream (trial_start, phase_enter, attempt_start/result, pick_confirmed, drop, arrival, contact_violation, trial_end), each carrying `trial_id` + sim-time `t` so it joins against the traces by time. The `trial_start` event also stamps the target object's ground-truth physical properties (`mass_kg`, `mu`, `mu_tors`, `condim`, `shape`, `size`, `izz_gcm2`) read straight from the compiled model, so completion time / success / phase can be correlated with object physics offline — [`parse_trials_tables.py`](parse_trials_tables.py) uses these to auto-fill the object-properties table.
 - `pose_trace.npz` — an always-on ~50 Hz **full-state** trace across all phases: the complete MuJoCo state (`qpos`/`qvel`/`act`/`ctrl` + force channels), body poses, and per-finger contact forces.
 - `trial_<id>_<method>_<object>_<outcome>.npz` — per-`mj_step` trial trace (fingertip pos/force, object pose/vel), one per trial.
 
@@ -129,6 +151,7 @@ This is *kinematic* replay — it re-plays the recorded state, it does not re-si
 | `--dashboard` | off | Launch a live pyqtgraph metrics dashboard (separate process): planning mode, proximity-based active object, scrolling fingertip→object distances, net hand→object wrench, per-finger contact normal forces, a combined RRT+IK planner solution log, and — in `contact_aware_teleop` — a **grasp-recommender panel** with per-solve statistics (status, seeds converged, solve time, γ_min, wrench feasibility, IK error) plus a rolling session summary. |
 | `--viz-only` | off | Debug mode: disables arm/hand collision physics and never calls `mj_step`. REACH and GRASP phases hold their IK solution kinematically so you can inspect the IK/RRT result without dynamics interference. |
 | `--trial-log [RUN_DIR]` | off | *(dexpilot / contact_aware_teleop)* Record the run under `logs/<RUN_DIR>/` (auto-named `<mode>_<timestamp>` if omitted): `events.jsonl` + `pose_trace.npz` + per-trial `.npz`. Replay with [`replay_pose_trace.py`](replay_pose_trace.py). See [Trial logging & replay](#trial-logging--replay). |
+| `--object BODY` | `obj_red_box` | Which pickable object body to spawn. All sweep objects are defined in `models/scene_pick_place.xml`, but only this one survives compile — the others are deleted from the `MjSpec` before compilation, so the scene contains exactly one target (run dir = one object). See [Object sweep](#object-sweep) for the available bodies and their properties. |
 | `--seed N` | none | RNG seed for object randomization — the same seed reproduces the same layout (positions and sizes). Default: fresh entropy every run. Ignored with `--no-randomize`. |
 | `--no-randomize` | off | Skip object randomization entirely: objects keep the positions, sizes, and colors authored in `models/scene_pick_place.xml`. |
 | `--camera N` | auto | *(teleop modes only)* Camera index forwarded to the built-in single-camera MediaPipe publisher. Defaults to auto-select (prefers external/USB camera at index ≥ 1). Run `python ui/mediapipe_joint_angles.py --list-cameras` to see available indices. |

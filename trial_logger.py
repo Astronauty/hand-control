@@ -69,6 +69,37 @@ GEOM_TYPE_CYLINDER = 5
 GEOM_TYPE_BOX      = 6
 
 
+def object_props_from_model(model, body_id: int, geom_id: int) -> dict:
+    """Ground-truth physical properties of a target object, read straight from the
+    compiled MuJoCo model (no mj_* calls — pure array access, so this stays import-light).
+
+    Stamped onto trial_start (see TrialRunner.start_trial) so each trial records the ACTUAL
+    simulated physics of its object — not the XML intent — letting the sweep conditions be
+    correlated with completion time / success / phase durations in parse_trials_tables.py.
+
+      mass_kg   body_mass (post-compile; for a single-geom object == the geom's mass)
+      mu        tangential (sliding) friction, geom_friction[:,0]
+      mu_tors   torsional friction, geom_friction[:,1] (held fixed across the sweep)
+      condim    contact dimensionality (6 for the pads/objects here)
+      shape     geom type id (GEOM_TYPE_BOX etc. above) — feeds the table's Shape column
+      size      geom_size (half-extents / radius, shape-dependent)
+      izz_gcm2  principal moment about the body's local z under uniform density
+                (MuJoCo computes body_inertia from mesh+mass), converted kg·m² -> g·cm².
+                Matches the paper's I_zz footnote-c definition. NOTE: this is the principal
+                z; for a non-z-symmetric object MuJoCo may reorder principal axes, so treat
+                it as "principal moment near vertical" rather than exactly world-z.
+    """
+    return {
+        'mass_kg':  float(model.body_mass[body_id]),
+        'mu':       float(model.geom_friction[geom_id, 0]),
+        'mu_tors':  float(model.geom_friction[geom_id, 1]),
+        'condim':   int(model.geom_condim[geom_id]),
+        'shape':    int(model.geom_type[geom_id]),
+        'size':     model.geom_size[geom_id].tolist(),
+        'izz_gcm2': float(model.body_inertia[body_id, 2] * 1e7),
+    }
+
+
 def rest_half_height(geom_type: int, geom_size: np.ndarray) -> float:
     """Object half-height at rest (z-offset from floor to body origin), shape-aware.
     Matches the convention already used in models/scene_pick_place.xml body `pos` z
@@ -97,6 +128,10 @@ class EventLogger:
         self._dashboard = dashboard
 
     def log(self, trial_id: int, t: float, event: str, **fields):
+        # Drop None-valued fields so optional annotations (e.g. approach_sub, which is
+        # None outside APPROACH; prev/prev_sub on the first marker) neither clutter the
+        # JSONL nor render as literal "key=None" in the dashboard's inline event log.
+        fields = {k: v for k, v in fields.items() if v is not None}
         row = {'trial_id': trial_id, 't': round(float(t), 6), 'event': event, **fields}
         self._fh.write(json.dumps(row, default=_json_default) + '\n')
         self._fh.flush()   # trials are minutes apart; flush cost is negligible
@@ -251,23 +286,56 @@ class ContactEpisodeCounter:
 
 # ── Trial state machine (Pick + Transport) ──────────────────────────────────────────────
 
+class ApproachSub:
+    """Sub-label rendered under APPROACH (dash + logged on the phase_enter event), so a
+    single phase name still conveys what the operator is doing before the grasp:
+      TELEOP    — free teleop wrist-tracking, BEFORE lock-in (before L is pressed).
+      PLANNING  — from lock-in (L) onward: BOTH the background RRT/IK plan AND the
+                  kinematic waypoint replay toward the pregrasp pose fold into this one
+                  sub-label (the operator sees the arm 'getting into position').
+    """
+    TELEOP   = 'teleop'
+    PLANNING = 'planning'
+
+
 class TrialPhase:
-    """Standardized phase names (see the pipeline stages):
-      APPROACH  — teleop, BEFORE the RRT is invoked (pre-lock-in). Not a trial phase in
-                  practice (trials start at lock-in), kept for completeness / external use.
-      PICK      — RRT + grasp controller invoked: planning, waypoint replay, and the grasp
-                  attempts all happen here (the old PLAN/REACH/GRASP collapse into PICK).
+    """Standardized phase names — the SINGLE logged vocabulary (see from_control). The
+    control loop keeps its own finer state strings ('PLAN'/'REACH'/'GRASP', plus the
+    pre-lock-in teleop period); from_control() maps those onto this set so events.jsonl
+    and the pose trace speak one language.
+
+      APPROACH  — everything BEFORE the operator commits the grasp (first Enter). Carries
+                  an ApproachSub sub-label: TELEOP (pre-lock-in teleop) or PLANNING
+                  (RRT plan + kinematic replay, i.e. control 'PLAN'/'REACH').
+      PICK      — grasp committed (control 'GRASP', entered on the first Enter): grasp
+                  posture + squeeze + lift attempts all happen here.
       TRANSPORT — object successfully picked and lifted (entered at pick_confirmed).
       PLACE     — object placed; the trial finishes.
     """
     APPROACH  = 'APPROACH'
-    PICK      = 'PICK'        # RRT plan + replay + grasp attempts all happen here
+    PICK      = 'PICK'        # grasp committed (control 'GRASP'): posture + squeeze + lift
     TRANSPORT = 'TRANSPORT'   # entered at pick_confirmed
     PLACE     = 'PLACE'       # object placed; trial done
-    # Back-compat aliases (old names) → new phases, so external log readers don't break.
-    PLAN      = 'PICK'
-    REACH     = 'PICK'
-    GRASP     = 'PICK'
+
+    @staticmethod
+    def from_control(control_phase: str, teleop_active: bool) -> tuple[str, str | None]:
+        """Map a control-loop state onto (phase, approach_sub) in the standardized
+        vocabulary. approach_sub is None for any non-APPROACH phase.
+
+        control_phase: the main loop's 'PLAN' | 'REACH' | 'GRASP' string.
+        teleop_active: True while in pre-lock-in teleop (before L) — takes precedence
+                       over control_phase, which sits at its 'REACH' init value then.
+
+        TRANSPORT / PLACE are NOT produced here: they are owned by the success state
+        machine (TrialRunner), which advances the trial's own `phase` past PICK on
+        pick_confirmed / arrival. from_control only classifies the pre-grasp control
+        states, so it never regresses a lifted object back to APPROACH/PICK."""
+        if teleop_active:
+            return TrialPhase.APPROACH, ApproachSub.TELEOP
+        if control_phase in ('PLAN', 'REACH'):
+            return TrialPhase.APPROACH, ApproachSub.PLANNING
+        # 'GRASP' (first Enter committed the grasp) and any fallthrough → PICK
+        return TrialPhase.PICK, None
 
 
 class TrialOutcome:
@@ -284,7 +352,9 @@ class TrialState:
     method: str            # 'dexpilot' | 'contact_aware_teleop'
     object_name: str
     t_start: float
-    phase: str = TrialPhase.PICK   # trials start at lock-in, i.e. once RRT is invoked
+    phase: str = TrialPhase.APPROACH   # trials start at lock-in (control 'PLAN'), which
+                                        # is APPROACH/planning; advances to PICK when the
+                                        # operator commits the grasp (control 'GRASP')
     attempt_id: int = 0
     attempt_active: bool = False   # trigger condition currently engaged (pinch/squeeze)
     dwell_t0: float | None = None  # sim-time the current continuous lift began
@@ -325,14 +395,22 @@ class TrialRunner:
     # -- lifecycle -----------------------------------------------------------------
 
     def start_trial(self, trial_id: int, method: str, object_name: str,
-                     t_now: float) -> TrialState:
+                     t_now: float, props: dict | None = None) -> TrialState:
+        """props: optional physical-property snapshot of the target object (mass, mu,
+        I_zz, ...), stamped onto the trial_start event so the object's ground-truth
+        physics can be correlated with completion time / success / phase offline. Built
+        with object_props_from_model() at the call site; None keeps the old schema."""
         self.contact_counter.reset()
         self.trace = TraceBuffer()
         state = TrialState(trial_id=trial_id, method=method, object_name=object_name,
                             t_start=t_now)
         self.events.log(trial_id, t_now, 'trial_start', method=method,
-                         object=object_name)
-        self.events.log(trial_id, t_now, 'phase_enter', phase=TrialPhase.PICK)
+                         object=object_name, **(props or {}))
+        # No phase_enter here: a trial starts at lock-in (control 'PLAN') → APPROACH,
+        # and the caller's marker site already emits that transition from control_phase
+        # (teleop→planning→PICK). TrialState.phase defaults to APPROACH to match, so the
+        # trial machine's own phase never regresses. Emitting here too would duplicate
+        # the marker site's APPROACH row on the lock-in step.
         return state
 
     def check_timeout(self, state: TrialState, t_now: float) -> bool:
@@ -426,7 +504,11 @@ class TrialRunner:
         Returns True if the trial reached arrival (success) this step.
         """
         if state.phase not in (TrialPhase.PICK, TrialPhase.TRANSPORT):
-            self.set_phase(state, t_now, TrialPhase.PICK)
+            # Enter PICK SILENTLY: the caller's marker site owns the APPROACH↔PICK
+            # boundary (it logs PICK from control_phase 'GRASP' on the same step), so
+            # logging here too would duplicate that row. This machine only *logs*
+            # PICK→TRANSPORT and TRANSPORT→{PICK on drop, PLACE on arrival}.
+            state.phase = TrialPhase.PICK
 
         if state.phase == TrialPhase.PICK:
             if trigger_fired and not state.attempt_active:
@@ -458,15 +540,6 @@ class TrialRunner:
                     state.dwell_t0 = None   # reset dwell, SAME attempt continues
 
         elif state.phase == TrialPhase.TRANSPORT:
-            if height_above_rest <= LIFT_HEIGHT_M:
-                state.n_drops += 1
-                self.events.log(state.trial_id, t_now, 'drop', count=state.n_drops)
-                state.attempt_active = False
-                state.dwell_t0 = None
-                state.pick_confirmed = False
-                self.set_phase(state, t_now, TrialPhase.PICK)
-                return False
-
             if (place_xy_offset is not None and object_speed is not None
                     and place_xy_offset <= place_marker_half_extent
                     and object_speed < ARRIVAL_SPEED_M_S):
@@ -476,6 +549,16 @@ class TrialRunner:
                                  xy_offset_m=round(place_xy_offset, 4))
                 state.outcome = TrialOutcome.SUCCESS
                 return True
+
+
+            if height_above_rest <= LIFT_HEIGHT_M:
+                state.n_drops += 1
+                self.events.log(state.trial_id, t_now, 'drop', count=state.n_drops)
+                state.attempt_active = False
+                state.dwell_t0 = None
+                state.pick_confirmed = False
+                self.set_phase(state, t_now, TrialPhase.PICK)
+                return False
 
         return False
 

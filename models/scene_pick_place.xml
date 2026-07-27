@@ -35,7 +35,33 @@
       <site name="obj_red_box_c1" pos="-0.040 0 0" quat="1 0 0 0"/>
       <site name="obj_red_box_c2" pos=" 0.040 0 0" quat="0 0 1 0"/>
     </body>
-    
+
+    <!-- Object-property sweep: two SIBLING cubes of the exact same geometry as
+         obj_red_box (Object 1, the baseline above), varying ONE physical property each
+         relative to it. Only ONE object body survives compile: the loader deletes the
+         non-selected ones via MjSpec.delete() before spec.compile() (see the --object
+         flag in kinova_leap_pick_place.py), so nq stays 30 and the single-object
+         keyframes remain valid. condim=6 and the torsional/rolling friction terms are
+         held FIXED across all three so mu and mass are the only variables.
+           Object 1  obj_red_box    mass=0.25  mu=2.0   (baseline)
+           Object 2  obj_box_lowmu  mass=0.25  mu=1.2   (0.6x friction)
+           Object 3  obj_box_light  mass=0.15  mu=2.0   (0.6x mass) -->
+    <body name="obj_box_lowmu" pos="0.60 0.42 0.040">
+      <freejoint/>
+      <geom name="obj_box_lowmu_geom" type="box" size="0.040 0.040 0.040"
+        rgba="0.85 0.55 0.15 1" mass="0.25" friction="1.2 0.05 0.005" condim="6"/>
+      <site name="obj_box_lowmu_c1" pos="-0.040 0 0" quat="1 0 0 0"/>
+      <site name="obj_box_lowmu_c2" pos=" 0.040 0 0" quat="0 0 1 0"/>
+    </body>
+
+    <body name="obj_box_light" pos="0.60 0.42 0.040">
+      <freejoint/>
+      <geom name="obj_box_light_geom" type="box" size="0.040 0.040 0.040"
+        rgba="0.85 0.15 0.55 1" mass="0.15" friction="2.0 0.05 0.005" condim="6"/>
+      <site name="obj_box_light_c1" pos="-0.040 0 0" quat="1 0 0 0"/>
+      <site name="obj_box_light_c2" pos=" 0.040 0 0" quat="0 0 1 0"/>
+    </body>
+
 
 
     <!-- BLUE category: cylinder

@@ -39,7 +39,8 @@ from grasp_control.constrained_ik import configure_sqp
 from live_dashboard import Dashboard
 from trial_logger import (EventLogger, TrialRunner, TrialPhase, TraceBuffer,
                           DexPilotAttemptTrigger, ContactAwareAttemptTrigger,
-                          rest_half_height, LIFT_HEIGHT_M, TRIAL_TIMEOUT_S)
+                          rest_half_height, object_props_from_model,
+                          LIFT_HEIGHT_M, TRIAL_TIMEOUT_S)
 
 # NLP grasp recommender (contact_aware_teleop mode). simulation/ hosts the planner;
 # _geom_normal_np gives the outward surface normal used to build inward contact frames.
@@ -289,6 +290,8 @@ def make_key_callback(key_queue):
 _RANDOMIZE_OBJ_INFO = [
     # (body_name, geom_name, base_rgb) — pure R/G/B, no colour jitter
     ('obj_red_box',        'obj_red_box_geom',        [1.0, 0.0, 0.0]),
+    ('obj_box_lowmu',      'obj_box_lowmu_geom',      [0.85, 0.55, 0.15]),
+    ('obj_box_light',      'obj_box_light_geom',      [0.85, 0.15, 0.55]),
     ('obj_red_sphere',     'obj_red_sphere_geom',     [1.0, 0.0, 0.0]),
     ('obj_blue_cylinder',  'obj_blue_cylinder_geom',  [0.0, 0.0, 1.0]),
     ('obj_blue_capsule',   'obj_blue_capsule_geom',   [0.0, 0.0, 1.0]),
@@ -506,6 +509,15 @@ if __name__ == "__main__":
              "mid-trial target switch — see trial_logger.py for the full state "
              "machine. Omit the flag entirely (default) to disable trial logging: "
              "the tool then behaves exactly as without this flag.")
+    _arg_parser.add_argument(
+        '--object', default='obj_red_box',
+        help="Which pickable object body to spawn for this run. All sweep objects are "
+             "defined in scene_pick_place.xml, but only this one survives compile — the "
+             "others are deleted from the spec before compilation (MjSpec.delete), so the "
+             "scene contains exactly one target. Choices are the obj_* body names, e.g. "
+             "obj_red_box (Object 1, baseline), obj_box_lowmu (Object 2, 0.6x friction), "
+             "obj_box_light (Object 3, 0.6x mass). Run dir = one object, so trial logs "
+             "and parse_trials_tables.py pool cleanly per condition.")
     args = _arg_parser.parse_args()
     # In-code defaults for behaviours that used to be always-True CLI flags. These
     # never had a way to turn them OFF from the command line, so they only cluttered
@@ -588,7 +600,37 @@ if __name__ == "__main__":
         print(f"[trial-log] mode={args.mode}: logging pose_trace + phase markers only "
               "(no trial success state machine — no attempt trigger for this mode).")
 
-    model = mj.MjModel.from_xml_path('models/scene_pick_place.xml')
+    # Load as an editable spec so we can prune the scene to the single --object body
+    # BEFORE compiling. Deleting the non-selected sweep objects (vs. parking them
+    # off-scene) keeps them out of the compiled model entirely: no stray geoms in the
+    # proximity argmin, no extra contact pairs, and nq stays 30 so the single-object
+    # <keyframe> poses remain valid. Sweep objects share the 'obj_box_' prefix or are
+    # the baseline obj_red_box; all other bodies (robot, markers, mocap) are untouched.
+    _spec = mj.MjSpec.from_file('models/scene_pick_place.xml')
+    _sweep_bodies = [b for b in _spec.bodies
+                     if b.name == 'obj_red_box' or b.name.startswith('obj_box_')]
+    _sweep_names = {b.name for b in _sweep_bodies}
+    if args.object not in _sweep_names:
+        sys.exit(f"--object {args.object!r} is not a pickable object body in the scene; "
+                 f"choose one of: {', '.join(sorted(_sweep_names))}")
+    _to_delete = [b for b in _sweep_bodies if b.name != args.object]
+    if _to_delete:
+        # The <keyframe> poses are 30-vec qpos (23 robot + 7 object) sized for the
+        # single-object scene; they must be dropped BEFORE deleting any object body.
+        # Deleting a body while keyframes still reference the old qpos layout corrupts
+        # the spec's keyframe registry ("repeated name 'pose_00'" on compile), so keys
+        # go first. These keyframes are autonomous-mode test poses only (not used by the
+        # trial/teleop pipeline), so dropping them for a swept run is harmless. To keep
+        # them, snapshot k.qpos, delete, then spec.add_key() them back after the body
+        # deletes — they stay valid since every sweep cube shares obj_red_box's geometry.
+        for _k in list(_spec.keys):
+            _spec.delete(_k)
+        for _b in _to_delete:
+            _spec.delete(_b)
+    print(f"[scene] spawning object '{args.object}' "
+          f"(pruned {len(_to_delete)} other sweep object(s)"
+          f"{'; dropped test keyframes' if _to_delete else ''})")
+    model = _spec.compile()
     data  = mj.MjData(model)
 
     N_ROBOT = 23  # joint_1..7 (Gen3 arm) + 16 LEAP finger joints; object joints follow
@@ -672,12 +714,19 @@ if __name__ == "__main__":
     # rather than a fixed lookup.
     object_defs = [
         ({'index': 'obj_red_box_c2',        'thumb': 'obj_red_box_c1'},        'obj_red_box'),
+        ({'index': 'obj_box_lowmu_c2',      'thumb': 'obj_box_lowmu_c1'},      'obj_box_lowmu'),
+        ({'index': 'obj_box_light_c2',      'thumb': 'obj_box_light_c1'},      'obj_box_light'),
         ({'index': 'obj_red_sphere_c2',     'thumb': 'obj_red_sphere_c1'},     'obj_red_sphere'),
         ({'index': 'obj_blue_cylinder_c2',  'thumb': 'obj_blue_cylinder_c1'},  'obj_blue_cylinder'),
         ({'index': 'obj_blue_capsule_c2',   'thumb': 'obj_blue_capsule_c1'},   'obj_blue_capsule'),
         ({'index': 'obj_green_box_c2',      'thumb': 'obj_green_box_c1'},      'obj_green_box'),
         ({'index': 'obj_green_cylinder_c2', 'thumb': 'obj_green_cylinder_c1'}, 'obj_green_cylinder'),
     ]
+    # Keep only object defs whose body actually survived the spec prune (deleted sweep
+    # objects — and any commented-out categories — resolve to id -1). In practice this
+    # leaves exactly the one --object body for a swept run.
+    object_defs = [(cs, bn) for (cs, bn) in object_defs
+                   if mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, bn) >= 0]
     objects = []
     for contact_sites, body_name in object_defs:
         missing = [f for f in FINGER_SET if f not in contact_sites]
@@ -721,12 +770,14 @@ if __name__ == "__main__":
                 or _bname in ('leap_palm', 'bracelet_link')):
             _robot_geom_names.append(_gname)
     # 'floor' is the ground plane — keep every checked hand geom above it (both IK and RRT).
+    # Object geoms the IK/RRT keep clear of. Built from the objects that ACTUALLY survived
+    # the spec prune (each obj's live geom name) plus the floor, rather than a hardcoded
+    # list — so it always names exactly the spawned object(s) and never references a
+    # deleted/commented-out geom. (The spawned --object's own geom is included; the
+    # active-finger 0mm-clearance exemption vs the target is applied separately downstream.)
     _OBJ_GEOM_NAMES = [
-        'obj_red_box_geom', 'obj_red_sphere_geom',
-        'obj_blue_cylinder_geom', 'obj_blue_capsule_geom',
-        'obj_green_box_geom', 'obj_green_cylinder_geom',
-        'floor',
-    ]
+        mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, o['id_geom']) for o in objects
+    ] + ['floor']
 
     # Tier-1 collision subset for the grasp RECOMMENDER's NLP (contact_aware_teleop).
     # The recommender historically ran with NO arm/object collision (only the middle/ring
@@ -1224,11 +1275,9 @@ if __name__ == "__main__":
     # proximal links / wrist sweep straight through objects unnoticed. The historical reason
     # for tips-only (the active fingers legitimately pass near the target at the goal) is now
     # handled by the per-plan target-aware pair-clearance overrides below.
-    OBJ_BODIES = [
-        'obj_red_box', 'obj_red_sphere',
-        'obj_blue_cylinder', 'obj_blue_capsule',
-        'obj_green_box', 'obj_green_cylinder',
-    ]
+    # Object bodies for the RRT to keep clear of — the ones that survived the spec prune
+    # (== the spawned --object), not a hardcoded list that could name deleted bodies.
+    OBJ_BODIES = [o['name'] for o in objects]
     planner = RRTPlanner(model, _robot_geom_names, OBJ_BODIES,
                          extra_obj_geom_names=['floor'], n_robot=N_ROBOT,
                          n_plan=7,            # plan only the 7 arm joints; finger DOF fixed at goal
@@ -2386,7 +2435,7 @@ if __name__ == "__main__":
 
     # Objects the NLP recommender supports (box-like first, per the plan). The planner
     # is shape-aware but validated on boxes; extend this set as other shapes are proven.
-    _CAT_SUPPORTED = {'obj_red_box', 'obj_green_box'}
+    _CAT_SUPPORTED = {'obj_red_box', 'obj_green_box', 'obj_box_lowmu', 'obj_box_light'}
 
     # Actuated-joint qpos indices (planner.solve wants q_ref as the nu-length actuated
     # vector, in actuator order) — same as GraspPlanner3D._act_idx.
@@ -3358,9 +3407,11 @@ if __name__ == "__main__":
                                 _trial_runner.abandon_trial(_trial_state, data.time)
                             _trial_id = (_trial_state.trial_id + 1
                                         if _trial_state is not None else 1)
+                            _tobj = objects[_prox_idx]
                             _trial_state = _trial_runner.start_trial(
-                                _trial_id, args.mode, objects[_prox_idx]['name'],
-                                data.time)
+                                _trial_id, args.mode, _tobj['name'], data.time,
+                                props=object_props_from_model(
+                                    model, _tobj['id_body'], _tobj['id_geom']))
                             if _cat_trigger is not None:
                                 _cat_trigger.reset()
                     elif _k == 'bspheres':
@@ -3780,8 +3831,11 @@ if __name__ == "__main__":
                                 _trial_runner.abandon_trial(_trial_state, data.time)
                             _trial_id = (_trial_state.trial_id + 1
                                         if _trial_state is not None else 1)
+                            _tobj = objects[0]
                             _trial_state = _trial_runner.start_trial(
-                                _trial_id, 'dexpilot', objects[0]['name'], data.time)
+                                _trial_id, 'dexpilot', _tobj['name'], data.time,
+                                props=object_props_from_model(
+                                    model, _tobj['id_body'], _tobj['id_geom']))
                             _dp_trigger.reset()
                     elif _k == 'calib_orient':
                         # Hold hand to MATCH the robot wrist, then press 9 to
@@ -4143,9 +4197,11 @@ if __name__ == "__main__":
                         if _trial_runner is not None:
                             _trial_id = (_trial_state.trial_id + 1
                                          if _trial_state is not None else 1)
+                            _tobj = objects[active_idx]
                             _trial_state = _trial_runner.start_trial(
-                                _trial_id, args.mode, objects[active_idx]['name'],
-                                data.time)
+                                _trial_id, args.mode, _tobj['name'], data.time,
+                                props=object_props_from_model(
+                                    model, _tobj['id_body'], _tobj['id_geom']))
                             if _dp_trigger is not None:
                                 _dp_trigger.reset()
                         print(f"\r\n[auto-rec] LOCK-IN {objects[active_idx]['name']} "
@@ -4715,9 +4771,11 @@ if __name__ == "__main__":
                             if _trial_runner is not None:
                                 _trial_id = (_trial_state.trial_id + 1
                                             if _trial_state is not None else 1)
+                                _tobj = objects[obj_i]
                                 _trial_state = _trial_runner.start_trial(
-                                    _trial_id, args.mode, objects[obj_i]['name'],
-                                    data.time)
+                                    _trial_id, args.mode, _tobj['name'], data.time,
+                                    props=object_props_from_model(
+                                        model, _tobj['id_body'], _tobj['id_geom']))
                                 if _dp_trigger is not None:
                                     _dp_trigger.reset()
                         print(f"\r\n[Control] → {targets[active_tgt]['label']}")
@@ -4834,7 +4892,7 @@ if __name__ == "__main__":
                     data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
                     data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
                 if _kf_loaded_name is not None:
-                    _bid_kf = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'obj_red_box')
+                    _bid_kf = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, args.object)
                     print(f"\r\n[Control] KEYFRAME {_kf_loaded_name} "
                           f"({_kf_idx + 1}/{model.nkey}) loaded — box at "
                           f"{np.array2string(data.xpos[_bid_kf], precision=3)}, arm+hand at "
