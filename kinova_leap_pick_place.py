@@ -3920,7 +3920,10 @@ if __name__ == "__main__":
                     _hh_dp = _trial_rest_hh[0]
                     _height_above_rest_dp = (float(data.geom_xpos[_dp_obj['id_geom']][2])
                                              - _hh_dp)
-                    _d_s1_dp = _dexpilot_ctrl.retargeter.last_d_s1
+                    # Median-filtered d_s1 so the trial trigger matches the DEBOUNCED
+                    # pinch the fingers actually act on (falls back to raw if absent).
+                    _rtg = _dexpilot_ctrl.retargeter
+                    _d_s1_dp = getattr(_rtg, 'last_d_s1_filt', _rtg.last_d_s1)
                     _touching_dp = _dp_obj['id_geom'] in {
                         (c.geom2 if c.geom1 in _HAND_GIDS else c.geom1)
                         for c in data.contact[:data.ncon]
@@ -5170,8 +5173,9 @@ if __name__ == "__main__":
                     _hh = _trial_rest_hh[active_idx]
                     _height_above_rest = float(data.geom_xpos[obj['id_geom']][2]) - _hh
                     if _dp_trigger is not None:
-                        _d_s1 = (_dexpilot_ctrl.retargeter.last_d_s1
-                                 if _dexpilot_ctrl is not None else [float('inf')] * 3)
+                        _d_s1 = ([float('inf')] * 3 if _dexpilot_ctrl is None
+                                 else getattr(_dexpilot_ctrl.retargeter, 'last_d_s1_filt',
+                                              _dexpilot_ctrl.retargeter.last_d_s1))
                         _touching = obj['id_geom'] in {
                             (c.geom2 if c.geom1 in _HAND_GIDS else c.geom1)
                             for c in data.contact[:data.ncon]
