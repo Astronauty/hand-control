@@ -3276,7 +3276,14 @@ if __name__ == "__main__":
                                  and _trial_state.phase in (TrialPhase.TRANSPORT,
                                                             TrialPhase.PLACE))
                 _std_key = (_std_phase, _approach_sub)
-                if _std_key != _prev_control_phase and not _sm_past_pick:
+                # This marker owns ONLY the APPROACH sub-label transitions (teleop↔planning).
+                # PICK/TRANSPORT/PLACE are logged by the trial state machine
+                # (TrialRunner.set_phase / step_pick_or_transport), which is the single owner
+                # for all modes — dexpilot has no 'GRASP' control_phase, so the marker could
+                # never log its forward PICK anyway. Gating to APPROACH here avoids a
+                # duplicate PICK row in contact_aware (where the machine now logs PICK too).
+                if (_std_phase == TrialPhase.APPROACH
+                        and _std_key != _prev_control_phase and not _sm_past_pick):
                     _tid = _trial_state.trial_id if _trial_state is not None else 0
                     _prev_std, _prev_sub = (_prev_control_phase
                                             if _prev_control_phase is not None
@@ -5279,7 +5286,33 @@ if __name__ == "__main__":
                                                            # next trial_start replaces it
                 _tid  = _trial_state.trial_id
                 _tnow = data.time
-                if control_phase in ('PLAN', 'REACH'):
+                if (control_phase in ('PLAN', 'REACH')
+                        and _trial_state.phase == TrialPhase.TRANSPORT):
+                    # RELEASED WHILE CARRYING (control went GRASP→REACH on release) but the
+                    # trial machine is still in TRANSPORT: the object may be settling into
+                    # the place area. Do NOT regress the trial to APPROACH — keep driving
+                    # step_pick_or_transport so the SET-IN-PLACE arrival can fire as the box
+                    # comes to rest in the footprint (a released-in-target placement), or a
+                    # drop is counted if it settles outside. trigger_active=False (grasp
+                    # released); the arrival branch ignores the trigger.
+                    _hh = _trial_rest_hh[active_idx]
+                    _height_above_rest = float(data.geom_xpos[obj['id_geom']][2]) - _hh
+                    _sid = _trial_place_sid.get(active_idx, -1)
+                    _xy_off = _spd = None
+                    if _sid >= 0:
+                        _xy_off = float(np.linalg.norm(
+                            data.geom_xpos[obj['id_geom']][:2]
+                            - data.site_xpos[_sid][:2]))
+                        _dofadr = _trial_dofadr[active_idx]
+                        _spd = float(np.linalg.norm(data.qvel[_dofadr:_dofadr + 3]))
+                    _trial_runner.step_pick_or_transport(
+                        _trial_state, _tnow, trigger_fired=False, trigger_active=False,
+                        height_above_rest=_height_above_rest,
+                        place_xy_offset=_xy_off, object_speed=_spd)
+                    if (_trial_state.outcome is None
+                            and _trial_runner.check_timeout(_trial_state, _tnow)):
+                        _trial_runner.end_trial(_trial_state, _tnow)
+                elif control_phase in ('PLAN', 'REACH'):
                     # Standardized phase: PLAN/REACH both classify as APPROACH/planning.
                     # set_phase logs a phase_enter only on an actual change, so this stays
                     # a single APPROACH marker across the whole plan+replay span (the

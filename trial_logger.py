@@ -383,6 +383,8 @@ class TrialState:
     attempt_active: bool = False   # trigger condition currently engaged (pinch/squeeze)
     dwell_t0: float | None = None  # sim-time the current continuous lift began
     pick_confirmed: bool = False
+    pick_logged: bool = False   # forward phase_enter PICK emitted for the current PICK entry
+                                 # (reset on a drop so a re-pick logs PICK again)
     n_inadvertent_contacts: int = 0
     n_drops: int = 0
     max_slip_mm: float = 0.0       # diagnostic only, does not gate drop counting
@@ -543,14 +545,23 @@ class TrialRunner:
         Returns True if the trial reached arrival (success) this step.
         """
         if state.phase not in (TrialPhase.PICK, TrialPhase.TRANSPORT):
-            # Enter PICK SILENTLY: the caller's marker site owns the APPROACH↔PICK
-            # boundary (it logs PICK from control_phase 'GRASP' on the same step), so
-            # logging here too would duplicate that row. This machine only *logs*
-            # PICK→TRANSPORT and TRANSPORT→{PICK on drop, PLACE on arrival}.
+            # Advance internal state to PICK SILENTLY (needed for the attempt logic below),
+            # but do NOT log phase_enter here: this method is called every step from t=0 in
+            # dexpilot, so logging on first-call would stamp PICK at APPROACH before any
+            # grasp. The forward PICK is logged instead on the first attempt_start (below) —
+            # the meaningful "grasp attempt begins" moment, correct for BOTH modes.
             state.phase = TrialPhase.PICK
 
         if state.phase == TrialPhase.PICK:
             if trigger_fired and not state.attempt_active:
+                # Log the forward APPROACH→PICK entry on the FIRST attempt (idempotent via
+                # set_phase; state.phase is already PICK so we force the log with a small
+                # helper). Single owner of PICK logging for all modes — the control-loop
+                # marker no longer logs PICK (it never could for dexpilot: no 'GRASP').
+                if not state.pick_logged:
+                    state.pick_logged = True
+                    self.events.log(state.trial_id, t_now, 'phase_enter',
+                                     phase=TrialPhase.PICK)
                 state.attempt_id += 1
                 state.attempt_active = True
                 state.dwell_t0 = None
@@ -615,7 +626,10 @@ class TrialRunner:
                 state.attempt_active = False
                 state.dwell_t0 = None
                 state.pick_confirmed = False
+                # set_phase logs the TRANSPORT→PICK phase_enter itself; mark pick_logged so
+                # the next attempt_start doesn't emit a second PICK for this same entry.
                 self.set_phase(state, t_now, TrialPhase.PICK)
+                state.pick_logged = True
                 return False
 
         return False
