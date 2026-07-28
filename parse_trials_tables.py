@@ -10,10 +10,12 @@ two LaTeX tables:
 
 WHAT IS AND ISN'T COMPUTABLE FROM THE CURRENT LOGS
 --------------------------------------------------
-The ENTIRE analysis is restricted to VALID trials: a trial counts iff it confirmed a pick
-AND was not abandoned (operator reset / target switch). Abandoned and never-picked trials
-are dropped up front, so they never dilute any metric's denominator. All metrics are
-computed directly from events.jsonl (no trace files needed), over that valid set:
+The ENTIRE analysis is restricted to VALID trials: a trial counts iff it reached a terminal
+state (a trial_end — success or timeout — or a successful arrival) AND was not abandoned
+(operator reset / target switch). A timeout that never grasped the object IS valid: it is a
+genuine task failure and counts against end-to-end. Only abandoned trials and unterminated
+trials (run killed mid-trial) are dropped. All metrics are computed directly from
+events.jsonl (no trace files needed), over that valid set:
   * completion time     — trial_end.duration_s (WALL-CLOCK: the operator's real elapsed
                           time. Sim runs slower than real-time, so the sim-time span is
                           logged separately as duration_sim_s and is NOT what's reported),
@@ -132,10 +134,12 @@ def trial_summary(evs: list[dict]) -> dict | None:
 def collect(run_dirs):
     """Pool VALID trials across run dirs into records keyed by (method, object).
 
-    A trial is VALID iff it confirmed a pick AND was not abandoned (operator reset / target
-    switch). Invalid trials are excluded from the ENTIRE analysis — every metric (completion
-    time, drops, end-to-end) is computed only over the valid set, so a run's aborted/never-
-    grasped attempts never dilute the denominators. Each record:
+    A trial is VALID iff it reached a terminal state (trial_end or a successful arrival) and
+    was NOT abandoned (operator reset / target switch). A trial that timed out without ever
+    confirming a pick IS valid — it is a genuine TASK FAILURE (the operator could not grasp
+    the object within the time budget) and counts against end-to-end, not silently excluded.
+    Only abandoned trials (operator gave up / switched target) and unterminated trials (run
+    killed mid-trial — trial_summary returns None) are excluded. Each record:
       duration_s, n_drops(int), success(bool), + the object property fields.
     Everything is event-based (no trace files)."""
     records = defaultdict(list)
@@ -145,9 +149,9 @@ def collect(run_dirs):
         for tid, evs in group_trials(rows).items():
             s = trial_summary(evs)
             if s is None:
-                continue   # trial never ended / never placed; not scorable
-            if s['outcome'] == 'abandoned' or not s['pick_confirmed']:
-                continue   # invalid: abandoned or never picked — excluded from ALL metrics
+                continue   # trial never reached a terminal state (run killed mid-trial)
+            if s['outcome'] == 'abandoned':
+                continue   # excluded: operator reset / target switch (not a real attempt)
             records[(s['method'], s['object'])].append({
                 'duration_s': s['duration_s'],
                 'n_drops':   s.get('n_drops', 0) or 0,
@@ -275,7 +279,7 @@ def build_time_table(records, methods, objects, method_labels):
 
 
 def build_success_table(records, methods, objects, method_labels):
-    # `records` already holds ONLY valid trials (picked & not abandoned; see collect), so
+    # `records` already holds ONLY valid trials (terminated & not abandoned; see collect), so
     # every count here is over the valid set. 'Successful pick' is trivially n/n and omitted.
     def stage_counts(m, o):
         recs = records.get((m, o), [])
@@ -286,10 +290,11 @@ def build_success_table(records, methods, objects, method_labels):
 
     lines = [
         r'\begin{table}[t]', r'  \centering', r'  \begin{threeparttable}',
-        r'    \caption{Subtask outcomes over VALID trials (a trial is valid iff it confirmed '
-        r'a pick and was not abandoned). Transport drops is the total number of drop events '
-        r'over the valid trials ($n$), lower is better; end-to-end is successes/valid, higher '
-        r'is better. Collision-avoidance is omitted for teleop (not measured in the logs).}',
+        r'    \caption{Subtask outcomes over VALID trials (a trial is valid iff it reached a '
+        r'terminal state and was not abandoned; a timeout without a successful pick counts as '
+        r'a task failure). Transport drops is the total number of drop events over the valid '
+        r'trials ($n$), lower is better; end-to-end is successes/valid, higher is better. '
+        r'Collision-avoidance is omitted for teleop (not measured in the logs).}',
         r'    \label{tab:subtask_success}',
         r'    \begin{tabular}{ll' + 'c' * len(objects) + '}',
         r'      \toprule',
@@ -323,8 +328,9 @@ def build_success_table(records, methods, objects, method_labels):
         r'      \item[a] Total \texttt{drop} events (object fell out of the grasp during '
         r'carry) over the valid trials. $n$ is the valid-trial count; lower is better.',
         r'      \item[b] Trials reaching the place site (\texttt{outcome=success}) over the '
-        r'valid trials. Valid = confirmed a pick and not abandoned (operator reset / target '
-        r'switch); abandoned and never-picked trials are excluded from the entire analysis.',
+        r'valid trials. Valid = reached a terminal state (success or timeout) and not '
+        r'abandoned; a timeout without a successful grasp counts as a task failure. Only '
+        r'abandoned (operator reset / target switch) and unterminated trials are excluded.',
         r'    \end{tablenotes}',
         r'  \end{threeparttable}',
         r'\end{table}',
@@ -357,7 +363,7 @@ def emit_tables(dirs, args, heading=None):
     if heading:
         print(f'# === {heading} ===', file=sys.stderr)
     print('# VALID trials pooled per (method, object)  '
-          '[valid = picked & not abandoned]:', file=sys.stderr)
+          '[valid = terminated & not abandoned]:', file=sys.stderr)
     for (m, o), recs in sorted(records.items()):
         n = len(recs)
         ndrops = sum(r['n_drops'] for r in recs)
