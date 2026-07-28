@@ -710,6 +710,41 @@ if __name__ == "__main__":
     # final hard clamp so no single frame can ever integrate a runaway solve.
     JOG_LAM_MIN     = 0.02  # rad·m base DLS damping (peak arm rate ~0.2/(2*sqrt(0.02))≈0.7 rad/s)
     JOG_QDOT_MAX    = 2.0   # rad/s hard cap on the mapped arm joint rate (safety backstop)
+    # --- Arm velocity-injection SAFETY NETS (guardrails, NOT dynamics tuning) ---------
+    # The dexpilot/pre-lock-in drive injects _qdot_arm straight into data.qvel[:7] and
+    # runs a stiff (wn=100) PD with the arm's model damping zeroed (matching the GRASP
+    # carry). That combination is a stiff, effectively UNDAMPED spring in free-space
+    # tracking (nothing to dissipate ringing), which occasionally cascades into a qacc
+    # explosion (observed peak |qacc|~7e9, |qvel|~1e7, arm teleporting through geometry,
+    # ncon 4->300, then MuJoCo BADQACC-resets). These two guards CAP the runaway without
+    # touching the REACH/GRASP feel: both thresholds sit far outside the normal operating
+    # envelope (|qdot|<=JOG_QDOT_MAX=2, substep dt=timestep=2ms), so they are no-ops in
+    # normal tracking and only fire once the state has already begun diverging.
+    #   #1 QVEL clamp: bound the injected arm velocity STATE every substep, right before
+    #      mj_step, so a diverging spring can't integrate an ever-growing qvel into a
+    #      position teleport. 4 rad/s = 2x the commanded ceiling -> never touches normal.
+    #   #3 dt cap: the real-time catch-up runs _n_sub physics steps of model.opt.timestep;
+    #      a stiff undamped spring diverges once wn*dt approaches 2, so keep every substep
+    #      well inside that limit. timestep is already 2ms (wn*dt=0.2), but bound _n_sub so
+    #      a slow frame can't drive the arm far open-loop between control corrections.
+    QVEL_ARM_MAX        = 4.0   # rad/s hard clamp on data.qvel[:7] per substep (safety net)
+    # ROOT-CAUSE gate for the qacc explosion. Trace analysis showed 95-98% of spikes fire
+    # with the arm at the all-zeros qpos0 straight-up pose (an EXACT pinch-site Jacobian
+    # singularity, sigma_min~0) and near-zero arm velocity — i.e. NOT ringing, but the
+    # stiff undamped PD driven from a singular pose toward the distant home target after an
+    # out-of-band mj_resetData (viewer Backspace / BADQACC auto-reset, both on other
+    # threads). Below this sigma_min the drive FREEZES the arm and skips the injection
+    # substeps for the frame (mirrors the Backspace key-handler's _dp_reset_frame path),
+    # breaking the reset->spike->BADQACC-reset cascade at its source. Matches the DLS
+    # damping-onset threshold JOG_SING_EPS so the gate trips exactly where the solve would
+    # start amplifying by ~1/lam.
+    DP_SING_FREEZE_EPS  = 0.02  # rad·m sigma_min below which the arm drive freezes (== JOG_SING_EPS)
+    # Ceiling on the open-loop sim-time advanced per control iteration (substeps run at
+    # the fixed model.opt.timestep, so each mj_step is already stable at wn*dt=0.2; this
+    # only bounds how FAR the zero-damped arm rides open-loop between control corrections).
+    # 10ms / 2ms = 5 = _DP_MAX_SUBSTEPS, so at the current cap this is a NO-OP; it only
+    # bites if _DP_MAX_SUBSTEPS is later raised, keeping the catch-up burst bounded.
+    DP_SUBSTEP_DT_MAX   = 0.010 # s  ceiling on effective open-loop sim-time per iteration
     # contact_aware_teleop post-grasp wrist tracking: P-gain from wrist pose error to a
     # Cartesian velocity command (1/s). The command is then slew-limited to the NCF accel
     # budget and DLS-mapped to joint rates, so this only sets how briskly the wrist closes
@@ -1032,10 +1067,13 @@ if __name__ == "__main__":
             dash.push({'type': 'trial_time', 'remaining': None,
                        'elapsed': None, 'elapsed_wall': None, 'trial_id': None})
             return
-        elapsed = t_now - state.t_start                       # sim-time (drives the timeout)
+        elapsed = t_now - state.t_start                       # sim-time elapsed (reference)
         elapsed_wall = time.time() - state.t_start_wall       # operator's real elapsed time
         dash.push({'type': 'trial_time',
-                   'remaining': TRIAL_TIMEOUT_S - elapsed,     # sim-time budget countdown
+                   # Countdown is WALL-CLOCK now, matching check_timeout (the trial ends after
+                   # TRIAL_TIMEOUT_S of REAL time) so the shown timer agrees with the actual
+                   # timeout and with duration_s.
+                   'remaining': TRIAL_TIMEOUT_S - elapsed_wall,
                    'elapsed': elapsed,                         # sim-time elapsed (reference)
                    'elapsed_wall': elapsed_wall,              # WALL elapsed — the experiment clock
                    'trial_id': state.trial_id})
@@ -3010,17 +3048,22 @@ if __name__ == "__main__":
         v_lin = np.clip(v_lin, -JOG_VEL, JOG_VEL)          # cap peak speed
         jog_v = jog_v + np.clip(v_lin - jog_v, -dv_max, dv_max)
         jog_w = jog_w + np.clip(v_ang - jog_w, -dv_max, dv_max)
+        # Always compute the pinch-site Jacobian's smallest singular value, even when
+        # holding still — the caller uses it to GATE the injection loop away from singular
+        # poses (the all-zeros qpos0 an out-of-band mj_resetData snaps to is an exact
+        # pinch-site singularity; driving the stiff PD from there teleports qvel — see the
+        # singular-state guard at the injection sites). Returned as the 4th value.
+        Jp = np.zeros((3, model.nv))
+        Jr = np.zeros((3, model.nv))
+        mj.mj_jacSite(model, data, Jp, Jr, _PINCH_SID)
+        J6 = np.vstack([Jp[:, :7], Jr[:, :7]])
+        sigma_min = float(np.linalg.svd(J6, compute_uv=False)[-1])
         qdot_arm = np.zeros(7)
         if np.any(jog_v) or np.any(jog_w):
-            Jp = np.zeros((3, model.nv))
-            Jr = np.zeros((3, model.nv))
-            mj.mj_jacSite(model, data, Jp, Jr, _PINCH_SID)
-            J6 = np.vstack([Jp[:, :7], Jr[:, :7]])
             v6 = np.array([jog_v[0], jog_v[1], jog_v[2], jog_w[0], jog_w[1], jog_w[2]])
             # Singularity-robust DLS (same damping schedule as the GRASP jog), but with a
             # base damping FLOOR so a true singularity (sigma_min→0) can't blow up: the
             # ramp adds up to JOG_LAM_MAX**2 near singular, JOG_LAM_MIN is always present.
-            sigma_min = np.linalg.svd(J6, compute_uv=False)[-1]
             lam2_ramp = (0.0 if sigma_min >= JOG_SING_EPS
                          else (1.0 - (sigma_min / JOG_SING_EPS) ** 2) * JOG_LAM_MAX ** 2)
             lam2 = JOG_LAM_MIN + lam2_ramp
@@ -3031,7 +3074,7 @@ if __name__ == "__main__":
             _qdmax = np.abs(qdot_arm).max()
             if _qdmax > JOG_QDOT_MAX:
                 qdot_arm *= JOG_QDOT_MAX / _qdmax
-        return qdot_arm, jog_v, jog_w
+        return qdot_arm, jog_v, jog_w, sigma_min
 
     _ik_vis_mode   = None          # None | 'grasp': freeze physics to show IK config
     _show_bspheres = False         # 7: overlay the IK's per-geom collision bounding spheres
@@ -3646,16 +3689,50 @@ if __name__ == "__main__":
                     # via the shared solver so pre-lock-in and pure dexpilot stay identical.
                     if _teleop_arm_hold is None:
                         _teleop_arm_hold = data.qpos[:7].copy()   # seed at the live arm pose
-                    _qdot_arm, _teleop_jog_v, _teleop_jog_w = _solve_wrist_qdot(
+                    _qdot_arm, _teleop_jog_v, _teleop_jog_w, _sigma_min = _solve_wrist_qdot(
                         _teleop_wrist_tgt, _teleop_jog_v, _teleop_jog_w)
+
+                    # SINGULAR-STATE GATE (root-cause fix for the qacc explosion). An
+                    # out-of-band mj_resetData (viewer Backspace / BADQACC, both on other
+                    # threads) snaps data.qpos to the all-zeros qpos0 straight-up pose — an
+                    # exact pinch-site singularity. Driving the stiff, zero-damped PD from
+                    # there toward the distant home target teleports qvel (observed
+                    # |qacc|~1e9), which itself BADQACC-resets back to qpos0: a self-
+                    # sustaining spike loop. If the arm is at/near that singularity (or a
+                    # reset just fired), FREEZE for this frame: zero the injection, re-seed
+                    # the hold at the live pose, and skip the substeps (mirrors the
+                    # Backspace key-handler's _dp_reset_frame path). Tracking resumes
+                    # automatically once the arm is re-homed off the singularity.
+                    _arm_singular = _sigma_min < DP_SING_FREEZE_EPS
+                    _reset_frame  = data.time < _last_sim_time - 1e-12
+                    if _arm_singular or _reset_frame:
+                        _qdot_arm = np.zeros(7)
+                        _teleop_arm_hold = data.qpos[:7].copy()
 
                     _hand_tgt = (_teleop_q[7:] if _teleop_q is not None
                                  else _Q_BIAS_DP[7:])
                     _dp_target[7:N_ROBOT] = _hand_tgt
-                    if args.physics:
+                    if _arm_singular or _reset_frame:
+                        # FREEZE: hold the arm at its (just re-seeded) live pose and skip
+                        # physics for this frame so the stiff PD is never driven from the
+                        # singular/just-reset pose. Zero arm velocity so nothing integrates;
+                        # leave the hand at its retarget target. mj_forward refreshes derived
+                        # quantities without advancing dynamics.
+                        _dp_target[:7] = _teleop_arm_hold
+                        data.qpos[:7]  = _teleop_arm_hold
+                        data.qvel[:7]  = 0.0
+                        mj.mj_forward(model, data)
+                        _n_sub = 0
+                    elif args.physics:
                         _elapsed = time.time() - step_start
+                        # GUARD #3: bound the open-loop sim-time advanced per iteration by
+                        # BOTH _DP_MAX_SUBSTEPS and DP_SUBSTEP_DT_MAX/timestep, so the zero-
+                        # damped arm can't ride many steps open-loop between control
+                        # corrections. At the current cap (10ms/2ms=5=_DP_MAX_SUBSTEPS) this
+                        # is a NO-OP; it only trims bursts if _DP_MAX_SUBSTEPS is raised.
+                        _sub_budget = max(1, int(DP_SUBSTEP_DT_MAX / model.opt.timestep))
                         _n_sub = int(np.clip(round(_elapsed / model.opt.timestep),
-                                             1, _DP_MAX_SUBSTEPS))
+                                             1, min(_DP_MAX_SUBSTEPS, _sub_budget)))
                         for _ in range(_n_sub):
                             # Match the GRASP carry EXACTLY — the fix for "still slightly slow".
                             # A feedforward TORQUE only cancels the damping; the arm velocity
@@ -3685,6 +3762,12 @@ if __name__ == "__main__":
                             _err = _dp_target - data.qpos[:N_ROBOT]
                             tau_ctrl[:7]        = (_dp_Kp_arm * _err[:7]
                                                    + _ARM_DAMPING_TRACK * (_qdot_arm - data.qvel[:7]))
+                            # GUARD #1: clamp the arm velocity STATE before mj_step so a
+                            # diverging spring can't integrate a runaway qvel into a position
+                            # teleport. |_qdot_arm|<=JOG_QDOT_MAX=2, so QVEL_ARM_MAX=4 never
+                            # touches normal tracking — this only bites once qvel has blown up.
+                            np.clip(data.qvel[:7], -QVEL_ARM_MAX, QVEL_ARM_MAX,
+                                    out=data.qvel[:7])
                             # Fingers stay PD-driven with real dynamics (NOT kinematically
                             # pinned): a pinned finger can't respond to contact/friction, which
                             # breaks grasping — and grasping with this same DexPilot tracking is
@@ -4007,34 +4090,60 @@ if __name__ == "__main__":
                         # a kinematic pin can't develop contact/friction).
                         if _teleop_arm_hold is None:
                             _teleop_arm_hold = data.qpos[:7].copy()   # seed at live arm pose
-                        _qdot_arm, _teleop_jog_v, _teleop_jog_w = _solve_wrist_qdot(
+                        _qdot_arm, _teleop_jog_v, _teleop_jog_w, _sigma_min = _solve_wrist_qdot(
                             _teleop_wrist_tgt, _teleop_jog_v, _teleop_jog_w)
                         if q_teleop is not None:
                             _dp_target[7:N_ROBOT] = q_teleop[7:]   # retargeted finger targets
-                        # REAL-TIME CATCH-UP: as many substeps as fit the elapsed wall time
-                        # (capped). The arm velocity command is held constant across this
-                        # iteration's substeps (re-solved next iteration from fresh error).
-                        _elapsed = time.time() - step_start
-                        _n_sub = int(np.clip(round(_elapsed / model.opt.timestep),
-                                             1, _DP_MAX_SUBSTEPS))
-                        _dpp_t0 = time.perf_counter() if DP_PROFILE else 0.0
-                        for _ in range(_n_sub):
-                            # Arm: velocity injection (data.qvel[:7]=_qdot_arm) + position PD
-                            # trim + damping-cancel, advancing the hold in lockstep — the arm
-                            # rides the commanded velocity directly (see the pre-lock-in drive
-                            # for the full rationale). Fingers: PD to the retarget target so
-                            # they respond to contact and can grasp.
-                            _teleop_arm_hold += _qdot_arm * model.opt.timestep
-                            _dp_target[:7] = _teleop_arm_hold
-                            data.qvel[:7] = _qdot_arm
-                            tau_ctrl[:] = 0.0
-                            _err = _dp_target - data.qpos[:N_ROBOT]
-                            tau_ctrl[:7]        = (_dp_Kp_arm * _err[:7]
-                                                   + _ARM_DAMPING_TRACK * (_qdot_arm - data.qvel[:7]))
-                            tau_ctrl[7:N_ROBOT] = Kp[7:] * _err[7:]
-                            data.qfrc_applied[:] = tau_ctrl
-                            data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
-                            mj.mj_step(model, data)
+                        # SINGULAR-STATE GATE (root-cause fix — see the pre-lock-in drive for
+                        # the full rationale). An out-of-band mj_resetData (viewer Backspace /
+                        # BADQACC) snaps qpos to the singular all-zeros qpos0; driving the
+                        # stiff zero-damped PD from there teleports qvel and re-triggers the
+                        # BADQACC reset — a self-sustaining spike loop. If the arm is at/near
+                        # that singularity (or a reset just fired), FREEZE this frame.
+                        _arm_singular = _sigma_min < DP_SING_FREEZE_EPS
+                        _reset_frame  = data.time < _last_sim_time - 1e-12
+                        if _arm_singular or _reset_frame:
+                            _teleop_arm_hold = data.qpos[:7].copy()
+                            _dp_target[:7]   = _teleop_arm_hold
+                            data.qvel[:7]    = 0.0
+                            mj.mj_forward(model, data)
+                            _n_sub = 0
+                        else:
+                            # REAL-TIME CATCH-UP: as many substeps as fit the elapsed wall
+                            # time (capped). The arm velocity command is held constant across
+                            # this iteration's substeps (re-solved next iter from fresh error).
+                            _elapsed = time.time() - step_start
+                            # GUARD #3 (see the pre-lock-in drive): cap substep count by both
+                            # _DP_MAX_SUBSTEPS and the safe-dt budget so a slow frame can't
+                            # drive the zero-damped arm many steps open-loop between
+                            # control corrections.
+                            _sub_budget = max(1, int(DP_SUBSTEP_DT_MAX / model.opt.timestep))
+                            _n_sub = int(np.clip(round(_elapsed / model.opt.timestep),
+                                                 1, min(_DP_MAX_SUBSTEPS, _sub_budget)))
+                            _dpp_t0 = time.perf_counter() if DP_PROFILE else 0.0
+                            for _ in range(_n_sub):
+                                # Arm: velocity injection (data.qvel[:7]=_qdot_arm) + position
+                                # PD trim + damping-cancel, advancing the hold in lockstep —
+                                # the arm rides the commanded velocity directly (see the pre-
+                                # lock-in drive). Fingers: PD to the retarget target so they
+                                # respond to contact and can grasp.
+                                _teleop_arm_hold += _qdot_arm * model.opt.timestep
+                                _dp_target[:7] = _teleop_arm_hold
+                                data.qvel[:7] = _qdot_arm
+                                tau_ctrl[:] = 0.0
+                                _err = _dp_target - data.qpos[:N_ROBOT]
+                                tau_ctrl[:7]        = (_dp_Kp_arm * _err[:7]
+                                                       + _ARM_DAMPING_TRACK * (_qdot_arm - data.qvel[:7]))
+                                # GUARD #1 (see the pre-lock-in drive): clamp the arm velocity
+                                # state before mj_step so a diverging spring can't teleport
+                                # qpos. QVEL_ARM_MAX=4 >> JOG_QDOT_MAX=2, so this is a no-op in
+                                # normal tracking and only bites once qvel has already blown up.
+                                np.clip(data.qvel[:7], -QVEL_ARM_MAX, QVEL_ARM_MAX,
+                                        out=data.qvel[:7])
+                                tau_ctrl[7:N_ROBOT] = Kp[7:] * _err[7:]
+                                data.qfrc_applied[:] = tau_ctrl
+                                data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
+                                mj.mj_step(model, data)
                         if DP_PROFILE:
                             _dpp_acc['substeps'] += time.perf_counter() - _dpp_t0
                     elif q_teleop is not None:

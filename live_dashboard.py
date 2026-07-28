@@ -22,8 +22,9 @@ Message protocol (plain dicts put on the queue):
     {'type': 'trial_time',                            # trial countdown, pushed each
                         'remaining': float|None,      #   frame; None clears the timer (no
                         'elapsed': float|None,        #   active trial). remaining =
-                        'elapsed_wall': float|None,   #   TRIAL_TIMEOUT_S - elapsed sim-time;
-                        'trial_id': int|None}         #   elapsed_wall = operator real time
+                        'elapsed_wall': float|None,   #   TRIAL_TIMEOUT_S - elapsed WALL time
+                        'trial_id': int|None}         #   (matches the timeout); elapsed=sim,
+                                                       #   elapsed_wall=operator real time
     {'type': 'event',   'trial_id': int, 't': float,  # mirror of one events.jsonl row;
                         't_wall': float,              #   t=sim-time, t_wall=wall-clock;
                         'event': str, ...}            #   teed by EventLogger.log(). Extra
@@ -387,9 +388,9 @@ def _run(queue, fingers, horizon_s, dt_hint):
                         _TIME_CRIT_STYLE if rem < 3.0
                         else _TIME_WARN_STYLE if rem < 10.0
                         else _TIME_OK_STYLE)
-                    # Show WALL-clock elapsed (the operator's real time, and the clock the
-                    # logged completion time is measured in). Sim-time elapsed is appended
-                    # in parentheses for reference since it drives the timeout countdown.
+                    # Show WALL-clock elapsed (the operator's real time, the clock the
+                    # logged completion time AND the countdown/timeout now use). Sim-time
+                    # elapsed is appended in parentheses for reference.
                     elw = msg.get('elapsed_wall')
                     el  = msg.get('elapsed')
                     if elw is not None:

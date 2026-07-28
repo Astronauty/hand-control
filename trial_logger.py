@@ -442,8 +442,15 @@ class TrialRunner:
 
     def check_timeout(self, state: TrialState, t_now: float) -> bool:
         """Call once per step; returns True (and marks outcome) if the trial has timed
-        out. Caller is responsible for calling end_trial() immediately after."""
-        if t_now - state.t_start >= TRIAL_TIMEOUT_S and state.outcome is None:
+        out. Caller is responsible for calling end_trial() immediately after.
+
+        Timeout is measured in WALL-CLOCK (the operator's real elapsed time) so it agrees
+        with the reported completion time (duration_s) and the dashboard countdown, and so
+        TRIAL_TIMEOUT_S means the same real seconds regardless of the sim's real-time factor.
+        Wall time is also monotonic across sim resets (data.time snapping to 0), so t_now is
+        no longer used for the timeout decision."""
+        if (time.time() - state.t_start_wall >= TRIAL_TIMEOUT_S
+                and state.outcome is None):
             state.outcome = TrialOutcome.TIMEOUT
             return True
         return False
