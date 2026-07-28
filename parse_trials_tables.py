@@ -294,11 +294,11 @@ def build_success_table(records, methods, objects, method_labels):
 
     lines = [
         r'\begin{table}[t]', r'  \centering', r'  \begin{threeparttable}',
-        r'    \caption{Subtask outcomes over VALID trials (a trial is valid iff it reached a '
-        r'terminal state and was not abandoned; a timeout without a successful pick counts as '
-        r'a task failure). Pick attempts and transport drops are totals over the valid trials '
-        r'($n$), lower is better; end-to-end is successes/valid, higher is better. '
-        r'Collision-avoidance is omitted for teleop (not measured in the logs).}',
+        r'    \caption{Subtask outcomes over the $n$ VALID trials per object (a trial is valid '
+        r'iff it reached a terminal state and was not abandoned; a timeout without a '
+        r'successful pick counts as a task failure). Pick attempts and transport drops are '
+        r'totals over those trials, lower is better; end-to-end is successes/$n$, higher is '
+        r'better. Collision-avoidance is omitted for teleop (not measured in the logs).}',
         r'    \label{tab:subtask_success}',
         r'    \begin{tabular}{ll' + 'c' * len(objects) + '}',
         r'      \toprule',
@@ -310,16 +310,18 @@ def build_success_table(records, methods, objects, method_labels):
     ]
     for mi, m in enumerate(methods):
         label = method_labels.get(m, m)
-        att_cells, stab_cells, e2e_cells = [], [], []
+        n_cells, att_cells, stab_cells, e2e_cells = [], [], [], []
         for o in objects:
             n_valid, n_att, n_drops, n_e2e = stage_counts(m, o)
-            # Pick attempts / transport drops = event totals over the valid trials (n_valid).
-            att_cells.append(r'$-$' if n_valid == 0
-                             else f'{n_att}~({{\\scriptsize $n{{=}}{n_valid}$}})')
-            stab_cells.append(r'$-$' if n_valid == 0
-                              else f'{n_drops}~({{\\scriptsize $n{{=}}{n_valid}$}})')
+            # n is a property of the (method, object) cell — reported once in its own row,
+            # not repeated on every subtask. Attempts/drops are then bare totals.
+            n_cells.append(str(n_valid))
+            att_cells.append(r'$-$' if n_valid == 0 else str(n_att))
+            stab_cells.append(r'$-$' if n_valid == 0 else str(n_drops))
             e2e_cells.append(fmt_frac(n_e2e, n_valid, bold=(m != methods[0])))
-        lines.append(r'      \multirow{3}{*}{%s}' % label)
+        lines.append(r'      \multirow{4}{*}{%s}' % label)
+        lines.append(r'        & Valid trials ($n$)             & '
+                     + ' & '.join(n_cells) + r' \\')
         lines.append(r'        & Pick attempts\tnote{a}          & '
                      + ' & '.join(att_cells) + r' \\')
         lines.append(r'        & Transport drops\tnote{b}        & '
@@ -333,11 +335,11 @@ def build_success_table(records, methods, objects, method_labels):
         r'    \end{tabular}',
         r'    \begin{tablenotes}[para,flushleft]',
         r'      \footnotesize',
-        r'      \item[a] Total grasp attempts (\texttt{attempt\_start} events) over the valid '
-        r'trials; more attempts means the object was harder to grasp. $n$ is the valid-trial '
-        r'count; lower is better.',
+        r'      \item[a] Total grasp attempts (\texttt{attempt\_start} events) over the '
+        r'$n$ valid trials; more attempts means the object was harder to grasp. Lower is '
+        r'better.',
         r'      \item[b] Total \texttt{drop} events (object fell out of the grasp during '
-        r'carry) over the valid trials. $n$ is the valid-trial count; lower is better.',
+        r'carry) over the $n$ valid trials. Lower is better.',
         r'      \item[c] Trials reaching the place site (\texttt{outcome=success}) over the '
         r'valid trials. Valid = reached a terminal state (success or timeout) and not '
         r'abandoned; a timeout without a successful grasp counts as a task failure. Only '
