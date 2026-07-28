@@ -10,28 +10,17 @@ two LaTeX tables:
 
 WHAT IS AND ISN'T COMPUTABLE FROM THE CURRENT LOGS
 --------------------------------------------------
-Directly from events.jsonl:
+Everything is computed directly from events.jsonl (no trace files needed):
   * completion time     — trial_end.duration_s (WALL-CLOCK: the operator's real elapsed
                           time. Sim runs slower than real-time, so the sim-time span is
                           logged separately as duration_sim_s and is NOT what's reported.)
   * successful pick     — a 'pick_confirmed' event exists for the trial (the object was
                           held > LIFT_HEIGHT_M above rest continuously for DWELL_S ≥ the
                           pick-dwell threshold; that IS the "lifted clear for ≥X s" test).
+  * transport drops     — total number of 'drop' events (object fell out of the grasp during
+                          carry) over the VALID trials (not abandoned, and picked). Reported
+                          as a raw count with the valid-trial count n; lower is better.
   * end-to-end success  — trial_end.outcome == 'success' (reached the place site).
-
-NOT in events.jsonl — computed OFFLINE here from the per-trial trace (trial_*.npz):
-  * stable transport grasp — max_slip_mm in events.jsonl is ALWAYS 0.0 (trial_logger.py's
-                          note_slip() is defined but never wired into the control loop), and
-                          in-hand rotation is not logged as a scalar at all. Both are
-                          reconstructed from the trace:
-                            - in-hand slip: object position expressed in the HAND frame
-                              (leap_palm), deviation from its value at pick_confirmed. Using
-                              the hand frame (not world) removes the legitimate carry motion
-                              so only true in-hand sliding is counted.
-                            - in-hand rotation: object orientation relative to the palm
-                              orientation (exact wrist frame via mj_forward on the logged
-                              q_robot), geodesic angle from its pick-time value. Also
-                              carry-reorientation-free.
 
 NOT computable for teleop (EXCLUDED, matching the paper): collision-avoidance rate. The
 inadvertent-contact counter (n_inadvertent_contacts) only runs during the autonomous RRT
@@ -41,7 +30,7 @@ contacts are not counted, so the collision-avoidance subtask is intentionally om
 USAGE
 -----
   python3 parse_trials_tables.py logs/contact_aware_teleop_*/ [logs/dexpilot_*/ ...]
-  python3 parse_trials_tables.py --slip-mm 20 --rot-deg 30 logs/<run>/...
+  python3 parse_trials_tables.py --objects obj_red_box obj_box_lowmu logs/<run>/...
 
 Object columns are auto-discovered from the trials' object names (sorted); pass
 --objects to fix an explicit order / subset. Each run dir may contain many trials; pass
@@ -50,23 +39,12 @@ as many run dirs as you like and they are pooled per (method, object).
 import argparse
 import glob
 import json
-import math
 import os
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-
-# Trace reconstruction needs the scene model (for the leap_palm wrist frame + FK).
-# Imported lazily so --help / pure-events parsing works without mujoco installed.
-SCENE_XML = 'models/scene_pick_place.xml'
-PALM_BODY = 'leap_palm'
-N_ROBOT = 23   # q_robot columns in the trace (matches kinova_leap_pick_place.py)
-
-# Phase code stored per trace row (kinova_leap_pick_place.py step_pick_or_transport sample):
-#   0 = PICK, 1 = TRANSPORT. Transport rows are the object-carry segment.
-PHASE_TRANSPORT = 1
 
 
 # ── events.jsonl parsing ────────────────────────────────────────────────────────────────
@@ -142,179 +120,13 @@ def trial_summary(evs: list[dict]) -> dict | None:
     }
 
 
-# ── per-trial trace: in-hand slip + rotation over transport ──────────────────────────────
-
-# Object bodies subject to the --object spawn prune (mirrors the loader in
-# kinova_leap_pick_place.py and _build_replay_model in replay_pose_trace.py): the baseline
-# obj_red_box plus the obj_box_* sweep siblings. Only one survives compile per run.
-def _is_sweep_body(name: str) -> bool:
-    return name == 'obj_red_box' or name.startswith('obj_box_')
-
-
-class TraceFK:
-    """Loads the scene model once and reconstructs the leap_palm (wrist/hand) frame per
-    trace row from the logged q_robot+obj_qpos, so object pose can be expressed in the
-    hand frame — the frame in which 'in-hand slip/rotation' is meaningful.
-
-    The model is PRUNED to the trial's object: the scene now defines multiple sweep cubes
-    (nq=44 with all three), but a --object run deletes the others before compile, so its
-    trace is a single-object 30-vec (23 robot + 7 obj) qpos. Rebuild the same pruned model
-    (delete the other sweep bodies + the single-object keyframes, then compile) so nq==30
-    matches the trace layout. object_name=None falls back to the raw scene (older single-
-    object logs)."""
-
-    def __init__(self, object_name: str | None = None):
-        import mujoco as mj   # lazy: only needed when a trace is actually processed
-        self._mj = mj
-        if object_name is None:
-            self._model = mj.MjModel.from_xml_path(SCENE_XML)
-        else:
-            spec = mj.MjSpec.from_file(SCENE_XML)
-            to_delete = [b for b in spec.bodies
-                         if _is_sweep_body(b.name) and b.name != object_name]
-            if to_delete:
-                for k in list(spec.keys):   # keyframes are single-object; drop before deletes
-                    spec.delete(k)
-                for b in to_delete:
-                    spec.delete(b)
-            self._model = spec.compile()
-        self._data = mj.MjData(self._model)
-        self._palm = mj.mj_name2id(self._model, mj.mjtObj.mjOBJ_BODY, PALM_BODY)
-        if self._palm < 0:
-            raise RuntimeError(f"body '{PALM_BODY}' not found in {SCENE_XML}")
-        if self._model.nq != N_ROBOT + 7:
-            raise RuntimeError(f"model nq={self._model.nq} != {N_ROBOT}+7 for object "
-                               f"{object_name!r}; trace layout assumption "
-                               "(q_robot[23] + obj_qpos[7]) is stale")
-
-    def palm_pose(self, q_robot: np.ndarray, obj_qpos: np.ndarray):
-        """Return (p_palm[3], R_palm[3,3]) in world for one reconstructed step."""
-        self._data.qpos[:] = np.concatenate([q_robot, obj_qpos])
-        self._mj.mj_forward(self._model, self._data)
-        return (self._data.xpos[self._palm].copy(),
-                self._data.xmat[self._palm].reshape(3, 3).copy())
-
-
-def _quat_geodesic_deg(q, q_ref):
-    """Angle (deg) of the rotation taking q_ref to q. MuJoCo quats are [w,x,y,z]."""
-    def _mul(a, b):
-        aw, ax, ay, az = a
-        bw, bx, by, bz = b
-        return np.array([aw*bw - ax*bx - ay*by - az*bz,
-                         aw*bx + ax*bw + ay*bz - az*by,
-                         aw*by - ax*bz + ay*bw + az*bx,
-                         aw*bz + ax*by - ay*bx + az*bw])
-    q_ref_inv = np.array([q_ref[0], -q_ref[1], -q_ref[2], -q_ref[3]])
-    rel = _mul(q, q_ref_inv)
-    w = float(np.clip(abs(rel[0]), -1.0, 1.0))
-    return math.degrees(2.0 * math.acos(w))
-
-
-def transport_slip_rotation(trace_path: Path, fk: TraceFK) -> tuple[float, float] | None:
-    """Max in-hand slip (mm) and rotation (deg) over the TRANSPORT segment of one trial's
-    trace, both referenced to the object's pose-in-hand at the first transport step
-    (== pick_confirmed). Returns None if the trace has no transport rows (e.g. the trial
-    was abandoned before a confirmed pick — nothing to score for transport stability)."""
-    z = np.load(trace_path)
-    if 'phase' not in z.files:
-        return None
-    # The FK reconstruction of the hand frame needs the robot joint config + object qpos.
-    # The per-trial trace schema (trial_<id>_*.npz) currently stores obj_pos/obj_quat/
-    # p_thumb/p_index but NOT q_robot/obj_qpos, so the palm-frame slip/rotation metric can't
-    # be computed from it — skip gracefully (stable stat becomes unavailable, '-') rather
-    # than KeyError, so the events-based tables (time, pick, e2e) still print.
-    if not {'q_robot', 'obj_qpos', 'obj_pos', 'obj_quat'}.issubset(z.files):
-        return None
-    tmask = z['phase'] == PHASE_TRANSPORT
-    n = int(tmask.sum())
-    if n == 0:
-        return None
-    idx = np.nonzero(tmask)[0]
-
-    obj_pos  = z['obj_pos'];  obj_quat = z['obj_quat']
-    q_robot  = z['q_robot'];  obj_qpos = z['obj_qpos']
-
-    # Object pose expressed in the palm frame, per transport step. Reference = first row.
-    rel_p = np.empty((n, 3))
-    rel_ang_ref = None
-    slip = np.empty(n)
-    rot  = np.empty(n)
-    p0_hand = None
-    for k, i in enumerate(idx):
-        p_palm, R_palm = fk.palm_pose(q_robot[i], obj_qpos[i])
-        # object position in the palm frame (carry motion cancels out)
-        p_in_hand = R_palm.T @ (obj_pos[i] - p_palm)
-        # object orientation relative to palm: quat(R_palm^T) ∘ obj_quat, as an angle vs ref
-        R_rel = R_palm.T @ _quat_to_R(obj_quat[i])
-        q_rel = _R_to_quat(R_rel)
-        if k == 0:
-            p0_hand = p_in_hand
-            rel_ang_ref = q_rel
-        slip[k] = np.linalg.norm(p_in_hand - p0_hand) * 1e3   # mm
-        rot[k]  = _quat_geodesic_deg(q_rel, rel_ang_ref)      # deg
-    return float(slip.max()), float(rot.max())
-
-
-def _quat_to_R(q):
-    """MuJoCo [w,x,y,z] quat -> rotation matrix."""
-    w, x, y, z = q
-    return np.array([
-        [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
-        [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
-        [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)],
-    ])
-
-
-def _R_to_quat(R):
-    """Rotation matrix -> MuJoCo [w,x,y,z] quat (numerically stable branch)."""
-    tr = R[0, 0] + R[1, 1] + R[2, 2]
-    if tr > 0:
-        s = math.sqrt(tr + 1.0) * 2
-        w = 0.25 * s
-        x = (R[2, 1] - R[1, 2]) / s
-        y = (R[0, 2] - R[2, 0]) / s
-        z = (R[1, 0] - R[0, 1]) / s
-    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
-        w = (R[2, 1] - R[1, 2]) / s
-        x = 0.25 * s
-        y = (R[0, 1] + R[1, 0]) / s
-        z = (R[0, 2] + R[2, 0]) / s
-    elif R[1, 1] > R[2, 2]:
-        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
-        w = (R[0, 2] - R[2, 0]) / s
-        x = (R[0, 1] + R[1, 0]) / s
-        y = 0.25 * s
-        z = (R[1, 2] + R[2, 1]) / s
-    else:
-        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
-        w = (R[1, 0] - R[0, 1]) / s
-        x = (R[0, 2] + R[2, 0]) / s
-        y = (R[1, 2] + R[2, 1]) / s
-        z = 0.25 * s
-    return np.array([w, x, y, z])
-
-
-def find_trace(run_dir: Path, trial_id: int) -> Path | None:
-    """Per-trial trace filename is trial_<id:04d>_<method>_<object>_<outcome>.npz
-    (TrialRunner._trace_filename). Match on the id prefix, which is unique per run."""
-    hits = sorted(run_dir.glob(f'trial_{trial_id:04d}_*.npz'))
-    return hits[0] if hits else None
-
-
 # ── table assembly ───────────────────────────────────────────────────────────────────────
 
-def collect(run_dirs, slip_mm, rot_deg, need_trace):
+def collect(run_dirs):
     """Pool trials across run dirs into records keyed by (method, object). Each record:
-      duration_s, picked(bool), stable(bool|None), success(bool).
-    stable is None when it can't be scored (no transport segment) — those trials still
-    count in the denominators up through the pick stage."""
-    # One TraceFK per object (each pruned to that object → nq=30). A run set can mix objects
-    # across dirs, so a single shared FK would use the wrong object's model. Built lazily;
-    # a build failure for one object (e.g. name absent from the scene) disables only that
-    # object's stable-transport stat, not the whole run.
-    fk_by_obj: dict[str, TraceFK] = {}
-    fk_failed: set[str] = set()
+      duration_s, picked(bool), abandoned(bool), n_drops(int), success(bool).
+    Transport stability is reported as the total number of DROP events (object lost during
+    carry) over VALID trials — see build_success_table. Everything is event-based (no traces)."""
     records = defaultdict(list)
     for rd in run_dirs:
         rd = Path(rd)
@@ -322,34 +134,13 @@ def collect(run_dirs, slip_mm, rot_deg, need_trace):
         for tid, evs in group_trials(rows).items():
             s = trial_summary(evs)
             if s is None:
-                continue   # trial never ended; not scorable
-            picked   = s['pick_confirmed']
-            success  = (s['outcome'] == 'success')
-            stable = None
-            if picked and need_trace:
-                tp = find_trace(rd, tid)
-                obj_name = s['object']
-                if tp is not None and obj_name not in fk_failed:
-                    fk = fk_by_obj.get(obj_name)
-                    if fk is None:
-                        try:
-                            fk = TraceFK(obj_name)
-                            fk_by_obj[obj_name] = fk
-                        except Exception as e:
-                            fk_failed.add(obj_name)
-                            print(f"# stable-transport disabled for object {obj_name!r}: "
-                                  f"{e}", file=sys.stderr)
-                            fk = None
-                    if fk is not None:
-                        sr = transport_slip_rotation(tp, fk)
-                        if sr is not None:
-                            max_slip, max_rot = sr
-                            stable = (max_slip <= slip_mm) and (max_rot <= rot_deg)
+                continue   # trial never ended / never placed; not scorable
             records[(s['method'], s['object'])].append({
                 'duration_s': s['duration_s'],
-                'picked':  picked,
-                'stable':  stable,
-                'success': success,
+                'picked':    s['pick_confirmed'],
+                'abandoned': (s['outcome'] == 'abandoned'),
+                'n_drops':   s.get('n_drops', 0) or 0,
+                'success':   (s['outcome'] == 'success'),
                 'mass_g':   s['mass_g'],
                 'mu':       s['mu'],
                 'izz_gcm2': s['izz_gcm2'],
@@ -472,29 +263,30 @@ def build_time_table(records, methods, objects, method_labels):
     return '\n'.join(lines)
 
 
-def build_success_table(records, methods, objects, method_labels, slip_mm, rot_deg):
+def build_success_table(records, methods, objects, method_labels):
     def stage_counts(m, o):
         recs = records.get((m, o), [])
         n_all   = len(recs)
         n_pick  = sum(1 for r in recs if r['picked'])
-        # stable scored only over picked trials that HAVE a transport trace
-        scored  = [r for r in recs if r['picked'] and r['stable'] is not None]
-        n_stab_den = len(scored)
-        n_stab  = sum(1 for r in scored if r['stable'])
         n_e2e   = sum(1 for r in recs if r['success'])
-        return n_all, n_pick, n_stab_den, n_stab, n_e2e
+        # Transport stability = total DROP events over VALID trials. Valid = NOT abandoned
+        # (operator reset / target switch) AND picked (a trial that never confirmed a pick
+        # never entered transport, so 'dropped during carry' is undefined for it).
+        valid = [r for r in recs if not r['abandoned'] and r['picked']]
+        n_valid = len(valid)
+        n_drops = sum(r['n_drops'] for r in valid)
+        return n_all, n_pick, n_valid, n_drops, n_e2e
 
     lines = [
         r'\begin{table}[t]', r'  \centering', r'  \begin{threeparttable}',
-        r'    \caption{Subtask success (successes/attempts). Conditional: each subtask is '
-        r'scored only over trials in which all preceding subtasks succeeded. '
-        r'Collision-avoidance is omitted for teleop (not measured in the current logs). '
-        f'Stable transport = in-hand slip $\\le {slip_mm:.0f}$\\,mm and rotation '
-        f'$\\le {rot_deg:.0f}^\\circ$ over the carry.}}',
+        r'    \caption{Subtask outcomes. Successful pick and end-to-end are '
+        r'successes/attempts (higher is better). Transport drops is the total number of '
+        r'drop events over the valid trials ($n$), lower is better. '
+        r'Collision-avoidance is omitted for teleop (not measured in the current logs).}',
         r'    \label{tab:subtask_success}',
         r'    \begin{tabular}{ll' + 'c' * len(objects) + '}',
         r'      \toprule',
-        r'      & & \multicolumn{%d}{c}{Success (successes/attempts) $\uparrow$} \\'
+        r'      & & \multicolumn{%d}{c}{Subtask outcome (per object)} \\'
         % len(objects),
         r'      \cmidrule(lr){3-%d}' % (len(objects) + 2),
         '      Method & Subtask & ' + ' & '.join(objects) + r' \\',
@@ -504,14 +296,17 @@ def build_success_table(records, methods, objects, method_labels, slip_mm, rot_d
         label = method_labels.get(m, m)
         pick_cells, stab_cells, e2e_cells = [], [], []
         for o in objects:
-            n_all, n_pick, n_stab_den, n_stab, n_e2e = stage_counts(m, o)
+            n_all, n_pick, n_valid, n_drops, n_e2e = stage_counts(m, o)
             pick_cells.append(fmt_frac(n_pick, n_all))
-            stab_cells.append(fmt_frac(n_stab, n_stab_den))
+            # Transport stability = number of DROP events over the valid trials (n_valid).
+            # Reported as "drops (n=valid)"; lower is better. '-' when no valid trials.
+            stab_cells.append(r'$-$' if n_valid == 0
+                              else f'{n_drops}~({{\\scriptsize $n{{=}}{n_valid}$}})')
             e2e_cells.append(fmt_frac(n_e2e, n_all, bold=(m != methods[0])))
         lines.append(r'      \multirow{3}{*}{%s}' % label)
         lines.append(r'        & Successful pick\tnote{a}        & '
                      + ' & '.join(pick_cells) + r' \\')
-        lines.append(r'        & Stable transport grasp\tnote{b} & '
+        lines.append(r'        & Transport drops\tnote{b}        & '
                      + ' & '.join(stab_cells) + r' \\')
         lines.append(r'      \cmidrule(lr){2-%d}' % (len(objects) + 2))
         lines.append(r'        & End-to-end                      & '
@@ -525,9 +320,10 @@ def build_success_table(records, methods, objects, method_labels, slip_mm, rot_d
         r'      \footnotesize',
         r'      \item[a] Object lifted clear of the support surface and held for the '
         r'pick-dwell window (pick\_confirmed). Denominator: all trials.',
-        f'      \\item[b] Object retained without in-hand slip exceeding {slip_mm:.0f}\\,mm '
-        f'or rotation exceeding {rot_deg:.0f}$^\\circ$ over the transport trajectory. '
-        r'Denominator: trials passing successful pick with a recorded transport segment.',
+        r'      \item[b] Total \texttt{drop} events (object fell out of the grasp during '
+        r'carry) over the valid trials. Valid = trials that confirmed a pick and were not '
+        r'abandoned (operator reset / target switch). $n$ is the valid-trial count; lower '
+        r'drops is better.',
         r'    \end{tablenotes}',
         r'  \end{threeparttable}',
         r'\end{table}',
@@ -547,7 +343,7 @@ def emit_tables(dirs, args, heading=None):
     stdout (a per-(method,object) summary goes to stderr). `heading` prefixes both the
     stderr summary and the LaTeX output with a comment naming the scope (used by
     --per-run). Returns True if any completed trials were found."""
-    records = collect(dirs, args.slip_mm, args.rot_deg, need_trace=not args.no_trace)
+    records = collect(dirs)
     if not records:
         tag = f' for {heading}' if heading else ''
         print(f'# no completed trials found{tag}', file=sys.stderr)
@@ -562,11 +358,11 @@ def emit_tables(dirs, args, heading=None):
     print('# trials pooled per (method, object):', file=sys.stderr)
     for (m, o), recs in sorted(records.items()):
         n = len(recs); npick = sum(r['picked'] for r in recs)
-        nstab_den = sum(1 for r in recs if r['picked'] and r['stable'] is not None)
-        nstab = sum(1 for r in recs if r['stable'])
+        valid = [r for r in recs if not r['abandoned'] and r['picked']]
+        ndrops = sum(r['n_drops'] for r in valid)
         ns = sum(r['success'] for r in recs)
         print(f'#   {m:24} {o:16}  N={n:3}  pick={npick}  '
-              f'stable={nstab}/{nstab_den}  success={ns}', file=sys.stderr)
+              f'drops={ndrops}(n={len(valid)})  success={ns}', file=sys.stderr)
     print('', file=sys.stderr)
 
     if heading:
@@ -575,8 +371,7 @@ def emit_tables(dirs, args, heading=None):
     print()
     print(build_time_table(records, methods, objects, METHOD_LABELS))
     print()
-    print(build_success_table(records, methods, objects, METHOD_LABELS,
-                              args.slip_mm, args.rot_deg))
+    print(build_success_table(records, methods, objects, METHOD_LABELS))
     return True
 
 
@@ -584,14 +379,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('run_dirs', nargs='+', help='logs/<run>/ directories (globs expanded)')
-    ap.add_argument('--slip-mm', type=float, default=20.0,
-                    help='max in-hand slip (mm) for a stable transport grasp (default 20)')
-    ap.add_argument('--rot-deg', type=float, default=30.0,
-                    help='max in-hand rotation (deg) for a stable transport grasp (default 30)')
     ap.add_argument('--objects', nargs='*', default=None,
                     help='explicit object column order/subset (default: auto, sorted)')
-    ap.add_argument('--no-trace', action='store_true',
-                    help='skip the trace-based stable-transport stage (events.jsonl only)')
     ap.add_argument('--per-run', action='store_true',
                     help='emit a separate table pair per run dir (default: pool all dirs '
                          'into one table pair)')
