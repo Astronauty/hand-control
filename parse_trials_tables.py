@@ -127,22 +127,48 @@ def trial_summary(evs: list[dict]) -> dict | None:
 
 # ── per-trial trace: in-hand slip + rotation over transport ──────────────────────────────
 
+# Object bodies subject to the --object spawn prune (mirrors the loader in
+# kinova_leap_pick_place.py and _build_replay_model in replay_pose_trace.py): the baseline
+# obj_red_box plus the obj_box_* sweep siblings. Only one survives compile per run.
+def _is_sweep_body(name: str) -> bool:
+    return name == 'obj_red_box' or name.startswith('obj_box_')
+
+
 class TraceFK:
     """Loads the scene model once and reconstructs the leap_palm (wrist/hand) frame per
     trace row from the logged q_robot+obj_qpos, so object pose can be expressed in the
-    hand frame — the frame in which 'in-hand slip/rotation' is meaningful."""
+    hand frame — the frame in which 'in-hand slip/rotation' is meaningful.
 
-    def __init__(self):
+    The model is PRUNED to the trial's object: the scene now defines multiple sweep cubes
+    (nq=44 with all three), but a --object run deletes the others before compile, so its
+    trace is a single-object 30-vec (23 robot + 7 obj) qpos. Rebuild the same pruned model
+    (delete the other sweep bodies + the single-object keyframes, then compile) so nq==30
+    matches the trace layout. object_name=None falls back to the raw scene (older single-
+    object logs)."""
+
+    def __init__(self, object_name: str | None = None):
         import mujoco as mj   # lazy: only needed when a trace is actually processed
         self._mj = mj
-        self._model = mj.MjModel.from_xml_path(SCENE_XML)
+        if object_name is None:
+            self._model = mj.MjModel.from_xml_path(SCENE_XML)
+        else:
+            spec = mj.MjSpec.from_file(SCENE_XML)
+            to_delete = [b for b in spec.bodies
+                         if _is_sweep_body(b.name) and b.name != object_name]
+            if to_delete:
+                for k in list(spec.keys):   # keyframes are single-object; drop before deletes
+                    spec.delete(k)
+                for b in to_delete:
+                    spec.delete(b)
+            self._model = spec.compile()
         self._data = mj.MjData(self._model)
         self._palm = mj.mj_name2id(self._model, mj.mjtObj.mjOBJ_BODY, PALM_BODY)
         if self._palm < 0:
             raise RuntimeError(f"body '{PALM_BODY}' not found in {SCENE_XML}")
         if self._model.nq != N_ROBOT + 7:
-            raise RuntimeError(f"model nq={self._model.nq} != {N_ROBOT}+7; trace layout "
-                               "assumption (q_robot[23] + obj_qpos[7]) is stale")
+            raise RuntimeError(f"model nq={self._model.nq} != {N_ROBOT}+7 for object "
+                               f"{object_name!r}; trace layout assumption "
+                               "(q_robot[23] + obj_qpos[7]) is stale")
 
     def palm_pose(self, q_robot: np.ndarray, obj_qpos: np.ndarray):
         """Return (p_palm[3], R_palm[3,3]) in world for one reconstructed step."""
@@ -174,6 +200,13 @@ def transport_slip_rotation(trace_path: Path, fk: TraceFK) -> tuple[float, float
     was abandoned before a confirmed pick — nothing to score for transport stability)."""
     z = np.load(trace_path)
     if 'phase' not in z.files:
+        return None
+    # The FK reconstruction of the hand frame needs the robot joint config + object qpos.
+    # The per-trial trace schema (trial_<id>_*.npz) currently stores obj_pos/obj_quat/
+    # p_thumb/p_index but NOT q_robot/obj_qpos, so the palm-frame slip/rotation metric can't
+    # be computed from it — skip gracefully (stable stat becomes unavailable, '-') rather
+    # than KeyError, so the events-based tables (time, pick, e2e) still print.
+    if not {'q_robot', 'obj_qpos', 'obj_pos', 'obj_quat'}.issubset(z.files):
         return None
     tmask = z['phase'] == PHASE_TRANSPORT
     n = int(tmask.sum())
@@ -259,7 +292,12 @@ def collect(run_dirs, slip_mm, rot_deg, need_trace):
       duration_s, picked(bool), stable(bool|None), success(bool).
     stable is None when it can't be scored (no transport segment) — those trials still
     count in the denominators up through the pick stage."""
-    fk = None
+    # One TraceFK per object (each pruned to that object → nq=30). A run set can mix objects
+    # across dirs, so a single shared FK would use the wrong object's model. Built lazily;
+    # a build failure for one object (e.g. name absent from the scene) disables only that
+    # object's stable-transport stat, not the whole run.
+    fk_by_obj: dict[str, TraceFK] = {}
+    fk_failed: set[str] = set()
     records = defaultdict(list)
     for rd in run_dirs:
         rd = Path(rd)
@@ -273,13 +311,23 @@ def collect(run_dirs, slip_mm, rot_deg, need_trace):
             stable = None
             if picked and need_trace:
                 tp = find_trace(rd, tid)
-                if tp is not None:
+                obj_name = s['object']
+                if tp is not None and obj_name not in fk_failed:
+                    fk = fk_by_obj.get(obj_name)
                     if fk is None:
-                        fk = TraceFK()
-                    sr = transport_slip_rotation(tp, fk)
-                    if sr is not None:
-                        max_slip, max_rot = sr
-                        stable = (max_slip <= slip_mm) and (max_rot <= rot_deg)
+                        try:
+                            fk = TraceFK(obj_name)
+                            fk_by_obj[obj_name] = fk
+                        except Exception as e:
+                            fk_failed.add(obj_name)
+                            print(f"# stable-transport disabled for object {obj_name!r}: "
+                                  f"{e}", file=sys.stderr)
+                            fk = None
+                    if fk is not None:
+                        sr = transport_slip_rotation(tp, fk)
+                        if sr is not None:
+                            max_slip, max_rot = sr
+                            stable = (max_slip <= slip_mm) and (max_rot <= rot_deg)
             records[(s['method'], s['object'])].append({
                 'duration_s': s['duration_s'],
                 'picked':  picked,
