@@ -20,6 +20,8 @@ events.jsonl (no trace files needed), over that valid set:
                           time. Sim runs slower than real-time, so the sim-time span is
                           logged separately as duration_sim_s and is NOT what's reported),
                           over successful valid trials.
+  * pick attempts      — total number of 'attempt_start' events (grasp tries) over the valid
+                          trials; more = harder to grasp. Raw count with the valid-trial n.
   * transport drops     — total number of 'drop' events (object fell out of the grasp during
                           carry) over the valid trials. Reported as a raw count with the
                           valid-trial count n; lower is better.
@@ -113,12 +115,12 @@ def trial_summary(evs: list[dict]) -> dict | None:
         'outcome':      end.get('outcome'),
         'duration_s':   end.get('duration_s'),
         'pick_confirmed': any(e.get('event') == 'pick_confirmed' for e in evs),
-        'n_attempts':   end.get('n_attempts', 0),
-        # Count DROP EVENTS directly, not trial_end.n_drops. drop events are always logged,
-        # whereas n_drops is only on trial_end — an arrival-only success (synthesized end
-        # above) would otherwise report 0 drops even if the object was dropped and recovered
-        # before the successful place. This counts drops-into-success correctly for all end
-        # types (trial_end, timeout, and arrival-recovered).
+        # Count attempt_start / drop EVENTS directly, not the trial_end.n_* fields. The
+        # events are always logged, whereas n_attempts/n_drops are only on trial_end — an
+        # arrival-only success (synthesized end above) would otherwise report 0. This counts
+        # grasp attempts and drops-into-success correctly for all end types (trial_end,
+        # timeout, and arrival-recovered).
+        'n_attempts':   sum(1 for e in evs if e.get('event') == 'attempt_start'),
         'n_drops':      sum(1 for e in evs if e.get('event') == 'drop'),
         # Physical properties, stamped onto trial_start by object_props_from_model()
         # (trial_logger.py). Absent (-> None) in older logs written before the props stamp.
@@ -154,6 +156,7 @@ def collect(run_dirs):
                 continue   # excluded: operator reset / target switch (not a real attempt)
             records[(s['method'], s['object'])].append({
                 'duration_s': s['duration_s'],
+                'n_attempts': s.get('n_attempts', 0) or 0,
                 'n_drops':   s.get('n_drops', 0) or 0,
                 'success':   (s['outcome'] == 'success'),
                 'mass_g':   s['mass_g'],
@@ -284,16 +287,17 @@ def build_success_table(records, methods, objects, method_labels):
     def stage_counts(m, o):
         recs = records.get((m, o), [])
         n_valid = len(recs)
+        n_att   = sum(r['n_attempts'] for r in recs)
         n_drops = sum(r['n_drops'] for r in recs)
         n_e2e   = sum(1 for r in recs if r['success'])
-        return n_valid, n_drops, n_e2e
+        return n_valid, n_att, n_drops, n_e2e
 
     lines = [
         r'\begin{table}[t]', r'  \centering', r'  \begin{threeparttable}',
         r'    \caption{Subtask outcomes over VALID trials (a trial is valid iff it reached a '
         r'terminal state and was not abandoned; a timeout without a successful pick counts as '
-        r'a task failure). Transport drops is the total number of drop events over the valid '
-        r'trials ($n$), lower is better; end-to-end is successes/valid, higher is better. '
+        r'a task failure). Pick attempts and transport drops are totals over the valid trials '
+        r'($n$), lower is better; end-to-end is successes/valid, higher is better. '
         r'Collision-avoidance is omitted for teleop (not measured in the logs).}',
         r'    \label{tab:subtask_success}',
         r'    \begin{tabular}{ll' + 'c' * len(objects) + '}',
@@ -306,17 +310,21 @@ def build_success_table(records, methods, objects, method_labels):
     ]
     for mi, m in enumerate(methods):
         label = method_labels.get(m, m)
-        stab_cells, e2e_cells = [], []
+        att_cells, stab_cells, e2e_cells = [], [], []
         for o in objects:
-            n_valid, n_drops, n_e2e = stage_counts(m, o)
-            # Transport drops = number of DROP events over the valid trials (n_valid).
+            n_valid, n_att, n_drops, n_e2e = stage_counts(m, o)
+            # Pick attempts / transport drops = event totals over the valid trials (n_valid).
+            att_cells.append(r'$-$' if n_valid == 0
+                             else f'{n_att}~({{\\scriptsize $n{{=}}{n_valid}$}})')
             stab_cells.append(r'$-$' if n_valid == 0
                               else f'{n_drops}~({{\\scriptsize $n{{=}}{n_valid}$}})')
             e2e_cells.append(fmt_frac(n_e2e, n_valid, bold=(m != methods[0])))
-        lines.append(r'      \multirow{2}{*}{%s}' % label)
-        lines.append(r'        & Transport drops\tnote{a}        & '
+        lines.append(r'      \multirow{3}{*}{%s}' % label)
+        lines.append(r'        & Pick attempts\tnote{a}          & '
+                     + ' & '.join(att_cells) + r' \\')
+        lines.append(r'        & Transport drops\tnote{b}        & '
                      + ' & '.join(stab_cells) + r' \\')
-        lines.append(r'        & End-to-end\tnote{b}             & '
+        lines.append(r'        & End-to-end\tnote{c}             & '
                      + ' & '.join(e2e_cells) + r' \\')
         if mi != len(methods) - 1:
             lines.append(r'      \midrule')
@@ -325,9 +333,12 @@ def build_success_table(records, methods, objects, method_labels):
         r'    \end{tabular}',
         r'    \begin{tablenotes}[para,flushleft]',
         r'      \footnotesize',
-        r'      \item[a] Total \texttt{drop} events (object fell out of the grasp during '
+        r'      \item[a] Total grasp attempts (\texttt{attempt\_start} events) over the valid '
+        r'trials; more attempts means the object was harder to grasp. $n$ is the valid-trial '
+        r'count; lower is better.',
+        r'      \item[b] Total \texttt{drop} events (object fell out of the grasp during '
         r'carry) over the valid trials. $n$ is the valid-trial count; lower is better.',
-        r'      \item[b] Trials reaching the place site (\texttt{outcome=success}) over the '
+        r'      \item[c] Trials reaching the place site (\texttt{outcome=success}) over the '
         r'valid trials. Valid = reached a terminal state (success or timeout) and not '
         r'abandoned; a timeout without a successful grasp counts as a task failure. Only '
         r'abandoned (operator reset / target switch) and unterminated trials are excluded.',
