@@ -112,7 +112,12 @@ def trial_summary(evs: list[dict]) -> dict | None:
         'duration_s':   end.get('duration_s'),
         'pick_confirmed': any(e.get('event') == 'pick_confirmed' for e in evs),
         'n_attempts':   end.get('n_attempts', 0),
-        'n_drops':      end.get('n_drops', 0),
+        # Count DROP EVENTS directly, not trial_end.n_drops. drop events are always logged,
+        # whereas n_drops is only on trial_end — an arrival-only success (synthesized end
+        # above) would otherwise report 0 drops even if the object was dropped and recovered
+        # before the successful place. This counts drops-into-success correctly for all end
+        # types (trial_end, timeout, and arrival-recovered).
+        'n_drops':      sum(1 for e in evs if e.get('event') == 'drop'),
         # Physical properties, stamped onto trial_start by object_props_from_model()
         # (trial_logger.py). Absent (-> None) in older logs written before the props stamp.
         'mass_g':       (mass_kg * 1e3) if mass_kg is not None else None,
