@@ -3319,10 +3319,14 @@ if __name__ == "__main__":
                         data.geom_xpos[_ao['id_geom']][:2] - data.site_xpos[_sid_tr][:2]))
                     _da_tr = _trial_dofadr[active_idx]
                     _spd_tr = float(np.linalg.norm(data.qvel[_da_tr:_da_tr + 3]))
-                _trial_runner.step_pick_or_transport(
+                _arrived_tr = _trial_runner.step_pick_or_transport(
                     _trial_state, _tnow_tr, trigger_fired=False, trigger_active=False,
                     height_above_rest=_h_tr, place_xy_offset=_xy_tr, object_speed=_spd_tr)
-                if (_trial_state.outcome is None
+                # Arrival sets outcome=SUCCESS but does NOT write trial_end / save the trace —
+                # the caller must call end_trial. Do so on arrival, or on a timeout.
+                if _arrived_tr:
+                    _trial_runner.end_trial(_trial_state, _tnow_tr)
+                elif (_trial_state.outcome is None
                         and _trial_runner.check_timeout(_trial_state, _tnow_tr)):
                     _trial_runner.end_trial(_trial_state, _tnow_tr)
 

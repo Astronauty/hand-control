@@ -102,11 +102,28 @@ def group_trials(rows: list[dict]) -> dict[int, list[dict]]:
 
 def trial_summary(evs: list[dict]) -> dict | None:
     """Reduce one trial's events to the fields the tables need. Returns None if the
-    trial never ended (no trial_end — e.g. the run was killed mid-trial)."""
+    trial neither ended (trial_end) nor reached a successful place (arrival).
+
+    An 'arrival' event means the object was placed in the target (the state machine set
+    outcome=SUCCESS). A bug left some runs writing 'arrival' but no 'trial_end' (the
+    loop-top arrival path didn't call end_trial), so treat a logged arrival as an implicit
+    successful completion: outcome='success', duration from trial_start→arrival (wall-clock
+    if both carry t_wall, else sim-time). This recovers those trials without a re-run."""
     start = next((e for e in evs if e.get('event') == 'trial_start'), None)
     end   = next((e for e in evs if e.get('event') == 'trial_end'), None)
-    if start is None or end is None:
+    if start is None:
         return None
+    if end is None:
+        arrival = next((e for e in evs if e.get('event') == 'arrival'), None)
+        if arrival is None:
+            return None   # trial neither ended nor placed — not scorable
+        # Synthesize an end from the arrival (a successful place).
+        if start.get('t_wall') is not None and arrival.get('t_wall') is not None:
+            _dur = max(0.0, arrival['t_wall'] - start['t_wall'])
+        else:
+            _dur = max(0.0, arrival.get('t', 0.0) - start.get('t', 0.0))
+        end = {'outcome': 'success', 'duration_s': round(_dur, 3),
+               'n_attempts': arrival.get('attempt', 0), 'n_drops': 0}
     mass_kg = start.get('mass_kg')
     return {
         'method':       start.get('method', 'unknown'),
