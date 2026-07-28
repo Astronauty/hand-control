@@ -3294,6 +3294,38 @@ if __name__ == "__main__":
                                       prox_idx=int(_prox_idx))
                     _prev_control_phase = _std_key
 
+            # ALWAYS-RUN transport arrival/drop check (contact_aware modes). The main
+            # trial-drive block (control_phase=='GRASP' branch) runs AFTER the control_phase
+            # kinematic-replay branches, several of which `continue` and skip it — so while
+            # the object settles in the place area under control_phase REACH, the arrival
+            # check was never called and PLACE never fired (observed: a red_box carried into
+            # the footprint, 903 settled-in-footprint rows, no arrival/trial_end). The
+            # arrival/drop decision is pure object kinematics (xy offset, speed, height), so
+            # evaluate it here at loop top — before any `continue` — whenever the trial is in
+            # TRANSPORT. Gated to _dp_trigger is None so dexpilot (own block below, ~4031)
+            # doesn't double-fire; the contact_aware GRASP-branch call skips TRANSPORT to
+            # avoid a second evaluation the same step.
+            if (_dp_trigger is None and _trial_runner is not None
+                    and _trial_state is not None and _trial_state.outcome is None
+                    and _trial_state.phase == TrialPhase.TRANSPORT
+                    and 0 <= active_idx < len(objects)):
+                _ao = objects[active_idx]
+                _tnow_tr = data.time
+                _h_tr = float(data.geom_xpos[_ao['id_geom']][2]) - _trial_rest_hh[active_idx]
+                _sid_tr = _trial_place_sid.get(active_idx, -1)
+                _xy_tr = _spd_tr = None
+                if _sid_tr >= 0:
+                    _xy_tr = float(np.linalg.norm(
+                        data.geom_xpos[_ao['id_geom']][:2] - data.site_xpos[_sid_tr][:2]))
+                    _da_tr = _trial_dofadr[active_idx]
+                    _spd_tr = float(np.linalg.norm(data.qvel[_da_tr:_da_tr + 3]))
+                _trial_runner.step_pick_or_transport(
+                    _trial_state, _tnow_tr, trigger_fired=False, trigger_active=False,
+                    height_above_rest=_h_tr, place_xy_offset=_xy_tr, object_speed=_spd_tr)
+                if (_trial_state.outcome is None
+                        and _trial_runner.check_timeout(_trial_state, _tnow_tr)):
+                    _trial_runner.end_trial(_trial_state, _tnow_tr)
+
             # Always-on pose recorder: one throttled row per iteration, ALL phases (the
             # trial trace only runs post-lock-in). Phase is reconstructed offline from
             # events.jsonl phase_enter timestamps vs `t` here. Uses last frame's qpos
@@ -5286,32 +5318,14 @@ if __name__ == "__main__":
                                                            # next trial_start replaces it
                 _tid  = _trial_state.trial_id
                 _tnow = data.time
-                if (control_phase in ('PLAN', 'REACH')
-                        and _trial_state.phase == TrialPhase.TRANSPORT):
-                    # RELEASED WHILE CARRYING (control went GRASP→REACH on release) but the
-                    # trial machine is still in TRANSPORT: the object may be settling into
-                    # the place area. Do NOT regress the trial to APPROACH — keep driving
-                    # step_pick_or_transport so the SET-IN-PLACE arrival can fire as the box
-                    # comes to rest in the footprint (a released-in-target placement), or a
-                    # drop is counted if it settles outside. trigger_active=False (grasp
-                    # released); the arrival branch ignores the trigger.
-                    _hh = _trial_rest_hh[active_idx]
-                    _height_above_rest = float(data.geom_xpos[obj['id_geom']][2]) - _hh
-                    _sid = _trial_place_sid.get(active_idx, -1)
-                    _xy_off = _spd = None
-                    if _sid >= 0:
-                        _xy_off = float(np.linalg.norm(
-                            data.geom_xpos[obj['id_geom']][:2]
-                            - data.site_xpos[_sid][:2]))
-                        _dofadr = _trial_dofadr[active_idx]
-                        _spd = float(np.linalg.norm(data.qvel[_dofadr:_dofadr + 3]))
-                    _trial_runner.step_pick_or_transport(
-                        _trial_state, _tnow, trigger_fired=False, trigger_active=False,
-                        height_above_rest=_height_above_rest,
-                        place_xy_offset=_xy_off, object_speed=_spd)
-                    if (_trial_state.outcome is None
-                            and _trial_runner.check_timeout(_trial_state, _tnow)):
-                        _trial_runner.end_trial(_trial_state, _tnow)
+                if _trial_state.phase == TrialPhase.TRANSPORT:
+                    # TRANSPORT arrival/drop is owned by the ALWAYS-RUN check at loop top
+                    # (which fires regardless of control_phase or any earlier `continue`).
+                    # Nothing to do here — skip so the arrival/drop is evaluated exactly once
+                    # per step. (This also means a release mid-carry, control_phase→REACH,
+                    # no longer regresses the trial to APPROACH: the loop-top check keeps it
+                    # in TRANSPORT until it settles into a place or drops.)
+                    pass
                 elif control_phase in ('PLAN', 'REACH'):
                     # Standardized phase: PLAN/REACH both classify as APPROACH/planning.
                     # set_phase logs a phase_enter only on an actual change, so this stays
