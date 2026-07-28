@@ -10,17 +10,19 @@ two LaTeX tables:
 
 WHAT IS AND ISN'T COMPUTABLE FROM THE CURRENT LOGS
 --------------------------------------------------
-Everything is computed directly from events.jsonl (no trace files needed):
+The ENTIRE analysis is restricted to VALID trials: a trial counts iff it confirmed a pick
+AND was not abandoned (operator reset / target switch). Abandoned and never-picked trials
+are dropped up front, so they never dilute any metric's denominator. All metrics are
+computed directly from events.jsonl (no trace files needed), over that valid set:
   * completion time     — trial_end.duration_s (WALL-CLOCK: the operator's real elapsed
                           time. Sim runs slower than real-time, so the sim-time span is
-                          logged separately as duration_sim_s and is NOT what's reported.)
-  * successful pick     — a 'pick_confirmed' event exists for the trial (the object was
-                          held > LIFT_HEIGHT_M above rest continuously for DWELL_S ≥ the
-                          pick-dwell threshold; that IS the "lifted clear for ≥X s" test).
+                          logged separately as duration_sim_s and is NOT what's reported),
+                          over successful valid trials.
   * transport drops     — total number of 'drop' events (object fell out of the grasp during
-                          carry) over the VALID trials (not abandoned, and picked). Reported
-                          as a raw count with the valid-trial count n; lower is better.
-  * end-to-end success  — trial_end.outcome == 'success' (reached the place site).
+                          carry) over the valid trials. Reported as a raw count with the
+                          valid-trial count n; lower is better.
+  * end-to-end success  — trial_end.outcome == 'success' (reached the place site), over the
+                          valid trials.
 
 NOT computable for teleop (EXCLUDED, matching the paper): collision-avoidance rate. The
 inadvertent-contact counter (n_inadvertent_contacts) only runs during the autonomous RRT
@@ -123,10 +125,14 @@ def trial_summary(evs: list[dict]) -> dict | None:
 # ── table assembly ───────────────────────────────────────────────────────────────────────
 
 def collect(run_dirs):
-    """Pool trials across run dirs into records keyed by (method, object). Each record:
-      duration_s, picked(bool), abandoned(bool), n_drops(int), success(bool).
-    Transport stability is reported as the total number of DROP events (object lost during
-    carry) over VALID trials — see build_success_table. Everything is event-based (no traces)."""
+    """Pool VALID trials across run dirs into records keyed by (method, object).
+
+    A trial is VALID iff it confirmed a pick AND was not abandoned (operator reset / target
+    switch). Invalid trials are excluded from the ENTIRE analysis — every metric (completion
+    time, drops, end-to-end) is computed only over the valid set, so a run's aborted/never-
+    grasped attempts never dilute the denominators. Each record:
+      duration_s, n_drops(int), success(bool), + the object property fields.
+    Everything is event-based (no trace files)."""
     records = defaultdict(list)
     for rd in run_dirs:
         rd = Path(rd)
@@ -135,10 +141,10 @@ def collect(run_dirs):
             s = trial_summary(evs)
             if s is None:
                 continue   # trial never ended / never placed; not scorable
+            if s['outcome'] == 'abandoned' or not s['pick_confirmed']:
+                continue   # invalid: abandoned or never picked — excluded from ALL metrics
             records[(s['method'], s['object'])].append({
                 'duration_s': s['duration_s'],
-                'picked':    s['pick_confirmed'],
-                'abandoned': (s['outcome'] == 'abandoned'),
                 'n_drops':   s.get('n_drops', 0) or 0,
                 'success':   (s['outcome'] == 'success'),
                 'mass_g':   s['mass_g'],
@@ -264,25 +270,21 @@ def build_time_table(records, methods, objects, method_labels):
 
 
 def build_success_table(records, methods, objects, method_labels):
+    # `records` already holds ONLY valid trials (picked & not abandoned; see collect), so
+    # every count here is over the valid set. 'Successful pick' is trivially n/n and omitted.
     def stage_counts(m, o):
         recs = records.get((m, o), [])
-        n_all   = len(recs)
-        n_pick  = sum(1 for r in recs if r['picked'])
+        n_valid = len(recs)
+        n_drops = sum(r['n_drops'] for r in recs)
         n_e2e   = sum(1 for r in recs if r['success'])
-        # Transport stability = total DROP events over VALID trials. Valid = NOT abandoned
-        # (operator reset / target switch) AND picked (a trial that never confirmed a pick
-        # never entered transport, so 'dropped during carry' is undefined for it).
-        valid = [r for r in recs if not r['abandoned'] and r['picked']]
-        n_valid = len(valid)
-        n_drops = sum(r['n_drops'] for r in valid)
-        return n_all, n_pick, n_valid, n_drops, n_e2e
+        return n_valid, n_drops, n_e2e
 
     lines = [
         r'\begin{table}[t]', r'  \centering', r'  \begin{threeparttable}',
-        r'    \caption{Subtask outcomes. Successful pick and end-to-end are '
-        r'successes/attempts (higher is better). Transport drops is the total number of '
-        r'drop events over the valid trials ($n$), lower is better. '
-        r'Collision-avoidance is omitted for teleop (not measured in the current logs).}',
+        r'    \caption{Subtask outcomes over VALID trials (a trial is valid iff it confirmed '
+        r'a pick and was not abandoned). Transport drops is the total number of drop events '
+        r'over the valid trials ($n$), lower is better; end-to-end is successes/valid, higher '
+        r'is better. Collision-avoidance is omitted for teleop (not measured in the logs).}',
         r'    \label{tab:subtask_success}',
         r'    \begin{tabular}{ll' + 'c' * len(objects) + '}',
         r'      \toprule',
@@ -294,22 +296,17 @@ def build_success_table(records, methods, objects, method_labels):
     ]
     for mi, m in enumerate(methods):
         label = method_labels.get(m, m)
-        pick_cells, stab_cells, e2e_cells = [], [], []
+        stab_cells, e2e_cells = [], []
         for o in objects:
-            n_all, n_pick, n_valid, n_drops, n_e2e = stage_counts(m, o)
-            pick_cells.append(fmt_frac(n_pick, n_all))
-            # Transport stability = number of DROP events over the valid trials (n_valid).
-            # Reported as "drops (n=valid)"; lower is better. '-' when no valid trials.
+            n_valid, n_drops, n_e2e = stage_counts(m, o)
+            # Transport drops = number of DROP events over the valid trials (n_valid).
             stab_cells.append(r'$-$' if n_valid == 0
                               else f'{n_drops}~({{\\scriptsize $n{{=}}{n_valid}$}})')
-            e2e_cells.append(fmt_frac(n_e2e, n_all, bold=(m != methods[0])))
-        lines.append(r'      \multirow{3}{*}{%s}' % label)
-        lines.append(r'        & Successful pick\tnote{a}        & '
-                     + ' & '.join(pick_cells) + r' \\')
-        lines.append(r'        & Transport drops\tnote{b}        & '
+            e2e_cells.append(fmt_frac(n_e2e, n_valid, bold=(m != methods[0])))
+        lines.append(r'      \multirow{2}{*}{%s}' % label)
+        lines.append(r'        & Transport drops\tnote{a}        & '
                      + ' & '.join(stab_cells) + r' \\')
-        lines.append(r'      \cmidrule(lr){2-%d}' % (len(objects) + 2))
-        lines.append(r'        & End-to-end                      & '
+        lines.append(r'        & End-to-end\tnote{b}             & '
                      + ' & '.join(e2e_cells) + r' \\')
         if mi != len(methods) - 1:
             lines.append(r'      \midrule')
@@ -318,12 +315,11 @@ def build_success_table(records, methods, objects, method_labels):
         r'    \end{tabular}',
         r'    \begin{tablenotes}[para,flushleft]',
         r'      \footnotesize',
-        r'      \item[a] Object lifted clear of the support surface and held for the '
-        r'pick-dwell window (pick\_confirmed). Denominator: all trials.',
-        r'      \item[b] Total \texttt{drop} events (object fell out of the grasp during '
-        r'carry) over the valid trials. Valid = trials that confirmed a pick and were not '
-        r'abandoned (operator reset / target switch). $n$ is the valid-trial count; lower '
-        r'drops is better.',
+        r'      \item[a] Total \texttt{drop} events (object fell out of the grasp during '
+        r'carry) over the valid trials. $n$ is the valid-trial count; lower is better.',
+        r'      \item[b] Trials reaching the place site (\texttt{outcome=success}) over the '
+        r'valid trials. Valid = confirmed a pick and not abandoned (operator reset / target '
+        r'switch); abandoned and never-picked trials are excluded from the entire analysis.',
         r'    \end{tablenotes}',
         r'  \end{threeparttable}',
         r'\end{table}',
@@ -355,14 +351,14 @@ def emit_tables(dirs, args, heading=None):
     # Summary to stderr so stdout stays pure LaTeX (pipe-friendly).
     if heading:
         print(f'# === {heading} ===', file=sys.stderr)
-    print('# trials pooled per (method, object):', file=sys.stderr)
+    print('# VALID trials pooled per (method, object)  '
+          '[valid = picked & not abandoned]:', file=sys.stderr)
     for (m, o), recs in sorted(records.items()):
-        n = len(recs); npick = sum(r['picked'] for r in recs)
-        valid = [r for r in recs if not r['abandoned'] and r['picked']]
-        ndrops = sum(r['n_drops'] for r in valid)
+        n = len(recs)
+        ndrops = sum(r['n_drops'] for r in recs)
         ns = sum(r['success'] for r in recs)
-        print(f'#   {m:24} {o:16}  N={n:3}  pick={npick}  '
-              f'drops={ndrops}(n={len(valid)})  success={ns}', file=sys.stderr)
+        print(f'#   {m:24} {o:16}  n_valid={n:3}  drops={ndrops}  success={ns}',
+              file=sys.stderr)
     print('', file=sys.stderr)
 
     if heading:
