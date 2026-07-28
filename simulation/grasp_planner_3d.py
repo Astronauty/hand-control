@@ -2445,16 +2445,24 @@ class MultiStartGraspPlanner3D:
         # along the object's local x and y axes, tried before the randomized
         # seeds below (counts against the n_seeds budget).
         seeds, attempts, rejected = [], 0, 0
-        # for _axis in (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])):
-        #     if len(seeds) >= n_seeds:
-        #         break
-        #     _fs = _fixed_antipodal_seed(geom_type, geom_size, c, obj_R_np, _axis)
-        #     if (not _reachable_contact(_fs['p1s'], _ground_z, _r_tip_min) or
-        #             not _reachable_contact(_fs['p2s'], _ground_z, _r_tip_min)):
-        #         log.debug(f"[seed_gen] fixed seed along axis {_axis.tolist()} "
-        #                   f"unreachable — skipped")
-        #         continue
-        #     seeds.append(_fs)
+        # Fixed canonical seeds FIRST: perfectly antipodal pairs through the object center
+        # along the box's OWN local x and y axes (d_world = obj_mat @ local_axis), so they are
+        # opposite-face for ANY object orientation — unlike _seed_pair, whose march is rotated
+        # about WORLD z and can exit an adjacent face on a substantially +z-rotated box
+        # (contacts ~90deg apart -> NLP converges but verify()'s wrench LP is infeasible). These
+        # guarantee >=1 clean antipodal candidate for the ranker to pick on rotated boxes.
+        # _assign_seed_by_finger orients thumb/index to the live hand, same as the random seeds.
+        for _axis in (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])):
+            if len(seeds) >= n_seeds:
+                break
+            _fs = _fixed_antipodal_seed(geom_type, geom_size, c, obj_R_np, _axis)
+            if (not _reachable_contact(_fs['p1s'], _ground_z, _r_tip_min) or
+                    not _reachable_contact(_fs['p2s'], _ground_z, _r_tip_min)):
+                log.debug(f"[seed_gen] fixed seed along axis {_axis.tolist()} "
+                          f"unreachable — skipped")
+                continue
+            _assign_seed_by_finger(_fs, _live_th, _live_if)
+            seeds.append(_fs)
 
         # sample seeds for solver
         while len(seeds) < n_seeds and attempts < max_attempts:

@@ -40,7 +40,7 @@ The current sweep holds three cubes of **identical geometry** (4 cm half-extent 
 |---|---|---|---|---|---|
 | `obj_red_box` | Object 1 (baseline) | 250 g | 2.00 | 2667 g·cm² | Default |
 | `obj_box_lowmu` | Object 2 (lower friction) | 250 g | **1.20** | 2667 g·cm² | 0.6× μ, same mass |
-| `obj_box_light` | Object 3 (lighter) | **150 g** | 2.00 | **1600 g·cm²** | 0.6× mass, same μ |
+| `obj_box_heavy` | Object 3 (heavier) | **350 g** | 2.00 | **3733 g·cm²** | 1.4× mass, same μ |
 
 `condim=6` and the torsional/rolling friction terms are held fixed across all three, so μ and mass are the only variables. `I_zz` is MuJoCo's principal moment about the vertical axis, computed from the mesh+mass under uniform density. To add a condition, copy one of the `obj_box_*` bodies in the scene XML (keep the shared `obj_box_` name prefix so the loader picks it up), register it in the `object_defs` list in `kinova_leap_pick_place.py`, and it becomes selectable via `--object`.
 
@@ -113,7 +113,7 @@ python kinova_leap_pick_place.py --mode contact_aware_teleop --trial-log my_run 
 
 # one object per run for a friction/mass sweep (see Object sweep above):
 python kinova_leap_pick_place.py --mode dexpilot --trial-log --object obj_box_lowmu
-python kinova_leap_pick_place.py --mode dexpilot --trial-log --object obj_box_light
+python kinova_leap_pick_place.py --mode dexpilot --trial-log --object obj_box_heavy
 ```
 
 Each run directory holds three correlated streams (see [`trial_logger.py`](trial_logger.py) for the full state machine):

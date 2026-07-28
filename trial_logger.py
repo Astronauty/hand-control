@@ -42,7 +42,7 @@ import numpy as np
 
 
 # ── Tunable constants (all settled in the design conversation) ────────────────────────
-LIFT_HEIGHT_M      = 0.03   # object clearance above rest height counted as "lifted"
+LIFT_HEIGHT_M      = 0.01  # object clearance above rest height counted as "lifted"
 DWELL_S             = 1.0    # continuous sim-time above LIFT_HEIGHT_M to confirm a pick
 CONTACT_PENETRATION_M = 0.0005  # min penetration depth to count as a real contact (not solver margin)
 CONTACT_EPISODE_COOLDOWN_S = 0.5  # min sim-time gap between counted episodes — a
