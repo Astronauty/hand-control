@@ -201,6 +201,109 @@ python internal_force_control.py
 
 ---
 
+## YCB object assets
+
+The [YCB object set](https://www.ycbbenchmarks.com/) provides scanned meshes of everyday
+objects. They ship as textured **concave** meshes, which MuJoCo cannot use for contact
+directly — a `<geom type="mesh">` collides against its *convex hull*, so a bowl becomes a
+solid dome and a drill's trigger cavity fills in. `scripts/build_ycb.py` converts each
+object into an MJCF with a convex-decomposed collision proxy, so concavities survive into
+the physics.
+
+Both `assets/ycb_raw/` (1.5 GB of downloads) and `assets/ycb_mjcf/` (584 MB of generated
+output) are gitignored — regenerate them with the steps below.
+
+### 1. Download
+
+YCB is published in a public S3 bucket, so no AWS account or credentials are needed —
+`--no-sign-request` fetches anonymously:
+
+```bash
+aws s3 cp --no-sign-request --recursive s3://ycb-benchmarks/ assets/ycb_raw/ \
+  --exclude "*" --include "*google_16k*"
+```
+
+The `--exclude "*" --include "*google_16k*"` filter is the important part: every object is
+published in `google_16k`, `google_64k`, and `google_512k` variants, and this pulls only
+the 16k tier (the Google-scanner reconstruction decimated to ~16k faces — the sim-friendly
+size). Without the filter the download is many times larger for no benefit here. Expect
+~1.5 GB and a while to transfer.
+
+That lands the tarballs at `assets/ycb_raw/data/google/<object>_google_16k.tgz`, though
+the build step finds them anywhere under `assets/ycb_raw/`. Each archive already contains
+the `<object>/google_16k/textured.obj` layout the converter looks for, so no manual
+unpacking or reorganising is needed.
+
+**84 objects, not 85.** `076_timer_google_16k.tgz` is a 45-byte stub *in the upstream
+bucket* — not a failed download. It is skipped with a `no google_16k mesh` message; every
+other object converts.
+
+### 2. Convert
+
+```bash
+uv run python scripts/build_ycb.py
+```
+
+This extracts any not-yet-extracted archive in place, then per object:
+
+1. Loads `google_16k/textured.obj` (the scan, with UVs).
+2. Runs [CoACD](https://github.com/SarahWeiii/CoACD) convex decomposition
+   (`max_convex_hull=8`) to split the concave mesh into a union of convex hulls —
+   geometry MuJoCo's solver can resolve exactly.
+3. Writes `assets/ycb_mjcf/<object>/<object>.xml` with the visual mesh, the hulls, and a
+   texture/material binding.
+
+The script is idempotent: already-extracted objects are skipped, so re-runs are cheap.
+CoACD is CPU-bound and single-threaded — a full 84-object run takes on the order of an
+hour. `max_convex_hull` is the accuracy/speed knob; raise it for irregular objects whose
+cavities matter (power drill, hammer), lower it to cut contact pairs.
+
+Output per object:
+
+```
+assets/ycb_mjcf/<object>/
+├── <object>.xml          # generated MJCF
+├── textured.obj          # visual mesh (copied)
+├── texture_map.png       # texture (copied)
+├── textured.mtl          # copied; MuJoCo does not read .mtl
+└── collision/part_*.obj  # generated convex hulls
+```
+
+Each MJCF is standalone and drops into a scene with a top-level
+`<include file="...xml"/>` (an `<include>` may not sit inside `<worldbody>`). Objects
+carry a `<freejoint/>` and no floor, so they free-fall unless the scene provides one.
+
+**Geom groups** separate the two representations — `group="2"` is the visual mesh
+(`contype=0 conaffinity=0`, purely cosmetic), `group="3"` the collision hulls. In any
+MuJoCo viewer press **`2`** / **`3`** to toggle each.
+
+**Textures.** MuJoCo ignores the OBJ sidecar `textured.mtl`, so the generator emits a
+`<texture type="2d">` (the default `"cube"` mapping garbles UV-mapped scans) plus a
+`<material>`, and binds the material to the visual geom — geoms have no `texture`
+attribute of their own, so the `geom → material → texture` chain is required. Collision
+hulls stay unmaterialed.
+
+### 3. Inspect
+
+```bash
+python -m mujoco.viewer --mjcf=assets/ycb_mjcf/006_mustard_bottle/006_mustard_bottle.xml
+```
+
+Press **Space** to pause (else the freejoint drops it out of frame), then **`3`** / **`2`**
+to show the hulls and hide the visual mesh. Or use the helper, which holds the object
+still and pre-sets the groups (run from `scripts/` — it imports `build_ycb`):
+
+```bash
+cd scripts
+python view_ycb.py 024_bowl                    # both, toggle with 2 / 3
+python view_ycb.py 024_bowl --collision-only   # hulls only
+```
+
+Worth checking the concave objects (`024_bowl`, `065-*_cups`, `035_power_drill`) — if a
+cavity is filled in rather than hollow, that object needs a higher `max_convex_hull`.
+
+---
+
 ## Camera calibration (ChArUco board)
 
 Calibration produces, per camera, the intrinsics (`camera_matrix`, `dist_coeffs`) and the extrinsic pose (`R_cam_world`, `t_cam_world`) that place the camera in a fixed **world frame** anchored to the board. Single-camera teleop uses these for metric wrist positioning; multi-camera triangulation uses them to fuse views (see [`teleop/MULTICAM.md`](teleop/MULTICAM.md)).
