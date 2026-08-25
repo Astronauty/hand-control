@@ -259,6 +259,7 @@ def make_key_callback(key_queue):
                                 #     dataset for offline IK-weight sweeping
         54:  'ik_vis',  # 6 — cycle IK config visualization
         55:  'bspheres', # 7 — toggle IK collision bounding-sphere overlay
+        89:  'obj_transparent', # Y — toggle transparency of the MANIPULATED object only
         56:  'teleop_start', # 8 — (dexpilot) start/re-zero tracking at current pose
         57:  'calib_orient', # 9 — (dexpilot) hold hand to match robot wrist, capture
                              #     the constant orientation correction
@@ -2101,65 +2102,106 @@ if __name__ == "__main__":
             print("[DexPilot] --no-mediapipe: single-cam publisher NOT started; "
                   "subscribing to an external /hand/joint_angles publisher.")
         else:
-            _mp_cmd = [sys.executable,
-                       'ui/mediapipe_joint_angles.py']
+            # 1) MediaPipe RGB cam hand pose tracking
+            # _mp_cmd = [sys.executable,
+            #            'ui/mediapipe_joint_angles.py']
+
+            # 2) Vive Focus Vision hand pose tracking
+            _mp_cmd = [sys.executable, 'ui/vive_hand_publisher.py', '--hand', 'right']
+
             if args.camera is not None:
                 _mp_cmd += ['--camera', str(args.camera)]
+                
             _mediapipe_proc = subprocess.Popen(_mp_cmd)
             print(f"[DexPilot] MediaPipe publisher launched (pid {_mediapipe_proc.pid})")
 
         from teleop.dexpilot_controller import DexPilotController
         from teleop.dexpilot_arm_controller import (load_camera_calibration,
                                                     load_teleop_config)
-        # Use the measured ChArUco calibration (camera_extrinsics/intrinsics.json)
-        # for the camera->robot rotation and pixel->metre scales. Falls back to a
-        # bare identity mapping if the calibration files aren't present.
-        try:
-            # Z-up world remap: the publisher flips the board frame (camera looks
-            # DOWN, board +Z points down) to MuJoCo Z-up via diag([1,-1,-1]).
-            # Pass the SAME remap here so R_cam_robot (orientation) lives in the
-            # same Z-up frame as the published position — otherwise position and
-            # orientation disagree and the wrist rotation maps wrong.
-            _world_from_board = np.diag([1.0, -1.0, -1.0])
-            _cam_kwargs = load_camera_calibration(world_from_board=_world_from_board)
-            # Position tunables from calibration/teleop_config.json (mode,
-            # abs_scale, world_from_board). --position-mode CLI overrides the
-            # config's mode when given. The publisher sends metric board-frame
-            # wrist coords (absolute publish mode), which BOTH position modes
-            # consume; only valid when calibration is present.
-            _pos_cfg = load_teleop_config()
-            if args.position_mode is not None:
-                _pos_cfg["position_mode"] = args.position_mode
-            _cam_kwargs.update(_pos_cfg)
-            # DIRECT hand->wrist orientation: with the arm palm frame now built
-            # from the stable IMAGE landmarks, the world->wrist rotation shown in
-            # the MediaPipe overlay maps 1:1 to the MuJoCo target — no press-8
-            # offset, no stale orientation_correction.json. Set False to re-enable
-            # the press-8 auto-calibration.
-            _cam_kwargs["identity_orientation"] = True
-            # MULTICAM (--no-mediapipe): the fused palm_R is already in the SHARED
-            # WORLD frame (triangulated), not a single camera's MediaPipe frame. So
-            # the single-cam R_cam_robot (= that one camera's R_world_cam, ~103.7°
-            # of rotation) must NOT be applied — it re-rotates an already-world palm
-            # and flips the wrist orientation. The orientation chain in step() is
-            #   R_des = R_correct @ R_cam_robot @ R_mp_to_cv @ palm_R,
-            # with R_correct=I (identity_orientation) and R_mp_to_cv=diag([1,-1,-1]).
-            # Choosing R_cam_robot = diag([1,-1,-1]) makes R_cam_robot@R_mp_to_cv = I,
-            # so R_des = palm_R maps the fused world palm DIRECTLY to the robot. The
-            # single-cam path keeps the measured R_cam_robot (unchanged below).
-            if args.no_mediapipe:
-                _cam_kwargs["R_cam_robot"] = np.diag([1.0, -1.0, -1.0])
-                print("[DexPilot] multicam: R_cam_robot neutralized (fused palm is "
-                      "already world-frame) — direct world->robot orientation.")
-            print(f"[DexPilot] loaded camera calibration: "
-                  f"scale_x={_cam_kwargs['scale_x']:.3f} scale_z={_cam_kwargs['scale_z']:.3f} "
-                  f"| position={_cam_kwargs['position_mode']} abs_scale={_cam_kwargs['abs_scale']:.2f} "
-                  f"| FULL 3-DOF IDENTITY orientation (direct mapping)")
-        except FileNotFoundError:
-            _cam_kwargs = {"R_cam_robot": np.eye(3), "position_mode": "legacy",
-                           "identity_orientation": True}
-            print("[DexPilot] no camera calibration found — using identity "
-                  "R_cam_robot, LEGACY delta positioning. Run calibration/charuco_calibration.py.")
+        # # [ONLY FOR MULTI-CAMERA SETUP] Use the measured ChArUco calibration (camera_extrinsics/intrinsics.json)
+        # # for the camera->robot rotation and pixel->metre scales. Falls back to a
+        # # bare identity mapping if the calibration files aren't present.
+        # try:
+        #     # Z-up world remap: the publisher flips the board frame (camera looks
+        #     # DOWN, board +Z points down) to MuJoCo Z-up via diag([1,-1,-1]).
+        #     # Pass the SAME remap here so R_cam_robot (orientation) lives in the
+        #     # same Z-up frame as the published position — otherwise position and
+        #     # orientation disagree and the wrist rotation maps wrong.
+        #     _world_from_board = np.diag([1.0, -1.0, -1.0])
+        #     _cam_kwargs = load_camera_calibration(world_from_board=_world_from_board)
+        #     # Position tunables from calibration/teleop_config.json (mode,
+        #     # abs_scale, world_from_board). --position-mode CLI overrides the
+        #     # config's mode when given. The publisher sends metric board-frame
+        #     # wrist coords (absolute publish mode), which BOTH position modes
+        #     # consume; only valid when calibration is present.
+        #     _pos_cfg = load_teleop_config()
+        #     if args.position_mode is not None:
+        #         _pos_cfg["position_mode"] = args.position_mode
+        #     _cam_kwargs.update(_pos_cfg)
+        #     # DIRECT hand->wrist orientation: with the arm palm frame now built
+        #     # from the stable IMAGE landmarks, the world->wrist rotation shown in
+        #     # the MediaPipe overlay maps 1:1 to the MuJoCo target — no press-8
+        #     # offset, no stale orientation_correction.json. Set False to re-enable
+        #     # the press-8 auto-calibration.
+        #     _cam_kwargs["identity_orientation"] = True
+        #     # MULTICAM (--no-mediapipe): the fused palm_R is already in the SHARED
+        #     # WORLD frame (triangulated), not a single camera's MediaPipe frame. So
+        #     # the single-cam R_cam_robot (= that one camera's R_world_cam, ~103.7°
+        #     # of rotation) must NOT be applied — it re-rotates an already-world palm
+        #     # and flips the wrist orientation. The orientation chain in step() is
+        #     #   R_des = R_correct @ R_cam_robot @ R_mp_to_cv @ palm_R,
+        #     # with R_correct=I (identity_orientation) and R_mp_to_cv=diag([1,-1,-1]).
+        #     # Choosing R_cam_robot = diag([1,-1,-1]) makes R_cam_robot@R_mp_to_cv = I,
+        #     # so R_des = palm_R maps the fused world palm DIRECTLY to the robot. The
+        #     # single-cam path keeps the measured R_cam_robot (unchanged below).
+        #     if args.no_mediapipe:
+        #         _cam_kwargs["R_cam_robot"] = np.diag([1.0, -1.0, -1.0])
+        #         print("[DexPilot] multicam: R_cam_robot neutralized (fused palm is "
+        #               "already world-frame) — direct world->robot orientation.")
+        #     print(f"[DexPilot] loaded camera calibration: "
+        #           f"scale_x={_cam_kwargs['scale_x']:.3f} scale_z={_cam_kwargs['scale_z']:.3f} "
+        #           f"| position={_cam_kwargs['position_mode']} abs_scale={_cam_kwargs['abs_scale']:.2f} "
+        #           f"| FULL 3-DOF IDENTITY orientation (direct mapping)")
+        # except FileNotFoundError:
+        #     _cam_kwargs = {"R_cam_robot": np.eye(3), "position_mode": "legacy",
+        #                    "identity_orientation": True}
+        #     print("[DexPilot] no camera calibration found — using identity "
+        #           "R_cam_robot, LEGACY delta positioning. Run calibration/charuco_calibration.py.")
+
+
+        # --- Vive Focus Vision input: no ChArUco calibration ------------------
+        # OpenXR STAGE space is already metric and gravity-aligned, so the two
+        # problems the board solved — recovering scale from pixels and locating
+        # cameras relative to the robot — do not exist. The saved scale_x/scale_z
+        # (1.236/0.927) are pixel->metre factors that would rescale already-metric
+        # data, and abs_scale=2.0 amplified hand travel to cover the workspace from
+        # a webcam's small capture volume, which a metre of headset-tracked travel
+        # does not need.
+        #
+        # R_cam_robot is diag([1,-1,-1]) rather than identity on purpose. The
+        # orientation chain in step() is
+        #     R_des = R_correct @ R_cam_robot @ R_mp_to_cv @ palm_R
+        # with R_mp_to_cv = diag([1,-1,-1]) and R_correct = I under
+        # identity_orientation, so this choice makes the pair cancel and maps the
+        # published world-frame palm straight to the robot wrist — the same thing
+        # the multicam branch did for its already-world-frame fused palm.
+        _cam_kwargs = {
+            "R_cam_robot": np.diag([1.0, -1.0, -1.0]),
+            "position_mode": "relative",   # press-8 rezeroable; see note below
+            "abs_scale": 3.0,              # 1:1, no amplification
+            "scale_x": 1.0,                # already metres
+            "scale_z": 1.0,
+            "identity_orientation": True,  # direct hand->wrist, no press-8 offset
+        }
+        if args.position_mode is not None:
+            _cam_kwargs["position_mode"] = args.position_mode
+        print(f"[DexPilot] Vive input: no camera calibration — metric STAGE "
+              f"coordinates, {_cam_kwargs['position_mode']} positioning at 1:1, "
+              f"direct orientation.")
+
+
+
+
         # Palm-DOWN home for teleop: pinch_site palm NORMAL (+X) points down
         # (world -Z) and FINGERS (+Z) point FORWARD (world +X) — palm flat over
         # the table, fingers reaching away. Natural neutral (hold your palm down,
@@ -2232,7 +2274,7 @@ if __name__ == "__main__":
             _Mfull = np.zeros((model.nv, model.nv))
             mj.mj_fullM(model, _Mfull, data.qM)
             _I_arm = np.clip(np.diag(_Mfull)[:7], 1e-3, None)   # per-arm-joint inertia
-            _WN = 100.0                                          # rad/s (~3 Hz) target
+            _WN = 30.0                                          # rad/s (~3 Hz) target
             _dp_Kp_arm = _I_arm * _WN**2
             # TEST (matches autonomous): save the compiled DEFAULT arm damping (0 in the
             # XML — the value autonomous holds the grasp at) BEFORE the tracking override,
@@ -2274,6 +2316,9 @@ if __name__ == "__main__":
             hand_alpha=_dp_hand_alpha, **_cam_kwargs)
         _dexpilot_ctrl.init_home(data)   # snapshots the wrist-down pose as home
         _dexpilot_ctrl.init_ros()
+
+        from ui.divergence_log import DivergenceLogger
+        _divlog = DivergenceLogger(model, out_dir='logs/divergence', n_robot=N_ROBOT)
 
         # Live finger-retargeting tuning by TEXT ENTRY: edit the 7 constants
         # (BETA/GAMMA/EPS/ETA1/ETA2/S1/S2 gains) in calibration/retarget_config.json
@@ -3076,8 +3121,67 @@ if __name__ == "__main__":
                 qdot_arm *= JOG_QDOT_MAX / _qdmax
         return qdot_arm, jog_v, jog_w, sigma_min
 
+    # Joint limits for the 7 arm DOF, and a mask of which are actually bounded.
+    # Gen3's joints 1/3/5/7 (indices 0,2,4,6) are CONTINUOUS — their jnt_range is
+    # [0,0], widened to [-pi,pi] above only so RRTPlanner samples them. Clamping a
+    # continuous joint to a real bound would pin it, so only the truly limited
+    # joints (1,3,5) are clamped.
+    _ARM_LIM = model.jnt_range[:7].copy()
+    _ARM_BOUNDED = np.array([True, True, True, True, True, True, True])
+    for _j in (0, 2, 4, 6):
+        _ARM_BOUNDED[_j] = False          # continuous revolute
+    _windup_warned = [False]
+
+    def _clamp_arm_hold(hold):
+        """Clamp the integrated arm PD target to the model's joint limits.
+
+        Without this the integrator is blind to the constraint: MuJoCo holds the
+        physical joint at its limit while `hold += qdot*dt` keeps advancing, so the
+        PD error grows without bound and Kp (~9500 on the base) turns it into
+        runaway torque. Measured in a divergence dump: joint 5 at 0.09 rad from its
+        limit while joints 2/4/6 carried 0.9-1.6 rad of target error — the DLS had
+        redistributed the blocked wrist velocity onto the unlimited continuous
+        joints, whose targets then sprinted away.
+        """
+        np.clip(hold[_ARM_BOUNDED], _ARM_LIM[_ARM_BOUNDED, 0],
+                _ARM_LIM[_ARM_BOUNDED, 1], out=hold[_ARM_BOUNDED])
+        _err = np.abs(hold - data.qpos[:7]).max()
+        if _err > 0.5 and not _windup_warned[0]:
+            _windup_warned[0] = True
+            print(f"\r\n[teleop] WARNING: arm PD target is {_err:.2f} rad from the "
+                  f"arm — the operator is commanding outside the reachable "
+                  f"workspace. Back off or press Backspace to re-home.")
+        elif _err < 0.2:
+            _windup_warned[0] = False     # re-arm once tracking recovers
+        return hold
+
     _ik_vis_mode   = None          # None | 'grasp': freeze physics to show IK config
     _show_bspheres = False         # 7: overlay the IK's per-geom collision bounding spheres
+    # Y: make ONLY the currently-manipulated object translucent (see the fingerpads /
+    # contacts through it) without touching the other scene objects. Tracks the geom whose
+    # alpha we lowered plus its original alpha so the toggle restores it exactly, and so a
+    # target/prox switch hands the transparency to the new object rather than stranding it.
+    _OBJ_ALPHA_ON  = 0.30          # alpha applied to the manipulated geom when transparent
+    _obj_transparent = False       # toggle state
+    _obj_tp_gid    = -1            # geom id currently made transparent (-1 = none)
+    _obj_tp_alpha0 = 1.0          # that geom's original rgba alpha, to restore on toggle-off
+
+    def _apply_obj_transparency(gid):
+        """Push the current _obj_transparent state onto geom `gid` (the manipulated
+        object). Restores any previously-dimmed geom to its stored alpha first, so exactly
+        one object is ever translucent and its original alpha is always recoverable.
+        Idempotent; safe to call every frame (only writes when the target geom changes)."""
+        global _obj_tp_gid, _obj_tp_alpha0
+        want = gid if (_obj_transparent and gid is not None and gid >= 0) else -1
+        if want == _obj_tp_gid:
+            return                          # already in the desired state
+        if _obj_tp_gid >= 0:                # restore the previously-dimmed geom
+            model.geom_rgba[_obj_tp_gid, 3] = _obj_tp_alpha0
+            _obj_tp_gid = -1
+        if want >= 0:                       # dim the new one, remembering its alpha
+            _obj_tp_alpha0 = float(model.geom_rgba[want, 3])
+            model.geom_rgba[want, 3] = _OBJ_ALPHA_ON
+            _obj_tp_gid = want
 
     # Precomputed (geom_id, bounding-sphere radius, tier) for every hand geom the IK
     # constrains — this is the coarse sphere model the IK actually "sees" (finger links
@@ -3453,7 +3557,7 @@ if __name__ == "__main__":
                 # back down within the step, leaving the arm lagging. One-shot per teleop
                 # entry; lock-in restores _ARM_DAMPING_TRACK and clears the flag.
                 if not _teleop_damping_zeroed:
-                    model.dof_damping[:7] = _ARM_DAMPING_DEFAULT
+                    model.dof_damping[:7] = _ARM_DAMPING_TRACK
                     _teleop_damping_zeroed = True
                 # Throttle the ROS hand poll to ~60 Hz sim-time (data is camera-rate; polling
                 # every 1 ms iteration cost ~1 ms/iter for nothing new). step() reads raw_msg
@@ -3565,6 +3669,11 @@ if __name__ == "__main__":
                             print("           tiers: green=contact(must touch)  "
                                   "amber=adjacent(-10mm)  blue=proximal(+2mm)  "
                                   "grey=passive(full)  RED=over-tier penetration of active obj")
+                    elif _k == 'obj_transparent':
+                        _obj_transparent = not _obj_transparent
+                        _apply_obj_transparency(objects[_prox_idx]['id_geom'])
+                        print(f"[teleop] manipulated object transparency "
+                              f"{'ON' if _obj_transparent else 'off'}  (Y to toggle)")
                     elif _k == 'lock_in':
                         _do_lock_in = True
                     elif _k == 'rec_vis':
@@ -3596,6 +3705,11 @@ if __name__ == "__main__":
                 _avg_d = [np.mean([_guarded_geom_dist(_tg, _o['id_geom'])
                                    for _tg in _ALL_TIP_GIDS]) for _o in objects]
                 _prox_idx = int(np.argmin(_avg_d))
+
+                # Hand the Y-toggle transparency to whichever object is now nearest, so it
+                # follows the manipuland as the operator moves between objects (no-op unless
+                # the toggle is on or the previously-dimmed object changed).
+                _apply_obj_transparency(objects[_prox_idx]['id_geom'])
 
                 # Latest recommendation candidate for the nearest object (drives both
                 # the markers and the P-preview pose).
@@ -3756,6 +3870,7 @@ if __name__ == "__main__":
                             # on squeeze). The kd term evaluates against the just-injected qvel
                             # (=0, exactly as GRASP), present only to damp any residual.
                             _teleop_arm_hold += _qdot_arm * model.opt.timestep
+                            _clamp_arm_hold(_teleop_arm_hold)
                             _dp_target[:7] = _teleop_arm_hold
                             data.qvel[:7] = _qdot_arm   # velocity injection (as the GRASP carry)
                             tau_ctrl[:] = 0.0
@@ -3782,6 +3897,7 @@ if __name__ == "__main__":
                             mj.mj_step(model, data)
                     else:
                         _teleop_arm_hold += _qdot_arm * model.opt.timestep
+                        _clamp_arm_hold(_teleop_arm_hold)
                         _dp_target[:7] = _teleop_arm_hold
                         data.qpos[:N_ROBOT] = _dp_target
                         data.qvel[:N_ROBOT] = 0.0
@@ -4063,6 +4179,7 @@ if __name__ == "__main__":
                     mj.mj_forward(model, data)
                 else:
                     _dpp_t0 = time.perf_counter() if DP_PROFILE else 0.0
+
                     # step() runs the finger retarget + updates the arm IK's internal
                     # target frame. We take the FINGER joints from its output (q_teleop[7:])
                     # and the WRIST TARGET FRAME from target_frame() — the ARM is driven by
@@ -4083,7 +4200,7 @@ if __name__ == "__main__":
                         # injection isn't bled by the heavy implicit damping (same as the
                         # pre-lock-in drive). init_home/reset restore TRACK + clear the flag.
                         if not _teleop_damping_zeroed:
-                            model.dof_damping[:7] = _ARM_DAMPING_DEFAULT
+                            model.dof_damping[:7] = _ARM_DAMPING_TRACK
                             _teleop_damping_zeroed = True
                         # ARM: resolved-rate wrist tracking (shared solver). FINGERS: PD to
                         # the retargeted joints (force-controlled — required for grasping;
@@ -4128,6 +4245,7 @@ if __name__ == "__main__":
                                 # lock-in drive). Fingers: PD to the retarget target so they
                                 # respond to contact and can grasp.
                                 _teleop_arm_hold += _qdot_arm * model.opt.timestep
+                                _clamp_arm_hold(_teleop_arm_hold)
                                 _dp_target[:7] = _teleop_arm_hold
                                 data.qvel[:7] = _qdot_arm
                                 tau_ctrl[:] = 0.0
@@ -4151,6 +4269,12 @@ if __name__ == "__main__":
                         data.qpos[:N_ROBOT] = q_teleop
                         data.qvel[:N_ROBOT] = 0.0
                         mj.mj_forward(model, data)
+
+                if '_qdot_arm' in dir():
+                    _divlog.sample(model, data, target=_dp_target,
+                                qdot_cmd=_qdot_arm, sigma_min=_sigma_min,
+                                wrist_tgt=_teleop_wrist_tgt)
+
 
                 _dpp_t0 = time.perf_counter() if DP_PROFILE else 0.0
                 # --- Detect out-of-band resets (MuJoCo's BADQACC auto-reset on
@@ -4709,13 +4833,13 @@ if __name__ == "__main__":
                     _squeeze_steps = 0
                     grasp_ctrl.set_squeeze(squeeze_on)
                     _push_squeeze(squeeze_on, gamma_live)
-                    # Draw the wrench cone at the APPLIED squeeze (gamma_live = raw x
-                    # GAMMA_SAFETY_FACTOR) so the cage reflects the safety multiplier —
-                    # it grows with the factor, making its effect visible as you tune it.
-                    # (The raw 1.0x cone is the minimum feasible boundary; the applied
-                    # cone is GAMMA_SAFETY_FACTOR times larger and the live trace sits
-                    # well inside it.)
-                    _push_wrench_cone(gamma_live, _p_O, _R_in, _mu)
+                    # Draw the wrench cone at the NOMINAL solved squeeze (gamma_raw =
+                    # the LP's minimum no-slip gamma, the true feasible boundary) so the
+                    # cage is the minimum feasible set the grasp must supply — NOT the
+                    # safety-scaled gamma_live (= raw x GAMMA_SAFETY_FACTOR) that actually
+                    # squeezes. The live applied-force trace staying inside this nominal
+                    # cage means the grasp is feasible at its minimum, unmagnified budget.
+                    _push_wrench_cone(gamma_raw, _p_O, _R_in, _mu)
                     # Single-Enter grasp (contact_aware_teleop): schedule the squeeze to
                     # auto-apply after SEAT_SETTLE_S, so this one Enter commits the whole
                     # grasp (posture now -> squeeze once the pads seat). The pre-fire site

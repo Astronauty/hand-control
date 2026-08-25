@@ -90,12 +90,31 @@ def _time_gradient_rgba(n, base_rgb):
     return rgba
 
 
+def _rescale_axis(axis, axis_txt, pts):
+    """Size the GLAxisItem triad to span the wrench-cone verts and pin the three
+    axis-label GLTextItems just past each arm's tip. `pts` is the cone's (n,3) vertices;
+    the triad arm on each axis is the max |coordinate| the cone reaches on that axis
+    (floored at 1 unit so the triad never collapses when the cone is tiny/absent).
+    Labels sit at 1.15x the arm length so they land slightly OUTSIDE the cone rather than
+    on its surface; their fixed pixel font keeps them readable at any zoom, and re-pinning
+    here keeps them attached to the tips as the cone changes."""
+    if pts.size == 0:
+        return
+    ext = np.abs(pts).max(axis=0)                      # per-axis cone reach
+    arm = np.maximum(ext, 1.0).astype(float)           # floor each arm at 1 unit
+    axis.setSize(x=arm[0], y=arm[1], z=arm[2])
+    tip = arm * 1.15                                    # labels sit just outside the cone
+    axis_txt[0].setData(pos=(tip[0], 0.0, 0.0))
+    axis_txt[1].setData(pos=(0.0, tip[1], 0.0))
+    axis_txt[2].setData(pos=(0.0, 0.0, tip[2]))
+
+
 def _run(queue, fingers, horizon_s, dt_hint):
     """Dashboard process entry point. Imports Qt lazily so the parent never loads it."""
     from collections import deque
     import pyqtgraph as pg
     import pyqtgraph.opengl as gl
-    from pyqtgraph.Qt import QtWidgets, QtCore
+    from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
 
     app = pg.mkQApp("hand-control dashboard")
     pg.setConfigOptions(antialias=True)
@@ -200,7 +219,7 @@ def _run(queue, fingers, horizon_s, dt_hint):
     # vectors plotted as a persistent trajectory in 3D over the SAME horizon_s window
     # as the 2D plots, with a colour gradient (dim/old -> bright/new) showing the
     # recent path of the applied force/moment. ---
-    def _wrench_view(title, base_rgb):
+    def _wrench_view(title, base_rgb, axis_labels):
         box = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(box)
         v.setContentsMargins(0, 0, 0, 0)
@@ -209,10 +228,24 @@ def _run(queue, fingers, horizon_s, dt_hint):
         lbl.setAlignment(QtCore.Qt.AlignCenter)
         w = gl.GLViewWidget()
         w.setCameraPosition(distance=3.0, elevation=22, azimuth=-60)
-        w.addItem(gl.GLGridItem())          # xy reference grid at the origin
+        # No reference grid (removed): the labelled axis triad below is the only spatial
+        # reference, which keeps the force/torque set uncluttered at any zoom.
         axis = gl.GLAxisItem()
-        axis.setSize(1, 1, 1)               # unit x/y/z axis triad (R/G/B by convention)
+        axis.setSize(1, 1, 1)               # x/y/z axis triad (R/G/B by convention);
+                                            # rescaled per-frame in drain() to the data extent
         w.addItem(axis)
+        # Per-axis text labels at the triad tips. GLTextItem renders at a FIXED pixel font
+        # size independent of camera distance, so the labels stay legible regardless of
+        # zoom; their world positions are re-pinned to the (rescaled) axis tips each frame.
+        # x=red, y=green, z=blue to match GLAxisItem's convention.
+        _axis_cols = ((255, 90, 90), (90, 220, 90), (110, 150, 255))
+        _axis_tip0 = ((1.08, 0.0, 0.0), (0.0, 1.08, 0.0), (0.0, 0.0, 1.08))
+        axis_txt = []
+        for name, col, pos0 in zip(axis_labels, _axis_cols, _axis_tip0):
+            t = gl.GLTextItem(text=name, color=col, pos=pos0,
+                              font=QtGui.QFont('Helvetica', 11))
+            w.addItem(t)
+            axis_txt.append(t)
         # Composite wrench-cone hull as a WIREFRAME cage (the feasible force/torque set
         # the solved gamma assumes): the live trace staying inside the cage means the
         # grasp can supply the applied wrench. Wireframe (GLLinePlotItem) rather than a
@@ -228,12 +261,14 @@ def _run(queue, fingers, horizon_s, dt_hint):
         w.addItem(head)
         v.addWidget(lbl)
         v.addWidget(w, 1)
-        return box, line, head, cone
+        return box, line, head, cone, axis, axis_txt
 
-    force_box,  force_line,  force_head,  force_cone  = _wrench_view(
-        "Net hand → object force  (Fx,Fy,Fz world, N)",        (1.0, 0.55, 0.2))
-    torque_box, torque_line, torque_head, torque_cone = _wrench_view(
-        "Net hand → object torque  (τx,τy,τz about COM, N·m)", (0.4, 0.7, 1.0))
+    force_box,  force_line,  force_head,  force_cone,  force_axis,  force_axis_txt  = \
+        _wrench_view("Net hand → object force  (Fx,Fy,Fz world, N)",
+                     (1.0, 0.55, 0.2), ('+Fx', '+Fy', '+Fz'))
+    torque_box, torque_line, torque_head, torque_cone, torque_axis, torque_axis_txt = \
+        _wrench_view("Net hand → object torque  (τx,τy,τz about COM, N·m)",
+                     (0.4, 0.7, 1.0), ('+τx', '+τy', '+τz'))
     _FORCE_RGB  = np.array([1.0, 0.55, 0.2], dtype=np.float32)
     _TORQUE_RGB = np.array([0.4, 0.7, 1.0], dtype=np.float32)
 
@@ -468,7 +503,7 @@ def _run(queue, fingers, horizon_s, dt_hint):
                 # Composite grasp wrench cone at the solved gamma, precomputed in the sim
                 # process (verts + triangle faces per subspace). Rendered as a wireframe:
                 # expand each triangle's 3 edges into a line-segment list. None clears it.
-                def _set_cone(item, key):
+                def _set_cone(item, key, axis, axis_txt):
                     payload = msg.get(key)
                     if payload is None:
                         item.setData(pos=np.zeros((0, 3), np.float32))
@@ -483,8 +518,13 @@ def _run(queue, fingers, horizon_s, dt_hint):
                     e = np.unique(np.sort(e, axis=1), axis=0)
                     seg = verts[e.reshape(-1)]          # (2*n_edges, 3) line-segment pairs
                     item.setData(pos=seg)
-                _set_cone(force_cone,  'force')
-                _set_cone(torque_cone, 'torque')
+                    # Size the axis triad to the CONE extent (the feasible set), not the
+                    # live force trace, so the labelled axes frame the cone and sit just
+                    # outside it — a stable reference that doesn't jitter with the applied
+                    # wrench.
+                    _rescale_axis(axis, axis_txt, verts)
+                _set_cone(force_cone,  'force',  force_axis,  force_axis_txt)
+                _set_cone(torque_cone, 'torque', torque_axis, torque_axis_txt)
             elif mt == 'grasp_rec':
                 status = msg.get('status', '?')
                 solve_ms = msg.get('solve_ms', float('nan'))
