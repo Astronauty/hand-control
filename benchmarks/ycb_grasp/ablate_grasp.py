@@ -45,7 +45,7 @@ from ycb_grasp import scene as S, workspace as W                                
 from ycb_grasp.ik_demo import (clearance_by_geom, home_bias, place_objects,     # noqa: E402
                                render, robot_geom_names)
 from ycb_grasp.ablate_ik import DEFAULT_OBJECTS                                 # noqa: E402
-from kinova_leap_pick_place import FINGER_SET, FINGER_TIP_SITES                 # noqa: E402
+from kinova_common.constants import FINGER_SET, FINGER_TIP_SITES                # noqa: E402
 
 N_ROBOT = 23
 # Matches clearance_by_geom's own +2mm default tier — GraspConfig3D.col_clearance_m

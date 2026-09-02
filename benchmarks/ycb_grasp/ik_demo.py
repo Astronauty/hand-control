@@ -30,8 +30,8 @@ sys.path.insert(0, str(REPO / "benchmarks"))
 
 from grasp_control import ConstrainedIKSolver, SpatialIKSolver      # noqa: E402
 from grasp_control.constrained_ik import configure_sqp              # noqa: E402
-from kinova_leap_pick_place import (FINGER_CODE, FINGER_SET,        # noqa: E402
-                                    FINGER_TIP_SITES, GEN3_XML)
+from kinova_common.constants import (FINGER_CODE, FINGER_SET,       # noqa: E402
+                                     FINGER_TIP_SITES, GEN3_XML)
 from ycb_grasp import scene as S, workspace as W                    # noqa: E402
 
 N_ROBOT = 23

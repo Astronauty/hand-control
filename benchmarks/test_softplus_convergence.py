@@ -33,9 +33,8 @@ from grasp_control.constrained_ik import (
     check_analytic_jacobians,
 )
 from grasp_control.ik import SpatialIKSolver
-from kinova_leap_pick_place import (
-    FINGER_SET, FINGER_CODE, FINGER_TIP_SITES, GEN3_XML, _randomize_objects,
-)
+from kinova_common.constants import FINGER_SET, FINGER_CODE, FINGER_TIP_SITES, GEN3_XML
+from kinova_leap_pick_place import _randomize_objects
 
 # ---------------------------------------------------------------------------
 # Softplus SDF variants (replace fmax → softplus in outside term only)

@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO / "benchmarks"))
 
 import grasp_control.constrained_ik as cik                      # noqa: E402
 from grasp_control import ConstrainedIKSolver, SpatialIKSolver  # noqa: E402
-from kinova_leap_pick_place import FINGER_SET, FINGER_TIP_SITES  # noqa: E402
+from kinova_common.constants import FINGER_SET, FINGER_TIP_SITES  # noqa: E402
 from ycb_grasp import scene as S, workspace as W                # noqa: E402
 from ycb_grasp.ik_demo import (clearance_by_geom, home_bias,    # noqa: E402
                                object_hull_verts, pinch_targets_from,
