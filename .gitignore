@@ -232,3 +232,9 @@ __marimo__/
 # YCB object assets (downloads + generated MJCF; see README)
 assets/ycb_raw/
 assets/ycb_mjcf/
+# Generated caches (SDF/UV-atlas precompute, reachable-workspace cache)
+assets/ycb_sdf/
+assets/ycb_uv_atlas/
+assets/kinova_workspace.npz
+# Benchmark run outputs (plots/CSVs from ablation scripts)
+benchmarks/ycb_grasp/out/

@@ -133,9 +133,20 @@ try:
         _sphere_plane_distance,
         _sphere_sphere_distance,
     )
+    from grasp_control import object_sdf as _object_sdf
     _CIK_AVAILABLE = True
 except ImportError:
     _CIK_AVAILABLE = False
+    _object_sdf = None
+
+try:
+    from grasp_control import object_uv_atlas as _object_uv_atlas
+    _UV_ATLAS_AVAILABLE = _object_uv_atlas._XATLAS_AVAILABLE
+except ImportError:
+    _object_uv_atlas = None
+    _UV_ATLAS_AVAILABLE = False
+
+_GEOM_TYPE_MESH = 7   # mj.mjtGeom.mjGEOM_MESH
 
 log = logging.getLogger("grasp_planner_3d")
 if not log.handlers:
@@ -151,14 +162,24 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SQP_SOLVER_OPTS = {
-    'verbose':               False,
-    'print_time':            True,
+    'print_time':            False,
     'qpsol':                 'osqp',
-    'qpsol_options':         {'error_on_fail': True,
-                              'verbose': False,
-                              'print_problem': False,
-                              'osqp': {'verbose': False, 'polish': False}},
-    'max_iter':              500,
+    # error_on_fail=False: with O(500) inequality constraints on 23 DOFs the
+    # linearised QP subproblem is often primal-infeasible at the initial
+    # (DLS warm-start) point; OSQP finds the minimum-constraint-violation
+    # direction and lets SQP continue, instead of aborting right there.
+    # polish=True: more accurate QP subproblem solutions.
+    # (This block was previously out of sync with constrained_ik._SQP_SOLVER_OPTS
+    # despite the "copied verbatim" comment above — error_on_fail=True/polish=False/
+    # max_iter=500/missing tol_du measurably degraded convergence, see
+    # RECOMMENDER_CONVERGENCE_FINDINGS.md-adjacent staged-convergence testing.)
+    'qpsol_options':         {'error_on_fail': False,
+                              'osqp': {'verbose': False, 'polish': True}},
+    'max_iter':              800,
+    # tol_du is a KKT-residual (dual) tolerance that scales with the objective
+    # weight — see constrained_ik._SQP_SOLVER_OPTS's tuning note (co-tuned with
+    # tip_weight=100 there). Kept identical here for the same reason.
+    'tol_du':                1e-2,
     'hessian_approximation': 'limited-memory',
     'lbfgs_memory':          20,
     'convexify_strategy':    'regularize',
@@ -283,7 +304,88 @@ def _sym_inward_normal_ca(p, geom_type, center_dm, Rt_dm, size):
     raise ValueError(f"symbolic normals not implemented for geom_type={geom_type}")
 
 
-def _geom_sdf_np(point, geom_type: int, center, mat, size) -> float:
+# ── Mesh (YCB) object SDF support ───────────────────────────────────────────
+# geom_type == 7 (mjGEOM_MESH) objects have no analytic form, so their SDF is
+# a precomputed table (grasp_control.object_sdf) queried through a small set
+# of module-level CasADi Functions built once per object shape and cached
+# here by body id. conservative=False everywhere below: these are used to
+# PLACE contacts, not to keep the arm clear of the object (see object_sdf's
+# casadi_fn docstring — the conservative offset biases a projected contact
+# ~1mm outside the true surface).
+# Keyed by (id(model), body_id), NOT body_id alone: body_id is just an integer
+# index into ONE model's body array, and a freshly-built MjModel (e.g. a new
+# object attached via ycb_grasp.scene.build) reliably reuses the same small
+# integer indices as any other freshly-built model with the same scene
+# structure. Keying by body_id alone silently served a DIFFERENT object's
+# cached SDF table across separate MjModel instances that happened to attach
+# their object at the same body index — measured: two different YCB objects
+# in the same process solved to bit-identical (wrong) results. id(model) is a
+# stable Python identity, unique per live MjModel instance, so this cannot
+# collide across scenes. object_sdf.load_or_bake's own on-DISK cache is
+# already correctly content-hash-keyed (grasp_control/object_sdf.py's
+# _cache_key, over the hull vertices) — this in-process layer only wraps that
+# in CasADi Functions, so re-keying here costs a re-wrap, not a re-bake, when
+# the same object recurs across separate model instances.
+_MESH_SDF_CACHE: dict[tuple[int, int], dict] = {}
+
+
+def _mesh_sdf_entry(model, body_id: int) -> dict:
+    """Lazily bake/load and cache the CasADi SDF machinery for one object body."""
+    cache_key = (id(model), body_id)
+    entry = _MESH_SDF_CACHE.get(cache_key)
+    if entry is not None:
+        return entry
+    if _object_sdf is None:
+        raise RuntimeError("object_sdf module unavailable — cannot handle mesh geoms")
+    table, hulls = _object_sdf.load_or_bake(model, body_id)
+    # Unique per (model, body) — see the cache-key comment above; a plain
+    # body_id-based name can collide across separate MjModel instances the
+    # same way the old cache key did.
+    _tag = f"gp3_sdf_{id(model)}_{body_id}"
+    fn = _object_sdf.casadi_fn(table, name=_tag, conservative=False)
+    # load_or_bake discards the raw hull vertices after baking (only keeps the
+    # half-space (A,b) form) — re-extract them the same way
+    # object_sdf.body_hull_halfspaces does, for _minor_axis_local's SVD (the
+    # table/hulls themselves don't carry a vertex array).
+    _hulls_v, _verts = _object_sdf.body_hull_halfspaces(model, body_id)
+    entry = dict(
+        table=table,
+        verts=_verts,
+        fn=fn,
+        grad_fn=_object_sdf.casadi_grad_fn(fn, name=f"{_tag}_grad"),
+        normal_fn=_object_sdf.casadi_normal_fn(fn, name=f"{_tag}_normal"),
+        # Full-length projector (k=5, object_sdf's own default) for seeding —
+        # _seed_pair/_march_sdf_np start from points a bbox-radius or more
+        # away from the surface, same regime object_sdf.surface_project was
+        # designed for.
+        project_fn=_object_sdf.surface_project(fn, k=5, name=f"{_tag}_proj"),
+        # Short projector (k=2) for the in-NLP tangent-plane reprojection: that
+        # seed already starts near the surface (it's a small tangent offset
+        # from an on-surface anchor), so a short unroll suffices — see
+        # object_sdf.surface_project's docstring on why more iters doesn't
+        # strictly help anyway (oscillates at creases past k~5).
+        project_fn_short=_object_sdf.surface_project(fn, k=2, name=f"{_tag}_proj2"),
+    )
+    _MESH_SDF_CACHE[cache_key] = entry
+    return entry
+
+
+def _mesh_sdf_np(point, entry: dict) -> float:
+    """Signed distance to a mesh object (numpy scalar), via the cached CasADi Function."""
+    return float(entry["fn"](np.asarray(point, float)))
+
+
+def _mesh_normal_np(point, entry: dict) -> np.ndarray:
+    """Outward unit surface normal at/near a mesh object surface (numpy)."""
+    return np.asarray(entry["normal_fn"](np.asarray(point, float))).flatten()
+
+
+def _mesh_project_np(point, entry: dict) -> np.ndarray:
+    """Project a free world-frame point onto the mesh surface (numpy)."""
+    return np.asarray(entry["project_fn"](np.asarray(point, float))).flatten()
+
+
+def _geom_sdf_np(point, geom_type: int, center, mat, size, mesh_entry: dict | None = None) -> float:
     """Shape-agnostic signed distance (numpy). Positive = outside."""
     p = np.asarray(point, float)
     c = np.asarray(center, float)
@@ -297,10 +399,12 @@ def _geom_sdf_np(point, geom_type: int, center, mat, size) -> float:
         r_xy = float(np.linalg.norm(p_l[:2])) - size[0]
         r_z  = abs(float(p_l[2])) - size[1]
         return float(np.sqrt(max(r_xy, 0)**2 + max(r_z, 0)**2) + min(max(r_xy, r_z), 0.0))
+    elif geom_type == _GEOM_TYPE_MESH and mesh_entry is not None:
+        return _mesh_sdf_np(p_l, mesh_entry)   # table is baked in the object BODY frame
     return float(np.linalg.norm(p - c))
 
 
-def _geom_normal_np(point, geom_type: int, center, mat, size) -> np.ndarray:
+def _geom_normal_np(point, geom_type: int, center, mat, size, mesh_entry: dict | None = None) -> np.ndarray:
     """Outward unit surface normal at nearest surface point (numpy)."""
     p = np.asarray(point, float)
     c = np.asarray(center, float)
@@ -326,6 +430,12 @@ def _geom_normal_np(point, geom_type: int, center, mat, size) -> np.ndarray:
         else:
             n_l = np.array([0.0, 0.0, np.sign(p_l[2])])
         return R @ n_l
+    elif geom_type == _GEOM_TYPE_MESH and mesh_entry is not None:
+        # Table queried in object BODY frame (p_l, matching constrained_ik's
+        # R_obj.T @ (p_world - c_obj) convention for the same table); the
+        # gradient there is a body-frame direction, so rotate back to world.
+        n_l = _mesh_normal_np(p_l, mesh_entry)
+        return R @ n_l
     n = p - c
     return n / (np.linalg.norm(n) + 1e-12)
 
@@ -347,12 +457,38 @@ def _span_margin(n1_out: np.ndarray, n2_out: np.ndarray, mu: float) -> float:
     return float(np.arccos(np.clip(c, -1.0, 1.0)) - (np.pi - 2.0 * np.arctan(mu)))
 
 
-def _project_to_surface_np(point, geom_type, center, mat, size, iters=12):
+def _contact_friction(model, obj_gid: int, *tip_gids: int) -> tuple[float, float]:
+    """(mu, mu_t) at an object-vs-fingertip contact, combined the way MuJoCo's own
+    contact solver actually does it: ELEMENTWISE MAX of geom_friction across the two
+    geoms in contact (confirmed empirically against mj_forward's d.contact[i].friction
+    — MuJoCo does NOT average or take the object's value alone).
+
+    model.geom_friction is [sliding, torsional, rolling] per geom; this returns just
+    the two components _embed_wrench_cone_ca/build_W_ca use: sliding (index 0, "mu")
+    and torsional (index 1, "mu_t" — the soft-finger spin-friction coefficient, see
+    scripts/3D_minimum_NCF_soft.py). Previously mu was read from the OBJECT geom only
+    (model.geom_friction[obj_gid][0]), ignoring the fingertip pad's own friction
+    entirely — not wrong when the pad happens to be softer/equal, but not the actual
+    contact value MuJoCo's physics uses, and mu_t had no source at all (soft-finger
+    torsion wasn't modeled). tip_gids: one or more fingertip geoms actually touching
+    the object (e.g. thumb_gid, index_gid) — max'd in along with the object's own.
+    """
+    fric = model.geom_friction[obj_gid].copy()
+    for gid in tip_gids:
+        fric = np.maximum(fric, model.geom_friction[gid])
+    return float(fric[0]), float(fric[1])
+
+
+def _project_to_surface_np(point, geom_type, center, mat, size, iters=12, mesh_entry=None):
     """Move a world-frame point to the nearest surface point.
 
     BOX: exact closed form — clamp to box in local frame, snap dominant axis to
     its face.  One step, always exact, works from corners and edges where the
     SDF gradient is diagonal and a single Newton step falls short.
+
+    MESH: object_sdf.surface_project's unit-gradient-step iteration (not
+    Newton — Newton divides by ‖grad d‖², which blows up at the creases where
+    convex hulls meet; see object_sdf.py's surface_project docstring).
 
     Other geometries: iterated Newton steps (12 iterations converges from
     anywhere within a few bbox radii at negligible cost).
@@ -368,6 +504,10 @@ def _project_to_surface_np(point, geom_type, center, mat, size, iters=12):
         q[k] = np.sign(q[k]) * float(size[k])
         return c + R @ q
 
+    if geom_type == _GEOM_TYPE_MESH and mesh_entry is not None:
+        p_l = R.T @ (p - c)
+        return c + R @ _mesh_project_np(p_l, mesh_entry)
+
     for _ in range(iters):
         s = _geom_sdf_np(p, geom_type, c, mat, size)
         if abs(s) < 1e-9:
@@ -377,22 +517,22 @@ def _project_to_surface_np(point, geom_type, center, mat, size, iters=12):
 
 
 def _march_sdf_np(p_start, direction, geom_type, center, mat, size,
-                  max_steps=80):
+                  max_steps=80, mesh_entry=None):
     """Sphere-march from p_start along direction until exiting the object, then project to surface."""
     d_unit = np.asarray(direction, float)
     d_unit = d_unit / (np.linalg.norm(d_unit) + 1e-12)
     p = np.asarray(p_start, float)
     for _ in range(max_steps):
-        sdf = _geom_sdf_np(p, geom_type, center, mat, size)
+        sdf = _geom_sdf_np(p, geom_type, center, mat, size, mesh_entry=mesh_entry)
         if sdf > 1e-5:
-            return _project_to_surface_np(p, geom_type, center, mat, size)
+            return _project_to_surface_np(p, geom_type, center, mat, size, mesh_entry=mesh_entry)
         step = max(abs(sdf) * 0.5, 1e-3)
         p = p + step * d_unit
-    return _project_to_surface_np(p, geom_type, center, mat, size)
+    return _project_to_surface_np(p, geom_type, center, mat, size, mesh_entry=mesh_entry)
 
 
 def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
-               delta_max=np.deg2rad(45)):
+               delta_max=np.deg2rad(45), mesh_entry=None):
     """
     One antipodal seed pair, sampled exactly on the object surface.
 
@@ -412,8 +552,8 @@ def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
     u = rng.standard_normal(3)
     u[2] *= 0.5                              # bias toward side faces, away from top/bottom
     u /= np.linalg.norm(u) + 1e-12
-    p1s = _project_to_surface_np(c + u * bbox_r, geom_type, c, obj_mat, size)
-    n1_in = -_geom_normal_np(p1s, geom_type, c, obj_mat, size)
+    p1s = _project_to_surface_np(c + u * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    n1_in = -_geom_normal_np(p1s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
 
     # Rotate march direction about world z only — prevents downward tilt that
     # exits through the bottom face and hits _reachable_contact rejection.
@@ -423,8 +563,8 @@ def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
     d  = Rz @ n1_in
     delta = abs(ang)
 
-    p2s = _march_sdf_np(p1s + 1e-3 * d, d, geom_type, c, obj_mat, size)
-    n2_in = -_geom_normal_np(p2s, geom_type, c, obj_mat, size)
+    p2s = _march_sdf_np(p1s + 1e-3 * d, d, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    n2_in = -_geom_normal_np(p2s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
 
     return {
         'p1':       p1s.copy(),
@@ -455,15 +595,43 @@ def _assign_seed_by_finger(seed, live_thumb, live_index):
         seed['n1_in'], seed['n2_in'] = seed['n2_in'], seed['n1_in']
 
 
-def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis):
+def _minor_axis_local(geom_type, size, mesh_entry=None):
+    """Unit vector in the OBJECT LOCAL frame along the object's minor principal
+    axis (thinnest direction) — the natural two-finger pinch axis, matching
+    benchmarks/ycb_grasp/ik_demo.py's pinch_targets_from (SVD on hull
+    vertices). A random-direction antipodal search (_seed_pair) can pick an
+    awkward, hard-to-reach pinch geometry; this gives MultiStartGraspPlanner3D
+    a well-conditioned seed to try FIRST, before the randomized ones.
+
+    BOX (geom_type 6): shortest half-extent axis — exact, no SVD needed.
+    MESH: SVD of the body-frame hull vertices baked into mesh_entry's table
+    (same vertices object_sdf.body_hull_halfspaces already extracted).
+    CYLINDER/SPHERE: no well-defined "minor axis" (axisymmetric); falls back
+    to local x — _seed_pair's randomized seeds are relied on for those shapes.
+    """
+    if geom_type == 6:   # BOX — shortest half-extent
+        ax = int(np.argmin(np.asarray(size, float)[:3]))
+        v = np.zeros(3); v[ax] = 1.0
+        return v
+    if geom_type == _GEOM_TYPE_MESH and mesh_entry is not None:
+        V = mesh_entry.get("verts")
+        if V is not None and len(V) >= 3:
+            c = V.mean(0)
+            _, _, Vt = np.linalg.svd(V - c, full_matrices=False)
+            return Vt[2] / (np.linalg.norm(Vt[2]) + 1e-12)
+    return np.array([1.0, 0.0, 0.0])
+
+
+def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis, mesh_entry=None):
     """
     One deterministic, perfectly antipodal seed pair along a fixed axis
     (given in the OBJECT's local frame) through the object center — zero
     angular jitter, unlike _seed_pair's randomized march direction.
 
-    Two of these (local x and local y) are tried first by
-    MultiStartGraspPlanner3D.solve(), ahead of the randomized seeds, as a
-    canonical "grab from the side" starting point for every object.
+    Tried FIRST by MultiStartGraspPlanner3D.solve(), ahead of the randomized
+    seeds, as a well-conditioned starting point for every object — local_axis
+    is normally _minor_axis_local's result (the natural pinch axis), not an
+    arbitrary guess.
 
     local_axis : (3,) unit vector in the object's local frame, e.g. [1,0,0].
 
@@ -475,10 +643,10 @@ def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis):
     d_world /= np.linalg.norm(d_world) + 1e-12
     bbox_r = float(np.max(size)) * 2.5
 
-    p1s = _project_to_surface_np(c + d_world * bbox_r, geom_type, c, obj_mat, size)
-    n1_in = -_geom_normal_np(p1s, geom_type, c, obj_mat, size)
-    p2s = _project_to_surface_np(c - d_world * bbox_r, geom_type, c, obj_mat, size)
-    n2_in = -_geom_normal_np(p2s, geom_type, c, obj_mat, size)
+    p1s = _project_to_surface_np(c + d_world * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    n1_in = -_geom_normal_np(p1s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    p2s = _project_to_surface_np(c - d_world * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    n2_in = -_geom_normal_np(p2s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
 
     return {
         'p1':        p1s.copy(),
@@ -490,6 +658,76 @@ def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis):
         'offsets':   (0.0, 0.0),
         'delta_deg': 0.0,
     }
+
+
+def _chart_pair_seeds(uv_atlas: dict, center, obj_mat, geom_type, size, mesh_entry=None,
+                      max_down_deg: float = 60.0, top_k: int = 5):
+    """Ranked list of chart-aware antipodal seed pairs for a MESH object,
+    replacing _seed_pair's random-direction march for the use_uv_atlas_contact
+    path — see the session's seeding-rethink notes (chart assignment is fixed
+    for the WHOLE solve at seed time, see _mesh_uv_local_contact_ca /
+    GraspPlanner3D.solve's chart-assignment comment, so a good seed here is
+    the only lever available; nothing downstream can escape a bad chart
+    choice).
+
+    Filters the atlas's big (>= min_area_frac) charts by
+    object_uv_atlas.filter_bottom_facing_charts (drops charts resting against
+    the table at the object's CURRENT placement — gravity-based, see that
+    function's docstring), then scores every chart PAIR by
+    combo_score = -||n_i + n_j|| (small resultant norm = well-opposed normals
+    = force-closure-friendly; reduces to maximizing -n_i.n_j for pairs, see
+    chart_score_debug.py's docstring for the N-finger generalization this
+    matches). Returns the top_k pairs, best (most negative... i.e. highest
+    score) first, each as a p1s/p2s/n1_in/n2_in seed dict (same schema as
+    _seed_pair/_fixed_antipodal_seed) — the chart CENTROID (object-local),
+    projected onto the true SDF surface, is used as that chart's contact
+    point (no further in-chart search here; _mesh_uv_local_contact_ca's local
+    neighborhood is what actually explores within the chart during the NLP).
+
+    Returns [] if uv_atlas is None or fewer than 2 charts survive filtering
+    (caller falls back to the existing _seed_pair random search).
+    """
+    if uv_atlas is None:
+        return []
+    atlas = uv_atlas["atlas"]
+    big = uv_atlas["big_chart_ids"]
+    chart_normal = uv_atlas["chart_normal"]
+    chart_centroid = uv_atlas["chart_centroid"]
+
+    c = np.asarray(center, float)
+    up_local = obj_mat.T @ np.array([0.0, 0.0, 1.0])
+    charts = _object_uv_atlas.filter_bottom_facing_charts(
+        big, chart_normal, up_local, max_down_deg=max_down_deg)
+    if len(charts) < 2:
+        return []
+
+    scored = []
+    for i in range(len(charts)):
+        for j in range(i + 1, len(charts)):
+            ci, cj = int(charts[i]), int(charts[j])
+            s = chart_normal[ci] + chart_normal[cj]
+            scored.append((-float(np.linalg.norm(s)), ci, cj))
+    scored.sort(key=lambda t: -t[0])   # highest score (closest to 0) first
+
+    seeds = []
+    for score, ci, cj in scored[:top_k]:
+        p1s_l = chart_centroid[ci]
+        p2s_l = chart_centroid[cj]
+        p1s = _project_to_surface_np(c + obj_mat @ p1s_l, geom_type, c, obj_mat, size,
+                                     mesh_entry=mesh_entry)
+        p2s = _project_to_surface_np(c + obj_mat @ p2s_l, geom_type, c, obj_mat, size,
+                                     mesh_entry=mesh_entry)
+        n1_in = -_geom_normal_np(p1s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+        n2_in = -_geom_normal_np(p2s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+        seeds.append({
+            'p1': p1s.copy(), 'p2': p2s.copy(),
+            'p1s': p1s, 'p2s': p2s,
+            'n1_in': n1_in, 'n2_in': n2_in,
+            'offsets': (0.0, 0.0), 'delta_deg': 0.0,
+            'chart_pair': (ci, cj),
+            'antipodal_score': score,   # -||n_ci + n_cj|| — see docstring
+        })
+    return seeds
 
 
 def _reachable_contact(p, ground_z, r_tip, z_margin=0.002):
@@ -589,6 +827,232 @@ def _sym_geom_surface_con(opti, p_sym, d, geom_type: int,
         opti.subject_to(ca.sumsqr(p_loc) == r ** 2)
 
 
+def _tangent_basis_np(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Two unit vectors spanning the plane perpendicular to unit normal n."""
+    n = np.asarray(n, float)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    t1 = ref - np.dot(ref, n) * n
+    t1 /= np.linalg.norm(t1) + 1e-12
+    t2 = np.cross(n, t1)
+    return t1, t2
+
+
+def _mesh_tangent_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np.ndarray,
+                             center_np, mat_np, mesh_entry: dict, t_bound: float = 0.05):
+    """Mesh contact as a 2-DOF tangent-plane offset from a seed point, reprojected onto
+    the surface via object_sdf's short (k=2) unit-gradient-step projector.
+
+    Replaces the free-R^3-point + SDF=0 equality used for analytic shapes: the returned
+    expression `p_world` is on (near) the surface BY CONSTRUCTION, so no new equality
+    constraint is added for mesh objects — only the 2 tangential DOF are free, bounded to
+    keep the offset within the projector's basin of good convergence (t_bound, metres).
+
+    Parameters
+    ----------
+    seed_world      : (3,) world-frame anchor point (already on the surface, e.g. from
+                       _seed_pair), around which the tangent frame is built.
+    seed_normal_out : (3,) OUTWARD unit normal at the seed, defines the tangent plane.
+
+    Returns (t_var, p_world) — the new opti.variable(2) and the CasADi expression for the
+    resulting world-frame contact point.
+    """
+    t1, t2 = _tangent_basis_np(seed_normal_out)
+    seed_l = mat_np.T @ (np.asarray(seed_world, float) - np.asarray(center_np, float))
+    t1_l   = mat_np.T @ t1
+    t2_l   = mat_np.T @ t2
+
+    t_var = opti.variable(2)
+    opti.subject_to(opti.bounded(-t_bound, t_var[0], t_bound))
+    opti.subject_to(opti.bounded(-t_bound, t_var[1], t_bound))
+    opti.set_initial(t_var, np.zeros(2))
+
+    p_tangent_l = ca.DM(seed_l) + t_var[0] * ca.DM(t1_l) + t_var[1] * ca.DM(t2_l)
+    p_surf_l    = mesh_entry["project_fn_short"](p_tangent_l)
+    p_world     = ca.DM(center_np) + ca.DM(mat_np) @ p_surf_l
+    return t_var, p_world
+
+
+def _mesh_uv_local_contact_ca(opti, seed_world: np.ndarray, center_np, mat_np,
+                              mesh_entry: dict, uv_atlas: dict, chart_id: int,
+                              rings: int = 2):
+    """Mesh contact as a 2-DOF offset in a UV-ATLAS-DERIVED local plane, bounded
+    by that local neighborhood's ACTUAL boundary polygon (not an arbitrary
+    Euclidean box like _mesh_tangent_contact_ca's t_bound) — see
+    grasp_control.object_uv_atlas module docstring for the full design
+    rationale (why a local neighborhood, not the whole chart, in one solve;
+    how GraspPlanner3D's existing Picard relinearization loop re-centers this
+    between stages to reach the whole chart across a multi-stage solve).
+
+    Same call signature/frame convention as _mesh_tangent_contact_ca (seed_world
+    is WORLD frame; center_np/mat_np are the object's world pose, used to
+    convert to/from the object-local frame the uv_atlas and mesh_entry SDF
+    both operate in — object_uv_atlas.body_visual_mesh folds geom_pos/geom_quat
+    the same way object_sdf.body_hull_halfspaces does, so the two agree on
+    what "local frame" means).
+
+    chart_id : which atlas chart this contact is assigned to — decided ONCE at
+        seed time (object_uv_atlas.nearest_big_chart) and held fixed for the
+        whole solve; only the local neighborhood WITHIN this chart is rebuilt
+        between Picard stages (see caller in GraspPlanner3D.solve).
+
+    Returns (uv_var, p_world) — the new opti.variable(2) and the CasADi
+    expression for the resulting world-frame contact point (matches
+    _mesh_tangent_contact_ca's return contract exactly).
+    """
+    seed_l = mat_np.T @ (np.asarray(seed_world, float) - np.asarray(center_np, float))
+    nb = _object_uv_atlas.local_neighborhood(uv_atlas, chart_id, seed_l, rings=rings)
+    centroid, (t1, t2) = nb["plane_centroid"], nb["plane_basis"]
+    bound_A, bound_b = nb["bound_A"], nb["bound_b"]
+
+    uv_var = opti.variable(2)
+    # Linear inequality bound from the local neighborhood's actual convex-hull
+    # boundary (in-plane coords) — replaces _mesh_tangent_contact_ca's fixed
+    # +/-t_bound box with the real local extent of usable surface.
+    opti.subject_to(ca.DM(bound_A) @ uv_var <= ca.DM(bound_b))
+    opti.set_initial(uv_var, nb["seed_uv"])
+
+    p_flat_l = ca.DM(centroid) + uv_var[0] * ca.DM(t1) + uv_var[1] * ca.DM(t2)
+    p_surf_l = mesh_entry["project_fn_short"](p_flat_l)
+    p_world  = ca.DM(center_np) + ca.DM(mat_np) @ p_surf_l
+    return uv_var, p_world
+
+
+def _friction_cone_verts(mu: float) -> np.ndarray:
+    """5-vertex linearized Coulomb cone in the LOCAL contact frame [n_in|t1|t2]
+    (origin + 4 unit-normal-force edges at ±mu tangential). Shared by the
+    embedded wrench-cone LP and the GWS primitive-wrench matrix so both use
+    the exact same cone geometry. Point-contact-with-friction (PCwF): pure
+    force generators, no torsional/spin component about the contact normal —
+    see _soft_finger_torque_ca / build_W_ca's mu_t argument for the
+    soft-finger extension (scripts/3D_minimum_NCF_soft.py)."""
+    return np.array([[0.0, 0.0, 0.0],
+                     [1.0, 0.0, -mu],
+                     [1.0, -mu, 0.0],
+                     [1.0,  mu, 0.0],
+                     [1.0, 0.0,  mu]])
+
+
+def _soft_finger_torque_ca(n_O, mu_t: float):
+    """(tau_plus, tau_minus): the ± free-vector spin-moment terms ADDED to the
+    p×f torque of the 2 soft-finger vertices (build_W_ca's f_soft columns),
+    each carrying normal force ncf=1 (unit squeeze, matching the rest of
+    _friction_cone_verts' unit-force convention) — so the moment is exactly
+    mu_t*n_O, no ncf factor needed here.
+
+    n_O : (3,) contact INWARD normal, expressed in the OBJECT BODY frame
+        (R_ow @ R_param[:,0] — R_param's column 0 is n_in by the
+        [n_in|t1|t2] convention built by _build_contact_frame_3d /
+        _symbolic_contact_frame_ca). A free vector: does NOT depend on
+        contact position (no lever arm), matching
+        scripts/3D_minimum_NCF_soft.py's t5_b/t6_b (mu_t*ncf*n_b term, added
+        directly to the cross-product torque, not multiplied through it).
+    """
+    tau = mu_t * n_O
+    return tau, -tau
+
+
+def build_W_ca(p1, p2, R1_param, R2_param, obj_center_np, obj_R_np, mu,
+               mu_t: float = 0.0):
+    """Primitive wrench matrix W (6 x n*s), n=2 contacts x s cone edges each.
+    s=5 (PCwF) when mu_t<=0 (default — unchanged from before); s=7 (soft
+    finger) when mu_t>0, adding 2 pure-normal-force+spin-moment generators per
+    contact (scripts/3D_minimum_NCF_soft.py's soft-finger linearization) so W
+    can express torque about the grasp axis — a PCwF W is structurally rank-
+    deficient there (2-contact pinch, zero moment arm on that axis for any
+    tangential force), a finding from the rubiks-cube GWS-only test session.
+
+    Column j of contact i is the object-body-frame wrench [τ;f] produced by a
+    unit-normal-force generator along that contact's j-th generator (cone edge
+    or soft-finger torsion vertex). Shares _friction_cone_verts/R_param/
+    obj-frame convention with _embed_wrench_cone_ca's per-corner _wrench_sum
+    so the GWS block and the existing wrench-feasibility LP agree on what a
+    "primitive wrench" is.
+
+    Returns a (6, 2*(5 or 7)) CasADi MX expression, symbolic in p1/p2 (and
+    R1_param/R2_param if those are themselves expressions, e.g. under
+    symbolic_normals).
+    """
+    verts_c = _friction_cone_verts(mu)
+    obj_c   = ca.DM(obj_center_np)
+    R_ow    = ca.DM(obj_R_np.T)   # world → object body-frame rotation
+
+    def _col(p, f, extra_tau=None):
+        p_O = R_ow @ (p - obj_c)
+        f_O = R_ow @ f
+        tau = ca.cross(p_O, f_O)
+        if extra_tau is not None:
+            tau = tau + extra_tau
+        return ca.vertcat(tau, f_O)
+
+    cols = []
+    for p, R_param in ((p1, R1_param), (p2, R2_param)):
+        forces = [R_param @ ca.DM(v) for v in verts_c]
+        cols.extend(_col(p, f) for f in forces)
+        if mu_t > 0.0:
+            n_O = R_ow @ R_param[:, 0]   # inward normal, object body frame
+            tau_plus, tau_minus = _soft_finger_torque_ca(n_O, mu_t)
+            f_soft = R_param @ ca.DM([1.0, 0.0, 0.0])   # unit normal force, both vertices
+            cols.append(_col(p, f_soft, extra_tau=tau_plus))
+            cols.append(_col(p, f_soft, extra_tau=tau_minus))
+    return ca.horzcat(*cols)
+
+
+def _embed_gws_ca(opti, W):
+    """Add the min-weight (FRoGGeR) LP as NLP decision variables/constraints.
+
+        max_{alpha,beta}  beta
+        s.t.  W @ alpha == 0
+              sum(alpha) == 1
+              alpha >= beta * 1
+
+    Single-level: alpha/beta are opti.variable()s in the SAME Opti problem as
+    q/p1/p2/W's own p1/p2-dependence, not a nested LP differentiated through —
+    IPOPT's KKT system couples everything and gives exact gradients. At
+    convergence beta == the min-weight metric's optimal value and alpha is the
+    closure witness (see module-level GWS brief).
+
+    alpha is left free (no alpha >= 0): if the current contact geometry is not
+    yet in force closure, beta < 0 with some alpha_j < 0 is the CORRECT value,
+    and must stay smoothly climbable rather than becoming infeasible.
+
+    Returns (alpha, beta).
+    """
+    n_cols = int(W.shape[1])
+    alpha  = opti.variable(n_cols)
+    beta   = opti.variable()
+    opti.subject_to(W @ alpha == ca.DM.zeros(6, 1))
+    opti.subject_to(ca.sum1(alpha) == 1.0)
+    opti.subject_to(alpha - beta * ca.DM.ones(n_cols, 1) >= 0)
+    return alpha, beta
+
+
+# ca.det/ca.chol have no AD rule for MX (CasADi raises "'eval' not defined for
+# class Determinant" from IPOPT's gradient pass — confirmed empirically, not
+# just undocumented). SX supports both with proper derivative rules, so the
+# logdet is built once as a small SX-graph Function and called from the MX
+# problem — CasADi differentiates through an embedded Function call fine, this
+# only avoids doing linear algebra directly in MX. M is SPD by construction
+# (W W^T + delta*I, delta>0), so a Cholesky-based logdet (2*sum(log(diag(L))))
+# is valid and only needs the diagonal of L, not a full logm/eig.
+_x_sx = ca.SX.sym('_gws_logdet_x', 6, 6)
+_logdet_sx_fn = ca.Function(
+    'gws_span_logdet6',
+    [_x_sx],
+    [2 * ca.sum1(ca.log(ca.diag(ca.chol(_x_sx))))])
+
+
+def _gws_span_logdet_ca(W, delta: float):
+    """logdet(W W^T + delta*I) — smooth barrier pushing all 6 singular values
+    of W up together (full-rank / well-spanned wrench hull), unlike a hard
+    rank or sigma_min constraint. delta keeps it defined when rank(W) < 6
+    (e.g. collinear contacts, coplanar normals — see module-level GWS brief's
+    "critical caveat").
+    """
+    M = W @ W.T + delta * ca.DM.eye(6)
+    return _logdet_sx_fn(M)
+
+
 def _embed_wrench_cone_ca(opti, p1, p2,
                            R1_param, R2_param,
                            obj_center_np, obj_R_np,
@@ -641,11 +1105,7 @@ def _embed_wrench_cone_ca(opti, p1, p2,
     _gamma  = opti.variable()
     opti.subject_to(opti.bounded(0, _gamma, gamma_max))
 
-    verts_c = np.array([[0.0, 0.0, 0.0],
-                         [1.0, 0.0, -mu],
-                         [1.0, -mu, 0.0],
-                         [1.0,  mu, 0.0],
-                         [1.0, 0.0,  mu]])
+    verts_c = _friction_cone_verts(mu)
     forces1 = [R1_param @ ca.DM(v) for v in verts_c]
     forces2 = [R2_param @ ca.DM(v) for v in verts_c]
     obj_c   = ca.DM(obj_center_np)
@@ -789,6 +1249,15 @@ class GraspConfig3D:
     wrench_constraint: bool  = True   # embedded LP wrench constraint in NLP
     max_iter:          int   = 50    # per-stage max iterations (Picard loop uses n_normal_relinearize+1 stages)
 
+    # Diagnostic/staging mode: hold p1/p2 at their seed values (ca.DM constants) instead
+    # of opti.variable/tangent-plane expressions — no surface constraint, no contact
+    # search, matching ConstrainedIKSolver's fixed-target IK exactly (same NLP shape as
+    # the empirically-validated sqp-ms4 backend from ablate_ik.py). Use with
+    # wrench_constraint=False for a true apples-to-apples baseline before re-enabling
+    # contacts-as-variables / wrench-cone / GWS one at a time — see
+    # RECOMMENDER_CONVERGENCE_FINDINGS.md's staged-decoupling recommendation.
+    fixed_contacts:    bool  = False
+
     # Grasp-axis alignment cost: penalize the grasp axis (p2-p1, normalized) deviating
     # from the contact inward normal, so the two contacts stay ANTIPODALLY OPPOSED (the
     # squeeze force routes straight between them). Shape-agnostic force-closure geometry:
@@ -796,6 +1265,55 @@ class GraspConfig3D:
     # contacts into a wrench-infeasible offset. 0.0 = off. Uses the frozen normal (box) /
     # symbolic normal (curved), same as the wrench frame.
     w_align:           float = 0.0
+
+    # Grasp-Wrench-Space (GWS) min-weight quality objective (FRoGGeR-style relaxation
+    # of the Ferrari-Canny epsilon metric — see the module-level GWS implementation
+    # brief). Embeds the min-weight LP (alpha, beta) as NLP variables alongside q/p1/p2
+    # so IPOPT can steer contact placement toward deep, well-conditioned force closure,
+    # not just measure it post-hoc. ADDITIVE to w_align, not a replacement — both
+    # default to 0.0 (off); existing callers (kinova_leap_pick_place.py etc.) that set
+    # w_align are unaffected until they explicitly opt into w_gws/w_span.
+    #   -w_gws  * beta                              (maximize the min-weight margin)
+    #   -w_span * logdet(W W^T + gws_span_delta*I)   (push toward a full-rank, well-
+    #                                                  spanned wrench hull; beta alone
+    #                                                  can be positive but nearly
+    #                                                  meaningless if W is rank-deficient
+    #                                                  — see the brief's "critical caveat")
+    # 0.0 = off for either term.
+    w_gws:              float = 0.0
+    w_span:              float = 0.0
+    gws_span_delta:      float = 1e-6   # keeps logdet finite when rank(W) < 6
+
+    # Soft-finger contact model for W (build_W_ca / GWS only — NOT the task-specific
+    # wrench_constraint LP, which stays PCwF). False (default): point-contact-with-
+    # friction, 5 generators/contact — matches all prior behavior exactly. True: adds
+    # 2 torsional-spin generators/contact (7 total), letting a 2-contact pinch's W
+    # express torque about the grasp axis, which PCwF is STRUCTURALLY rank-deficient
+    # in (a flat-face antipodal grasp measured rank(W)=5/6 with PCwF this session —
+    # the two soft-finger generators are exactly what's missing). mu_t is read from
+    # model geom_friction (index 1, torsional) via _contact_friction — real per-object/
+    # per-fingertip values already authored in the MJCF, combined the way MuJoCo's own
+    # contact solver does it (elementwise max), not a hand-picked constant.
+    gws_soft_finger:    bool = False
+
+    # Mesh contact parameterization. False (default) — _mesh_tangent_contact_ca:
+    # 2-DOF offset in a Euclidean tangent plane at the seed, bounded by a fixed
+    # +/-t_bound Euclidean box unrelated to the object's real geometry. True —
+    # _mesh_uv_local_contact_ca: 2-DOF offset in a plane fit to the seed's actual
+    # local mesh neighborhood (a fixed-size ring of triangles within a large,
+    # precomputed UV-atlas CHART — see grasp_control.object_uv_atlas module
+    # docstring), bounded by that neighborhood's real boundary polygon. Re-centered
+    # between Picard relinearization stages (n_normal_relinearize) the same way the
+    # existing loop already re-centers the frozen surface normal for curved
+    # analytic shapes — lets a multi-stage solve walk across a whole chart via a
+    # sequence of small, cheap local linearizations, rather than being permanently
+    # confined to one Euclidean neighborhood of the seed for the whole solve.
+    # Requires xatlas (pip install xatlas); falls back to the tangent-plane scheme
+    # with a log warning if unavailable.
+    use_uv_atlas_contact: bool = False
+    uv_atlas_rings:       int  = 2      # face-adjacency hops per local neighborhood
+    uv_atlas_min_chart_frac: float = _object_uv_atlas.DEFAULT_MIN_CHART_AREA_FRAC \
+                                     if _object_uv_atlas is not None else 0.01
 
     # Fingertip PAD alignment cost: penalize each tip's pad axis (R_tip(q) @ pad_axis, the
     # fingerpad normal in world) deviating from the contact INWARD surface normal, so the pad
@@ -889,6 +1407,20 @@ class GraspConfig3D:
     # w_align cannot rescue. A smaller angle keeps contact 2 on the opposing face while
     # still allowing some obliqueness.
     seed_march_jitter_deg: float = 15.0
+
+    # q_ref (arm-pose) restart perturbation — matches ablate_ik.py's RESTART_SIGMA
+    # pattern: seed 0 uses q_ref exactly as given (the operator's actual retargeted
+    # pose), each subsequent seed perturbs it by Gaussian noise (arm/hand split, since
+    # the arm's 7 DOF and the hand's redundant DOF have very different sensible scales)
+    # before running that seed's DLS-warm-start + NLP solve. This is a STAND-IN for
+    # eventually sampling from a real distribution around the operator's pose; for now
+    # it only exists to give MultiStartGraspPlanner3D the same "diversify the STARTING
+    # arm configuration across restarts" mechanism ConstrainedIKSolver's sqp-ms4 backend
+    # already has (ablate_ik.py's RESTART_SIGMA=(0.25, 0.35) rad) — GraspPlanner3D
+    # previously only diversified the CONTACT seed, never the arm pose, across its
+    # n_seeds budget. 0.0 = off (seed 0 behavior only, i.e. unchanged from before).
+    qref_restart_sigma_arm:  float = 0.0
+    qref_restart_sigma_hand: float = 0.0
 
     # Solver — use_slsqp=True  → SQP+OSQP (default; linear face-pin + wrench constraints exact)
     #           use_slsqp=False → IPOPT (interior-point; use for non-box geometries)
@@ -1015,6 +1547,7 @@ class GraspPlanner3D:
 
         c = self.cfg
         self._obj_gid    = self._require_geom(c.obj_geom)
+        self._obj_bid    = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, c.obj_body)
         self._thumb_sid  = self._require_site(c.thumb_site)
         self._index_sid  = self._require_site(c.index_site)
         self._thumb_gid  = self._require_geom(c.thumb_geom)
@@ -1122,11 +1655,43 @@ class GraspPlanner3D:
         self._n_arm_joints = min(len(_PALM_DOWN_ARM), n_act)
 
         gs = model.geom_size[self._obj_gid]
-        self._obj_hx        = float(gs[0])
-        self._obj_hy        = float(gs[1])
-        self._obj_hz        = float(gs[2])
-        self._obj_size      = model.geom_size[self._obj_gid].copy()
         self._obj_geom_type = int(model.geom_type[self._obj_gid])
+        self._mesh_entry    = None
+        self._uv_atlas      = None   # dict: atlas, big_chart_ids, area_frac
+        if self._obj_geom_type == _GEOM_TYPE_MESH:
+            # geom_size is meaningless for a mesh geom — every analytic-shape
+            # consumer of hx/hy/hz (bounding-box constraint, seed bbox_r
+            # radius) instead gets object_sdf's baked bounding radius, a
+            # conservative stand-in for "half-extent" in every axis.
+            self._mesh_entry = _mesh_sdf_entry(model, self._obj_bid)
+            _rb = float(self._mesh_entry["table"]["rbound"])
+            self._obj_hx = self._obj_hy = self._obj_hz = _rb
+            self._obj_size = np.array([_rb, _rb, _rb])
+            if c.use_uv_atlas_contact:
+                if not _UV_ATLAS_AVAILABLE:
+                    self.log.warning(
+                        "[uv_atlas] use_uv_atlas_contact=True but xatlas is not "
+                        "installed — falling back to the tangent-plane contact scheme.")
+                else:
+                    _atlas, _big, _area_frac = _object_uv_atlas.load_or_build(
+                        model, self._obj_bid, min_area_frac=c.uv_atlas_min_chart_frac)
+                    # Per-chart normal/centroid — cheap (O(triangles), no disk cache
+                    # needed), used by the antipodal chart-pair/triple seeding
+                    # heuristic and the bottom-facing filter (see
+                    # object_uv_atlas.chart_normals_centroids /
+                    # filter_bottom_facing_charts docstrings).
+                    _chart_n, _chart_c = _object_uv_atlas.chart_normals_centroids(_atlas)
+                    self._uv_atlas = dict(atlas=_atlas, big_chart_ids=_big, area_frac=_area_frac,
+                                          chart_normal=_chart_n, chart_centroid=_chart_c)
+                    self.log.info(
+                        f"[uv_atlas] {_atlas['n_charts']} charts, {len(_big)} usable "
+                        f"(>{c.uv_atlas_min_chart_frac*100:.0f}% area, "
+                        f"{_area_frac[_big].sum()*100:.1f}% of surface)")
+        else:
+            self._obj_hx        = float(gs[0])
+            self._obj_hy        = float(gs[1])
+            self._obj_hz        = float(gs[2])
+            self._obj_size      = model.geom_size[self._obj_gid].copy()
 
         # Joint limit vectors (vectorized constraint — mirrors constrained_ik)
         lo_list, hi_list = [], []
@@ -1219,8 +1784,17 @@ class GraspPlanner3D:
         data_cb.qvel[:] = self.data.qvel[:]
         mj.mj_forward(model, data_cb)
 
-        obj_center_np = data_cb.geom_xpos[self._obj_gid].copy()
-        obj_R_np      = data_cb.geom_xmat[self._obj_gid].reshape(3, 3).copy()
+        if self._obj_geom_type == _GEOM_TYPE_MESH:
+            # object_sdf's table is baked in the BODY frame (per-hull geom_pos/
+            # geom_quat offsets are folded in at bake time — see object_sdf.
+            # body_hull_halfspaces), so queries must use the body's own world
+            # pose, not any individual hull geom's (which may not even equal
+            # the body's for an off-center hull).
+            obj_center_np = data_cb.xpos[self._obj_bid].copy()
+            obj_R_np      = data_cb.xmat[self._obj_bid].reshape(3, 3).copy()
+        else:
+            obj_center_np = data_cb.geom_xpos[self._obj_gid].copy()
+            obj_R_np      = data_cb.geom_xmat[self._obj_gid].reshape(3, 3).copy()
         n_obj_dof     = model.nq - n_act
         obj_qpos_snap = data_cb.qpos[n_act:].copy() if n_obj_dof > 0 else None
 
@@ -1231,7 +1805,9 @@ class GraspPlanner3D:
         _g_O    = obj_R_np.T @ model.opt.gravity
         _ab     = cfg.accel_budget_xyz
         _aab    = cfg.ang_accel_budget_xyz
-        _mu     = round(1 * float(model.geom_friction[self._obj_gid][0]), 3)
+        _mu_raw, _mu_t_raw = _contact_friction(model, self._obj_gid, self._thumb_gid, self._index_gid)
+        _mu     = round(1 * _mu_raw, 3)
+        _mu_t   = round(1 * _mu_t_raw, 3)
         _nlp_fx = _mass * (_ab[0] + abs(_g_O[0]))
         _nlp_fy = _mass * (_ab[1] + abs(_g_O[1]))
         _nlp_fz = _mass * (_ab[2] + abs(_g_O[2]))
@@ -1257,27 +1833,50 @@ class GraspPlanner3D:
         p2_seed = (np.asarray(p2_init, float) if p2_init is not None
                    else obj_center + np.array([0.0,  hy, 0.0]))
 
+        # UV-atlas CHART assignment — decided ONCE here from the initial seed,
+        # held fixed for the whole solve (only the LOCAL neighborhood within
+        # the chart is rebuilt between Picard relinearization stages, in
+        # _run_stage below — see _mesh_uv_local_contact_ca / object_uv_atlas
+        # module docstring). obj_center_np/obj_R_np are already computed above
+        # this point in solve() (used by _d1_ws/_d2_ws just below).
+        _p1_chart_id = _p2_chart_id = None
+        if cfg.use_uv_atlas_contact and self._uv_atlas is not None:
+            _atlas = self._uv_atlas["atlas"]
+            _big_ids = self._uv_atlas["big_chart_ids"]
+            _p1_l = obj_R_np.T @ (p1_seed - obj_center_np)
+            _p2_l = obj_R_np.T @ (p2_seed - obj_center_np)
+            _p1_chart_id = _object_uv_atlas.nearest_big_chart(_atlas, _big_ids, _p1_l)
+            _p2_chart_id = _object_uv_atlas.nearest_big_chart(_atlas, _big_ids, _p2_l)
+
         # ── DLS warm-start IK ───────────────────────────────────────────────
+        # Target the SAME offset point the main NLP cost optimizes for
+        # (contact + r_tip*outward_normal, not the bare contact point) — using
+        # the bare contact as the DLS target left the warm start short by
+        # ~r_tip (a few mm, the fingerpad radius) in the approach direction,
+        # before SQP/IPOPT even starts. ablate_ik.py's DLS call and its
+        # ConstrainedIKSolver refine stage share this exact target for the
+        # same reason (benchmarks/ycb_grasp/ablate_ik.py:94,108).
         _t_ws = time.perf_counter()
         self._dls_data.qpos[:n_act] = q_ref
         if obj_qpos_snap is not None:
             self._dls_data.qpos[n_act:] = obj_qpos_snap
+        _d1_ws = (np.asarray(d1, float) if d1 is not None
+                  else _geom_normal_np(p1_seed, geom_type, obj_center_np, obj_R_np, geom_size,
+                                       mesh_entry=self._mesh_entry))
+        _d2_ws = (np.asarray(d2, float) if d2 is not None
+                  else _geom_normal_np(p2_seed, geom_type, obj_center_np, obj_R_np, geom_size,
+                                       mesh_entry=self._mesh_entry))
+        _dls_tgt1 = p1_seed + cfg.r_thumb * _d1_ws
+        _dls_tgt2 = p2_seed + cfg.r_index * _d2_ws
         q_dls = self._dls_ik.solve(
             self.model, self._dls_data,
             [self._thumb_sid, self._index_sid],
-            [p1_seed, p2_seed],
+            [_dls_tgt1, _dls_tgt2],
             q_bias=q_ref, null_gain=0.3)
         mj.mj_kinematics(self.model, self._dls_data)
-        
-        # DLS target is the contact point; IK error is ‖site − (p + r·n_out)‖.
-        _d1_ws = (np.asarray(d1, float) if d1 is not None
-                  else _geom_normal_np(p1_seed, geom_type, obj_center_np, obj_R_np, geom_size))
-        _d2_ws = (np.asarray(d2, float) if d2 is not None
-                  else _geom_normal_np(p2_seed, geom_type, obj_center_np, obj_R_np, geom_size))
-        _err_th = float(np.linalg.norm(
-            self._dls_data.site_xpos[self._thumb_sid] - (p1_seed + cfg.r_thumb * _d1_ws)))
-        _err_if = float(np.linalg.norm(
-            self._dls_data.site_xpos[self._index_sid] - (p2_seed + cfg.r_index * _d2_ws)))
+
+        _err_th = float(np.linalg.norm(self._dls_data.site_xpos[self._thumb_sid] - _dls_tgt1))
+        _err_if = float(np.linalg.norm(self._dls_data.site_xpos[self._index_sid] - _dls_tgt2))
         self.log.info(
             f"[dls_ws] th={_err_th*1e3:.1f}mm  idx={_err_if*1e3:.1f}mm  "
             f"dt={1e3*(time.perf_counter()-_t_ws):.0f}ms")
@@ -1293,7 +1892,8 @@ class GraspPlanner3D:
             for _ai, (_agid, _ar) in enumerate(zip(self._arm_gids, self._arm_radii)):
                 _gp = _data_prune.geom_xpos[_agid]
                 _arm_dist = (_geom_sdf_np(_gp, geom_type, obj_center_np,
-                                          obj_R_np, geom_size) - _ar)
+                                          obj_R_np, geom_size,
+                                          mesh_entry=self._mesh_entry) - _ar)
                 # Prune against THIS geom's own object clearance, not the scalar default —
                 # a proximal finger link with a tighter required clearance must be kept even
                 # when it sits slightly farther than col_clearance_m would demand. Contact-
@@ -1358,8 +1958,54 @@ class GraspPlanner3D:
             # ── Build Opti ────────────────────────────────────────────────
             _opti = ca.Opti()
             _q  = _opti.variable(n_act)
-            _p1 = _opti.variable(3)
-            _p2 = _opti.variable(3)
+            _is_mesh = (geom_type == _GEOM_TYPE_MESH and self._mesh_entry is not None)
+            _t1_var = _t2_var = None   # set below iff a mesh 2-DOF contact var is built
+            if cfg.fixed_contacts:
+                # Staging/diagnostic mode: p1/p2 are CONSTANTS at the seed value, not
+                # decision variables — same NLP shape as ConstrainedIKSolver's
+                # fixed-target IK (q only). No surface constraint needed (nothing to
+                # constrain); section 2 below is skipped for these via _is_mesh-style
+                # gating (see include_surface branch).
+                _p1 = ca.DM(np.asarray(p1_ws, float))
+                _p2 = ca.DM(np.asarray(p2_ws, float))
+            elif _is_mesh and _p1_chart_id is not None:
+                # UV-atlas local-neighborhood parameterization: p1/p2 become 2-DOF
+                # expressions (offset in a plane fit to the seed's local mesh
+                # neighborhood WITHIN its assigned chart, bounded by that
+                # neighborhood's real boundary — not an arbitrary Euclidean box),
+                # reprojected onto the surface. Re-centered on p1_ws/p2_ws every
+                # call, so the Picard loop's existing between-stage re-seeding
+                # (see the caller in solve()) walks this across the whole chart
+                # over multiple stages — see _mesh_uv_local_contact_ca /
+                # grasp_control.object_uv_atlas module docstring. Chart id itself
+                # is fixed for the whole solve (decided once, above, from the
+                # ORIGINAL seed) — only the local neighborhood within it changes.
+                _t1_var, _p1 = _mesh_uv_local_contact_ca(
+                    _opti, p1_ws, obj_center_np, obj_R_np, self._mesh_entry,
+                    self._uv_atlas["atlas"], _p1_chart_id, rings=cfg.uv_atlas_rings)
+                _t2_var, _p2 = _mesh_uv_local_contact_ca(
+                    _opti, p2_ws, obj_center_np, obj_R_np, self._mesh_entry,
+                    self._uv_atlas["atlas"], _p2_chart_id, rings=cfg.uv_atlas_rings)
+            elif _is_mesh:
+                # Tangent-plane parameterization: p1/p2 become 2-DOF expressions
+                # (offset in the local tangent plane at the seed, reprojected
+                # onto the surface) instead of free R^3 points + an SDF=0
+                # equality — see _mesh_tangent_contact_ca. Surface adherence is
+                # structural, so no equality constraint is added in section 2
+                # below for mesh objects.
+                _n1_seed_out = -np.asarray(d1_lp, float) if d1_lp is not None else \
+                    _geom_normal_np(p1_ws, geom_type, obj_center_np, obj_R_np, geom_size,
+                                    mesh_entry=self._mesh_entry)
+                _n2_seed_out = -np.asarray(d2_lp, float) if d2_lp is not None else \
+                    _geom_normal_np(p2_ws, geom_type, obj_center_np, obj_R_np, geom_size,
+                                    mesh_entry=self._mesh_entry)
+                _t1_var, _p1 = _mesh_tangent_contact_ca(
+                    _opti, p1_ws, _n1_seed_out, obj_center_np, obj_R_np, self._mesh_entry)
+                _t2_var, _p2 = _mesh_tangent_contact_ca(
+                    _opti, p2_ws, _n2_seed_out, obj_center_np, obj_R_np, self._mesh_entry)
+            else:
+                _p1 = _opti.variable(3)
+                _p2 = _opti.variable(3)
 
             _tp1   = thumb_cb(_q)
             _tp2   = index_cb(_q)
@@ -1448,7 +2094,10 @@ class GraspPlanner3D:
                     ca.DM(self._lo_vec), _q, ca.DM(self._hi_vec)))
 
             # ── 2. Surface constraints ────────────────────────────────────────
-            if include_surface:
+            # Mesh contacts are on-surface BY CONSTRUCTION (tangent-plane +
+            # reprojection above) — no equality constraint needed or added.
+            # fixed_contacts: p1/p2 are constants, nothing to constrain either.
+            if include_surface and not _is_mesh and not cfg.fixed_contacts:
                 _Rt_dm = ca.DM(obj_R_np.T)
                 _c_dm  = ca.DM(obj_center_np)
                 for _p, _d_lp in ((_p1, d1_lp), (_p2, d2_lp)):
@@ -1458,13 +2107,17 @@ class GraspPlanner3D:
                                             edge_margin=cfg.edge_margin_m)
 
 
-            # Bounding box: prevents p1/p2 from flying to infinity
-            for _p in (_p1, _p2):
-                for _i, _h in enumerate([hx, hy, hz]):
-                    _opti.subject_to(_opti.bounded(
-                        obj_center[_i] - _h - margin,
-                        _p[_i],
-                        obj_center[_i] + _h + margin))
+            # Bounding box: prevents p1/p2 from flying to infinity (mesh contacts
+            # are already surface-pinned, so this is a loose safety net only).
+            # fixed_contacts: p1/p2 are constants — a constraint on a constant is a
+            # useless no-op check, skip it.
+            if not cfg.fixed_contacts:
+                for _p in (_p1, _p2):
+                    for _i, _h in enumerate([hx, hy, hz]):
+                        _opti.subject_to(_opti.bounded(
+                            obj_center[_i] - _h - margin,
+                            _p[_i],
+                            obj_center[_i] + _h + margin))
 
             # ── 3. Wrench feasibility (embedded LP) ───────────────────────
             _gamma_lp    = None
@@ -1475,7 +2128,19 @@ class GraspPlanner3D:
             _R2_param    = None
             _n1_in       = None   # frozen contact normals actually used this stage
             _n2_in       = None
-            if cfg.wrench_constraint:
+            _R1_expr     = None   # set below iff a contact frame is actually needed
+            _R2_expr     = None
+            # Contact frame [n_in|t1|t2] is needed by BOTH the wrench-cone LP
+            # (gamma/y/s) and the GWS min-weight LP (alpha/beta) — they share the
+            # same _friction_cone_verts/frame convention (see build_W_ca's
+            # docstring). Build it whenever EITHER wants it, not just when
+            # wrench_constraint=True: previously GWS silently no-opted (with only
+            # a log warning) whenever wrench_constraint=False, since _R1_expr was
+            # never assigned outside that flag's block — GWS was supposed to be
+            # independently selectable (see GraspConfig3D.w_gws's "ADDITIVE...
+            # both default to 0.0" docstring) but structurally wasn't.
+            _need_contact_frame = cfg.wrench_constraint or cfg.w_gws > 0.0 or cfg.w_span > 0.0
+            if _need_contact_frame:
                 use_sym_normals = (cfg.symbolic_normals and
                                    geom_type in (2, 5))  # sphere / cylinder only
                 if use_sym_normals:
@@ -1494,9 +2159,11 @@ class GraspPlanner3D:
                     # Default: contact frames as 3×3 parameter — frozen per NLP solve,
                     # updated between Picard iterations by the outer loop.
                     _n1_in = -(d1_lp if d1_lp is not None else
-                                _geom_normal_np(p1_ws, geom_type, obj_center_np, obj_R_np, geom_size))
+                                _geom_normal_np(p1_ws, geom_type, obj_center_np, obj_R_np, geom_size,
+                                                mesh_entry=self._mesh_entry))
                     _n2_in = -(d2_lp if d2_lp is not None else
-                                _geom_normal_np(p2_ws, geom_type, obj_center_np, obj_R_np, geom_size))
+                                _geom_normal_np(p2_ws, geom_type, obj_center_np, obj_R_np, geom_size,
+                                                mesh_entry=self._mesh_entry))
                     _R1_param = _opti.parameter(3, 3)
                     _R2_param = _opti.parameter(3, 3)
                     _opti.set_value(_R1_param, np.column_stack(_build_contact_frame_3d(_n1_in)))
@@ -1504,6 +2171,7 @@ class GraspPlanner3D:
                     _R1_expr = _R1_param
                     _R2_expr = _R2_param
 
+            if cfg.wrench_constraint:
                 # Grasp-axis torque projection. A 2-contact pinch geometrically CANNOT
                 # resist torque about the grasp axis (the line through the two contacts):
                 # the friction-cone forces have no moment arm about it, so any nonzero
@@ -1550,18 +2218,59 @@ class GraspPlanner3D:
                 #         _opti.set_initial(_y1_k, _y_init)
                 #         _opti.set_initial(_y2_k, _y_init)
 
-                # Cold-start γ and y's to uniform values instead of LP solutions. 
+                # Cold-start γ and y's to uniform values instead of LP solutions.
                 _opti.set_initial(_gamma_lp, 1.0)
                 for _w_k, _y1_k, _y2_k in zip(_corners, _y1_list, _y2_list):
                     _opti.set_initial(_y1_k, np.ones(5) / 5.0)
                     _opti.set_initial(_y2_k, np.ones(5) / 5.0)
 
-
-
+            # ── GWS min-weight / span quality objective ─────────────────────
+            # Additive to the existing wrench-cone LP above, not a replacement
+            # (see module-level GWS brief + cfg.w_gws/w_span docstring). Only
+            # built when actually weighted, since it adds a bilinear equality
+            # (W depends on p1/p2, alpha is a new variable multiplying W) that
+            # would otherwise cost solver time for zero objective benefit.
+            _cost_gws  = ca.DM(0.0)
+            _cost_span = ca.DM(0.0)
+            _gws_alpha = _gws_beta = _gws_W = None
+            if (cfg.w_gws > 0.0 or cfg.w_span > 0.0) and _R1_expr is None:
+                self.log.warning(
+                    "[gws] w_gws/w_span > 0 but wrench_constraint=False — no contact "
+                    "frame (_R1_expr) available, GWS terms skipped this stage.")
+            if (cfg.w_gws > 0.0 or cfg.w_span > 0.0) and _R1_expr is not None:
+                _gws_mu_t = _mu_t if cfg.gws_soft_finger else 0.0
+                _gws_W = build_W_ca(_p1, _p2, _R1_expr, _R2_expr,
+                                    obj_center_np, obj_R_np, _mu, mu_t=_gws_mu_t)
+                _gws_alpha, _gws_beta = _embed_gws_ca(_opti, _gws_W)
+                # Uniform witness + beta<0 (not yet necessarily in closure) is a
+                # neutral, always-valid start — mirrors the gamma/y cold-start
+                # convention just above (no LP pre-solve to warm-start from).
+                _opti.set_initial(_gws_alpha, np.ones(_gws_W.shape[1]) / _gws_W.shape[1])
+                _opti.set_initial(_gws_beta, -1e-3)
+                if cfg.w_gws > 0.0:
+                    _cost_gws = -_gws_beta   # maximize beta = minimize -beta
+                if cfg.w_span > 0.0:
+                    _cost_span = -_gws_span_logdet_ca(_gws_W, cfg.gws_span_delta)
+                _cost = _cost + cfg.w_gws * _cost_gws + cfg.w_span * _cost_span
 
 
             # Finalize cost (gamma + y regularizer + wrench-cone slack — all normalized)
             # Sentinel zero expressions let the log helper always evaluate all terms.
+            #
+            # When GWS is active (w_gws/w_span > 0), gamma/y/slack are dropped from the
+            # COST (effective weights zeroed below) but stay as NLP CONSTRAINTS — the
+            # embedded wrench-cone LP still gates feasibility (a corner must be
+            # resistable, budget-bounded by gamma_max), it just no longer competes with
+            # beta/logdet for the contact-placement gradient (they'd otherwise pull in
+            # overlapping directions — a deeper/better-conditioned wrench hull generally
+            # also needs less gamma — inflating tuning difficulty for no benefit). The
+            # task-specific wrench budget is still independently certified post-solve by
+            # verify()'s min_gamma_for_accel_lp_hard, unaffected by this gating.
+            _gws_active = _gws_W is not None   # actually built this stage, not just weighted
+            _w_gamma_eff = 0.0 if _gws_active else cfg.w_gamma
+            _w_y_eff     = 0.0 if _gws_active else cfg.w_y
+            _w_slack_eff = 0.0 if _gws_active else cfg.w_slack
+
             _cost_gamma = ca.DM(0.0)
             _cost_y     = ca.DM(0.0)
             _cost_slack = ca.DM(0.0)
@@ -1575,9 +2284,9 @@ class GraspPlanner3D:
                 _cost_y     = sum(ca.sumsqr(y1k) + ca.sumsqr(y2k)
                                   for y1k, y2k in zip(_y1_list, _y2_list)) / (_n_y * _y_ref**2)
                 _opti_cost = (_cost
-                              + cfg.w_gamma * _cost_gamma
-                              + cfg.w_y     * _cost_y)
-                if cfg.w_slack is not None and _s_list:
+                              + _w_gamma_eff * _cost_gamma
+                              + _w_y_eff     * _cost_y)
+                if _w_slack_eff and _s_list:
                     # Per-row normalization: rows 0-2 are torque (N*m), rows 3-5
                     # are force (N) — mixed units, so each needs its own
                     # reference scale before summing squares (same pattern as
@@ -1593,7 +2302,7 @@ class GraspPlanner3D:
                     _ref6 = ca.DM([_t_ref_slack] * 3 + [max(_g_ref, 1e-6)] * 3)
                     _cost_slack = (sum(ca.sumsqr(s_k / _ref6) for s_k in _s_list)
                                    / max(len(_s_list), 1))
-                    _opti_cost = _opti_cost + cfg.w_slack * _cost_slack
+                    _opti_cost = _opti_cost + _w_slack_eff * _cost_slack
                 _opti.minimize(_opti_cost)
             else:
                 _opti.minimize(_cost)
@@ -1669,8 +2378,13 @@ class GraspPlanner3D:
 
             # ── Initial guess ─────────────────────────────────────────────
             _opti.set_initial(_q,  q_ws)
-            _opti.set_initial(_p1, p1_ws)
-            _opti.set_initial(_p2, p2_ws)
+            if not _is_mesh and not cfg.fixed_contacts:
+                _opti.set_initial(_p1, p1_ws)
+                _opti.set_initial(_p2, p2_ws)
+            # else (_is_mesh): _p1/_p2 are expressions of _t1_var/_t2_var, already
+            # initialized to (0,0) inside _mesh_tangent_contact_ca (i.e. "start
+            # exactly at the seed anchor"). (fixed_contacts): _p1/_p2 are DM
+            # constants — set_initial on a non-variable raises, so skip entirely.
 
             # ── Solver ────────────────────────────────────────────────────
             _n_iter = max_iter_override or cfg.max_iter
@@ -1756,6 +2470,14 @@ class GraspPlanner3D:
                             _rec['q']  = np.asarray(_opti.debug.value(_q),  float).flatten()
                             _rec['p1'] = np.asarray(_opti.debug.value(_p1), float).flatten()
                             _rec['p2'] = np.asarray(_opti.debug.value(_p2), float).flatten()
+                            # Raw (u,v) decision-variable trajectory — mesh contacts only
+                            # (_mesh_tangent_contact_ca / _mesh_uv_local_contact_ca both name
+                            # their 2-DOF variable _t1_var/_t2_var; ground truth, cheaper and
+                            # more accurate than re-deriving uv from the recorded p1/p2 world
+                            # points post-hoc, which would need a triangle re-lookup).
+                            if _is_mesh and _t1_var is not None:
+                                _rec['uv1'] = np.asarray(_opti.debug.value(_t1_var), float).flatten()
+                                _rec['uv2'] = np.asarray(_opti.debug.value(_t2_var), float).flatten()
                             if _gamma_lp is not None:
                                 _rec['gamma'] = float(_opti.debug.value(_gamma_lp))
                                 if _s_list:
@@ -1770,9 +2492,11 @@ class GraspPlanner3D:
                         _p1v = np.asarray(_opti.debug.value(_p1), float).flatten()
                         _p2v = np.asarray(_opti.debug.value(_p2), float).flatten()
                         _n1a = _geom_normal_np(_p1v, geom_type,
-                                               obj_center_np, obj_R_np, geom_size)
+                                               obj_center_np, obj_R_np, geom_size,
+                                               mesh_entry=self._mesh_entry)
                         _n2a = _geom_normal_np(_p2v, geom_type,
-                                               obj_center_np, obj_R_np, geom_size)
+                                               obj_center_np, obj_R_np, geom_size,
+                                               mesh_entry=self._mesh_entry)
                         _cos1 = float(np.clip(np.dot(_d1_frozen, _n1a), -1.0, 1.0))
                         _cos2 = float(np.clip(np.dot(_d2_frozen, _n2a), -1.0, 1.0))
                         _mismatch = max(np.degrees(np.arccos(_cos1)),
@@ -1881,8 +2605,10 @@ class GraspPlanner3D:
                 try:
                     _p1v = np.asarray(val_fn(_p1), float)
                     _p2v = np.asarray(val_fn(_p2), float)
-                    _n1o = _geom_normal_np(_p1v, geom_type, obj_center_np, obj_R_np, geom_size)
-                    _n2o = _geom_normal_np(_p2v, geom_type, obj_center_np, obj_R_np, geom_size)
+                    _n1o = _geom_normal_np(_p1v, geom_type, obj_center_np, obj_R_np, geom_size,
+                                           mesh_entry=self._mesh_entry)
+                    _n2o = _geom_normal_np(_p2v, geom_type, obj_center_np, obj_R_np, geom_size,
+                                           mesh_entry=self._mesh_entry)
                     _r1  = _p1v - obj_center_np
                     _r2  = _p2v - obj_center_np
                     _tau = np.cross(_r1, _n1o) + np.cross(_r2, _n2o)
@@ -1927,6 +2653,14 @@ class GraspPlanner3D:
                     if 'slack_norm' in _iter_rec[0]:
                         _out['slack_norm'] = np.stack(
                             [r['slack_norm'] for r in _iter_rec])
+                    # (u,v) trajectory in the local-neighborhood/tangent-plane frame —
+                    # see _opti_cb's uv1/uv2 recording note. Frame is per-STAGE (Picard
+                    # relinearization rebuilds it each stage — see GraspConfig3D.
+                    # use_uv_atlas_contact docstring), so uv1/uv2 are only directly
+                    # comparable WITHIN one saved file (one stage), not across stages.
+                    if 'uv1' in _iter_rec[0]:
+                        _out['uv1'] = np.stack([r['uv1'] for r in _iter_rec])
+                        _out['uv2'] = np.stack([r['uv2'] for r in _iter_rec])
                     np.savez(npz_path, **_out)
                     self.log.info(f"[{stage_label}] iter trace saved -> {npz_path}")
                 except Exception as _e_npz:
@@ -1982,6 +2716,7 @@ class GraspPlanner3D:
                     'cost':       float(_sol.value(_opti.f)),
                     'iterations': _sol.stats()['iter_count'],
                     'status':     'converged',
+                    'return_status': _sol.stats().get('return_status'),
                     'gamma_nlp':     float(_sol.value(_gamma_lp)) if _gamma_lp is not None else None,
                     'slack_norms':   ([float(np.linalg.norm(_sol.value(sk))) for sk in _s_list]
                                        if _s_list else None),
@@ -1990,6 +2725,7 @@ class GraspPlanner3D:
                     'n1_frozen':     _n1_in.tolist() if _n1_in is not None else None,
                     'n2_frozen':     _n2_in.tolist() if _n2_in is not None else None,
                     'stability_last20': _stab,
+                    'gws_beta':      float(_sol.value(_gws_beta)) if _gws_beta is not None else None,
                 }
             except Exception as _e:
                 self.log.warning(f"GraspPlanner3D._run_stage({stage_label}): {_e}")
@@ -2011,6 +2747,7 @@ class GraspPlanner3D:
                         'cost':       _opti.debug.value(_opti.f) if _st else None,
                         'iterations': (_st or {}).get('iter_count'),
                         'status':     'best-effort',
+                        'return_status': (_st or {}).get('return_status'),
                         'gamma_nlp':     float(_opti.debug.value(_gamma_lp)) if _gamma_lp is not None else None,
                         'slack_norms':   ([float(np.linalg.norm(_opti.debug.value(sk))) for sk in _s_list]
                                            if _s_list else None),
@@ -2019,13 +2756,17 @@ class GraspPlanner3D:
                         'n1_frozen':     _n1_in.tolist() if _n1_in is not None else None,
                         'n2_frozen':     _n2_in.tolist() if _n2_in is not None else None,
                         'stability_last20': _stab,
+                        'gws_beta':      (float(_opti.debug.value(_gws_beta))
+                                           if _gws_beta is not None else None),
                     }
                 except Exception as _e2:
                     self.log.error(f"GraspPlanner3D debug extraction: {_e2}")
                     _save_iter_npz('failed')
                     return {'success': False, 'q': None, 'p1': None, 'p2': None,
                             'cost': None, 'iterations': None, 'status': 'failed',
-                            'gamma_nlp': None, 'slack_norms': None, 'max_slack_norm': None}
+                            'return_status': None,
+                            'gamma_nlp': None, 'slack_norms': None, 'max_slack_norm': None,
+                            'gws_beta': None}
 
         # ── Run optimisation ─────────────────────────────────────────────────
         # Outer re-linearisation loop.  Contact normals are frozen per NLP solve
@@ -2033,9 +2774,11 @@ class GraspPlanner3D:
         # Early-exit when the contact positions have converged (position shift
         # < tol_p) or the normal mismatch is negligible (< tol_deg).
         _d1_lp = (np.asarray(d1, float) if d1 is not None
-                  else _geom_normal_np(p1_seed, geom_type, obj_center_np, obj_R_np, geom_size))
+                  else _geom_normal_np(p1_seed, geom_type, obj_center_np, obj_R_np, geom_size,
+                                       mesh_entry=self._mesh_entry))
         _d2_lp = (np.asarray(d2, float) if d2 is not None
-                  else _geom_normal_np(p2_seed, geom_type, obj_center_np, obj_R_np, geom_size))
+                  else _geom_normal_np(p2_seed, geom_type, obj_center_np, obj_R_np, geom_size,
+                                       mesh_entry=self._mesh_entry))
         _p1_ws, _p2_ws, _q_ws = p1_seed, p2_seed, q_dls
         _tol_p_m   = 5e-4    # 0.5 mm position shift → converged
         _tol_deg   = 2.0     # 2° normal mismatch → normals are accurate enough
@@ -2074,9 +2817,9 @@ class GraspPlanner3D:
             # 2. Normal mismatch: angle between frozen normal (used this solve)
             #    and actual surface normal at the new contact position.
             _n1_actual = _geom_normal_np(
-                _p1r, geom_type, obj_center_np, obj_R_np, geom_size)
+                _p1r, geom_type, obj_center_np, obj_R_np, geom_size, mesh_entry=self._mesh_entry)
             _n2_actual = _geom_normal_np(
-                _p2r, geom_type, obj_center_np, obj_R_np, geom_size)
+                _p2r, geom_type, obj_center_np, obj_R_np, geom_size, mesh_entry=self._mesh_entry)
             _cos1 = float(np.clip(np.dot(_d1_lp, _n1_actual), -1.0, 1.0))
             _cos2 = float(np.clip(np.dot(_d2_lp, _n2_actual), -1.0, 1.0))
             _mismatch_deg = max(np.degrees(np.arccos(_cos1)),
@@ -2111,8 +2854,10 @@ class GraspPlanner3D:
         if res.get('p1') is not None:
             _p1f  = np.asarray(res['p1'])
             _p2f  = np.asarray(res['p2'])
-            _n1f  = _geom_normal_np(_p1f, geom_type, obj_center_np, obj_R_np, geom_size)
-            _n2f  = _geom_normal_np(_p2f, geom_type, obj_center_np, obj_R_np, geom_size)
+            _n1f  = _geom_normal_np(_p1f, geom_type, obj_center_np, obj_R_np, geom_size,
+                                    mesh_entry=self._mesh_entry)
+            _n2f  = _geom_normal_np(_p2f, geom_type, obj_center_np, obj_R_np, geom_size,
+                                    mesh_entry=self._mesh_entry)
             _dot12 = float(np.dot(_n1f, _n2f))
             _sm    = _span_margin(_n1f, _n2f, _mu)
             self.log.info(
@@ -2137,20 +2882,31 @@ class GraspPlanner3D:
             data_v.mocap_pos[self._cp2_mocap] = result['p2']
         mj.mj_forward(model, data_v)
 
-        obj_pos = data_v.geom_xpos[self._obj_gid].copy()
-        obj_mat = data_v.geom_xmat[self._obj_gid].reshape(3, 3)
+        if self._obj_geom_type == _GEOM_TYPE_MESH:
+            obj_pos = data_v.xpos[self._obj_bid].copy()
+            obj_mat = data_v.xmat[self._obj_bid].reshape(3, 3)
+        else:
+            obj_pos = data_v.geom_xpos[self._obj_gid].copy()
+            obj_mat = data_v.geom_xmat[self._obj_gid].reshape(3, 3)
 
         # IK residual uses the same offset target as the NLP: p + r·n_out
         # Measuring ‖site − p‖ would always return ~r_tip regardless of convergence.
         _p1_np  = np.asarray(result['p1'], float)
         _p2_np  = np.asarray(result['p2'], float)
-        _n1_out = _geom_normal_np(_p1_np, self._obj_geom_type, obj_pos, obj_mat, self._obj_size)
-        _n2_out = _geom_normal_np(_p2_np, self._obj_geom_type, obj_pos, obj_mat, self._obj_size)
+        _n1_out = _geom_normal_np(_p1_np, self._obj_geom_type, obj_pos, obj_mat, self._obj_size,
+                                  mesh_entry=self._mesh_entry)
+        _n2_out = _geom_normal_np(_p2_np, self._obj_geom_type, obj_pos, obj_mat, self._obj_size,
+                                  mesh_entry=self._mesh_entry)
         _tgt1   = _p1_np + self.cfg.r_thumb * _n1_out
         _tgt2   = _p2_np + self.cfg.r_index * _n2_out
         ik_t = float(np.linalg.norm(data_v.site_xpos[self._thumb_sid] - _tgt1))
         ik_i = float(np.linalg.norm(data_v.site_xpos[self._index_sid] - _tgt2))
 
+        # NOTE for CoACD (mesh) objects: self._obj_gid is only ONE representative
+        # hull among the body's several collision hulls, so these mj_geomDistance
+        # gaps can undercount penetration/overcount clearance against a different
+        # hull than the one actually nearest a given fingertip. Diagnostic-only
+        # (not used by solve/verify's pass/fail), so left as an approximation.
         gap_t = mj.mj_geomDistance(model, data_v, self._thumb_gid,  self._obj_gid, 0.5, None)
         gap_i = mj.mj_geomDistance(model, data_v, self._index_gid,  self._obj_gid, 0.5, None)
         gap_m = mj.mj_geomDistance(model, data_v, self._middle_gid, self._obj_gid, 0.5, None)
@@ -2165,7 +2921,8 @@ class GraspPlanner3D:
         gap_floor_r = float(data_v.geom_xpos[self._ring_gid][2])   - float(self.cfg.r_ring)   - _gz
 
         def _sdf3(p):
-            return _geom_sdf_np(p, self._obj_geom_type, obj_pos, obj_mat, self._obj_size)
+            return _geom_sdf_np(p, self._obj_geom_type, obj_pos, obj_mat, self._obj_size,
+                                mesh_entry=self._mesh_entry)
 
         s1 = _sdf3(result['p1'])
         s2 = _sdf3(result['p2'])
@@ -2186,9 +2943,11 @@ class GraspPlanner3D:
                 p1_np = np.asarray(result['p1'], float)
                 p2_np = np.asarray(result['p2'], float)
                 n1_out = _geom_normal_np(p1_np, self._obj_geom_type,
-                                          obj_pos, obj_mat, self._obj_size)
+                                          obj_pos, obj_mat, self._obj_size,
+                                          mesh_entry=self._mesh_entry)
                 n2_out = _geom_normal_np(p2_np, self._obj_geom_type,
-                                          obj_pos, obj_mat, self._obj_size)
+                                          obj_pos, obj_mat, self._obj_size,
+                                          mesh_entry=self._mesh_entry)
                 _, t1_1, t2_1 = _build_contact_frame_3d(-n1_out)
                 _, t1_2, t2_2 = _build_contact_frame_3d(-n2_out)
                 R1 = np.column_stack([-n1_out, t1_1, t2_1])
@@ -2199,7 +2958,8 @@ class GraspPlanner3D:
                 _mass_v  = float(model.body_mass[_bid_v])
                 _inert_v = model.body_inertia[_bid_v]
                 _aab_v   = cfg.ang_accel_budget_xyz
-                _mu_v    = round(0.8 * float(model.geom_friction[self._obj_gid][0]), 3)
+                _mu_v_raw, _ = _contact_friction(model, self._obj_gid, self._thumb_gid, self._index_gid)
+                _mu_v    = round(0.8 * _mu_v_raw, 3)
                 R_WO_v   = data_v.xmat[_bid_v].reshape(3, 3)
                 _g_O_v   = R_WO_v.T @ model.opt.gravity
                 _ab_v    = cfg.accel_budget_xyz
@@ -2274,6 +3034,7 @@ class GraspPlanner3D:
             'gamma_min':            gamma_min,
             'max_slack_norm':       max_slack_norm,
             'gamma_nlp':            result.get('gamma_nlp'),
+            'gws_beta':             result.get('gws_beta'),
             'n1_verify':            n1_out.tolist() if n1_out is not None else None,
             'n2_verify':            n2_out.tolist() if n2_out is not None else None,
         }
@@ -2334,8 +3095,10 @@ class MultiStartGraspPlanner3D:
         self._obj_hz        = self._planner._obj_hz
         self._obj_geom_type = self._planner._obj_geom_type
         self._obj_size      = self._planner._obj_size
+        self._mesh_entry    = self._planner._mesh_entry
         self._fk_data       = mj.MjData(model)           # FK queries for seed generation
         self._rng           = np.random.default_rng(42)  # reproducible random seeds
+        self.last_chart_rank_table = []   # set by solve() when use_uv_atlas_contact chart-pair seeding runs
         # Fingertip effective radii (r_thumb/r_index/r_middle/r_ring) are
         # measured from model geometry inside GraspPlanner3D.__init__ above —
         # nothing left to do here.
@@ -2343,10 +3106,12 @@ class MultiStartGraspPlanner3D:
 
         # Log friction and torque bounds that will be computed inline at solve time.
         _obj_gid = _pl._obj_gid
-        _mu_obj  = float(model.geom_friction[_obj_gid][0])
+        _mu_obj, _mu_t_obj = _contact_friction(model, _obj_gid, _pl._thumb_gid, _pl._index_gid)
         _mu_init = round(0.8 * _mu_obj, 3)
         _pl.log.info(
-            f"[friction] obj_mu={_mu_obj:.3f}  effective_mu={_mu_init:.3f} (0.8x safety margin)")
+            f"[friction] combined_mu={_mu_obj:.3f} (obj-vs-fingertip max)  "
+            f"effective_mu={_mu_init:.3f} (0.8x safety margin)  "
+            f"combined_mu_t={_mu_t_obj:.4f}")
 
         _bid_init   = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, _pl.cfg.obj_body)
         _inert_init = model.body_inertia[_bid_init]
@@ -2381,8 +3146,15 @@ class MultiStartGraspPlanner3D:
         obj_gid      = self._planner._obj_gid
         geom_type    = self._obj_geom_type
         geom_size    = self._obj_size
-        obj_center_np = self._planner.data.geom_xpos[obj_gid].copy()
-        obj_R_np      = self._planner.data.geom_xmat[obj_gid].reshape(3, 3).copy()
+        if geom_type == _GEOM_TYPE_MESH:
+            # See GraspPlanner3D.solve: object_sdf's table is body-frame, so
+            # pose must come from the body, not any one hull geom.
+            obj_bid       = self._planner._obj_bid
+            obj_center_np = self._planner.data.xpos[obj_bid].copy()
+            obj_R_np      = self._planner.data.xmat[obj_bid].reshape(3, 3).copy()
+        else:
+            obj_center_np = self._planner.data.geom_xpos[obj_gid].copy()
+            obj_R_np      = self._planner.data.geom_xmat[obj_gid].reshape(3, 3).copy()
 
         # DETERMINISTIC seeding: reset self._rng to a FIXED seed at the START of every solve.
         # Without this the RNG advances across solves, so the same (or a marginally-moved)
@@ -2421,7 +3193,8 @@ class MultiStartGraspPlanner3D:
         _g_O   = obj_R_np.T @ model.opt.gravity
         _ab    = cfg.accel_budget_xyz
         _aab   = cfg.ang_accel_budget_xyz
-        _mu    = round(0.8 * float(model.geom_friction[obj_gid][0]), 3)
+        _mu_raw2, _ = _contact_friction(model, obj_gid, self._planner._thumb_gid, self._planner._index_gid)
+        _mu    = round(0.8 * _mu_raw2, 3)
         _nlp_fx = _mass * (_ab[0] + abs(_g_O[0]))
         _nlp_fy = _mass * (_ab[1] + abs(_g_O[1]))
         _nlp_fz = _mass * (_ab[2] + abs(_g_O[2]))
@@ -2434,33 +3207,124 @@ class MultiStartGraspPlanner3D:
         max_attempts = 40 * n_seeds
 
         def _sdf(p):
-            return _geom_sdf_np(p, geom_type, obj_center_np, obj_R_np, geom_size)
+            return _geom_sdf_np(p, geom_type, obj_center_np, obj_R_np, geom_size,
+                                mesh_entry=self._mesh_entry)
 
         _ground_z  = cfg.ground_z
         _r_tip_min = min(cfg.r_thumb, cfg.r_index)  # conservative: unknown which tip goes where
 
         _t0 = time.perf_counter()
 
-        # ── Fixed canonical seeds: perfectly antipodal, center-aligned pairs
-        # along the object's local x and y axes, tried before the randomized
-        # seeds below (counts against the n_seeds budget).
+        # ── Fixed canonical seed: perfectly antipodal pair along the object's
+        # MINOR PRINCIPAL AXIS (thinnest direction — the natural two-finger
+        # pinch axis, same choice as benchmarks/ycb_grasp/ik_demo.py's
+        # pinch_targets_from), tried FIRST, ahead of the randomized seeds
+        # below (counts against the n_seeds budget). _seed_pair's
+        # random-direction search can land on an awkward, hard-to-reach pinch
+        # geometry (measured 2-6x worse DLS residual than the minor-axis
+        # choice on several YCB objects) — this gives every solve one
+        # well-conditioned attempt before falling back to random exploration.
         seeds, attempts, rejected = [], 0, 0
-        # for _axis in (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])):
-        #     if len(seeds) >= n_seeds:
-        #         break
-        #     _fs = _fixed_antipodal_seed(geom_type, geom_size, c, obj_R_np, _axis)
-        #     if (not _reachable_contact(_fs['p1s'], _ground_z, _r_tip_min) or
-        #             not _reachable_contact(_fs['p2s'], _ground_z, _r_tip_min)):
-        #         log.debug(f"[seed_gen] fixed seed along axis {_axis.tolist()} "
-        #                   f"unreachable — skipped")
-        #         continue
-        #     seeds.append(_fs)
+        _axis_local = _minor_axis_local(geom_type, geom_size, mesh_entry=self._mesh_entry)
+        _fs = _fixed_antipodal_seed(geom_type, geom_size, c, obj_R_np, _axis_local,
+                                    mesh_entry=self._mesh_entry)
+        if (_reachable_contact(_fs['p1s'], _ground_z, _r_tip_min) and
+                _reachable_contact(_fs['p2s'], _ground_z, _r_tip_min)):
+            _assign_seed_by_finger(_fs, _live_th, _live_if)
+            seeds.append(_fs)
+        else:
+            log.debug(f"[seed_gen] minor-axis seed (local axis {_axis_local.tolist()}) "
+                      f"unreachable — skipped")
+
+        # ── Chart-aware antipodal seeds (mesh + use_uv_atlas_contact only) ──
+        # Ranked by chart-normal antipodality (see _chart_pair_seeds docstring
+        # / the session's seeding-rethink notes) — tried NEXT, ahead of
+        # _seed_pair's random-direction search, since chart assignment is
+        # frozen for the whole solve at seed time (nothing downstream can
+        # move a contact to a different chart), making a good chart choice
+        # here strictly more valuable than positional randomization within an
+        # arbitrarily-chosen chart. Falls back silently to [] (leaving the
+        # random loop below as the only source) when the object isn't a mesh,
+        # use_uv_atlas_contact is off, or fewer than 2 charts survive the
+        # bottom-facing filter.
+        #
+        # Pure chart-normal antipodality has NO reachability awareness — measured
+        # this session on 036_wood_block: the top-scored pair (its two TALL side
+        # faces) is geometrically excellent (wrench beta consistently positive)
+        # but sits far from the object's base height, which the arm/hand cannot
+        # reach (ik cost stayed 2-3 orders of magnitude above a converged solve,
+        # err 60-130mm). Re-rank the geometric candidates by a cheap DLS-IK
+        # residual (same SpatialIKSolver/target-offset convention _run_stage's
+        # warm-start uses — see its "DLS warm-start IK" comment) before
+        # accepting: request MORE geometric candidates than the seed budget
+        # (over-generate), then keep only the ones DLS can actually reach,
+        # best-residual first.
+        if cfg.use_uv_atlas_contact and self._planner._uv_atlas is not None:
+            _chart_cands = _chart_pair_seeds(
+                self._planner._uv_atlas, c, obj_R_np, geom_type, geom_size,
+                mesh_entry=self._mesh_entry, top_k=max(n_seeds * 3, 8))
+
+            _dls_data2 = self._planner._dls_data
+            _scored_cands = []
+            for _cs in _chart_cands:
+                if not (_reachable_contact(_cs['p1s'], _ground_z, _r_tip_min) and
+                        _reachable_contact(_cs['p2s'], _ground_z, _r_tip_min)):
+                    continue
+                # Finger assignment (thumb vs index) BEFORE scoring, not after —
+                # _assign_seed_by_finger can swap which physical contact is p1
+                # vs p2, which changes the DLS targets _run_stage will actually
+                # solve later. Scoring pre-swap measured a DLS problem that
+                # wasn't the one actually used, giving a ranking inconsistent
+                # with the real per-seed [dls_ws] residuals logged downstream
+                # (caught this session: candidates re-ordered after the swap).
+                _assign_seed_by_finger(_cs, _live_th, _live_if)
+                _dls_data2.qpos[:] = self._planner.data.qpos[:]
+                _dls_data2.qpos[act_idx] = np.asarray(q_ref, float)[:len(act_idx)]
+                _tgt1 = _cs['p1s'] + cfg.r_thumb * (-_cs['n1_in'])
+                _tgt2 = _cs['p2s'] + cfg.r_index * (-_cs['n2_in'])
+                _q_dls_c = self._planner._dls_ik.solve(
+                    model, _dls_data2,
+                    [self._planner._thumb_sid, self._planner._index_sid],
+                    [_tgt1, _tgt2], q_bias=q_ref, null_gain=0.3)
+                mj.mj_kinematics(model, _dls_data2)
+                _e1 = np.linalg.norm(_dls_data2.site_xpos[self._planner._thumb_sid] - _tgt1)
+                _e2 = np.linalg.norm(_dls_data2.site_xpos[self._planner._index_sid] - _tgt2)
+                _dls_res = float(max(_e1, _e2))
+                _scored_cands.append((_dls_res, _cs))
+
+            _scored_cands.sort(key=lambda t: t[0])
+            # Full ranked table (chart_pair, antipodal_score, dls_res_mm) for every
+            # SCORED candidate (reachable ones only — see the _reachable_contact
+            # skip above), stashed on self for diagnostics/plotting (e.g.
+            # benchmarks/ycb_grasp/plot_uv_path.py's rank annotations) — not part
+            # of the res dict returned by solve() to avoid touching that schema.
+            self.last_chart_rank_table = [
+                dict(chart_pair=_cs.get('chart_pair'),
+                    antipodal_score=_cs.get('antipodal_score'),
+                    dls_res_mm=_dls_res * 1e3,
+                    accepted=False)
+                for _dls_res, _cs in _scored_cands
+            ]
+            _n_before = len(seeds)
+            for _rank, (_dls_res, _cs) in enumerate(_scored_cands):
+                if len(seeds) >= n_seeds:
+                    break
+                seeds.append(_cs)
+                self.last_chart_rank_table[_rank]['accepted'] = True
+                log.debug(f"[seed_gen] chart-pair {_cs.get('chart_pair')} "
+                         f"dls_res={_dls_res*1e3:.1f}mm")
+            log.info(f"[seed_gen] {len(seeds) - _n_before}/{len(_chart_cands)} "
+                    f"chart-pair seeds accepted (best DLS residual "
+                    f"{_scored_cands[0][0]*1e3:.1f}mm)"
+                    if _scored_cands else
+                    "[seed_gen] 0 chart-pair candidates reachable/scored")
 
         # sample seeds for solver
         while len(seeds) < n_seeds and attempts < max_attempts:
             attempts += 1
             s = _seed_pair(geom_type, geom_size, c, obj_R_np, bbox_r, self._rng,
-                           delta_max=np.deg2rad(cfg.seed_march_jitter_deg))
+                           delta_max=np.deg2rad(cfg.seed_march_jitter_deg),
+                           mesh_entry=self._mesh_entry)
             # # Hemisphere check — n1 and n2 must point into opposing hemispheres
             # if float(np.dot(s['n1_in'], s['n2_in'])) >= 0:
             #     rejected += 1
@@ -2493,11 +3357,15 @@ class MultiStartGraspPlanner3D:
         if warm_contacts is not None:
             try:
                 _wp1 = _project_to_surface_np(np.asarray(warm_contacts[0], float),
-                                              geom_type, c, obj_R_np, geom_size)
+                                              geom_type, c, obj_R_np, geom_size,
+                                              mesh_entry=self._mesh_entry)
                 _wp2 = _project_to_surface_np(np.asarray(warm_contacts[1], float),
-                                              geom_type, c, obj_R_np, geom_size)
-                _wn1 = -_geom_normal_np(_wp1, geom_type, c, obj_R_np, geom_size)
-                _wn2 = -_geom_normal_np(_wp2, geom_type, c, obj_R_np, geom_size)
+                                              geom_type, c, obj_R_np, geom_size,
+                                              mesh_entry=self._mesh_entry)
+                _wn1 = -_geom_normal_np(_wp1, geom_type, c, obj_R_np, geom_size,
+                                        mesh_entry=self._mesh_entry)
+                _wn2 = -_geom_normal_np(_wp2, geom_type, c, obj_R_np, geom_size,
+                                        mesh_entry=self._mesh_entry)
                 if (_reachable_contact(_wp1, _ground_z, _r_tip_min) and
                         _reachable_contact(_wp2, _ground_z, _r_tip_min)):
                     _warm_seed = {'p1': _wp1.copy(), 'p2': _wp2.copy(),
@@ -2516,10 +3384,32 @@ class MultiStartGraspPlanner3D:
             except Exception as _e:
                 log.debug(f"[seed_gen] warm-start seed skipped: {_e}")
 
+        # Per-seed q_ref restart perturbation (see cfg.qref_restart_sigma_arm/hand's
+        # docstring). Drawn from self._rng — the SAME fixed-per-solve RNG stream used
+        # for contact seeding above, so a re-solve on a static/near-static pose
+        # reproduces the same perturbations (the determinism this class already
+        # guarantees for contact seeds, extended to q_ref restarts). Seed 0 (index 0,
+        # including the warm-start seed prepended above when present) always gets the
+        # operator's UNPERTURBED q_ref — only later seeds explore around it.
+        _q_ref_base  = np.asarray(q_ref, float)
+        _n_arm       = self._planner._n_arm_joints
+        _sigma_arm   = float(cfg.qref_restart_sigma_arm)
+        _sigma_hand  = float(cfg.qref_restart_sigma_hand)
+        _lo_vec, _hi_vec = self._planner._lo_vec, self._planner._hi_vec
+
+        def _perturbed_q_ref(seed_idx: int) -> np.ndarray:
+            if seed_idx == 0 or (_sigma_arm <= 0.0 and _sigma_hand <= 0.0):
+                return _q_ref_base
+            q0 = _q_ref_base.copy()
+            q0[:_n_arm]  += self._rng.normal(0.0, _sigma_arm, _n_arm)
+            q0[_n_arm:]  += self._rng.normal(0.0, _sigma_hand, len(q0) - _n_arm)
+            return np.clip(q0, _lo_vec, _hi_vec)
+
         results = []
         for i, seed in enumerate(seeds):
             if dash is not None:
                 dash.push({'type': 'active', 'label': f'grasp3d seed {i+1}/{n_seeds}'})
+            _q_ref_seed = _perturbed_q_ref(i)
 
             # ── Pre-check LP on surface footprints (slack-relaxed — see
             #    cfg.precheck_slack_penalty) ───────────────────────────────────
@@ -2566,7 +3456,7 @@ class MultiStartGraspPlanner3D:
                 continue
 
             # ── Run NLP (warm-started from the pre-check LP's γ and cone y's) ──
-            r = self._planner.solve(q_ref, obj_pos,
+            r = self._planner.solve(_q_ref_seed, obj_pos,
                                     p1_init=seed['p1'],
                                     p2_init=seed['p2'],
                                     d1=-seed['n1_in'],   # outward normal
@@ -2580,14 +3470,18 @@ class MultiStartGraspPlanner3D:
             if r.get('p1') is not None:
                 _p1f = np.asarray(r['p1'])
                 _p2f = np.asarray(r['p2'])
-                sdf_p1 = _geom_sdf_np(_p1f, geom_type, obj_center_np, obj_R_np, geom_size)
-                sdf_p2 = _geom_sdf_np(_p2f, geom_type, obj_center_np, obj_R_np, geom_size)
+                sdf_p1 = _geom_sdf_np(_p1f, geom_type, obj_center_np, obj_R_np, geom_size,
+                                      mesh_entry=self._mesh_entry)
+                sdf_p2 = _geom_sdf_np(_p2f, geom_type, obj_center_np, obj_R_np, geom_size,
+                                      mesh_entry=self._mesh_entry)
                 if r.get('q') is not None:
                     self._fk_data.qpos[act_idx] = np.asarray(r['q'], float)[:len(act_idx)]
                     mj.mj_kinematics(model, self._fk_data)
                     # Use offset target p + r·n_out to match the NLP objective.
-                    _n1_out = _geom_normal_np(_p1f, geom_type, obj_center_np, obj_R_np, geom_size)
-                    _n2_out = _geom_normal_np(_p2f, geom_type, obj_center_np, obj_R_np, geom_size)
+                    _n1_out = _geom_normal_np(_p1f, geom_type, obj_center_np, obj_R_np, geom_size,
+                                              mesh_entry=self._mesh_entry)
+                    _n2_out = _geom_normal_np(_p2f, geom_type, obj_center_np, obj_R_np, geom_size,
+                                              mesh_entry=self._mesh_entry)
                     _tgt1   = _p1f + cfg.r_thumb * _n1_out
                     _tgt2   = _p2f + cfg.r_index * _n2_out
                     ik_th = float(np.linalg.norm(

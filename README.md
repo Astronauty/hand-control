@@ -247,27 +247,171 @@ uv run python scripts/build_ycb.py
 This extracts any not-yet-extracted archive in place, then per object:
 
 1. Loads `google_16k/textured.obj` (the scan, with UVs).
-2. Runs [CoACD](https://github.com/SarahWeiii/CoACD) convex decomposition
-   (`max_convex_hull=8`) to split the concave mesh into a union of convex hulls —
-   geometry MuJoCo's solver can resolve exactly.
-3. Writes `assets/ycb_mjcf/<object>/<object>.xml` with the visual mesh, the hulls, and a
-   texture/material binding.
+2. **Seals the scan into a watertight solid** (`scripts/mesh_seal.py`) so that volume —
+   and therefore mass and inertia — is defined at all.
+3. Runs [CoACD](https://github.com/SarahWeiii/CoACD) convex decomposition at
+   progressively finer concavity thresholds, **measuring against that solid after each
+   one**, and keeps the first result whose falsely-solid volume is acceptable.
+4. Writes `assets/ycb_mjcf/<object>/<object>.xml` with the visual mesh, the hulls, a
+   texture/material binding, and an `<inertial>` carrying the **published YCB mass**,
+   plus a fit record in `assets/ycb_mjcf/fit_report.json`.
 
-The script is idempotent: already-extracted objects are skipped, so re-runs are cheap.
-CoACD is CPU-bound and single-threaded — a full 84-object run takes on the order of an
-hour. `max_convex_hull` is the accuracy/speed knob; raise it for irregular objects whose
-cavities matter (power drill, hammer), lower it to cut contact pairs.
+The script is idempotent: objects already built at the current settings are skipped
+(`--force` overrides), and the report is checkpointed after each object, so an
+interrupted run resumes. A full 84-object run takes a few hours; `--jobs` sets how many
+objects run at once, but CoACD is itself heavily threaded (~28 cores on one object), so
+raising it past a handful mostly buys contention.
+
+#### The hull count is an output, not a setting
+
+The knob used to be `max_convex_hull=8`, applied uniformly. That fixes the *cost* of a
+collision proxy rather than its *fidelity*, and across shapes the two are unrelated —
+which is why near-convex objects came out right and cavities filled in. Auditing the
+whole set built that way, overshoot outside the scan ranges from 0.33 mm to 33.9 mm
+(median 4.07), and 57 of 84 objects sit beyond 3 mm:
+
+| object | hulls | overshoot p99 |
+|---|---|---|
+| `058_golf_ball` | 1 (CoACD stopped early) | 0.33 mm |
+| `013_apple` | 8 | 2.1 mm |
+| `011_banana` | 4 (stopped early) | 3.9 mm |
+| `048_hammer` | 5 (stopped early) | 8.0 mm |
+| `065-a_cups` | 8 | 10.4 mm |
+| `024_bowl` | 8 | 14.0 mm |
+| `025_mug` | 8 | 17.4 mm |
+| `029_plate` | 8 | 20.1 mm |
+| `027_skillet` | 8 | 31.6 mm |
+| `028_skillet_lid` | 8 | 33.9 mm |
+
+53 objects hit the cap of 8 and were truncated mid-decomposition; 46 of those are the
+ones beyond 3 mm. But the 31 that stopped early are not automatically fine either —
+11 of them also miss, because CoACD's *own* default concavity threshold is no more
+consistent across shapes than a hull count is: it stops a banana at 3.9 mm and a hammer
+at 8.0 mm. Neither knob is a fidelity criterion. Measuring is.
+
+Holding the *error* fixed instead lets the count land where the shape requires it: a
+golf ball takes 1 hull, an apple 1, a banana 5, `065-a_cups` 36, a mug ~70.
+`--max-hulls` is only a contact-cost backstop, and objects that hit it are reported as
+`budget_limited` rather than silently degraded.
+
+#### Sealing the scans, so that volume means something
+
+The scans are **open surfaces**: `025_mug` arrives as 157 disconnected components with
+~4.8k boundary edges, so "inside" is undefined, `trimesh` reports `is_watertight ==
+False`, and `mesh.volume` is a meaningless number. Nothing volume-based — fit, mass, or
+inertia — is computable until that is fixed. `scripts/mesh_seal.py` does it, and two
+routes were measured against objects with published masses so the answer could be
+checked:
+
+| route | mug implied density | bowl | verdict |
+|---|---|---|---|
+| MeshFix surface repair (`pymeshfix`) | 6226 kg/m³ | 4407 | fragments; wrong per object |
+| solid voxelisation + flood fill | 692 kg/m³ | 1637 | consistent |
+
+MeshFix is exact on one clean shell, but these are not: run per connected component,
+the mug's 36 surviving fragments seal to 19 cm³. Voxelisation — rasterise the shell,
+close hairline cracks, flood-fill from outside, call whatever the flood cannot reach
+interior — is immune to that, because a crack narrower than the pitch simply closes.
+Its implied densities land where the materials say: golf ball 1107 (real ~1130), sponge
+49 (foam ~50), mustard bottle 919 (~1000), cracker box 180 (~200).
+
+Its known bias is that a shell rasterises about a voxel thicker than it is, so
+thin-walled objects read heavy. That is bounded by the pitch, which makes it negligible
+against the centimetre-scale volumes the fit metric weighs, and it cancels out of the
+inertia tensor, which is rescaled to the published mass. Validated against analytic
+solids: a box and a sphere come back within 2.4% on volume and 2.3% on inertia.
+
+#### The common metric
+
+Measured on the sealed solid, the gate is **falsely-solid volume** — space the hulls
+claim is filled where the object is actually empty. That is the error that fills a cup
+and turns a bowl into a dome. It has two limbs, because one threshold does not mean the
+same thing on a convex object as on a hollow one:
+
+- `false_solid_frac ≤ --max-false-solid` (default 0.05), as a fraction of the object's
+  convex hull. Near-convex objects clear this at once, correctly: `013_apple` scores
+  0.018 with a **single** hull, and no hull count beats it — 30 hulls only reach 0.014.
+- `recovered ≥ 0.85` — of the false solid a plain convex hull carries, this much won
+  back. Hollow objects live here: the banana's hull is 33% false solid and no
+  achievable decomposition takes that to 5%.
+
+The 0.05 is set just above a floor CoACD imposes, rather than picked for looks. CoACD
+decomposes a **voxel remesh** of the scan at `preprocess_resolution=50` — voxels of
+`extent/50`, which is 4.3 mm on the cracker box and 5.0 mm on the bleach cleanser — so
+its hulls bulge about one such voxel outside the true surface no matter how many of them
+it makes. A 0.02 target sat underneath that floor, and objects with 1.3–3.1 mm of actual
+surface error churned the entire ladder and still reported as failures. Aiming below
+~0.05 means raising CoACD's preprocess resolution first, which costs roughly 3× the
+decomposition time.
+
+`recovered` is the more consistent of the two, and among similar shapes it is tight —
+`011_banana` at 0.858 and `065-a_cups` at 0.860 land on 2.98 mm and 2.45 mm of surface
+error, `025_mug` at 0.893 on 2.99 mm.
+
+**But do not read it as a bound on surface error.** Across the whole set, the objects
+sitting at `recovered ≥ 0.85` span 0.22 mm to 15.97 mm of surface p99 — `027_skillet`
+passes the volume gate at 17 hulls while still carrying a 16 mm local error. Volume
+agreement and distance agreement are different questions, and holding one fixed leaves
+the other loose.
+
+Measured on the independent surface diagnostic, against the old fixed count:
+
+| | median p99 | worst p99 | over 5 mm |
+|---|---|---|---|
+| fixed 8 hulls | 4.07 mm | 33.90 mm | 34 of 84 |
+| volume gate | **2.31 mm** | **15.97 mm** | **11 of 84** |
+
+Better on every aggregate — but **8 objects got worse**, and they are all cases where
+volume is blind to features that are shallow and broad. `003_cracker_box` collapsed to a
+single hull (a box *is* convex by volume) and went from 3.45 mm to 7.58 mm; `013_apple`
+from 2.07 mm to 4.75 mm, its stem dimple costing almost no volume. If that matters for a
+given object, `--max-false-solid` will not fix it — the fix is to require the surface
+metric as well, which `scripts/mesh_fit.py` already computes and the report already
+records as `overshoot_p99_mm` next to the volume numbers.
+
+#### Mass and inertia
+
+Every body carries an explicit `<inertial>` built from the **published YCB mass**
+(`scripts/ycb_masses.py`, transcribed from Table II of the YCB paper) with the tensor
+computed from the sealed solid and rescaled to that mass. YCB publishes mass and
+dimensions but *not* inertia tensors, so uniform density is assumed for the tensor's
+shape while the published figure sets its scale.
+
+This is a fix, not a decoration. With no `<inertial>`, MuJoCo infers mass from the geoms
+— counting the `contype=0` visual mesh *and* every overlapping collision hull.
+`011_banana` came out at **0.379 kg against a published 0.066 kg**, nearly half of it
+contributed by a mesh that exists only to be looked at, and the error moved every time
+the hull count changed. Of the 84 objects:
+
+- **64 published** — the table names the object directly.
+- **15 assembly-share** — the table gives one figure for a multi-part set
+  (`071_nine_hole_peg_test` 1435 g, `072_toy_airplane` 570 g, `073_lego_duplo` 523 g),
+  split across the parts by sealed volume.
+- **5 nominal-density** — no published mass exists (marbles are listed "N/A", the
+  Rubik's cube postdates the table), so 1000 kg/m³ is used.
+
+Each object's `mass_source` is in the report, so the assumed ones are never silently
+mixed in with the measured ones.
 
 Output per object:
 
 ```
-assets/ycb_mjcf/<object>/
-├── <object>.xml          # generated MJCF
-├── textured.obj          # visual mesh (copied)
-├── texture_map.png       # texture (copied)
-├── textured.mtl          # copied; MuJoCo does not read .mtl
-└── collision/part_*.obj  # generated convex hulls
+assets/ycb_mjcf/
+├── fit_report.json           # per-object: hull count, threshold, measured error
+└── <object>/
+    ├── <object>.xml          # generated MJCF
+    ├── textured.obj          # visual mesh (copied)
+    ├── texture_map.png       # texture (copied)
+    ├── textured.mtl          # copied; MuJoCo does not read .mtl
+    └── collision/part_*.obj  # generated convex hulls
 ```
+
+Each `fit_report.json` record carries the settings it was built at, the CoACD threshold
+that won (`"hull"` when a single convex hull sufficed), `false_solid_cm3` /
+`false_solid_frac` / `recovered`, the sealed and convex-hull volumes, the diagnostic
+`overshoot_p99_mm`, and `mass_kg` with its `mass_source`. Settings live on each record
+rather than on the file, so rebuilding one object at a tighter tolerance does not
+invalidate the other 83.
 
 Each MJCF is standalone and drops into a scene with a top-level
 `<include file="...xml"/>` (an `<include>` may not sit inside `<worldbody>`). Objects
@@ -299,8 +443,33 @@ python view_ycb.py 024_bowl                    # both, toggle with 2 / 3
 python view_ycb.py 024_bowl --collision-only   # hulls only
 ```
 
-Worth checking the concave objects (`024_bowl`, `065-*_cups`, `035_power_drill`) — if a
-cavity is filled in rather than hollow, that object needs a higher `max_convex_hull`.
+Worth checking the concave objects (`024_bowl`, `065-*_cups`, `035_power_drill`). To
+grade them instead of eyeballing them, `--audit` re-measures whatever is on disk without
+running CoACD at all:
+
+```bash
+uv run python scripts/build_ycb.py --audit                  # every built object
+uv run python scripts/build_ycb.py --audit --only 024_bowl
+```
+
+It seals each object and re-measures both metrics, printing them worst-fit-first — the
+fastest way to see whether a tighter tolerance is worth the extra hulls. To rebuild just
+the ones that disappoint:
+
+```bash
+uv run python scripts/build_ycb.py --only 024_bowl 025_mug --max-false-solid 0.01 --force
+```
+
+### 4. Verify
+
+```bash
+uv run python scripts/verify_ycb.py
+```
+
+Compiles every MJCF in MuJoCo and checks each body's mass against both the report and
+the published table, and each collision geom count against the hull files on disk. The
+mass check is the one that matters: it fails the moment an `<inertial>` goes missing and
+MuJoCo silently falls back to summing geoms.
 
 ---
 

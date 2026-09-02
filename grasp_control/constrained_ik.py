@@ -28,6 +28,8 @@ import casadi as ca
 import mujoco as mj
 import numpy as np
 
+from . import object_sdf as _object_sdf
+
 _call_counter = itertools.count()
 
 
@@ -571,22 +573,61 @@ _SQP_SOLVER_OPTS = {
 }
 
 
+# The SQP mode swaps module-level names in place. Keeping the swap list and the
+# pristine copies here makes this module the single source of truth: callers that
+# A/B the two backends restore via configure_ipopt() instead of each keeping its
+# own hardcoded name list, which silently goes stale whenever a name is added
+# (an un-restored name leaks SQP behaviour into a run labelled IPOPT, with no
+# error raised). simulation/test_cik_*.py predate this and still carry their own
+# copies; they are correct today but should be migrated to configure_ipopt().
+_SQP_PATCHES = {
+    '_sphere_box_distance':         '_softplus_sphere_box_distance',
+    '_sphere_cylinder_distance':    '_softplus_sphere_cylinder_distance',
+    '_SitePositionCallback':        '_SitePositionCallbackAnalytic',
+    '_SiteAxisCallback':            '_SiteAxisCallbackAnalytic',
+    '_GeomPositionCallback':        '_GeomPositionCallbackAnalytic',
+    '_BatchedGeomPositionCallback': '_BatchedGeomPositionCallbackAnalytic',
+}
+
+# Captured at import, before any configure_sqp() call can mutate them.
+_PRISTINE_GLOBALS = {name: globals()[name] for name in _SQP_PATCHES}
+
+_IPOPT_SOLVER_NAME = 'ipopt'
+
+# Constraint violation (m) under which a recorded iterate counts as feasible.
+# Matches IPOPT's constr_viol_tol.
+_FEAS_TOL = 1e-6
+
+
 def configure_sqp(solver):
     """Switch a ConstrainedIKSolver instance to the SQP + softplus-SDF mode.
 
     Replaces the module-level SDF functions and FK callbacks with their
     analytic-Jacobian / softplus-smoothed counterparts, and switches the
     CasADi solver from IPOPT to sqpmethod/OSQP.  Call once after construction.
+
+    NOTE: the swap is process-global. Use configure_ipopt() to undo it.
     """
-    import grasp_control.constrained_ik as _m
-    _m._sphere_box_distance          = _softplus_sphere_box_distance
-    _m._sphere_cylinder_distance     = _softplus_sphere_cylinder_distance
-    _m._SitePositionCallback         = _SitePositionCallbackAnalytic
-    _m._SiteAxisCallback             = _SiteAxisCallbackAnalytic
-    _m._GeomPositionCallback         = _GeomPositionCallbackAnalytic
-    _m._BatchedGeomPositionCallback  = _BatchedGeomPositionCallbackAnalytic
+    g = globals()
+    for name, repl in _SQP_PATCHES.items():
+        g[name] = g[repl]
     solver._solver_name = 'sqpmethod'
     solver._solver_opts = _SQP_SOLVER_OPTS
+
+
+def configure_ipopt(solver=None):
+    """Undo configure_sqp: restore the pristine module globals, and if a solver
+    is given, put it back on IPOPT with its default options.
+
+    Call between A/B runs in one process. Without it the exact-SDF / FD-Jacobian
+    path stays overwritten and the "IPOPT" arm silently measures SQP internals.
+    """
+    g = globals()
+    for name, orig in _PRISTINE_GLOBALS.items():
+        g[name] = orig
+    if solver is not None:
+        solver._solver_name = _IPOPT_SOLVER_NAME
+        solver._solver_opts = solver._default_ipopt_opts()
 
 
 class ConstrainedIKSolver:
@@ -625,7 +666,7 @@ class ConstrainedIKSolver:
                  arm_geom_names, obj_geom_names,
                  clearance=0.005, posture_weight=0.05,
                  pad_axis=(-1.0, 0.0, 0.0), orient_weight=0.0,
-                 tip_weight=1.0,
+                 tip_weight=1.0, sdf_bodies=(), jacobian='auto',
                  max_iter=500, verbose=False):
         self._model          = model
         self._n              = n_robot
@@ -673,6 +714,38 @@ class ConstrainedIKSolver:
         # Bounding-sphere radius for the sphere-vs-sphere fallback (non-box, non-plane geoms).
         self._obj_rbound       = [float(model.geom_rbound[gid]) for gid in self._obj_gids]
 
+        # --- mesh objects handled by a precomputed signed-distance table -----
+        # A mesh geom has no branch above and falls through to the bounding
+        # sphere, which for a YCB object is a ~12 cm ball around a few-cm shape;
+        # measured on the demo that inflates fingertip placement error 6-18x.
+        # One table per body covers all of that body's hulls at once, so the
+        # constraint count stops scaling with hull count -- which now matters,
+        # since hull count is set by a fidelity target (median 23, max 126)
+        # rather than a fixed budget.
+        self._sdf_objs = []
+        _sdf_bids = set()
+        for bname in (sdf_bodies or ()):
+            bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, bname)
+            if bid < 0:
+                raise ValueError(f"sdf_bodies: no body named {bname!r}")
+            table, _hulls = _object_sdf.load_or_bake(model, bid)
+            self._sdf_objs.append(dict(
+                name=bname, bid=bid,
+                fn=_object_sdf.casadi_fn(table, name=f"sdf_{bid}"),
+                rbound=float(table["rbound"])))
+            _sdf_bids.add(bid)
+
+        # Drop any explicitly-listed geom that belongs to an SDF body: the table
+        # already covers it, and constraining both is redundant work.
+        if _sdf_bids:
+            keep = [i for i, gid in enumerate(self._obj_gids)
+                    if gid < 0 or model.geom_bodyid[gid] not in _sdf_bids]
+            if len(keep) != len(self._obj_gids):
+                for attr in ("_obj_geom_names", "_obj_gids", "_obj_is_box",
+                             "_obj_is_plane", "_obj_is_cyl",
+                             "_obj_half_extents", "_obj_rbound"):
+                    setattr(self, attr, [getattr(self, attr)[i] for i in keep])
+
         limited        = model.jnt_limited[:n_robot].astype(bool)
         self._lo       = model.jnt_range[:n_robot, 0]
         self._hi       = model.jnt_range[:n_robot, 1]
@@ -691,8 +764,36 @@ class ConstrainedIKSolver:
         self._lo_vec = np.where(limited, self._lo, -1e19)
         self._hi_vec = np.where(limited, self._hi,  1e19)
 
-        self._solver_name = "ipopt"
-        self._solver_opts = {
+        # --- S3: exact vs finite-difference NLP Jacobian ---------------------
+        # IPOPT's own FD over the whole NLP was chosen because the analytic box
+        # and cylinder SDFs have kinks at face/edge/vertex transitions, and FD
+        # straddles them (see _default_ipopt_opts). Where no such geom is in the
+        # constraint set -- planes are linear, and the grid SDF is C2 with finite
+        # Hessians everywhere near the surface -- that smoothing buys nothing and
+        # costs 24 evaluations per iteration of gradient noise, which is what
+        # corrupts L-BFGS and produces the late divergence this works around.
+        if jacobian == 'auto':
+            # Measured on three YCB objects with only SDF + plane constraints
+            # (so 'exact' was safe): 0.73->0.28 mm on one, but 0.52->1.25 and
+            # 0.05->0.49 mm on the other two, at equal or slightly worse solve
+            # time. No consistent gain, so 'auto' keeps the FD default and
+            # 'exact' stays available to opt into. The late-divergence problem
+            # this was meant to address turned out to be the returned iterate,
+            # not gradient noise -- see the best-iterate tracking in solve().
+            self._jacobian = 'fd'
+        elif jacobian in ('exact', 'fd'):
+            self._jacobian = jacobian
+        else:
+            raise ValueError(f"jacobian must be 'auto', 'exact' or 'fd', got {jacobian!r}")
+
+        self._solver_name = _IPOPT_SOLVER_NAME
+        self._solver_opts = self._default_ipopt_opts()
+
+    def _default_ipopt_opts(self):
+        """IPOPT options for this solver. Factored out of __init__ so
+        configure_ipopt() can restore them after an SQP A/B run."""
+        verbose, max_iter = self._verbose, self._max_iter
+        return {
             "print_time": False,
             "ipopt": {
                 # IPOPT computes its own FD Jacobian of the NLP (not CasADi's chain-rule
@@ -702,7 +803,8 @@ class ConstrainedIKSolver:
                 # those kinks in the full distance expression, giving effectively smoothed
                 # gradients that L-BFGS handles far better than the exact one-sided derivatives.
                 # Switching to "exact" here requires smoothing the box SDF kinks first.
-                "jacobian_approximation": "finite-difference-values",
+                "jacobian_approximation": ("exact" if self._jacobian == "exact"
+                                           else "finite-difference-values"),
                 "hessian_approximation":  "limited-memory",
                 "print_level":  5 if verbose else 0,
                 "sb":           "yes",
@@ -719,7 +821,7 @@ class ConstrainedIKSolver:
     def solve(self, data, site_ids, targets,
               q_bias=None, q_init=None, skip_arm_geoms=frozenset(),
               reduced_clearance_geoms=frozenset(), reduced_clearance=0.0005,
-              inward_dirs=None, prune_margin=0.15):
+              inward_dirs=None, prune_margin=0.15, track_best=True):
         """
         Solve IK with collision-avoidance constraints.
 
@@ -758,7 +860,8 @@ class ConstrainedIKSolver:
 
         Returns
         -------
-        q : (n_robot,) — IPOPT solution, or best-iterate on failure.
+        q : (n_robot,) — IPOPT solution, or the best feasible iterate seen
+            (see track_best; on failure this is usually far better than the last).
         """
         n        = self._n
         ctr      = next(_call_counter)
@@ -857,6 +960,7 @@ class ConstrainedIKSolver:
 
         dist_exprs   = []
         pruned_pairs = []   # (arm_gid, obj_gid, arm_geom_name, obj_geom_name, clearance)
+        pruned_sdf   = []   # (arm_gid, sdf_obj, arm_geom_name, clearance)
         _ft6 = np.zeros(6)
         for i, (ag, gid1, arm_radius, obj_clr) in enumerate(arm_entries):
             p_arm = p_all[3 * i : 3 * i + 3]
@@ -892,8 +996,61 @@ class ConstrainedIKSolver:
                         p_arm, arm_radius, ca.DM(center), self._obj_rbound[j])
                 dist_exprs.append((expr, clr, ag, ogn))
 
+            # Mesh objects: one constraint per (arm geom, object), not per hull.
+            # The table lives in the object's BODY frame, so the object's pose
+            # enters only as the constant transform below -- a moving object
+            # needs no rebake (verified pose-invariant to 1e-16).
+            for so in self._sdf_objs:
+                c_obj = _scratch.xpos[so['bid']]
+                R_obj = _scratch.xmat[so['bid']].reshape(3, 3)
+                if prune_margin is not None:
+                    lb = (float(np.linalg.norm(_scratch.geom_xpos[gid1] - c_obj))
+                          - arm_radius - so['rbound'])
+                    if lb > obj_clr + prune_margin:
+                        # Tracked apart from pruned_pairs: that list is rechecked
+                        # with mj_geomDistance(gid1, gid2), and an SDF object has
+                        # no single gid2 -- a sentinel would negative-index to the
+                        # last geom in the model and silently check the wrong pair.
+                        pruned_sdf.append((gid1, so, ag, obj_clr))
+                        continue
+                p_loc = ca.DM(R_obj.T) @ (p_arm - ca.DM(c_obj))
+                expr = so['fn'](p_loc) - arm_radius
+                dist_exprs.append((expr, obj_clr, ag, so['name']))
+
         for d, clr, _ag, _og in dist_exprs:
             opti.subject_to(d >= clr)
+
+        # --- best-iterate tracking ---------------------------------------
+        # IPOPT can reach a near-converged point and then wander away from it:
+        # observed on the YCB demo descending to obj 1.3e-3 by iteration 200,
+        # then jumping to 4.9e-2 at 250 and never recovering. Returning the LAST
+        # iterate therefore discards a much better answer -- measured 34.7 mm
+        # returned against 0.5 mm found at iteration 257. Record each iterate and
+        # pick the best feasible one at the end.
+        #
+        # Only q is captured in the callback (a plain read, no re-evaluation);
+        # objective and violation are scored afterwards in one batch, so the
+        # per-iteration overhead stays negligible against the solve itself.
+        _iterates = []
+        if track_best:
+            opti.callback(lambda _i: _iterates.append(
+                np.array(opti.debug.value(q)).ravel().copy()))
+            _viol_expr = (ca.mmax(ca.vertcat(*[clr - d for d, clr, _, _ in dist_exprs]))
+                          if dist_exprs else ca.MX(-1.0))
+            _score = ca.Function('cik_score', [q], [cost, _viol_expr])
+
+        def _best_feasible(fallback_q, fallback_obj=None):
+            """Lowest-objective recorded iterate that satisfies the constraints."""
+            if not _iterates:
+                return fallback_q, None, None
+            best_q, best_obj, best_it = fallback_q, fallback_obj, None
+            for it, qi in enumerate(_iterates):
+                f_i, v_i = _score(qi)
+                if float(v_i) > _FEAS_TOL:
+                    continue
+                if best_obj is None or float(f_i) < best_obj:
+                    best_q, best_obj, best_it = qi, float(f_i), it
+            return best_q, best_obj, best_it
 
         opti.set_initial(q, q0)
         t_setup = time.time() - _t0_solve
@@ -973,11 +1130,20 @@ class ConstrainedIKSolver:
             """Exact-distance recheck of every pruned pair at the solution. Returns the
             worst (dist, clr, arm_geom, obj_geom) violation, or None. Same GJK guard as
             the pruning pass (bounding-sphere lower bound vs phantom 0.0)."""
-            if not pruned_pairs:
+            if not pruned_pairs and not pruned_sdf:
                 return None
             _scratch.qpos[:n] = q_sol
             mj.mj_kinematics(self._model, _scratch)
             worst = None
+            # SDF objects recheck against the table -- exact to its accuracy and,
+            # unlike GJK on mesh pairs, free of phantom zero readings.
+            for gid1, so, ag, clr in pruned_sdf:
+                c_obj = _scratch.xpos[so['bid']]
+                R_obj = _scratch.xmat[so['bid']].reshape(3, 3)
+                p_loc = R_obj.T @ (_scratch.geom_xpos[gid1] - c_obj)
+                dist = float(so['fn'](p_loc)) - float(self._model.geom_rbound[gid1])
+                if dist < clr and (worst is None or dist - clr < worst[0] - worst[1]):
+                    worst = (dist, clr, ag, so['name'])
             for gid1, gid2, ag, ogn, clr in pruned_pairs:
                 lb = (float(np.linalg.norm(_scratch.geom_xpos[gid2]
                                            - _scratch.geom_xpos[gid1]))
@@ -992,7 +1158,7 @@ class ConstrainedIKSolver:
 
         # Reset per-solve metrics; _diagnostics fills in the physical quantities and the
         # try/except branches add solver status. Read via solver.last_metrics after solve().
-        self.last_metrics = {'n_pruned': len(pruned_pairs)}
+        self.last_metrics = {'n_pruned': len(pruned_pairs) + len(pruned_sdf)}
         _t0_ipopt = time.time()
         try:
             sol  = opti.solve()
@@ -1005,6 +1171,12 @@ class ConstrainedIKSolver:
                   f"  obj={float(sol.value(opti.f)):.4g}")
             _diagnostics(sol.value, t_solve_ms, iters)
             q_sol = np.array(sol.value(q))
+            # On a converged solve the final point is normally also the best, so
+            # this usually confirms rather than replaces it.
+            q_best, obj_best, it_best = _best_feasible(q_sol, float(sol.value(opti.f)))
+            self.last_metrics.update(best_iter=it_best, best_obj=obj_best)
+            if it_best is not None:
+                q_sol = np.asarray(q_best)
             viol  = _violated_pruned_pair(q_sol)
             if viol is not None:
                 dist, clr, ag, ogn = viol
@@ -1031,7 +1203,14 @@ class ConstrainedIKSolver:
                                      iters=iters, success=False)
             print(f"[{_slabel}] FAILED: {st.get('return_status','?')}  iters={iters}")
             _diagnostics(opti.debug.value, t_solve_ms, iters)
-            return np.array(opti.debug.value(q))
+            q_last = np.array(opti.debug.value(q))
+            q_best, obj_best, it_best = _best_feasible(q_last)
+            self.last_metrics.update(best_iter=it_best, best_obj=obj_best)
+            if it_best is not None:
+                print(f"[{_slabel}] returning best feasible iterate {it_best}/{iters} "
+                      f"(obj {obj_best:.4g}) instead of the last")
+                return np.asarray(q_best)
+            return q_last
 
 
 def check_analytic_jacobians(model, n_robot, site_ids, geom_ids,
