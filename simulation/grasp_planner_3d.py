@@ -1191,11 +1191,9 @@ _SEED_RNG_CONST = 42
 
 
 @dataclass
-class GraspConfig3D:
-    """Configuration for the 3D grasp planner (Kinova Gen3 + LEAP hand)."""
-
-    # Cost weights — dimensionless priorities (each term normalized to ≈1 at its reference)
-    # d_ref=5mm, g_ref=task_load_N, y_ref=g_ref
+class CostWeights:
+    """Dimensionless NLP cost-term priorities (each term normalized to ≈1 at its
+    reference: d_ref=5mm, g_ref=task_load_N, y_ref=g_ref)."""
     w_ik:     float = 0.70   # reachability — dominant until IK < 5mm
     w_reg:    float = 0.03   # posture tie-breaker
     w_gamma:  float = 0.15   # grasp quality (was 0.1, now normalized by task load)
@@ -1205,13 +1203,15 @@ class GraspConfig3D:
     # Set to a float (e.g. 1e4) to opt into the slack-relaxed formulation.
     # w_slack:  float | None = None
     w_slack:  float = 1
-
     q_scale:  float = 1.0
 
-    # Wrench-cone slack tolerances (see _embed_wrench_cone_ca / min_gamma_for_accel_lp
-    # slack_penalty mode). A converged NLP no longer certifies exact wrench
-    # resistance by itself — wrench_ok additionally requires max_slack_norm below
-    # these thresholds. Absolute units: N for force rows, N*m for torque rows.
+
+@dataclass
+class SlackTolerances:
+    """Wrench-cone slack tolerances (see _embed_wrench_cone_ca / min_gamma_for_accel_lp
+    slack_penalty mode). A converged NLP no longer certifies exact wrench resistance by
+    itself — wrench_ok additionally requires max_slack_norm below these thresholds.
+    Absolute units: N for force rows, N*m for torque rows."""
     slack_tol_abs:          float = 1e1   # gates NLP result's wrench_ok
     verify_slack_penalty:   float = 1e3    # slack_penalty passed to verify()'s diagnostic LP
     verify_slack_tol:       float = 1e1   # gates verify()'s wf_tag OK vs SLACK
@@ -1235,29 +1235,9 @@ class GraspConfig3D:
     slack_cost_t_ref_floor: float = 1e-1   # N*m
 
 
-
-    # Fingertip mesh effective radius (site centroid to contact surface distance).
-    # Always measured from model geometry in GraspPlanner3D.__init__ — never a
-    # hardcoded guess; None here only until that measurement runs.
-    r_thumb:  float | None = None   # m
-    r_index:  float | None = None   # m
-    r_middle: float | None = None   # m  — used for middle/ring ground clearance
-    r_ring:   float | None = None   # m
-
-    # Constraint flags
-    joint_limits:      bool  = True   # active joint limit constraints in NLP
-    wrench_constraint: bool  = True   # embedded LP wrench constraint in NLP
-    max_iter:          int   = 50    # per-stage max iterations (Picard loop uses n_normal_relinearize+1 stages)
-
-    # Diagnostic/staging mode: hold p1/p2 at their seed values (ca.DM constants) instead
-    # of opti.variable/tangent-plane expressions — no surface constraint, no contact
-    # search, matching ConstrainedIKSolver's fixed-target IK exactly (same NLP shape as
-    # the empirically-validated sqp-ms4 backend from ablate_ik.py). Use with
-    # wrench_constraint=False for a true apples-to-apples baseline before re-enabling
-    # contacts-as-variables / wrench-cone / GWS one at a time — see
-    # RECOMMENDER_CONVERGENCE_FINDINGS.md's staged-decoupling recommendation.
-    fixed_contacts:    bool  = False
-
+@dataclass
+class AlignmentConfig:
+    """Grasp-axis and fingerpad orientation cost terms."""
     # Grasp-axis alignment cost: penalize the grasp axis (p2-p1, normalized) deviating
     # from the contact inward normal, so the two contacts stay ANTIPODALLY OPPOSED (the
     # squeeze force routes straight between them). Shape-agnostic force-closure geometry:
@@ -1265,55 +1245,6 @@ class GraspConfig3D:
     # contacts into a wrench-infeasible offset. 0.0 = off. Uses the frozen normal (box) /
     # symbolic normal (curved), same as the wrench frame.
     w_align:           float = 0.0
-
-    # Grasp-Wrench-Space (GWS) min-weight quality objective (FRoGGeR-style relaxation
-    # of the Ferrari-Canny epsilon metric — see the module-level GWS implementation
-    # brief). Embeds the min-weight LP (alpha, beta) as NLP variables alongside q/p1/p2
-    # so IPOPT can steer contact placement toward deep, well-conditioned force closure,
-    # not just measure it post-hoc. ADDITIVE to w_align, not a replacement — both
-    # default to 0.0 (off); existing callers (kinova_leap_pick_place.py etc.) that set
-    # w_align are unaffected until they explicitly opt into w_gws/w_span.
-    #   -w_gws  * beta                              (maximize the min-weight margin)
-    #   -w_span * logdet(W W^T + gws_span_delta*I)   (push toward a full-rank, well-
-    #                                                  spanned wrench hull; beta alone
-    #                                                  can be positive but nearly
-    #                                                  meaningless if W is rank-deficient
-    #                                                  — see the brief's "critical caveat")
-    # 0.0 = off for either term.
-    w_gws:              float = 0.0
-    w_span:              float = 0.0
-    gws_span_delta:      float = 1e-6   # keeps logdet finite when rank(W) < 6
-
-    # Soft-finger contact model for W (build_W_ca / GWS only — NOT the task-specific
-    # wrench_constraint LP, which stays PCwF). False (default): point-contact-with-
-    # friction, 5 generators/contact — matches all prior behavior exactly. True: adds
-    # 2 torsional-spin generators/contact (7 total), letting a 2-contact pinch's W
-    # express torque about the grasp axis, which PCwF is STRUCTURALLY rank-deficient
-    # in (a flat-face antipodal grasp measured rank(W)=5/6 with PCwF this session —
-    # the two soft-finger generators are exactly what's missing). mu_t is read from
-    # model geom_friction (index 1, torsional) via _contact_friction — real per-object/
-    # per-fingertip values already authored in the MJCF, combined the way MuJoCo's own
-    # contact solver does it (elementwise max), not a hand-picked constant.
-    gws_soft_finger:    bool = False
-
-    # Mesh contact parameterization. False (default) — _mesh_tangent_contact_ca:
-    # 2-DOF offset in a Euclidean tangent plane at the seed, bounded by a fixed
-    # +/-t_bound Euclidean box unrelated to the object's real geometry. True —
-    # _mesh_uv_local_contact_ca: 2-DOF offset in a plane fit to the seed's actual
-    # local mesh neighborhood (a fixed-size ring of triangles within a large,
-    # precomputed UV-atlas CHART — see grasp_control.object_uv_atlas module
-    # docstring), bounded by that neighborhood's real boundary polygon. Re-centered
-    # between Picard relinearization stages (n_normal_relinearize) the same way the
-    # existing loop already re-centers the frozen surface normal for curved
-    # analytic shapes — lets a multi-stage solve walk across a whole chart via a
-    # sequence of small, cheap local linearizations, rather than being permanently
-    # confined to one Euclidean neighborhood of the seed for the whole solve.
-    # Requires xatlas (pip install xatlas); falls back to the tangent-plane scheme
-    # with a log warning if unavailable.
-    use_uv_atlas_contact: bool = False
-    uv_atlas_rings:       int  = 2      # face-adjacency hops per local neighborhood
-    uv_atlas_min_chart_frac: float = _object_uv_atlas.DEFAULT_MIN_CHART_AREA_FRAC \
-                                     if _object_uv_atlas is not None else 0.01
 
     # Fingertip PAD alignment cost: penalize each tip's pad axis (R_tip(q) @ pad_axis, the
     # fingerpad normal in world) deviating from the contact INWARD surface normal, so the pad
@@ -1330,6 +1261,65 @@ class GraspConfig3D:
     # ConstrainedIKSolver.pad_axis: -x of the LEAP fingertip site frame.
     pad_axis:          tuple = (-1.0, 0.0, 0.0)
 
+
+@dataclass
+class GWSConfig:
+    """Grasp-Wrench-Space (GWS) min-weight quality objective (FRoGGeR-style relaxation
+    of the Ferrari-Canny epsilon metric — see the module-level GWS implementation
+    brief). Embeds the min-weight LP (alpha, beta) as NLP variables alongside q/p1/p2
+    so IPOPT can steer contact placement toward deep, well-conditioned force closure,
+    not just measure it post-hoc. ADDITIVE to AlignmentConfig.w_align, not a
+    replacement — both default to 0.0 (off); existing callers (kinova_leap_pick_place.py
+    etc.) that set w_align are unaffected until they explicitly opt into w_gws/w_span.
+        -w_gws  * beta                              (maximize the min-weight margin)
+        -w_span * logdet(W W^T + gws_span_delta*I)   (push toward a full-rank, well-
+                                                        spanned wrench hull; beta alone
+                                                        can be positive but nearly
+                                                        meaningless if W is rank-deficient
+                                                        — see the brief's "critical caveat")
+    0.0 = off for either term."""
+    w_gws:              float = 0.0
+    w_span:              float = 0.0
+    gws_span_delta:      float = 1e-6   # keeps logdet finite when rank(W) < 6
+
+    # Soft-finger contact model for W (build_W_ca / GWS only — NOT the task-specific
+    # wrench_constraint LP, which stays PCwF). False (default): point-contact-with-
+    # friction, 5 generators/contact — matches all prior behavior exactly. True: adds
+    # 2 torsional-spin generators/contact (7 total), letting a 2-contact pinch's W
+    # express torque about the grasp axis, which PCwF is STRUCTURALLY rank-deficient
+    # in (a flat-face antipodal grasp measured rank(W)=5/6 with PCwF this session —
+    # the two soft-finger generators are exactly what's missing). mu_t is read from
+    # model geom_friction (index 1, torsional) via _contact_friction — real per-object/
+    # per-fingertip values already authored in the MJCF, combined the way MuJoCo's own
+    # contact solver does it (elementwise max), not a hand-picked constant.
+    gws_soft_finger:    bool = False
+
+
+@dataclass
+class UVAtlasConfig:
+    """Mesh contact parameterization. use_uv_atlas_contact=False (default) —
+    _mesh_tangent_contact_ca: 2-DOF offset in a Euclidean tangent plane at the seed,
+    bounded by a fixed +/-t_bound Euclidean box unrelated to the object's real
+    geometry. True — _mesh_uv_local_contact_ca: 2-DOF offset in a plane fit to the
+    seed's actual local mesh neighborhood (a fixed-size ring of triangles within a
+    large, precomputed UV-atlas CHART — see grasp_control.object_uv_atlas module
+    docstring), bounded by that neighborhood's real boundary polygon. Re-centered
+    between Picard relinearization stages (n_normal_relinearize) the same way the
+    existing loop already re-centers the frozen surface normal for curved analytic
+    shapes — lets a multi-stage solve walk across a whole chart via a sequence of
+    small, cheap local linearizations, rather than being permanently confined to one
+    Euclidean neighborhood of the seed for the whole solve. Requires xatlas (pip
+    install xatlas); falls back to the tangent-plane scheme with a log warning if
+    unavailable."""
+    use_uv_atlas_contact: bool = False
+    uv_atlas_rings:       int  = 2      # face-adjacency hops per local neighborhood
+    uv_atlas_min_chart_frac: float = _object_uv_atlas.DEFAULT_MIN_CHART_AREA_FRAC \
+                                     if _object_uv_atlas is not None else 0.01
+
+
+@dataclass
+class CollisionConfig:
+    """Object/floor/arm clearance and collision-constraint configuration."""
     # Edge margin (HARD): keep contacts at least this far from every FACE EDGE, where a
     # pinch slips (short moment arm, friction cone falls off the face). Implemented by
     # shrinking the tangential face BOUNDS in _sym_geom_surface_con — a contact cannot be
@@ -1375,6 +1365,10 @@ class GraspConfig3D:
     # Matches the hardcoded _ground_p=[0,0,0] in the NLP collision constraint.
     ground_z: float = 0.0
 
+
+@dataclass
+class RegularizationConfig:
+    """Posture-regularization target for the NLP's tie-breaker cost term."""
     # Regularisation target.  None → use q_dls (DLS warm-start) per seed.
     # Set to a fixed palm-down neutral configuration so regularisation is
     # consistent across seeds and drives the arm toward a natural pose.
@@ -1392,8 +1386,11 @@ class GraspConfig3D:
     # if q_neutral is set explicitly (an explicit override always wins).
     reg_arm_toward_current: bool = True
 
-    # Profiling / Picard loop
-    # extra Picard iterations (n total solves); 
+
+@dataclass
+class MultiStartConfig:
+    """Multi-start seeding / Picard-relinearization / restart-diversification knobs."""
+    # extra Picard iterations (n total solves);
     # n_normal_relinearize can be zero for box, search stays within the seed faces
     # n_normal_relinearize = 2 for curved surfaces, since normals genuinely rotate there
     n_seeds:             int  = 5    # seed pairs per multi-start (each from _seed_pair)
@@ -1422,8 +1419,12 @@ class GraspConfig3D:
     qref_restart_sigma_arm:  float = 0.0
     qref_restart_sigma_hand: float = 0.0
 
-    # Solver — use_slsqp=True  → SQP+OSQP (default; linear face-pin + wrench constraints exact)
-    #           use_slsqp=False → IPOPT (interior-point; use for non-box geometries)
+
+@dataclass
+class SolverBackendConfig:
+    """NLP backend selection (SQP+OSQP vs IPOPT) and contact-frame differentiability."""
+    # use_slsqp=True  → SQP+OSQP (default; linear face-pin + wrench constraints exact)
+    # use_slsqp=False → IPOPT (interior-point; use for non-box geometries)
     use_slsqp:  bool  = False
     # symbolic_normals: build the wrench contact frame as a CasADi MX expression
     # of p1/p2 rather than a frozen parameter.  The frame is then re-evaluated at
@@ -1433,12 +1434,15 @@ class GraspConfig3D:
     # This causes L-BFGS to accumulate curvature pairs (s_k, y_k) that are
     # inconsistent across iterations because ∇f changes not just due to x movement
     # but also due to the frame rotating with x — demonstrably harder to solve.
-    
     symbolic_normals: bool = True
     smooth_sdf: bool  = True
     slsqp_alpha: float = 400.0  # smooth SDF alpha (collision avoidance SDF only)
 
 
+@dataclass
+class TaskWrenchConfig:
+    """Mass-scaled task-wrench budget for the embedded wrench-cone LP and the
+    post-solve gamma certificate."""
     # Acceleration budgets for mass-scaled task wrench computation.
     # Used in solve() to replace fixed task_fx/fy/fz with mass*(accel+gravity),
     # and in verify() for the post-solve gamma check.
@@ -1461,7 +1465,9 @@ class GraspConfig3D:
     gamma_max: float = 25   # N — hard upper bound on the wrench-cone squeeze force gamma
 
 
-    # Geometry names (must match scene XML)
+@dataclass
+class GeometryNames:
+    """Model geometry/site names (must match scene XML)."""
     obj_geom:    str = 'obj_red_box_geom'
     obj_body:    str = 'obj_red_box'
     thumb_site:  str = 'leap_th_ds_tip'
@@ -1478,6 +1484,148 @@ class GraspConfig3D:
     cp2_body:    str = 'cp2_body'
     cp3_body:    str = 'cp3_body'
     cp4_body:    str = 'cp4_body'
+
+
+# Flat legacy field name -> (nested group attr name, field name on that group).
+# Built once from the group dataclasses' own field lists (not hand-maintained) so it
+# can never drift out of sync with them.
+def _build_flat_field_map() -> dict[str, tuple[str, str]]:
+    import dataclasses as _dc
+    groups = {
+        'cost': CostWeights, 'slack': SlackTolerances, 'align': AlignmentConfig,
+        'gws': GWSConfig, 'uv_atlas': UVAtlasConfig, 'collision': CollisionConfig,
+        'reg': RegularizationConfig, 'multistart': MultiStartConfig,
+        'backend': SolverBackendConfig, 'task_wrench': TaskWrenchConfig,
+        'names': GeometryNames,
+    }
+    flat_map: dict[str, tuple[str, str]] = {}
+    for group_attr, group_cls in groups.items():
+        for f in _dc.fields(group_cls):
+            flat_map[f.name] = (group_attr, f.name)
+    return flat_map
+
+
+_GRASP_CFG_FLAT_FIELDS = _build_flat_field_map()
+_GRASP_CFG_GROUPS = {v[0] for v in _GRASP_CFG_FLAT_FIELDS.values()}
+
+
+class GraspConfig3D:
+    """Configuration for the 3D grasp planner (Kinova Gen3 + LEAP hand).
+
+    Grouped into nested sub-dataclasses by concern (cost, slack, alignment, GWS,
+    UV-atlas contacts, collision, regularization, multi-start, solver backend, task
+    wrench, geometry names) — see each group's own docstring. Two equivalent
+    construction styles:
+
+        # nested (new code)
+        GraspConfig3D(gws=GWSConfig(w_gws=5.0, w_span=1.0))
+
+        # flat (legacy — every existing call site in the repo uses this; still
+        # fully supported, dispatched to the right group automatically)
+        GraspConfig3D(w_gws=5.0, w_span=1.0)
+
+    Not a @dataclass itself (a custom __init__ is required to accept the flat-kwarg
+    legacy form), but every nested group IS a plain @dataclass, so
+    dataclasses.fields()/replace() etc. work fine on cfg.cost, cfg.gws, and so on.
+    """
+
+    # Explicit slots for every group, purely so IDEs/static analysis see the
+    # attributes; __init__ is what actually populates them.
+    cost: CostWeights
+    slack: SlackTolerances
+    align: AlignmentConfig
+    gws: GWSConfig
+    uv_atlas: UVAtlasConfig
+    collision: CollisionConfig
+    reg: RegularizationConfig
+    multistart: MultiStartConfig
+    backend: SolverBackendConfig
+    task_wrench: TaskWrenchConfig
+    names: GeometryNames
+
+    # Fields that were never grouped (kept top-level: solve()-wide flags/knobs that
+    # don't belong to any one concern, plus the four per-finger radii GraspPlanner3D
+    # itself measures and writes back in __init__).
+    joint_limits:      bool  = True
+    wrench_constraint: bool  = True
+    max_iter:          int   = 50
+    fixed_contacts:    bool  = False
+    r_thumb:  float | None = None
+    r_index:  float | None = None
+    r_middle: float | None = None
+    r_ring:   float | None = None
+
+    def __init__(self, **kwargs):
+        # Pull out any nested-group kwargs first (e.g. gws=GWSConfig(...)).
+        for group_attr, group_cls in (
+            ('cost', CostWeights), ('slack', SlackTolerances),
+            ('align', AlignmentConfig), ('gws', GWSConfig),
+            ('uv_atlas', UVAtlasConfig), ('collision', CollisionConfig),
+            ('reg', RegularizationConfig), ('multistart', MultiStartConfig),
+            ('backend', SolverBackendConfig), ('task_wrench', TaskWrenchConfig),
+            ('names', GeometryNames),
+        ):
+            setattr(self, group_attr, kwargs.pop(group_attr, None) or group_cls())
+
+        # Top-level (never grouped) fields.
+        self.joint_limits      = kwargs.pop('joint_limits', True)
+        self.wrench_constraint = kwargs.pop('wrench_constraint', True)
+        self.max_iter           = kwargs.pop('max_iter', 50)
+        self.fixed_contacts     = kwargs.pop('fixed_contacts', False)
+        self.r_thumb  = kwargs.pop('r_thumb', None)
+        self.r_index  = kwargs.pop('r_index', None)
+        self.r_middle = kwargs.pop('r_middle', None)
+        self.r_ring   = kwargs.pop('r_ring', None)
+
+        # Everything left is either a flat legacy field name (dispatch into its
+        # group) or an error.
+        unknown = []
+        for key, value in kwargs.items():
+            target = _GRASP_CFG_FLAT_FIELDS.get(key)
+            if target is None:
+                unknown.append(key)
+                continue
+            group_attr, field_name = target
+            setattr(getattr(self, group_attr), field_name, value)
+        if unknown:
+            raise TypeError(
+                f"GraspConfig3D() got unexpected keyword argument(s): {unknown!r}")
+
+    def __repr__(self):
+        groups = ', '.join(f'{g}={getattr(self, g)!r}' for g in sorted(_GRASP_CFG_GROUPS))
+        top = ', '.join(f'{k}={getattr(self, k)!r}' for k in
+                        ('joint_limits', 'wrench_constraint', 'max_iter', 'fixed_contacts',
+                         'r_thumb', 'r_index', 'r_middle', 'r_ring'))
+        return f'GraspConfig3D({groups}, {top})'
+
+    def __getattr__(self, name):
+        # Only called when normal attribute lookup fails, i.e. `name` isn't an
+        # instance attribute already set in __init__ — so this is exactly the flat
+        # legacy READ path (cfg.w_gws -> cfg.gws.w_gws), never shadowing a group.
+        target = _GRASP_CFG_FLAT_FIELDS.get(name)
+        if target is None:
+            raise AttributeError(
+                f"'GraspConfig3D' object has no attribute {name!r}")
+        group_attr, field_name = target
+        return getattr(object.__getattribute__(self, group_attr), field_name)
+
+    def __setattr__(self, name, value):
+        # Group attributes and top-level fields go through normally. A flat legacy
+        # NAME (e.g. cfg.w_gws = 5.0 after construction) is redirected into its
+        # group so mutation-after-construction keeps working exactly like the old
+        # flat dataclass.
+        if name in _GRASP_CFG_GROUPS or name in (
+            'joint_limits', 'wrench_constraint', 'max_iter', 'fixed_contacts',
+            'r_thumb', 'r_index', 'r_middle', 'r_ring',
+        ):
+            object.__setattr__(self, name, value)
+            return
+        target = _GRASP_CFG_FLAT_FIELDS.get(name)
+        if target is None:
+            object.__setattr__(self, name, value)
+            return
+        group_attr, field_name = target
+        setattr(object.__getattribute__(self, group_attr), field_name, value)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3087,7 +3235,18 @@ class MultiStartGraspPlanner3D:
     def __init__(self, model, data,
                  cfg: GraspConfig3D | None = None,
                  logger=None, log_dir: str | None = None,
-                 dashboard=None):
+                 dashboard=None,
+                 seed: int | None = None):
+        """
+        seed : int | None — the constant every solve() call resets its seed-generation
+            RNG to (see the reset in solve(), which explains why a FIXED reset rather
+            than a free-running stream is deliberate: continuity under sub-mm pose
+            jitter, not just reproducibility). None (default) keeps the original
+            hardcoded constant (_SEED_RNG_CONST=42) — existing callers are unaffected.
+            Pass an explicit int to run the SAME object/pose through independent seed
+            streams, e.g. for an ablation over NLP-seed randomization
+            (environments/grasp_bench's RandomizationConfig.nlp_seed).
+        """
         self._planner       = GraspPlanner3D(model, data, cfg, logger, log_dir,
                                              dashboard=dashboard)
         self._obj_hx        = self._planner._obj_hx
@@ -3097,7 +3256,8 @@ class MultiStartGraspPlanner3D:
         self._obj_size      = self._planner._obj_size
         self._mesh_entry    = self._planner._mesh_entry
         self._fk_data       = mj.MjData(model)           # FK queries for seed generation
-        self._rng           = np.random.default_rng(42)  # reproducible random seeds
+        self._seed_rng_const = _SEED_RNG_CONST if seed is None else int(seed)
+        self._rng           = np.random.default_rng(self._seed_rng_const)
         self.last_chart_rank_table = []   # set by solve() when use_uv_atlas_contact chart-pair seeding runs
         # Fingertip effective radii (r_thumb/r_index/r_middle/r_ring) are
         # measured from model geometry inside GraspPlanner3D.__init__ above —
@@ -3167,7 +3327,7 @@ class MultiStartGraspPlanner3D:
         # reintroduce the instability; a fixed constant + the pose-continuity of _seed_pair is
         # what actually gives stability under marginal pose changes. Frame-to-frame stickiness
         # on a static object is further handled by the warm-start seed + display hysteresis.
-        self._rng = np.random.default_rng(_SEED_RNG_CONST)
+        self._rng = np.random.default_rng(self._seed_rng_const)
 
         # Operator's LIVE thumb/index tip positions at q_ref, for KINEMATIC finger
         # assignment of each seed pair (below). Each _seed_pair labels its two contacts

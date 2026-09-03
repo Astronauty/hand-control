@@ -41,6 +41,7 @@ sys.path.insert(0, str(REPO / "benchmarks"))
 
 from simulation.grasp_planner_3d import (GraspConfig3D, MultiStartGraspPlanner3D,  # noqa: E402
                                          _geom_normal_np)
+from simulation.grasp_config_builder import for_ablation_default                # noqa: E402
 from ycb_grasp import scene as S, workspace as W                                # noqa: E402
 from ycb_grasp.ik_demo import (clearance_by_geom, home_bias, place_objects,     # noqa: E402
                                render, robot_geom_names)
@@ -157,11 +158,14 @@ def main():
     # Collision setup matching ablate_ik.py's ConstrainedIKSolver calls exactly
     # (robot_geom_names + clearance_by_geom, ik_demo.py) — GraspPlanner3D defaults
     # arm_geom_names to [] (NO arm-vs-object collision at all) unless set explicitly.
+    # Computed ONCE here (robot-only, doesn't depend on which object is attached)
+    # and passed into for_ablation_default (simulation/grasp_config_builder.py) —
+    # shared with kinova_leap_pick_place.py's for_teleop_recommender preset instead
+    # of each hand-assembling GraspConfig3D.
     _rgeoms = robot_geom_names(base)
     _obj_clr = clearance_by_geom(_rgeoms)
 
     cfg_kw = dict(n_seeds=args.n_seeds, max_iter=args.max_iter,
-                 arm_geom_names=_rgeoms, obj_clearance_by_geom=_obj_clr,
                  col_clearance_m=DEFAULT_COL_CLEARANCE_M)
     if args.gws:
         cfg_kw["wrench_constraint"] = False
@@ -193,7 +197,9 @@ def main():
             data.qpos[:N_ROBOT] = q_bias_full
             mj.mj_forward(model, data)
 
-            cfg = GraspConfig3D(**cfg_kw)
+            cfg = for_ablation_default(obj_geom='obj_red_box_geom', obj_body='obj_red_box',
+                                       arm_geom_names=_rgeoms, obj_clearance_by_geom=_obj_clr,
+                                       **cfg_kw)
             try:
                 res, planner = run_case(model, data, body_name, q_bias_full,
                                         np.asarray(pos, float), cfg, args.n_seeds)

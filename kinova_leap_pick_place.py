@@ -46,6 +46,7 @@ from trial_logger import (EventLogger, TrialRunner, TrialPhase, TraceBuffer,
 sys.path.insert(0, __file__.rsplit('/', 1)[0] + '/simulation')
 from grasp_planner_3d import (GraspConfig3D, MultiStartGraspPlanner3D,  # noqa: E402
                               _geom_normal_np, _geom_sdf_np)
+import simulation.grasp_config_builder as _grasp_config_builder  # noqa: E402
 
 from kinova_common.constants import (FINGER_TIP_SITES, FINGER_CODE, FINGER_SET,
                                      GEN3_XML, FINGERTIP_POINTING_AXIS)
@@ -2160,15 +2161,10 @@ if __name__ == "__main__":
                   f"{len(_rec_nonactive_geoms)} non-active (mf/rf, "
                   f"obj-clearance +{_REC_NONACTIVE_OBJ_CLR*1e3:.0f}mm) "
                   f"(active tiers: adjacent -10mm, proximal +2mm)")
-            cfg = GraspConfig3D(obj_geom=o['name'] + '_geom', obj_body=o['name'],
-                                max_iter=120, arm_geom_names=_rec_arm_geoms,
-                                obj_clearance_by_geom=_rec_obj_clearance,
-                                w_align=10.0, orient_weight=2.0, edge_margin_m=0.03,
-                                ground_clearance_m=0.010,   # +5mm over col_clearance for
-                                                            # curled middle/ring vs the table
-                                wrench_constraint=False, datum_gamma=True,
-                                accel_budget_xyz=tuple(NCF_ACCEL_BUDGET_XYZ),
-                                ang_accel_budget_xyz=tuple(NCF_ANG_ACCEL_BUDGET))
+            cfg = _grasp_config_builder.for_teleop_recommender(
+                o['name'], _rec_arm_geoms, _rec_obj_clearance,
+                accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
+                ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET)
             # Own MjData so the background solve never races the viewer's data.
             p = MultiStartGraspPlanner3D(model, mj.MjData(model), cfg)
             _cat_planners[obj_idx] = p
