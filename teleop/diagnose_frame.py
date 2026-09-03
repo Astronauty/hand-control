@@ -10,7 +10,7 @@ you mark a reference, the DELTA as you move your hand. Move your hand along ONE
 known real-world direction at a time and read which board coordinate changes:
 
   1. Start the publisher:  uv run python kinova_leap_pick_place.py --mode dexpilot --camera 0
-     (or run ui/mediapipe_joint_angles.py directly). Make sure a RIGHT hand is
+     (or run teleop/ui.py directly). Make sure a RIGHT hand is
      tracked and calibration is loaded (absolute board coords published).
   2. In another sourced terminal:  uv run python teleop/diagnose_frame.py
   3. Hold your hand still, press ENTER to mark the reference.

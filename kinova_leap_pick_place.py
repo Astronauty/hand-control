@@ -125,7 +125,7 @@ if __name__ == "__main__":
     _arg_parser.add_argument(
         '--camera', type=int, default=None,
         help="Force SINGLE-camera teleop on this index, forwarded to "
-             "ui/mediapipe_joint_angles.py (the 'Hand Tracking [cam N]' window). "
+             "teleop/ui.py (the 'Hand Tracking [cam N]' window). "
              "Passing this opts OUT of the default multicam fusion. Omit it to use "
              "the default: auto-discovered multi-camera fusion (see --multicam-auto).")
     _arg_parser.add_argument(
@@ -134,7 +134,7 @@ if __name__ == "__main__":
              "abs_scale × (board displacement from press-8). absolute: true absolute, "
              "hand's board position -> fixed robot position (board origin -> base "
              "origin), scaled by abs_scale, no re-zero. Default: from "
-             "calibration/teleop_config.json (relative if unset). Other tunables "
+             "teleop/calibration/teleop_config.json (relative if unset). Other tunables "
              "(abs_scale, world_from_board) live in that config file.")
     _arg_parser.add_argument(
         '--seed', type=int, default=None,
@@ -165,7 +165,7 @@ if __name__ == "__main__":
              "from the FUSED cameras. Repeat per camera (>=2), e.g. --multicam c0:0 "
              "--multicam c1:2. Implies --no-mediapipe (external publisher). Each "
              "NAME needs camera_intrinsics_<name>.json + camera_extrinsics_<name>.json "
-             "in calibration/.")
+             "in teleop/calibration/.")
     _arg_parser.add_argument(
         '--multicam-auto', action='store_true',
         help="Hands-off multi-camera: discover connected cameras and match each to "
@@ -186,7 +186,7 @@ if __name__ == "__main__":
     _arg_parser.add_argument(
         '--recalibrate-extrinsics', action='store_true',
         help="With --multicam: run the INTERACTIVE extrinsics-all walkthrough "
-             "(calibration/charuco_calibration.py) BEFORE launching — fix the "
+             "(teleop/calibration/charuco_calibration.py) BEFORE launching — fix the "
              "ChArUco board at the world origin and press SPACE per camera to "
              "re-solve each camera_extrinsics_<name>.json. Default reuses the saved "
              "extrinsics. Requires per-camera intrinsics to already exist.")
@@ -195,13 +195,13 @@ if __name__ == "__main__":
         help="With --recalibrate-extrinsics: MEASURED ChArUco square size in mm, "
              "forwarded to charuco_calibration.py's --square-mm. Must match the "
              "printed board actually on the rig (default 50.0, matching "
-             "calibration/charuco_calibration.py's DEFAULT_SQUARE_MM — keep the "
+             "teleop/calibration/charuco_calibration.py's DEFAULT_SQUARE_MM — keep the "
              "two in sync if the board changes).")
     _arg_parser.add_argument(
         '--no-mediapipe', '--external-hand', dest='no_mediapipe',
         action='store_true',
         help="dexpilot / contact_aware_teleop: do NOT spawn the built-in single-camera "
-             "publisher (ui/mediapipe_joint_angles.py). Use when an EXTERNAL process "
+             "publisher (teleop/ui.py). Use when an EXTERNAL process "
              "already publishes /hand/joint_angles — e.g. teleop/run_multicam.py — so "
              "the teleop app only subscribes. Avoids two publishers racing on the same "
              "topic (interleaved single-cam + fused poses).")
@@ -238,7 +238,7 @@ if __name__ == "__main__":
         _arg_parser.error("--multicam and --multicam-auto are mutually exclusive")
     # Multicam fusion is the DEFAULT hand source in teleop modes: a bare run
     # auto-discovers calibrated cameras and fuses them, so the single-cam publisher
-    # (ui/mediapipe_joint_angles.py, the "Hand Tracking [cam N]" window) never opens.
+    # (teleop/ui.py, the "Hand Tracking [cam N]" window) never opens.
     # Opt out explicitly with --no-mediapipe/--external-hand (external publisher) or
     # --camera N (force the single-cam publisher on that index). Passing --multicam
     # specs or --multicam-auto also takes this path with the given/discovered cameras.
@@ -254,17 +254,17 @@ if __name__ == "__main__":
         # --cam specs (below), and the app needs the resolved NAMES here too.
         import sys as _sys
         _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         'calibration'))
+                                         'teleop', 'calibration'))
         try:
             from camera_identity import (match_calibrated_cameras,
                                          calibrated_hardware_ids)
         except Exception as _e:
             _arg_parser.error(f"--multicam-auto unavailable (camera discovery): {_e}")
         _calib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  'calibration')
+                                  'teleop', 'calibration')
         if not calibrated_hardware_ids(_calib_dir):
             _arg_parser.error("--multicam-auto: no calibrated cameras with a stored "
-                              "hardware id. Run: python calibration/"
+                              "hardware id. Run: python teleop/calibration/"
                               "charuco_calibration.py intrinsics-all")
         _specs, _rs = match_calibrated_cameras(_calib_dir)
         if len(_specs) < 2:
@@ -1607,7 +1607,7 @@ if __name__ == "__main__":
                       "extrinsic in turn — KEEP THE BOARD FIXED at the world origin "
                       "for ALL cameras (that shared pose is the common frame). SPACE "
                       "to solve each, S to skip, Q to stop. Teleop starts after.")
-                _cal = _here + '/calibration/charuco_calibration.py'
+                _cal = _here + '/teleop/calibration/charuco_calibration.py'
                 sys.path.insert(0, _here + '/teleop')
                 from run_multicam import _intrinsics_res  # noqa: E402
                 _rs_names = set(args.multicam_realsense)
@@ -1684,7 +1684,7 @@ if __name__ == "__main__":
                   "subscribing to an external /hand/joint_angles publisher.")
         else:
             _mp_cmd = [sys.executable,
-                       'ui/mediapipe_joint_angles.py']
+                       'teleop/ui.py']
             if args.camera is not None:
                 _mp_cmd += ['--camera', str(args.camera)]
             _mediapipe_proc = subprocess.Popen(_mp_cmd)
@@ -1704,7 +1704,7 @@ if __name__ == "__main__":
             # orientation disagree and the wrist rotation maps wrong.
             _world_from_board = np.diag([1.0, -1.0, -1.0])
             _cam_kwargs = load_camera_calibration(world_from_board=_world_from_board)
-            # Position tunables from calibration/teleop_config.json (mode,
+            # Position tunables from teleop/calibration/teleop_config.json (mode,
             # abs_scale, world_from_board). --position-mode CLI overrides the
             # config's mode when given. The publisher sends metric board-frame
             # wrist coords (absolute publish mode), which BOTH position modes
@@ -1741,7 +1741,7 @@ if __name__ == "__main__":
             _cam_kwargs = {"R_cam_robot": np.eye(3), "position_mode": "legacy",
                            "identity_orientation": True}
             print("[DexPilot] no camera calibration found — using identity "
-                  "R_cam_robot, LEGACY delta positioning. Run calibration/charuco_calibration.py.")
+                  "R_cam_robot, LEGACY delta positioning. Run teleop/calibration/charuco_calibration.py.")
         # Palm-DOWN home for teleop: pinch_site palm NORMAL (+X) points down
         # (world -Z) and FINGERS (+Z) point FORWARD (world +X) — palm flat over
         # the table, fingers reaching away. Natural neutral (hold your palm down,
@@ -1841,7 +1841,7 @@ if __name__ == "__main__":
         _retarg_debug = (args.mode == 'dexpilot')
         # eps seed in METRES (world-landmark fingertips) — open-hand S1 ~0.07-0.11 m,
         # pinch ~0.01-0.03 m, so ~0.03 sits between the clusters. A saved
-        # calibration/retarget_config.json still wins over this seed.
+        # teleop/calibration/retarget_config.json still wins over this seed.
         #
         # Output smoothing (EMA) is a MAJOR lag source. In KINEMATIC mode the EMA is
         # the only smoothing, so a heavy alpha=0.3 (default) is fine. In --physics
@@ -1858,13 +1858,13 @@ if __name__ == "__main__":
         _dexpilot_ctrl.init_ros()
 
         # Live finger-retargeting tuning by TEXT ENTRY: edit the 7 constants
-        # (BETA/GAMMA/EPS/ETA1/ETA2/S1/S2 gains) in calibration/retarget_config.json
+        # (BETA/GAMMA/EPS/ETA1/ETA2/S1/S2 gains) in teleop/calibration/retarget_config.json
         # and save — dexpilot hot-reloads the file onto the live retargeter each
         # frame (poll_retarget_config, mtime-gated). contact_aware_teleop uses the
         # saved constants but isn't the live-tuning surface.
         _tune_retarget = (args.mode == 'dexpilot')
         if _tune_retarget:
-            print("[DexPilot] live tuning: edit calibration/retarget_config.json "
+            print("[DexPilot] live tuning: edit teleop/calibration/retarget_config.json "
                   "and save — changes hot-reload onto the retargeter.")
 
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")

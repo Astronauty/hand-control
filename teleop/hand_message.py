@@ -1,6 +1,6 @@
 """Shared builders for the /hand/joint_angles message (Float32MultiArray).
 
-The single-camera publisher (ui/mediapipe_joint_angles.py) and the multi-camera
+The single-camera publisher (teleop/ui.py) and the multi-camera
 fusion node (teleop/hand_fusion_node.py) must emit the SAME 183-float layout so
 everything downstream (DexPilotController / retargeter / arm IK) is unchanged.
 The layout math is centralised here so the two producers can't drift.
@@ -63,7 +63,7 @@ HAND_CONNECTIONS = [
     (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),  # pinky + palm base
 ]
 
-# Board -> world axis remap (must match ui/mediapipe_joint_angles.py). The camera
+# Board -> world axis remap (must match teleop/ui.py). The camera
 # looks DOWN at the board, so the board normal points into the table; this proper
 # rotation (det=+1) flips Y and Z so the published world frame is Z-up like MuJoCo.
 WORLD_FROM_BOARD = np.diag([1.0, -1.0, -1.0])
@@ -85,7 +85,7 @@ def get_euler_angles(points: np.ndarray) -> dict:
     """Per-joint Euler angles (ZYX degrees) from a (21,3) landmark array.
 
     `points` are wrist-relative-normalised internally. Mirrors the original
-    get_euler_angles() in ui/mediapipe_joint_angles.py exactly.
+    get_euler_angles() in teleop/ui.py exactly.
     """
     points = np.asarray(points, float)
     wrist = points[0]
@@ -121,7 +121,7 @@ def get_flexion_angles(points: np.ndarray) -> list:
     """6 flexion values from a (21,3) metric world-landmark array.
 
     [idx_mcp, idx_pip, idx_dip, thumb_spread, thumb_ip, thumb_ip*0.5], degrees.
-    Mirrors get_flexion_angles() in ui/mediapipe_joint_angles.py.
+    Mirrors get_flexion_angles() in teleop/ui.py.
     """
     pts = np.asarray(points, float)
 
@@ -147,7 +147,7 @@ def get_wrist_orientation_euler(image_points: np.ndarray) -> np.ndarray:
     """Wrist orientation (Euler ZYX degrees) from the palm plane.
 
     Uses wrist(0), index-MCP(5), pinky-MCP(17) — matches get_wrist_pose() in
-    ui/mediapipe_joint_angles.py (which builds the same palm frame).
+    teleop/ui.py (which builds the same palm frame).
     """
     pts = np.asarray(image_points, float)
     palm_R = compute_local_frame(pts[0], pts[5], pts[17])

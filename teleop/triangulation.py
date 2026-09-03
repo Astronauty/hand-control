@@ -8,7 +8,7 @@ pipeline, so it is de-risked first.
 
 Coordinate frame
   All cameras' extrinsics are solved against the SAME ChArUco board at the SAME
-  world origin (see calibration/charuco_calibration.py --name), so every camera's
+  world origin (see teleop/calibration/charuco_calibration.py --name), so every camera's
   projection matrix maps the ONE shared world frame -> that camera's pixels:
 
       P_k = K_k @ [ R_cam_world_k | t_cam_world_k ]        (3x4)
@@ -242,7 +242,7 @@ def reprojection_errors(cams: list[CameraModel],
                         pts: np.ndarray) -> np.ndarray:
     """Mean per-landmark reprojection error [px] over the cameras that saw it.
 
-    A calibration/triangulation health check: large values flag bad extrinsics
+    A teleop/calibration/triangulation health check: large values flag bad extrinsics
     or a mis-associated landmark. NaN where a landmark was not triangulated or
     no camera reprojects it.
 

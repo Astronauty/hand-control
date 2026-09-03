@@ -860,7 +860,7 @@ def main():
     show_debug = False  # toggled with 'D' — overlays flexion angles on video
 
     # Camera window. (Retargeting constants are now tuned by editing
-    # calibration/retarget_config.json, which the sim hot-reloads — no sliders here.)
+    # teleop/calibration/retarget_config.json, which the sim hot-reloads — no sliders here.)
     _win_name = f"Hand Tracking  [cam {camera_index}]"
     cv2.namedWindow(_win_name, cv2.WINDOW_NORMAL)
 

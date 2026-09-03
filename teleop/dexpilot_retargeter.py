@@ -28,7 +28,7 @@ import mujoco as mj
 # it hot-reloads (poll_config); loaded on construction. Next to the other teleop
 # calibration files.
 _CONFIG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.abspath(__file__)),
     "calibration", "retarget_config.json",
 )
 
@@ -510,7 +510,7 @@ class DexPilotRetargeter:
         self._dbg_drawn = False
 
     # ------------------------------------------------------------------
-    # Live-tuning config: edit calibration/retarget_config.json; poll_config()
+    # Live-tuning config: edit teleop/calibration/retarget_config.json; poll_config()
     # hot-reloads it each frame (dexpilot).
     # ------------------------------------------------------------------
 
@@ -554,7 +554,7 @@ class DexPilotRetargeter:
         """Hot-reload the tunables from JSON when the file has changed on disk.
 
         Cheap to call every frame: it only stats the file and reloads when the
-        mtime advances (so you can edit calibration/retarget_config.json in your
+        mtime advances (so you can edit teleop/calibration/retarget_config.json in your
         editor and the live retargeter picks it up on save). Returns True if a
         reload happened. Missing file resets the watch so a later create reloads.
         """

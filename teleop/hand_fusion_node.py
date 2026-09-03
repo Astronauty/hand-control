@@ -11,7 +11,7 @@ The number of cameras is configurable: pass --cameras <name...> with 2 or more
 names. Each name must match:
   * the --name used by that camera's hand_landmark_node (topic /hand/cam_<name>/…)
   * the calibration files camera_intrinsics_<name>.json / camera_extrinsics_<name>.json
-    in calibration/ (produced by charuco_calibration.py --name <name>).
+    in teleop/calibration/ (produced by charuco_calibration.py --name <name>).
 For backward compatibility, a camera with no _<name> calibration file falls back
 to the unsuffixed camera_intrinsics.json / camera_extrinsics.json.
 
@@ -47,7 +47,7 @@ from hand_message import (WORLD_FROM_BOARD, get_euler_angles,
                           build_message, sensor_qos)
 
 _CALIB_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "calibration")
+    os.path.dirname(os.path.abspath(__file__)), "calibration")
 
 N_LM = 21
 
@@ -553,7 +553,7 @@ class HandFusionNode(Node):
         # `span` is the time spread of the fused frame set — if reproj is high but
         # span is a large fraction of sync_window, the cause is temporal desync
         # (tighten --sync-window), NOT calibration. High reproj with span~0ms is a
-        # genuine calibration/extrinsics problem.
+        # genuine teleop/calibration/extrinsics problem.
         if t - self._last_ok_log > 2.0:
             errs = reprojection_errors(self._cams, uv_per_cam, pts)
             med = float(np.nanmedian(errs))

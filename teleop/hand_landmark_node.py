@@ -61,12 +61,11 @@ from hand_message import HAND_CONNECTIONS, WORLD_FROM_BOARD, sensor_qos
 
 # Model lives next to the original publisher.
 _MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "ui", "hand_landmarker.task")
+    os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 _CALIB_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "calibration")
+    os.path.dirname(os.path.abspath(__file__)), "calibration")
 
-_TRACK_HANDEDNESS = "Right"   # matches ui/mediapipe_joint_angles.py
+_TRACK_HANDEDNESS = "Right"   # matches teleop/ui.py
 N_LM = 21
 
 

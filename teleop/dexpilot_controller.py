@@ -143,7 +143,7 @@ class DexPilotController:
 
         Returns None until start() has been called AND the first extended
         message (≥120 floats) has arrived.
-        The message format expected (from ui/mediapipe_joint_angles.py):
+        The message format expected (from teleop/ui.py):
           [0:3]   wrist position in camera space
           [57:120] 21 MediaPipe world landmarks × 3 coords (metres)
         """
@@ -228,7 +228,7 @@ class DexPilotController:
         return self._retarg
 
     def poll_retarget_config(self) -> bool:
-        """Hot-reload the retargeting constants from calibration/retarget_config.json
+        """Hot-reload the retargeting constants from teleop/calibration/retarget_config.json
         when you edit + save it. Cheap (mtime check); call once per frame. Returns
         True on a reload. This is the text-entry tuning path: edit the JSON in your
         editor and the live retargeter picks it up."""

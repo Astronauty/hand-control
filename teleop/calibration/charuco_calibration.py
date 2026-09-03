@@ -295,7 +295,7 @@ def _open_camera(index: int, width: int, height: int,
     cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
     if not cap.isOpened():
         sys.exit(f"ERROR: could not open camera index {index}. "
-                 f"Check the index used by ui/mediapipe_joint_angles.py --list-cameras.")
+                 f"Check the index used by teleop/ui.py --list-cameras.")
     if max_res:
         _request_max_res(cap)
     else:

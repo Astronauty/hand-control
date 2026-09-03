@@ -40,7 +40,7 @@ calibrate each camera at its highest supported mode (best landmark precision):
 
 ```bash
 # wave the board around, at THIS camera's max resolution
-python calibration/charuco_calibration.py intrinsics --camera <idx> --name <name> \
+python teleop/calibration/charuco_calibration.py intrinsics --camera <idx> --name <name> \
     --square-mm <measured> --max-res
 ```
 
@@ -48,7 +48,7 @@ python calibration/charuco_calibration.py intrinsics --camera <idx> --name <name
 origin and walk through every camera without restarting:
 
 ```bash
-python calibration/charuco_calibration.py extrinsics-all \
+python teleop/calibration/charuco_calibration.py extrinsics-all \
     --cam c0:0 --cam c1:2 --cam rs:4 --square-mm <measured> --max-res
 ```
 
@@ -80,7 +80,7 @@ exactly the "hundreds of px, unfixable by re-doing extrinsics" failure.
 
    **(a) SDK factory values (fast, no session):**
    ```bash
-   python calibration/realsense_intrinsics.py --name rs           # 640x480 (pipeline default)
+   python teleop/calibration/realsense_intrinsics.py --name rs           # 640x480 (pipeline default)
    ```
    Queries pyrealsense2 for the color stream's intrinsics at the exact pipeline
    size and writes `camera_intrinsics_rs.json`. **Caveat:** the D435I's factory
@@ -90,7 +90,7 @@ exactly the "hundreds of px, unfixable by re-doing extrinsics" failure.
 
    **(b) Board calibration (recovers real k1,k2,p1,p2,k3):**
    ```bash
-   python calibration/charuco_calibration.py intrinsics \
+   python teleop/calibration/charuco_calibration.py intrinsics \
        --camera 8 --name rs --realsense --square-mm <measured>
    # --realsense defaults to 640x480 and captures via pyrealsense2 (same stream
    # as the pipeline). Fill the frame EDGES/CORNERS with the board across views —
@@ -101,7 +101,7 @@ exactly the "hundreds of px, unfixable by re-doing extrinsics" failure.
    `--realsense`. RealSense cameras then use `--rs-width/--rs-height` (default
    640×480), while webcams keep `--width/--height`:
    ```bash
-   python calibration/charuco_calibration.py extrinsics-all \
+   python teleop/calibration/charuco_calibration.py extrinsics-all \
        --cam c0:0 --cam c1:2 --cam rs:8 --realsense rs \
        --square-mm <measured>
    ```
@@ -112,13 +112,13 @@ exactly the "hundreds of px, unfixable by re-doing extrinsics" failure.
 > of the old K) — always re-run extrinsics for that camera after re-doing its
 > intrinsics.
 
-This writes `calibration/camera_intrinsics_<name>.json` and
+This writes `teleop/calibration/camera_intrinsics_<name>.json` and
 `camera_extrinsics_<name>.json`. Do **not** move the board between cameras'
 extrinsics steps — they must all reference the same physical pose.
 
 > Accuracy here dominates everything. Validate two ways:
 > - **Per camera (by eye):**
->   `python calibration/assess_extrinsics.py --camera <idx> --name <name> --square-mm <measured>`
+>   `python teleop/calibration/assess_extrinsics.py --camera <idx> --name <name> --square-mm <measured>`
 >   — checks the world axes are stable, scale is right, and jitter is low. Press
 >   `S` to (re)save that camera's extrinsic. Do NOT move the board between cameras.
 > - **Cross-camera (the real check):** launch the pipeline (step 2) and watch the
@@ -174,9 +174,9 @@ RealSense SDK serial) in `camera_intrinsics_<name>.json`. So:
   the existing file **without recalibrating** (the intrinsic values don't change):
   ```bash
   # webcam currently at index 0 -> stamp its id into camera_intrinsics_c0.json
-  python calibration/charuco_calibration.py stamp-id --camera 0 --name c0
+  python teleop/calibration/charuco_calibration.py stamp-id --camera 0 --name c0
   # RealSense (uses the SDK serial)
-  python calibration/charuco_calibration.py stamp-id --camera 8 --name rs --realsense
+  python teleop/calibration/charuco_calibration.py stamp-id --camera 8 --name rs --realsense
   ```
   It cross-checks that the camera's current stream size matches the file's
   calibrated `image_size` before stamping (guards against stamping the wrong
@@ -187,7 +187,7 @@ Resolution precedence per camera:
 `--width/--height`.** The calibrated size lives in the intrinsics file, so a bare
 `NAME` streams at exactly the resolution it was calibrated at — no `:WxH` on the
 CLI, no separate rig-config to keep in sync. `--list-cameras` on the old
-publisher (`python ui/mediapipe_joint_angles.py --list-cameras`) still lists
+publisher (`python teleop/ui.py --list-cameras`) still lists
 OpenCV indices.
 
 ### Visualization
@@ -264,7 +264,7 @@ python teleop/run_multicam.py --cam c0:0 --cam c1:2      # terminal 1
 python kinova_leap_pick_place.py --mode dexpilot --no-mediapipe   # terminal 2
 ```
 
-Do **not** also run `ui/mediapipe_joint_angles.py` (or omit `--no-mediapipe` in
+Do **not** also run `teleop/ui.py` (or omit `--no-mediapipe` in
 option B) at the same time — two publishers on `/hand/joint_angles` interleave
 poses. Use exactly one hand-pose source.
 

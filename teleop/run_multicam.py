@@ -15,8 +15,8 @@ Examples:
     python teleop/run_multicam.py --cam c0:1 --cam c1:2 --show
 
 Each <name> must have calibration files camera_intrinsics_<name>.json and
-camera_extrinsics_<name>.json in calibration/ (see
-calibration/charuco_calibration.py --name), all solved against the SAME board.
+camera_extrinsics_<name>.json in teleop/calibration/ (see
+teleop/calibration/charuco_calibration.py --name), all solved against the SAME board.
 
 This is a plain process supervisor (no ROS launch package needed, matching how
 the repo's other entrypoints run). Ctrl-C tears everything down.
@@ -33,7 +33,7 @@ import time
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _LANDMARK = os.path.join(_HERE, "hand_landmark_node.py")
 _FUSION = os.path.join(_HERE, "hand_fusion_node.py")
-_CALIB_DIR = os.path.join(os.path.dirname(_HERE), "calibration")
+_CALIB_DIR = os.path.join(_HERE, "calibration")
 
 
 class _PipelineDown(Exception):
@@ -170,7 +170,7 @@ def _auto_discover_cams():
         sys.exit(f"[run] --auto unavailable (camera_identity import failed): {e}")
     if not calibrated_hardware_ids(_CALIB_DIR):
         sys.exit("[run] --auto: no calibrated cameras with a stored hardware_id. "
-                 "Run: python calibration/charuco_calibration.py intrinsics-all")
+                 "Run: python teleop/calibration/charuco_calibration.py intrinsics-all")
     specs2, rs_names = match_calibrated_cameras(_CALIB_DIR)
     specs = [(name, idx, None) for name, idx in specs2]
     return specs, rs_names
@@ -189,7 +189,7 @@ def _check_calibration(names: list[str]) -> None:
         if missing:
             print(f"[run] WARNING: camera '{n}' missing {missing} — it will fall "
                   f"back to the shared single-cam calibration, which is WRONG for "
-                  f"triangulation. Run: python calibration/charuco_calibration.py "
+                  f"triangulation. Run: python teleop/calibration/charuco_calibration.py "
                   f"intrinsics --camera <idx> --name {n}  (then extrinsics).")
 
 

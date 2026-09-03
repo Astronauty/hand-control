@@ -36,8 +36,7 @@ import mujoco as mj
 
 from grasp_control import SpatialIKSolver
 
-_CALIB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "calibration")
+_CALIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration")
 _R_CORRECT_PATH = os.path.join(_CALIB_DIR, "orientation_correction.json")
 
 
@@ -45,7 +44,7 @@ _TELEOP_CONFIG_PATH = os.path.join(_CALIB_DIR, "teleop_config.json")
 
 
 def load_teleop_config(path: str | None = None) -> dict:
-    """Load DexPilot teleop tunables (calibration/teleop_config.json).
+    """Load DexPilot teleop tunables (teleop/calibration/teleop_config.json).
 
     Returns a dict of DexPilotController kwargs derived from the config's
     `position` block: `position_mode`, `abs_scale`, `world_from_board` (3x3 list
@@ -99,8 +98,8 @@ def load_camera_calibration(
         NOT full 3D metric positioning (no live per-frame depth).
 
     Args:
-        extrinsics_path: path to camera_extrinsics.json (default: calibration/).
-        intrinsics_path: path to camera_intrinsics.json (default: calibration/).
+        extrinsics_path: path to camera_extrinsics.json (default: teleop/calibration/).
+        intrinsics_path: path to camera_intrinsics.json (default: teleop/calibration/).
         world_from_board: optional 3x3 rotation mapping board axes -> robot world
                           axes. Default identity (board == robot world frame).
     Returns:
@@ -139,7 +138,7 @@ _PALM_LOCAL_AXIS = np.array([0.0, 0.0, 1.0])
 # Default camera → robot world rotation — a hand-guessed fallback used only when
 # no ChArUco calibration is available. Prefer load_camera_calibration() above,
 # which supplies a measured R_cam_robot (and pixel→metre scales) from
-# calibration/camera_extrinsics.json + camera_intrinsics.json.
+# teleop/calibration/camera_extrinsics.json + camera_intrinsics.json.
 # cam +x → robot +y,  cam +y → robot +z,  cam +z → robot -x
 _DEFAULT_R_CAM_ROBOT = np.array([
     [ 0,  0, -1],   # robot x = -cam z
