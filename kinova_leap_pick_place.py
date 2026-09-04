@@ -2161,7 +2161,7 @@ if __name__ == "__main__":
         _dexpilot_ctrl.init_home(data)   # snapshots the wrist-down pose as home
         _dexpilot_ctrl.init_ros()
 
-        from ui.divergence_log import DivergenceLogger
+        from teleop.divergence_log import DivergenceLogger
         _divlog = DivergenceLogger(model, out_dir='logs/divergence', n_robot=N_ROBOT)
 
         # Live finger-retargeting tuning by TEXT ENTRY: edit the 7 constants

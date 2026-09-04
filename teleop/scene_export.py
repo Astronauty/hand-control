@@ -15,7 +15,7 @@ instead of a flat panel floating in VR.
 
 Usage
 -----
-    python3 ui/scene_export.py --xml models/scene_pick_place.xml \\
+    python3 teleop/scene_export.py --xml models/scene_pick_place.xml \\
                               --out godot_scene/
 
 Writes:

@@ -67,7 +67,7 @@ logs)
 
 hands)
 	ros_env
-	exec python3 ui/vive_hand_publisher.py --hand "${2:-right}" --frame mujoco --yaw 270
+	exec python3 teleop/vive_hand_publisher.py --hand "${2:-right}" --frame mujoco --yaw 270
 	;;
 
 sim)
@@ -83,24 +83,24 @@ sim)
 
 viz)
 	ros_env
-	exec python3 ui/hand_viz.py
+	exec python3 teleop/hand_viz.py
 	;;
 
 ego)
 	ros_env
-	exec python3 ui/hand_ego_view.py
+	exec python3 teleop/hand_ego_view.py
 	;;
 
 mock)
 	cd "$HERE" || exit 1
-	exec python3 ui/mock_headset.py --motion "${2:-open_close}"
+	exec python3 teleop/mock_headset.py --motion "${2:-open_close}"
 	;;
 
 scene)
 	# Re-export the MuJoCo geometry after changing the scene XML. The geom count
 	# it prints is the number that decides whether the headset can hold 72 Hz.
 	cd "$HERE" || exit 1
-	python3 ui/scene_export.py --xml models/scene_pick_place.xml \
+	python3 teleop/scene_export.py --xml models/scene_pick_place.xml \
 		--out godot_scene/ --group-max "${2:-2}"
 	echo
 	echo "copy godot_scene/* into the Godot project's scene/ folder, then"

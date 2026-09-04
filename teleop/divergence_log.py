@@ -14,7 +14,7 @@ Usage
 -----
 Construct once, after `data` exists:
 
-    from ui.divergence_log import DivergenceLogger
+    from teleop.divergence_log import DivergenceLogger
     _divlog = DivergenceLogger(model, out_dir='logs/divergence')
 
 Call once per control iteration, right after mj_step / mj_forward:
@@ -32,7 +32,7 @@ than the reset does.
 
 Reading the dump
 ----------------
-    python3 ui/divergence_log.py logs/divergence/div_0001.npz
+    python3 teleop/divergence_log.py logs/divergence/div_0001.npz
 """
 
 import os
@@ -214,7 +214,7 @@ class DivergenceLogger:
             print(f"[divlog]   at peak: |qvel| {peak['qvel_max']:.3g}  "
                   f"sigma_min {peak['sigma_min']:.4f}  ncon {peak['ncon']}  "
                   f"max PD err {peak['err_max']:.3f} rad")
-            print(f"[divlog]   inspect: python3 ui/divergence_log.py {path}")
+            print(f"[divlog]   inspect: python3 teleop/divergence_log.py {path}")
 
 
 # ---------------------------------------------------------------------------

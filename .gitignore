@@ -245,3 +245,6 @@ models/robocasa_assets/
 
 # Stray empty file
 wrist
+
+# Claude Code local settings/temp
+.claude/

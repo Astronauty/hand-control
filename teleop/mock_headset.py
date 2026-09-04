@@ -10,10 +10,10 @@ MuJoCo) is exercised for real. Only the headset is simulated.
 Usage
 -----
     # terminal 1
-    python3 ui/vive_hand_publisher.py --hand right
+    python3 teleop/vive_hand_publisher.py --hand right
 
     # terminal 2
-    python3 ui/mock_headset.py --motion open_close
+    python3 teleop/mock_headset.py --motion open_close
 
     # terminal 3
     python3 kinova_leap_pick_place.py --mode dexpilot

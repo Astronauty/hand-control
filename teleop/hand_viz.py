@@ -8,12 +8,12 @@ message layout are correct and any remaining problem is downstream.
 
 Usage
 -----
-    python3 ui/hand_viz.py                      # world landmarks (raw[57:120])
-    python3 ui/hand_viz.py --show image         # image landmarks (raw[120:183])
-    python3 ui/hand_viz.py --show both          # side by side
-    python3 ui/hand_viz.py --absolute           # add the wrist back (raw[0:3])
+    python3 teleop/hand_viz.py                      # world landmarks (raw[57:120])
+    python3 teleop/hand_viz.py --show image         # image landmarks (raw[120:183])
+    python3 teleop/hand_viz.py --show both          # side by side
+    python3 teleop/hand_viz.py --absolute           # add the wrist back (raw[0:3])
 
-    python3 ui/hand_viz.py --print              # text only, no window (headless/SSH)
+    python3 teleop/hand_viz.py --print              # text only, no window (headless/SSH)
 
 Reading it
 ----------

@@ -21,8 +21,8 @@ region is unused by the retargeter).
 
 Usage
 -----
-    python3 ui/hand_ego_view.py
-    python3 ui/hand_ego_view.py --fov 100 --trail 60
+    python3 teleop/hand_ego_view.py
+    python3 teleop/hand_ego_view.py --fov 100 --trail 60
 """
 
 import argparse

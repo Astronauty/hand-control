@@ -19,8 +19,8 @@ Two problems this exists to solve.
 
 Usage
 -----
-    python3 ui/hand_quality.py --record 60        # capture 60 s, then report
-    python3 ui/hand_quality.py --analyse logs/hand_quality/hq_*.npz
+    python3 teleop/hand_quality.py --record 60        # capture 60 s, then report
+    python3 teleop/hand_quality.py --analyse logs/hand_quality/hq_*.npz
 
 Why bone length is the core metric
 ----------------------------------

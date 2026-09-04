@@ -15,14 +15,14 @@ Two ways to run it:
   In-process (preferred). Import and call from the sim loop, so poses are
   exactly the frame that was just stepped:
 
-      from ui.pose_stream import PoseStreamer
+      from teleop.pose_stream import PoseStreamer
       streamer = PoseStreamer('godot_scene/scene.json')
       ...
       streamer.send(model, data)          # once per viewer frame
 
   Standalone, for testing the link with no sim attached:
 
-      python3 ui/pose_stream.py --demo
+      python3 teleop/pose_stream.py --demo
 
 Setup
 -----

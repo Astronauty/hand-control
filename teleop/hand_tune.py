@@ -7,8 +7,8 @@ lights up the moment the debounced detector says it is pinched. Move the EPS
 slider and fingers change colour under your hand in real time, so you can pinch
 deliberately and watch exactly where the threshold catches and releases.
 
-    python3 ui/hand_tune.py                 # live from /hand/joint_angles
-    python3 ui/hand_tune.py --file hq_*.npz # scrub a recording instead
+    python3 teleop/hand_tune.py                 # live from /hand/joint_angles
+    python3 teleop/hand_tune.py --file hq_*.npz # scrub a recording instead
 
 Layout
 ------
