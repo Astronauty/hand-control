@@ -26,13 +26,25 @@ sudo apt-get install libxcb-cursor0
 
 ---
 
+## Repository layout
+
+- `kinova_leap_pick_place.py` — the main app (sim loop, control, teleop, trial logging).
+- `models/` — MJCF scenes/robot; `models/furniture/` vendored table/counter assets; `models/build_kinova_leap.py` regenerates the arm+hand model.
+- `teleop/` — hand-input publishers and teleop UI: `vive_hand_publisher.py` (Vive/VR), the DexPilot retargeter/controller/arm-controller, MediaPipe/multicam pipeline, `hand_tune.py`/`hand_quality.py` (pinch tuning + input-quality tools), and `teleop/calibration/` (ChArUco + config files).
+- `anyteleop/` — the AnyTeleop (`dex-retargeting`) finger-retargeting backend + `compare_retargeting.py`; see [`anyteleop/README.md`](anyteleop/README.md).
+- `simulation/` — the NLP grasp planner (`grasp_planner_3d.py`, `grasp_config_builder.py`).
+- `kinova_common/` — shared constants/wrench/geometry/keyboard helpers. `environments/` — object randomization + task-env scaffolding.
+- `benchmarks/ycb_grasp/` — YCB grasp benchmark scripts (see [YCB object assets](#ycb-object-assets)).
+- `godot_scene/` — exported headset scene (see [Godot headset scene](#godot-headset-scene)).
+- `start_teleop.sh` — the VR multi-terminal launcher.
+
 ## Kinova Gen3 + LEAP Hand Pick-and-Place
 
-**Scene:** `models/scene_pick_place.xml` — 7-DOF Gen3 arm + 16-DOF LEAP hand, plus a set of pickable objects (see [Object sweep](#object-sweep)).
+**Scene:** `models/scene_pick_place.xml` (default) or `models/scene_robocasa.xml` (`--scene robocasa`) — 7-DOF Gen3 arm + 16-DOF LEAP hand mounted on a table/counter, with pickable objects and a place bin (see [Scenes](#scenes---scene) and [Object sweep](#object-sweep)).
 
 ### Object sweep
 
-The scene defines several pickable object bodies, but each run spawns exactly **one**, chosen with `--object <body>`. All variants are authored in `models/scene_pick_place.xml`; at load time the non-selected ones are **deleted from the `MjSpec` before compilation** (not parked off-scene), so the compiled model contains a single target — no stray geoms in the proximity/collision checks, and `nq` stays fixed so per-object logs pool cleanly. This makes a run directory correspond to exactly one object condition.
+The scene defines several pickable object bodies. `--objects` selects which are spawned: `all` (default) co-spawns every object for the clear-the-table task, or a comma-separated subset. Non-selected bodies are **deleted from the `MjSpec` before compilation** (not parked off-scene), so there are no stray geoms in the proximity/collision checks; `nq = 23 + 7·N` for N kept objects. For the single-object **property sweep** below, pass the deprecated `--object <body>` (keeps exactly one body, so a run directory = one object condition and per-object logs pool cleanly).
 
 The current sweep holds three cubes of **identical geometry** (4 cm half-extent box), varying **one physical property each** relative to the baseline so friction and mass can be studied independently:
 
@@ -53,6 +65,29 @@ Each object's actual simulated mass / μ / I_zz is stamped onto the `trial_start
 ```bash
 python models/build_kinova_leap.py
 ```
+
+### Hand input sources (teleop)
+
+All teleop modes take the operator's hand pose from the ROS 2 topic `/hand/joint_angles`; the sim just subscribes, so **either** publisher works interchangeably:
+
+- **Vive Focus Vision headset (VR).** The headset streams metric, gravity-aligned hand pose over OpenXR (STAGE space), so there is **no ChArUco camera calibration** — the scale/extrinsics the board recovered don't exist as problems here. Published by `teleop/vive_hand_publisher.py`. This is the workflow driven by [`start_teleop.sh`](#running-via-vr-start_teleopsh) below.
+- **MediaPipe RGB camera.** A webcam + MediaPipe hand tracking, single-camera (`--camera N`) or fused multi-camera (`--multicam` / `--multicam-auto`, occlusion-robust). Needs [ChArUco camera calibration](#camera-calibration-charuco-board) for the camera→robot mapping and pixel→metre scale. Launched automatically by the sim unless `--no-mediapipe`/`--external-hand` is set.
+
+The examples below use `--camera 0` (MediaPipe); to drive the same mode from the headset instead, run it under `start_teleop.sh` (which sets `--no-mediapipe` and starts the Vive publisher).
+
+#### Running via VR (`start_teleop.sh`)
+
+`start_teleop.sh` orchestrates the multi-terminal Vive workflow — one command per terminal:
+
+```bash
+./start_teleop.sh link                     # T1: USB tunnels + launch the headset app (leave open)
+./start_teleop.sh hands                     # T2: Vive hand publisher -> /hand/joint_angles
+./start_teleop.sh sim contact_aware_w_dexpilot   # T3: MuJoCo teleop (press 8 to start tracking)
+./start_teleop.sh check                     # optional: confirm data on /hand/joint_angles
+# viz / ego / mock also available (skeleton view / tracker ego-view / synthetic hand)
+```
+
+The `sim` command takes the `--mode` as its first argument (default `dexpilot`) and **forwards any extra flags** — e.g. `./start_teleop.sh sim contact_aware_w_dexpilot --scene robocasa --trial-log`. `--no-mediapipe` is always applied (the headset is the sole publisher). See [Scenes](#scenes---scene) and the [CLI flags](#cli-flags).
 
 ### Modes
 
@@ -101,6 +136,17 @@ python kinova_leap_pick_place.py --mode dexpilot \
 
 `--multicam-auto` finds every calibrated camera currently plugged in (RealSense auto-flagged) — no indices or names to pass. With explicit `--multicam`, per-camera resolution is read from `camera_intrinsics_<name>.json`, so a bare `NAME:INDEX` is enough. Add `--recalibrate-extrinsics` to re-solve each camera's board pose interactively before teleop starts. See [CLI flags](#cli-flags) and [`teleop/MULTICAM.md`](teleop/MULTICAM.md).
 
+#### Godot headset scene
+
+For the Vive workflow, the headset renders the scene on-device (Godot APK) while the workstation runs the physics. The static MuJoCo geometry is exported to `godot_scene/` (`scene.json` + per-link meshes) by `teleop/scene_export.py`; the workstation then streams live geom poses to the headset over the scene socket. Regenerate after changing the scene XML:
+
+```bash
+./start_teleop.sh scene              # runs teleop/scene_export.py on models/scene_pick_place.xml
+# then copy godot_scene/* into the Godot project's scene/ folder and re-export the APK
+```
+
+The exported geom count (printed by the script) is what decides whether the headset can hold its refresh rate. `godot_scene/` is committed; the headset app itself lives in the separate Godot project.
+
 #### AnyTeleop baseline (2×2 comparison)
 
 To compare our approach against [AnyTeleop](https://yzqin.github.io/anyteleop/) (the published teleop system whose retargeting is the [`dex-retargeting`](https://github.com/dexsuite/dex-retargeting) library), the finger retargeter is swappable. This gives a 2×2 of **pipeline × finger retargeter**, exposed as four `--mode` values:
@@ -122,7 +168,14 @@ python kinova_leap_pick_place.py --mode anyteleop --camera 0
 python kinova_leap_pick_place.py --mode contact_aware_w_anyteleop --camera 0
 ```
 
-Select the dex-retargeting optimizer (`vector` or `dexpilot`) and hand in `calibration/anyteleop_config.json` (hot-reloaded each frame). The backend is fully self-contained in [`anyteleop/`](anyteleop/README.md) — see its README for how it works and how to remove it.
+Select the dex-retargeting optimizer (`vector` or `dexpilot`) and hand in `teleop/calibration/anyteleop_config.json` (hot-reloaded each frame). The backend is fully self-contained in [`anyteleop/`](anyteleop/README.md) — see its README for how it works and how to remove it.
+
+**Headless comparison.** `anyteleop/compare_retargeting.py` compares DexPilot vs AnyTeleop (vector & dexpilot) with no camera/ROS — solve latency, joint-limit saturation, fingertip-tracking error, and pairwise joint divergence — over a synthetic pose sweep or a replayed recording. Retargeting is a pure `landmarks → joints` function, so it runs fully offline.
+
+#### Teleop tuning tools
+
+- **`teleop/hand_tune.py`** — live 3D hand skeleton with the pinch thresholds beside it; move the EPS/hysteresis sliders and watch fingers light up as the debounced detector fires, then write the tuned values to `teleop/calibration/retarget_config.json` (hot-reloaded by dexpilot). `python teleop/hand_tune.py` (live) or `--file hq_*.npz` (scrub a recording).
+- **`teleop/hand_quality.py`** — record N seconds of `/hand/joint_angles` and report input-quality stats (`--record 60`), or analyse a saved `hq_*.npz` (`--analyse`). Produces the recordings `hand_tune.py`/`compare_retargeting.py` can replay.
 
 ---
 
@@ -142,21 +195,23 @@ python kinova_leap_pick_place.py --mode contact_aware_teleop --scene robocasa # 
 ./start_teleop.sh sim contact_aware_w_dexpilot --scene robocasa
 ```
 
-#### RoboCasa assets (optional, not committed)
+#### Real object meshes (optional, not committed)
 
-The RoboCasa scene works out of the box with primitive object stand-ins. To use **real RoboCasa kitchen object meshes**, download the NVIDIA MJCF asset subset (~1.3 GB, CC-BY-4.0) — it is **git-ignored** (`models/robocasa_assets/`), not committed:
+The scenes work out of the box with **primitive object stand-ins** (box variants + a sphere). Real object meshes are large, so they are **git-ignored** and downloaded/built on demand from their own pipelines:
 
-```bash
-pip install huggingface_hub
-hf download nvidia/PhysicalAI-Robotics-Manipulation-Objects-Kitchen-MJCF \
-  --repo-type dataset --local-dir models/robocasa_assets
-# then unzip the object categories you want, e.g.:
-#   unzip models/robocasa_assets/objects_lightwheel/<category>.zip -d models/robocasa_assets/objects_lightwheel/
-```
+- **YCB** — the sim-ready `assets/ycb_mjcf/` (watertight-sealed meshes, CoACD collision hulls, published YCB mass). See [YCB object assets](#ycb-object-assets) for the download + build (`scripts/build_ycb.py`).
+- **RoboCasa** — the NVIDIA MJCF kitchen-object subset (~1.3 GB, CC-BY-4.0), git-ignored at `models/robocasa_assets/`:
+  ```bash
+  pip install huggingface_hub
+  hf download nvidia/PhysicalAI-Robotics-Manipulation-Objects-Kitchen-MJCF \
+    --repo-type dataset --local-dir models/robocasa_assets
+  # then unzip the object categories you want, e.g.:
+  #   unzip models/robocasa_assets/objects_lightwheel/<category>.zip -d models/robocasa_assets/objects_lightwheel/
+  ```
 
-Each object is a self-contained MJCF (`model.xml` + `collision/`/`visual/` meshes + textures). The importer that wraps these into the scene's object contract (adds a freejoint, renames to `obj_*`, fixes mesh paths, and auto-derives the antipodal `_c1`/`_c2` grasp sites from each mesh's bounding box) is a follow-up; the primitive stand-ins are the current default.
+**Status:** wiring these mesh objects into the clear-table scenes is a **follow-up** (a load-time loader that attaches a chosen mesh object — reusing `benchmarks/ycb_grasp/scene.py`'s `MjSpec` attach path — names it `obj_<id>`, and auto-registers it in the object list). Scope note: mesh objects are for the **plain-teleop `dexpilot` / `anyteleop`** modes (which grasp by hand physics and don't need per-object contact sites); the **contact-aware** methods need per-object grasp-contact handling for meshes, which is being updated separately, so they stay on the primitive stand-ins for now.
 
-The counter's marble texture (`models/furniture/textures/robocasa_marble.png`, from RoboCasa, CC-BY-4.0) and the wood-table assets (`models/furniture/`, from reachy2_mujoco_assets / Vikash Kumar's furniture_sim, Apache-2.0) **are** vendored/committed.
+The committed/vendored surface assets: the counter's marble texture (`models/furniture/textures/robocasa_marble.png`, from RoboCasa, CC-BY-4.0) and the wood-table assets (`models/furniture/`, from reachy2_mujoco_assets / Vikash Kumar's furniture_sim, Apache-2.0).
 
 ---
 
@@ -203,12 +258,14 @@ This is *kinematic* replay — it re-plays the recorded state, it does not re-si
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mode {contact_aware_autonomous,contact_aware_teleop,dexpilot,anyteleop,contact_aware_w_dexpilot,contact_aware_w_anyteleop}` | `contact_aware_teleop` | **contact_aware_autonomous**: autonomous RRT+IK grasp to predefined per-object contact sites (`rrt` is a deprecated alias). **contact_aware_teleop**: wrist+finger teleop with a live NLP grasp recommender, lock-in → RRT → grasp. **dexpilot**: live MediaPipe retargeting teleop via ROS 2, no recommender. **Baseline 2×2** (see [AnyTeleop baseline](#anyteleop-baseline-22-comparison)): `dexpilot` / `anyteleop` = plain teleop with our DexPilot / the dex-retargeting backend; `contact_aware_w_dexpilot` (= `contact_aware_teleop`) / `contact_aware_w_anyteleop` = our contact-aware pipeline with each backend. The `*_anyteleop` modes need `uv sync --extra anyteleop`. |
+| `--mode {contact_aware_autonomous,contact_aware_teleop,dexpilot,anyteleop,contact_aware_w_dexpilot,contact_aware_w_anyteleop,rrt}` | `contact_aware_teleop` | **contact_aware_autonomous**: autonomous RRT+IK grasp to predefined per-object contact sites (`rrt` is a deprecated alias). **contact_aware_teleop**: wrist+finger teleop with a live NLP grasp recommender, lock-in → RRT → grasp. **dexpilot**: live MediaPipe retargeting teleop via ROS 2, no recommender. **Baseline 2×2** (see [AnyTeleop baseline](#anyteleop-baseline-22-comparison)): `dexpilot` / `anyteleop` = plain teleop with our DexPilot / the dex-retargeting backend; `contact_aware_w_dexpilot` (= `contact_aware_teleop`) / `contact_aware_w_anyteleop` = our contact-aware pipeline with each backend. The `*_anyteleop` modes need `uv sync --extra anyteleop`. |
 | `--ik-solver {sqp,ipopt}` | `sqp` | IK solver backend (see below). |
 | `--dashboard` | off | Launch a live pyqtgraph metrics dashboard (separate process): planning mode, proximity-based active object, scrolling fingertip→object distances, net hand→object wrench, per-finger contact normal forces, a combined RRT+IK planner solution log, and — in `contact_aware_teleop` — a **grasp-recommender panel** with per-solve statistics (status, seeds converged, solve time, γ_min, wrench feasibility, IK error) plus a rolling session summary. |
 | `--viz-only` | off | Debug mode: disables arm/hand collision physics and never calls `mj_step`. REACH and GRASP phases hold their IK solution kinematically so you can inspect the IK/RRT result without dynamics interference. |
 | `--trial-log [RUN_DIR]` | off | *(dexpilot / contact_aware_teleop)* Record the run under `logs/<RUN_DIR>/` (auto-named `<mode>_<timestamp>` if omitted): `events.jsonl` + `pose_trace.npz` + per-trial `.npz`. Replay with [`replay_pose_trace.py`](replay_pose_trace.py). See [Trial logging & replay](#trial-logging--replay). |
-| `--object BODY` | `obj_red_box` | Which pickable object body to spawn. All sweep objects are defined in `models/scene_pick_place.xml`, but only this one survives compile — the others are deleted from the `MjSpec` before compilation, so the scene contains exactly one target (run dir = one object). See [Object sweep](#object-sweep) for the available bodies and their properties. |
+| `--objects LIST` | `all` | Comma-separated pickable object bodies to **co-spawn** for the clear-the-table task, or `all`. Bodies not listed are pruned from the `MjSpec` before compile; `nq = 23 + 7·N` for N kept objects. See [Scenes](#scenes---scene). |
+| `--object BODY` | none | *(deprecated single-object alias; overrides `--objects`)* Spawn exactly one pickable body (old one-object-per-run behavior). All sweep objects are defined in `models/scene_pick_place.xml`; the others are deleted before compilation. See [Object sweep](#object-sweep). |
+| `--scene {pick_place,robocasa}` | `pick_place` | Which scene to load. `pick_place`: dark-wood table (`models/scene_pick_place.xml`, top z=0.625). `robocasa`: RoboCasa-style marble counter (`models/scene_robocasa.xml`, top z=0.86). The robot mounts on the surface; both share the multi-object task pipeline. See [Scenes](#scenes---scene). |
 | `--seed N` | none | RNG seed for object randomization — the same seed reproduces the same layout (positions and sizes). Default: fresh entropy every run. Ignored with `--no-randomize`. |
 | `--no-randomize` | off | Skip object randomization entirely: objects keep the positions, sizes, and colors authored in `models/scene_pick_place.xml`. |
 | `--camera N` | auto | *(teleop modes only)* Camera index forwarded to the built-in single-camera MediaPipe publisher. Defaults to auto-select (prefers external/USB camera at index ≥ 1). Run `python teleop/ui.py --list-cameras` to see available indices. |
@@ -220,7 +277,14 @@ This is *kinematic* replay — it re-plays the recorded state, it does not re-si
 | `--square-mm MM` | `50.0` | *(with `--recalibrate-extrinsics`)* MEASURED ChArUco square size in mm, forwarded to `charuco_calibration.py extrinsics`. Must match the board actually printed/mounted on the rig — measure a square with calipers, don't trust the nominal print size. Keep in sync with `DEFAULT_SQUARE_MM` in `teleop/calibration/charuco_calibration.py` if the board changes. |
 | `--camera-views` | off | *(with `--multicam`)* Tile each camera's live feed + landmark overlay in a window (subscribes to `/hand/cam_<name>/preview`), like `run_multicam.py --show-fused`'s camera grid. |
 | `--skeleton-view` | off | *(teleop modes)* Open a separate orbitable 3D window of the fused hand skeleton (from the world landmarks in `/hand/joint_angles`). |
-| `--no-mediapipe` / `--external-hand` | off | *(teleop modes)* Do **not** spawn the built-in single-camera publisher — for when an external process already publishes `/hand/joint_angles`. Implied by `--multicam`. |
+| `--no-mediapipe` / `--external-hand` | off | *(teleop modes)* Do **not** spawn the built-in single-camera publisher — for when an external process already publishes `/hand/joint_angles` (e.g. the Vive headset via `start_teleop.sh hands`, which sets this automatically). Implied by `--multicam`. |
+| `--pinch-debounce {on,off}` | `on` | *(teleop)* DexPilot pinch-state debounce (median + Schmitt hysteresis + N-frame). `off` = raw per-finger threshold (`d ≤ EPS`), no filtering — for clean input like VR, or to A/B its effect. Reaches both retargeters (DexPilot: also affects the solver's grasp; AnyTeleop: detection-only). See [DexPilot teleop controls](#contact-aware-teleop-mode-controls). |
+| `--output-ema {on,off}` | `on` | *(teleop)* EMA smoothing on the 16 hand joints. `off` = no smoothing (`hand_alpha=1.0`, raw solved q_hand each frame). Independent of `--pinch-debounce`. |
+| `--position-mode {relative,absolute}` | from `teleop/calibration/teleop_config.json` | *(teleop)* Wrist position mapping. `relative`: press-8 re-zeroable, robot tracks `abs_scale ×` board displacement. `absolute`: board origin → robot base, whole position × `abs_scale`. Overrides the config's `mode`. |
+| `--recommender-grasp` | off | *(contact_aware_autonomous)* Fire the same NLP grasp recommender the teleop pipeline uses (per-object `MultiStartGraspPlanner3D`) in autonomous mode, then auto-lock a wrench-feasible candidate. |
+| `--record-samples FILE` | off | *(contact_aware_teleop)* Append IK-tuning dataset samples (press **R**) to this JSONL file for offline IK-weight sweeping. |
+| `--collision-view` | off | Debug overlay of the IK/RRT collision spheres (also toggled live with **7**). |
+| `--hand-self-collision` | off | Re-enable LEAP hand self-collision (off by default: the 71 hand geoms would otherwise generate many intra-hand contacts). |
 
 Flags can be combined, e.g.:
 ```bash
@@ -586,6 +650,15 @@ Compiles every MJCF in MuJoCo and checks each body's mass against both the repor
 the published table, and each collision geom count against the hull files on disk. The
 mass check is the one that matters: it fails the moment an `<inertial>` goes missing and
 MuJoCo silently falls back to summing geoms.
+
+### YCB grasp benchmark
+
+`benchmarks/ycb_grasp/` holds the grasp/IK evaluation over the YCB objects: `scene.py` +
+`workspace.py` (per-object scene + reachable-workspace precompute), `ablate_grasp.py` /
+`ablate_ik.py` (grasp-config and IK-weight ablations), `config_sweep.py`, and `ik_demo.py`
+/ `plot_uv_path.py` (single-object demo + UV-atlas contact-path viz). Outputs land in
+`benchmarks/ycb_grasp/out/` (git-ignored). These drive the mesh-aware grasp planner
+(convex-decomposed collision + UV-atlas contact charts, [IK solver modes](#ik-solver-modes)).
 
 ---
 
