@@ -34,3 +34,26 @@ dependencies = [
     "pandas>=2.3.3",
     "pyarrow>=25.0.0",
 ]
+
+[project.optional-dependencies]
+# AnyTeleop baseline (the dex-retargeting finger backend, --mode anyteleop /
+# contact_aware_w_anyteleop). Kept optional so the base install stays lean and the
+# add-on is fully removable (`uv sync` without --extra prunes it). Pinned <0.5.0:
+# 0.5.0+ requires numpy>=2 (conflicts with the numpy<2 pin above), while its changelog
+# confirms 0.5.0 is packaging-only — the retargeting algorithm/configs are IDENTICAL to
+# 0.4.6, so there is no accuracy cost. `torch` is pinned to the CPU build (see the
+# [tool.uv] torch-cpu index below) to avoid pulling the ~5GB CUDA stack.
+# Install:  uv sync --extra anyteleop
+# The LEAP URDF is vendored in anyteleop/assets/ (not shipped by the wheel).
+anyteleop = ["dex-retargeting==0.4.6", "torch==2.14.0+cpu"]
+
+[tool.uv]
+# Scope the PyTorch CPU wheel index to torch only, so the base environment (which has no
+# torch) is completely unaffected; the CUDA-heavy default torch is never resolved.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

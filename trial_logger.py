@@ -528,7 +528,8 @@ class TrialRunner:
                                 height_above_rest: float,
                                 place_xy_offset: float | None = None,
                                 object_speed: float | None = None,
-                                place_marker_half_extent: float = 0.15):
+                                place_marker_half_extent: float = 0.15,
+                                inside_container: bool | None = None):
         """Call every step once REACH has ended (GRASP begins). Drives the attempt /
         dwell / confirm / transport / drop / arrival state machine.
 
@@ -543,11 +544,19 @@ class TrialRunner:
                          relevant (e.g. still in GRASP, not TRANSPORT).
         object_speed:    object linear speed (m/s), for the arrival settle check.
 
-        Arrival is a SET-IN-PLACE check: success once the object is inside the place
-        footprint and settled (speed < ARRIVAL_SPEED_M_S), whether it is held clear over
-        the target OR set down into it. A descent below LIFT_HEIGHT_M inside the footprint
-        is treated as a placement-in-progress (stay in TRANSPORT until it settles), NOT a
-        drop; only a descent outside the footprint counts a drop and reverts to PICK.
+        inside_container: optional 3D-containment predicate for a BOWL/container target
+                         (object XY within the rim AND z between the bowl floor and rim).
+                         When provided (not None) it REPLACES the flat XY-footprint test —
+                         "in place" == inside the container. When None, the legacy flat
+                         footprint check (place_xy_offset <= place_marker_half_extent) is
+                         used, so existing flat place-site callers are unaffected.
+
+        Arrival is a SET-IN-PLACE check: success once the object is "in place" (inside the
+        container if inside_container is given, else inside the flat footprint) AND settled
+        (speed < ARRIVAL_SPEED_M_S), whether held clear over the target OR set down into it.
+        A descent below LIFT_HEIGHT_M while in place is a placement-in-progress (stay in
+        TRANSPORT until it settles), NOT a drop; only a descent while NOT in place counts a
+        drop and reverts to PICK.
 
         Returns True if the trial reached arrival (success) this step.
         """
@@ -608,8 +617,13 @@ class TrialRunner:
             #       rule (the object was still moving whenever it was above the threshold,
             #       and the moment it descended it was counted as a drop instead).
             # A descent to/below the threshold OUTSIDE the footprint is still a drop.
-            in_place = (place_xy_offset is not None
-                        and place_xy_offset <= place_marker_half_extent)
+            # "in place" = inside the 3D container when given (bowl task), else inside the
+            # flat XY footprint (legacy place-site task).
+            if inside_container is not None:
+                in_place = bool(inside_container)
+            else:
+                in_place = (place_xy_offset is not None
+                            and place_xy_offset <= place_marker_half_extent)
             settled = (object_speed is not None and object_speed < ARRIVAL_SPEED_M_S)
             if in_place and settled:
                 self.set_phase(state, t_now, TrialPhase.PLACE)   # object placed → finish

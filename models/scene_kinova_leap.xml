@@ -23,8 +23,20 @@
     <exclude body1="base_link" body2="shoulder_link"/>
   </contact>
 
+  <!-- Wood table for the "clear the table" task: the reachy2/furniture_sim simpleWoodTable
+       (dark walnut planks, box-primitive collision, top surface at z=0.625 = TABLE_TOP_Z).
+       The robot base is mounted ON this table top (base_link raised to TABLE_TOP_Z in the
+       loader, kinova_leap_pick_place.py), the common tabletop-manipulation convention, so
+       grasps are level with the base. TABLE_TOP_Z=0.625 is mirrored in the Python
+       (object rest z + _randomize_objects z_rest) — keep in sync. -->
+  <include file="furniture/simpleTable_asset.xml"/>
+
   <worldbody>
     <light pos="0 0 1.5" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <!-- Table centered under the robot workspace (arm base at ~(0,0), reaches +y forward). -->
+    <body name="table" pos="0.0 0.25 0.0">
+      <include file="furniture/simpleWoodTable_body.xml"/>
+    </body>
   </worldbody>
 </mujoco>

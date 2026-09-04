@@ -1,9 +1,12 @@
 {
-  "BETA": 5.0,
-  "GAMMA": 0.002,
-  "EPS": 0.030,
-  "ETA1": 0.02,
-  "ETA2": 0.03,
-  "S1_GAIN": 200.0,
-  "S2_GAIN": 400.0
+ "BETA": 5.0,
+ "GAMMA": 0.002,
+ "EPS": 0.03,
+ "ETA1": 0.02,
+ "ETA2": 0.03,
+ "S1_GAIN": 200.0,
+ "S2_GAIN": 400.0,
+ "PINCH_ENTER_FRAC": 1.0,
+ "PINCH_EXIT_FRAC": 1.6,
+ "PINCH_MEDIAN_N": 2.0
 }

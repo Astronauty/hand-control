@@ -16,37 +16,33 @@
   <option cone="elliptic" impratio="100"/>
 
   <worldbody>
-    <!-- Pick area: visual-only reference marker, 30 cm × 30 cm -->
-    <geom name="pick_area_marker" type="box" size="0.15 0.15 0.0005" pos="0.65 0.5 0.001"
-      rgba="0.6 0.6 0.6 0.35" contype="0" conaffinity="0"/>
-
-    <!-- RED category: box + sphere
-         z = half-height so each object rests on the floor at startup.
-         Contact sites use the +x inward-normal convention (local x-axis = inward surface normal). -->
-    <body name="obj_red_box" pos="0.60 0.42 0.040">
+    <!-- CLEAR-THE-TABLE benchmark. The robot base is mounted ON the wood table (base_link
+         raised to TABLE_TOP_Z=0.625 in the loader) at (0,0); the table is centered at
+         (0,0.25) with its top at z=0.625. Objects co-exist on the table in front of the base
+         (+y, ~0.3-0.45m reach, level with the base = easy IK regime), each resting at
+         z=TABLE_TOP_Z + half-height, at distinct XY (>=0.10 apart). The loader keeps the
+         bodies named in --objects and prunes the rest; nq = 23 + 7*N for N kept objects.
+         Contact sites use the +x inward-normal convention; _c1/_c2 are the antipodal grasp
+         points. condim=6 + torsional/rolling friction match the fingertip pads (both grasp
+         geoms carry the torsional term to resist twist). Friction/mass VARY per object for
+         the parametric deviations; the shape+condim baseline is held fixed.
+           obj_red_box    box    mass=0.25  mu=2.0   (baseline)
+           obj_box_lowmu  box    mass=0.25  mu=1.2   (0.6x friction)
+           obj_box_heavy  box    mass=0.35  mu=2.0   (1.4x mass)
+           obj_red_sphere sphere mass=0.25  mu=2.0   (orange/lemon/ball stand-in) -->
+    <!-- Objects on the LEFT (-x), spread along the table LENGTH (x); bin on the RIGHT (+x).
+         This matches the operator's table layout after the world_from_board x<->y swap
+         (calibration/teleop_config.json), so operator-left maps to robot-left. All within
+         reach (dist < 0.55 m from the base at origin). >=0.12 apart along x. -->
+    <body name="obj_red_box" pos="-0.38 0.30 0.665">
       <freejoint/>
-      <!-- condim=6 + raised torsional/rolling friction to match the fingertip pads
-           (leap_tip class). Contact params combine elementwise-MAX, so BOTH geoms must
-           carry the torsional term for the pinch contact to resist the box twisting
-           about the grasp axis (observed |rot.grasp_axis|=1.00 during slip). Old
-           friction="2.0 0.05 0.001" (condim=3) gave the twist DOF nothing to push on. -->
       <geom name="obj_red_box_geom" type="box" size="0.040 0.040 0.040"
         rgba="0.85 0.15 0.15 1" mass="0.25" friction="2.0 0.05 0.005" condim="6"/>
       <site name="obj_red_box_c1" pos="-0.040 0 0" quat="1 0 0 0"/>
       <site name="obj_red_box_c2" pos=" 0.040 0 0" quat="0 0 1 0"/>
     </body>
 
-    <!-- Object-property sweep: two SIBLING cubes of the exact same geometry as
-         obj_red_box (Object 1, the baseline above), varying ONE physical property each
-         relative to it. Only ONE object body survives compile: the loader deletes the
-         non-selected ones via MjSpec.delete() before spec.compile() (see the --object
-         flag in kinova_leap_pick_place.py), so nq stays 30 and the single-object
-         keyframes remain valid. condim=6 and the torsional/rolling friction terms are
-         held FIXED across all three so mu and mass are the only variables.
-           Object 1  obj_red_box    mass=0.25  mu=2.0   (baseline)
-           Object 2  obj_box_lowmu  mass=0.25  mu=1.2   (0.6x friction)
-           Object 3  obj_box_heavy  mass=0.35  mu=2.0   (1.4x mass) -->
-    <body name="obj_box_lowmu" pos="0.60 0.42 0.040">
+    <body name="obj_box_lowmu" pos="-0.26 0.30 0.665">
       <freejoint/>
       <geom name="obj_box_lowmu_geom" type="box" size="0.040 0.040 0.040"
         rgba="0.85 0.55 0.15 1" mass="0.25" friction="1.2 0.05 0.005" condim="6"/>
@@ -54,7 +50,7 @@
       <site name="obj_box_lowmu_c2" pos=" 0.040 0 0" quat="0 0 1 0"/>
     </body>
 
-    <body name="obj_box_heavy" pos="0.60 0.42 0.040">
+    <body name="obj_box_heavy" pos="-0.14 0.30 0.665">
       <freejoint/>
       <geom name="obj_box_heavy_geom" type="box" size="0.040 0.040 0.040"
         rgba="0.55 0.15 0.55 1" mass="0.35" friction="2.0 0.05 0.005" condim="6"/>
@@ -62,15 +58,39 @@
       <site name="obj_box_heavy_c2" pos=" 0.040 0 0" quat="0 0 1 0"/>
     </body>
 
+    <!-- Sphere stand-in (orange/lemon/sports-ball). Antipodal equatorial contact sites at
+         (+/-radius, 0, 0): local +x points inward toward the center for both, a valid
+         antipodal grasp pair. object_defs / _RANDOMIZE_OBJ_INFO already register this body
+         name, so no Python change is needed to make it pickable. -->
+    <body name="obj_red_sphere" pos="-0.02 0.30 0.660">
+      <freejoint/>
+      <geom name="obj_red_sphere_geom" type="sphere" size="0.035"
+        rgba="0.95 0.55 0.15 1" mass="0.25" friction="2.0 0.05 0.005" condim="6"/>
+      <site name="obj_red_sphere_c1" pos="-0.035 0 0" quat="1 0 0 0"/>
+      <site name="obj_red_sphere_c2" pos=" 0.035 0 0" quat="0 0 1 0"/>
+    </body>
 
-
-    <!-- Place areas: one per color category, color-matched, below the robot.
-         Laid out along -y (fixed x), spaced 0.2m apart. Shifted 0.1m further in -y and
-         enlarged (marker half-extent 0.15, matching the arrival tol in trial_logger.py).
-         Each marker pos is aligned to its site so the visual == the arrival footprint. -->
-    <site name="place_red_site" pos="0.6 -0.25 0.001" size="0.001"/>
-    <geom name="place_red_marker" type="box" size="0.15 0.15 0.0005"
-      pos="0.6 -0.25 0.001" rgba="0.85 0.15 0.15 0.35" contype="0" conaffinity="0"/>
+    <!-- Bin/tray (fixed place target) at (0.40, 0.30) on the table top (z=0.625). A clean
+         rectangular open box: a flat base + 4 upright walls flush with the base edges (no
+         gaps). Inner footprint ~0.20 x 0.20, walls ~0.05 tall. Kept the geom names
+         bowl_base/bowl_wall_* so the arm's collision list and the 3D-containment arrival
+         test (object XY within +/-BIN_HALF of center AND z between the base top and wall top)
+         work unchanged. Base top at z=0.635; wall top at z=0.685.
+         Wall segments overlap at the corners (half-extents include the wall thickness) so the
+         box is fully closed — no open corners. -->
+    <geom name="bowl_base" type="box" pos="0.40 0.30 0.630" size="0.12 0.12 0.005"
+      rgba="0.25 0.35 0.85 1" contype="1" conaffinity="1"/>
+    <geom name="bowl_wall_n" type="box" pos="0.40 0.415 0.660" size="0.12 0.008 0.030"
+      rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
+    <geom name="bowl_wall_s" type="box" pos="0.40 0.185 0.660" size="0.12 0.008 0.030"
+      rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
+    <geom name="bowl_wall_e" type="box" pos="0.515 0.30 0.660" size="0.008 0.12 0.030"
+      rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
+    <geom name="bowl_wall_w" type="box" pos="0.285 0.30 0.660" size="0.008 0.12 0.030"
+      rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
+    <!-- Kept named place_red_site so the trial-logger place-site lookup resolves via its
+         existing _DEFAULT_PLACE_SITE fallback with no Python change. -->
+    <site name="place_red_site" pos="0.40 0.30 0.660" size="0.001"/>
 
     <!-- Contact-point marker spheres for GraspPlanner3D visualisation. -->
     <body name="cp1_body" mocap="true">
@@ -95,22 +115,8 @@
     </body>
   </worldbody>
 
-  <!-- Test keyframes: ~10 well-distributed box PICK poses pulled from trial pose_trace.npz
-       logs (farthest-point-sampled over x,y,yaw; penetration-filtered; arm away from box).
-       Full 30-vec qpos = [robot 23 | box 7]; the robot 23 is the REAL logged pose recorded
-       alongside that box pose. Load one in autonomous mode to run the recommender + jog from
-       a controlled config (viewer: cycle keyframes, or mj_resetDataKeyframe by name/index).
-       Regenerate via scratchpad/sample_keyframes.py. -->
-  <keyframe>
-    <key name="pose_00" qpos="0.114505 -0.18337 1.1282 0.242184 0.377284 -0.19752 -2.01312 1.53201 0.325816 0.207135 -0.0535756 1.41072 0.434814 0.133183 -0.0837214 1.30329 0.528602 0.0450158 -0.0892917 1.6305 -0.0252224 0.0704117 -0.000888167 0.6 0.42 0.0398826 1 0 0 0"/>
-    <key name="pose_01" qpos="-0.687775 0.776375 3.32239 -2.07658 0.0587136 1.11744 3.13717 0.184868 -0.1811 -0.00502688 0.207578 0.0468158 0.149428 -0.00354319 0.0440571 -0.0833948 0.131379 0.000753709 -0.0851178 0.889732 0.0299598 0.0605739 -0.0114922 0.464341 0.660068 0.041222 0.0200626 -0.436853 0.898649 -0.0344377"/>
-    <key name="pose_02" qpos="-0.504252 0.661031 3.23635 -2.0573 -0.527135 1.20788 3.03453 0.750749 -0.748996 0.516701 0.811872 0.0253544 -0.0812357 -0.0235892 0.15907 -0.115573 0.131151 -0.0283112 0.0215938 0.872702 0.102277 0.702563 0.0613174 0.693846 0.252639 0.0394623 0.685524 0.00316305 -0.00364521 -0.728034"/>
-    <key name="pose_03" qpos="-3.02741 1.86458 2.00187 -0.148997 -0.949551 2.25128 1.19491 0.591921 0.121156 0.134853 0.180388 0.843099 0.205134 0.141469 0.224878 1.14712 0.203787 0.156801 0.265662 0.667459 0.154455 0.868913 0.171887 0.686604 0.446283 0.0398894 0.537748 1.53126e-05 -3.24282e-06 0.843105"/>
-    <key name="pose_04" qpos="-0.529593 0.93687 3.70171 -1.28228 0.973647 0.77069 2.19338 0.0968888 -0.13505 0.00486209 0.126278 0.122126 0.0470405 0.0102518 0.150277 0.102475 0.319523 0.0109066 0.131012 0.572364 0.0871494 0.296253 -0.000622502 0.602708 0.510812 0.0414675 0.555162 -0.57667 0.409345 -0.437817"/>
-    <key name="pose_05" qpos="-0.277302 0.913313 2.55118 -2.1338 -0.231115 1.73296 2.08084 -0.107528 -0.545352 -0.0206173 0.25909 -0.449301 -0.116722 -0.231404 -0.0294001 -0.362275 -0.0389766 -0.383064 -0.205448 1.16079 -0.13651 0.0221835 -0.00374033 0.501816 0.471294 0.0398913 0.648342 -0.648326 -0.282243 0.28225"/>
-    <key name="pose_06" qpos="-0.838631 0.95151 3.16228 -2.57002 -0.666359 1.96931 2.93324 0.559466 -0.478182 0.133866 0.496534 0.307059 -0.0235542 0.0571431 0.19709 0.0253514 0.184835 0.0440656 -0.0589677 0.913855 0.167704 0.373891 0.020531 0.628733 0.468629 0.0456833 0.897743 -0.0741834 -0.047255 0.43165"/>
-    <key name="pose_07" qpos="-0.53611 1.18129 4.06291 -0.798072 1.08816 0.82811 1.4921 0.0612895 -0.0898781 -0.0252076 0.136546 0.0757277 0.0248988 -0.0125692 0.126457 0.0822036 0.221222 -7.98203e-05 0.114561 0.471731 0.0884055 0.278871 -0.00538733 0.627333 0.43925 0.0404751 0.709586 -0.144527 0.68516 0.0784612"/>
-    <key name="pose_08" qpos="-0.674427 1.04658 3.46883 -0.28807 -0.108398 0.102235 2.98364 0.603297 -0.0360831 0.591783 0.320454 0.652001 0.744212 0.333768 0.24101 0.433675 1.03161 0.234754 0.133469 0.407815 -0.0503416 0.759907 0.131064 0.718275 0.431236 0.0457095 0.0532326 0.726222 0.683055 -0.056597"/>
-    <key name="pose_09" qpos="-0.512673 1.14484 4.24988 -0.690125 1.14554 0.933556 1.22843 0.301809 -0.127364 0.0527374 0.16603 0.378507 0.0112216 0.0917227 0.152529 0.364209 0.205863 0.100985 0.136893 0.385925 0.0974788 0.182608 -0.0363783 0.628096 0.428863 0.0455982 0.716502 -0.0606508 0.676968 0.15704"/>
-  </keyframe>
+  <!-- Test keyframes removed: they were 30-vec (23 robot + 7 for ONE object) autonomous-mode
+       test poses sized for the single-object floor scene. With N co-present objects on the
+       table nq = 23 + 7*N, so those keyframes are invalid. Regenerate for the multi-object
+       table scene via scratchpad/sample_keyframes.py if autonomous replay poses are needed. -->
 </mujoco>

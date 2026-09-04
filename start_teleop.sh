@@ -5,7 +5,11 @@
 #   ./start_teleop.sh link      terminal 1: USB tunnels + launch the headset app
 #   ./start_teleop.sh logs      terminal 2: headset app output
 #   ./start_teleop.sh hands     terminal 3: hand publisher  (uplink,  9870)
-#   ./start_teleop.sh sim       terminal 4: MuJoCo teleop
+#   ./start_teleop.sh sim [MODE] [flags...]   terminal 4: MuJoCo teleop
+#        MODE (default dexpilot): dexpilot | anyteleop |
+#             contact_aware_w_dexpilot | contact_aware_w_anyteleop  (the 2x2 baseline)
+#        flags... are forwarded (e.g. --trial-log --object obj_red_box)
+#        anyteleop modes need:  uv sync --extra anyteleop
 #   ./start_teleop.sh viz       optional:   skeleton view
 #   ./start_teleop.sh ego       optional:   what the tracker sees
 #   ./start_teleop.sh mock      no headset: synthetic hand into the real socket
@@ -63,12 +67,18 @@ logs)
 
 hands)
 	ros_env
-	exec python3 ui/vive_hand_publisher.py --hand "${2:-right}" --frame mujoco
+	exec python3 ui/vive_hand_publisher.py --hand "${2:-right}" --frame mujoco --yaw 270
 	;;
 
 sim)
 	ros_env
-	exec python3 kinova_leap_pick_place.py --mode dexpilot --no-mediapipe
+	# $2 = --mode value (default dexpilot); $3+ = extra flags (e.g. --trial-log --object).
+	# --no-mediapipe is always on: the VR headset (./start_teleop.sh hands) is the sole
+	# /hand/joint_angles publisher, so the app must never spawn a camera publisher.
+	# anyteleop / contact_aware_w_anyteleop need:  uv sync --extra anyteleop
+	MODE="${2:-dexpilot}"
+	if [ "$#" -ge 2 ]; then shift 2; else shift "$#"; fi   # drop 'sim' + mode; rest = extra flags
+	exec python3 kinova_leap_pick_place.py --mode "$MODE" --no-mediapipe "$@"
 	;;
 
 viz)
@@ -117,7 +127,7 @@ check)
 	;;
 
 *)
-	sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'
 	exit 1
 	;;
 esac

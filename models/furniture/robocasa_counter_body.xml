@@ -1,0 +1,22 @@
+<mujocoinclude>
+<!-- RoboCasa-style counter body. Dimensions: a 1.3 x 0.75 m marble top (half 0.65 x 0.375,
+     0.025 thick) on a base cabinet, top surface at z = TABLE_TOP_COUNTER = 0.86 (a realistic
+     kitchen-counter height). The robot base mounts ON the top (loader raises base_link to
+     TABLE_TOP_Z). The top collision geom is named `counter_top_col` and, at scene level, the
+     tabletop the arm avoids is named `table` — so we name the top box `table` here to plug
+     into the existing _STATIC_OBSTACLE_GEOMS list with no code change.
+     Visual geoms (group 1, no collision) carry the marble material; a matching named
+     collision box sits under the top. -->
+    <body name="robocasa_counter" pos="0 0 0">
+        <!-- Marble top: visual + a named collision box -->
+        <geom type="box" size="0.65 0.375 0.025" pos="0 0 0.835" material="counter_top"
+              group="1" contype="0" conaffinity="0"/>
+        <geom name="table" type="box" size="0.65 0.375 0.025" pos="0 0 0.835"
+              class="counter_col" mass="60"/>
+
+        <!-- Base cabinet body (marble-clad box under the top). Visual + collision. -->
+        <geom type="box" size="0.62 0.35 0.405" pos="0 0 0.405" material="counter_base"
+              group="1" contype="0" conaffinity="0"/>
+        <geom type="box" size="0.62 0.35 0.405" pos="0 0 0.405" class="counter_col"/>
+    </body>
+</mujocoinclude>

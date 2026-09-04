@@ -79,6 +79,41 @@ _S = float(np.sqrt(0.5))
 Q_C = np.array([_S, _S, 0.0, 0.0])         # wxyz
 Q_C_INV = np.array([_S, -_S, 0.0, 0.0])
 
+# ---------------------------------------------------------------------------
+# Yaw alignment — the calibration the ChArUco board used to provide.
+#
+# The webcam rig solved each camera's extrinsics against a board placed at the
+# world origin, so the resulting world frame was aligned to the robot BY
+# CONSTRUCTION. OpenXR's STAGE space has no such anchor: gravity fixes Z (which
+# is why height is always correct), but the origin and YAW come from wherever
+# the operator happened to be facing when the play space was established.
+#
+# So a yaw offset between hand and robot is expected, not a bug — and it will
+# come back if the guardian is re-run or the headset is set up facing a
+# different way. It lives here rather than in the app because changing it is a
+# restart instead of an APK rebuild, and rather than in dexpilot because every
+# other frame convention is already in this file.
+#
+# Applied to POSITIONS and the wrist QUATERNION together, as a proper rotation
+# about the vertical axis. Note a bare X<->Y swap is a REFLECTION (det = -1)
+# and would mirror the hand, putting the thumb on the wrong side; --yaw 90 is
+# the rotation that swaps the axes correctly.
+# ---------------------------------------------------------------------------
+
+_YAW_R = np.eye(3)          # applied in MuJoCo frame (Z up)
+_YAW_Q = np.array([1.0, 0.0, 0.0, 0.0])     # wxyz, identity
+
+
+def set_yaw(deg):
+    """Build the yaw rotation once, at startup."""
+    global _YAW_R, _YAW_Q
+    a = np.radians(float(deg))
+    c, s_ = np.cos(a), np.sin(a)
+    _YAW_R = np.array([[c, -s_, 0.0],
+                       [s_,  c, 0.0],
+                       [0.0, 0.0, 1.0]])
+    _YAW_Q = np.array([np.cos(a / 2), 0.0, 0.0, np.sin(a / 2)])   # wxyz, about Z
+
 
 def quat_mul(a, b):
     """Hamilton product; operands and result in wxyz."""
@@ -93,13 +128,19 @@ def quat_mul(a, b):
 
 
 def xr_to_mujoco(poses):
-    """(N,7) [pos xyz | quat xyzw] -> (N,3) positions, (N,4) quats wxyz."""
+    """(N,7) [pos xyz | quat xyzw] -> (N,3) positions, (N,4) quats wxyz.
+
+    Two stages: the fixed OpenXR(Y-up) -> MuJoCo(Z-up) basis change, then the
+    operator-set yaw. Both are proper rotations, so the hand is never mirrored.
+    """
     p = poses[:, 0:3]
     pos = np.column_stack([p[:, 0], -p[:, 2], p[:, 1]])
+    pos = pos @ _YAW_R.T
 
     quat = np.empty((poses.shape[0], 4))
     for i, (qx, qy, qz, qw) in enumerate(poses[:, 3:7]):
-        quat[i] = quat_mul(quat_mul(Q_C, np.array([qw, qx, qy, qz])), Q_C_INV)
+        q = quat_mul(quat_mul(Q_C, np.array([qw, qx, qy, qz])), Q_C_INV)
+        quat[i] = quat_mul(_YAW_Q, q)
     return pos, quat
 
 
@@ -123,7 +164,13 @@ def decode(buf, want_hand):
 
     # Raw OpenXR-frame landmarks, kept alongside the MuJoCo-converted ones so
     # --frame can select between them without re-deriving anything.
+    # The --frame openxr branch needs the same yaw, applied about OpenXR's
+    # vertical (its +Y) rather than MuJoCo's +Z.
     lm_xr = joints[XR_TO_MP, 0:3]
+    if not np.allclose(_YAW_R, np.eye(3)):
+        _c, _s = _YAW_R[0, 0], _YAW_R[1, 0]
+        _Ry = np.array([[_c, 0.0, _s], [0.0, 1.0, 0.0], [-_s, 0.0, _c]])
+        lm_xr = lm_xr @ _Ry.T
     wrist_xr = lm_xr[MP_WRIST]
 
     # Headset pose, the last 7 floats of the payload. Carried through so the
@@ -401,6 +448,28 @@ def selftest():
     print("\nOK — framing and frame conversion behave as expected.")
 
 
+def check_yaw():
+    """Show what each candidate yaw does, so the right one can be picked by
+    matching observed behaviour instead of by trial and error in the sim."""
+    moves = {"right (hand +X)": [0.20, 0.0, 0.0],
+             "forward (hand -Z)": [0.0, 0.0, -0.20],
+             "up (hand +Y)": [0.0, 0.20, 0.0]}
+    print("hand motion -> robot motion, per --yaw setting")
+    print("(robot axes: +X right, +Y forward/away, +Z up)\n")
+    for deg in (0, 90, 180, 270):
+        set_yaw(deg)
+        print(f"  --yaw {deg}")
+        for name, v in moves.items():
+            pose = np.zeros((1, 7)); pose[0, 0:3] = v; pose[0, 6] = 1.0
+            out = xr_to_mujoco(pose)[0][0]
+            ax = "XYZ"[int(np.argmax(np.abs(out)))]
+            sg = "+" if out[np.argmax(np.abs(out))] > 0 else "-"
+            print(f"      hand {name:<18} -> robot {sg}{ax}  "
+                  f"{np.round(out, 3)}")
+        print()
+    set_yaw(0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
@@ -408,6 +477,15 @@ def main():
     ap.add_argument("--hand", choices=["left", "right"], default="right")
     ap.add_argument("--topic", default="/hand/joint_angles")
     ap.add_argument("--stale-ms", type=int, default=250)
+    ap.add_argument("--yaw", type=float, default=0.0,
+                    help="degrees of yaw between the headset's STAGE frame and "
+                         "the robot base. OpenXR fixes Z by gravity but its yaw "
+                         "comes from wherever the operator faced when the play "
+                         "space was set, so this replaces the ChArUco board's "
+                         "alignment. Try 90 / -90 / 180; see --check-yaw.")
+    ap.add_argument("--check-yaw", action="store_true",
+                    help="print how each yaw maps hand motion to robot axes, "
+                         "then exit")
     ap.add_argument("--frame", choices=["openxr", "mujoco"], default="openxr",
                     help="landmark frame convention (see the layout notes above); "
                          "try openxr first, switch if the hand looks rotated")
@@ -418,6 +496,12 @@ def main():
     if args.selftest:
         selftest()
         return 0
+    if args.check_yaw:
+        check_yaw()
+        return 0
+    set_yaw(args.yaw)
+    if args.yaw:
+        print(f"[yaw] hand frame rotated {args.yaw:+.0f} deg about vertical")
     run_ros(args)
     return 0
 

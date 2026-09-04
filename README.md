@@ -101,6 +101,63 @@ python kinova_leap_pick_place.py --mode dexpilot \
 
 `--multicam-auto` finds every calibrated camera currently plugged in (RealSense auto-flagged) — no indices or names to pass. With explicit `--multicam`, per-camera resolution is read from `camera_intrinsics_<name>.json`, so a bare `NAME:INDEX` is enough. Add `--recalibrate-extrinsics` to re-solve each camera's board pose interactively before teleop starts. See [CLI flags](#cli-flags) and [`teleop/MULTICAM.md`](teleop/MULTICAM.md).
 
+#### AnyTeleop baseline (2×2 comparison)
+
+To compare our approach against [AnyTeleop](https://yzqin.github.io/anyteleop/) (the published teleop system whose retargeting is the [`dex-retargeting`](https://github.com/dexsuite/dex-retargeting) library), the finger retargeter is swappable. This gives a 2×2 of **pipeline × finger retargeter**, exposed as four `--mode` values:
+
+| `--mode` | Pipeline | Finger retargeter |
+|---|---|---|
+| `dexpilot` | plain teleop (no recommender) | our hand-rolled DexPilot |
+| `anyteleop` | plain teleop | dex-retargeting |
+| `contact_aware_w_dexpilot` | Ours (NLP recommender + lock-in) | our hand-rolled DexPilot |
+| `contact_aware_w_anyteleop` | Ours | dex-retargeting |
+
+`contact_aware_w_dexpilot` is identical to `contact_aware_teleop`; the two `*_anyteleop` modes are the new conditions. Everything but the finger retargeter (arm/wrist tracking, recommender, lock-in) is held fixed across a row, and each mode writes a distinct `logs/<mode>_<timestamp>/` dir.
+
+The `*_anyteleop` modes need the optional dependency (installs `dex-retargeting==0.4.6` + a CPU torch build; leaves the base env untouched):
+
+```bash
+uv sync --extra anyteleop
+python kinova_leap_pick_place.py --mode anyteleop --camera 0
+python kinova_leap_pick_place.py --mode contact_aware_w_anyteleop --camera 0
+```
+
+Select the dex-retargeting optimizer (`vector` or `dexpilot`) and hand in `calibration/anyteleop_config.json` (hot-reloaded each frame). The backend is fully self-contained in [`anyteleop/`](anyteleop/README.md) — see its README for how it works and how to remove it.
+
+---
+
+### Scenes (`--scene`)
+
+The clear-the-table task runs in one of two scenes; the robot mounts on the work surface and moves objects (on the **left**) into a bin (on the **right**). Both share the same multi-object task pipeline (proximity target selection, 3D-containment arrival, trial metrics).
+
+| `--scene` | Surface | Notes |
+|---|---|---|
+| `pick_place` (default) | dark-wood table (`models/scene_pick_place.xml`, top z=0.625) | vendored reachy2/furniture_sim table, box collision |
+| `robocasa` | RoboCasa-style marble counter (`models/scene_robocasa.xml`, top z=0.86) | dark-tinted RoboCasa marble; real RoboCasa object meshes optional (see below) |
+
+```bash
+python kinova_leap_pick_place.py --mode contact_aware_teleop                  # wood table
+python kinova_leap_pick_place.py --mode contact_aware_teleop --scene robocasa # RoboCasa counter
+# via the VR workflow (flags pass through the `sim` command):
+./start_teleop.sh sim contact_aware_w_dexpilot --scene robocasa
+```
+
+#### RoboCasa assets (optional, not committed)
+
+The RoboCasa scene works out of the box with primitive object stand-ins. To use **real RoboCasa kitchen object meshes**, download the NVIDIA MJCF asset subset (~1.3 GB, CC-BY-4.0) — it is **git-ignored** (`models/robocasa_assets/`), not committed:
+
+```bash
+pip install huggingface_hub
+hf download nvidia/PhysicalAI-Robotics-Manipulation-Objects-Kitchen-MJCF \
+  --repo-type dataset --local-dir models/robocasa_assets
+# then unzip the object categories you want, e.g.:
+#   unzip models/robocasa_assets/objects_lightwheel/<category>.zip -d models/robocasa_assets/objects_lightwheel/
+```
+
+Each object is a self-contained MJCF (`model.xml` + `collision/`/`visual/` meshes + textures). The importer that wraps these into the scene's object contract (adds a freejoint, renames to `obj_*`, fixes mesh paths, and auto-derives the antipodal `_c1`/`_c2` grasp sites from each mesh's bounding box) is a follow-up; the primitive stand-ins are the current default.
+
+The counter's marble texture (`models/furniture/textures/robocasa_marble.png`, from RoboCasa, CC-BY-4.0) and the wood-table assets (`models/furniture/`, from reachy2_mujoco_assets / Vikash Kumar's furniture_sim, Apache-2.0) **are** vendored/committed.
+
 ---
 
 ### Trial logging & replay
@@ -146,7 +203,7 @@ This is *kinematic* replay — it re-plays the recorded state, it does not re-si
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mode {contact_aware_autonomous,contact_aware_teleop,dexpilot}` | `contact_aware_autonomous` | **contact_aware_autonomous**: autonomous RRT+IK grasp to predefined per-object contact sites (`rrt` is a deprecated alias). **contact_aware_teleop**: wrist+finger teleop with a live NLP grasp recommender, lock-in → RRT → grasp. **dexpilot**: live MediaPipe retargeting teleop via ROS 2, no recommender. |
+| `--mode {contact_aware_autonomous,contact_aware_teleop,dexpilot,anyteleop,contact_aware_w_dexpilot,contact_aware_w_anyteleop}` | `contact_aware_teleop` | **contact_aware_autonomous**: autonomous RRT+IK grasp to predefined per-object contact sites (`rrt` is a deprecated alias). **contact_aware_teleop**: wrist+finger teleop with a live NLP grasp recommender, lock-in → RRT → grasp. **dexpilot**: live MediaPipe retargeting teleop via ROS 2, no recommender. **Baseline 2×2** (see [AnyTeleop baseline](#anyteleop-baseline-22-comparison)): `dexpilot` / `anyteleop` = plain teleop with our DexPilot / the dex-retargeting backend; `contact_aware_w_dexpilot` (= `contact_aware_teleop`) / `contact_aware_w_anyteleop` = our contact-aware pipeline with each backend. The `*_anyteleop` modes need `uv sync --extra anyteleop`. |
 | `--ik-solver {sqp,ipopt}` | `sqp` | IK solver backend (see below). |
 | `--dashboard` | off | Launch a live pyqtgraph metrics dashboard (separate process): planning mode, proximity-based active object, scrolling fingertip→object distances, net hand→object wrench, per-finger contact normal forces, a combined RRT+IK planner solution log, and — in `contact_aware_teleop` — a **grasp-recommender panel** with per-solve statistics (status, seeds converged, solve time, γ_min, wrench feasibility, IK error) plus a rolling session summary. |
 | `--viz-only` | off | Debug mode: disables arm/hand collision physics and never calls `mj_step`. REACH and GRASP phases hold their IK solution kinematically so you can inspect the IK/RRT result without dynamics interference. |

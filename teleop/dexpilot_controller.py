@@ -52,12 +52,21 @@ class DexPilotController:
         debug: bool = False,
         eps: float | None = None,
         hand_tracking: bool = True,
+        retargeter: str = "dexpilot",
+        pinch_debounce: bool = True,
+        output_ema: bool = True,
         **arm_kwargs,
     ) -> None:
         self._n_arm   = n_arm
         self._n_hand  = n_hand
         self._n_robot = n_arm + n_hand
-        self._hand_alpha = hand_alpha
+        # Independent noisy-input filter toggles (see --pinch-debounce / --output-ema).
+        #   pinch_debounce: median + hysteresis + N-frame on the pinch DECISION, in the
+        #     retargeter (passed through below). False → raw per-finger threshold.
+        #   output_ema: EMA smoothing on the 16 hand joints here. False → hand_alpha=1.0
+        #     (use the raw solved q_hand each frame, no smoothing).
+        self._output_ema = bool(output_ema)
+        self._hand_alpha = hand_alpha if self._output_ema else 1.0
         # When False, the LEAP fingers hold a fixed OPEN pose (q_bias hand joints)
         # instead of DexPilot retargeting — easier to read the hand orientation
         # during orientation debugging (fingers don't curl together).
@@ -68,7 +77,18 @@ class DexPilotController:
         arm_bias = q_bias[:n_arm] if q_bias is not None else None
 
         self._ros    = ROSInterface()
-        self._retarg = DexPilotRetargeter(model, n_arm=n_arm, debug=debug, eps=eps)
+        # Finger-retargeting backend. Default 'dexpilot' keeps the original hand-rolled
+        # retargeter (and this import path) untouched; 'anyteleop' lazily loads the
+        # separable dex-retargeting backend (see anyteleop/). Guarded so a missing
+        # anyteleop package never affects the default path.
+        if str(retargeter).lower() == "dexpilot":
+            self._retarg = DexPilotRetargeter(model, n_arm=n_arm, debug=debug, eps=eps,
+                                              pinch_debounce=pinch_debounce)
+        else:
+            from anyteleop.factory import make_retargeter
+            self._retarg = make_retargeter(retargeter, model, n_arm=n_arm,
+                                           debug=debug, eps=eps,
+                                           pinch_debounce=pinch_debounce)
         self._arm    = DexPilotArmController(
             model,
             n_arm=n_arm,

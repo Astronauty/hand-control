@@ -51,7 +51,17 @@ QVEL_TRIGGER = 1e3
 class DivergenceLogger:
 
     def __init__(self, model, out_dir="logs/divergence", history=600,
-                 n_robot=23, cooldown_s=2.0, verbose=True):
+                 n_robot=23, cooldown_s=2.0, verbose=True, continuous=True,
+                 flush_every=500):
+        """
+        continuous=True (default) writes EVERY sampled iteration to a run-stamped
+        CSV, in addition to the triggered .npz snapshots. The trigger-only design
+        was a trap in practice: a freeze that never diverges produces no file at
+        all, and a stale dump from an earlier run looks identical to a fresh one,
+        so the same numbers get re-read and re-diagnosed. The continuous log
+        always exists, is always current, and its filename carries the run's
+        start time so runs can never be confused for one another.
+        """
         self.out_dir = out_dir
         self.n_robot = n_robot
         self.buf = deque(maxlen=history)
@@ -60,9 +70,24 @@ class DivergenceLogger:
         self.cooldown_s = cooldown_s
         self._last_dump_wall = 0.0
         self.verbose = verbose
+        self.n_rows = 0
         os.makedirs(out_dir, exist_ok=True)
+
+        # Run-stamped so a new session NEVER overwrites an old one. The .npz
+        # snapshots restart at div_0001 each process and DO overwrite; this does
+        # not.
+        self._csv = None
+        if continuous:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            self.csv_path = os.path.join(out_dir, f"run_{stamp}.csv")
+            self._csv = open(self.csv_path, "w", buffering=1)
+            self._csv.write("i,t,t_wall,qacc_max,qvel_max,sigma_min,err_max,"
+                            "qdot_max,ncon,frozen\n")
+            self._flush_every = flush_every
         if verbose:
-            print(f"[divlog] capturing {history} iterations of history -> {out_dir}/")
+            print(f"[divlog] {history} iterations of history -> {out_dir}/")
+            if continuous:
+                print(f"[divlog] continuous log -> {self.csv_path}")
 
     def sample(self, *args, **kwargs):
         """Wrapper so a logging bug can never kill the control loop — and with
@@ -116,6 +141,24 @@ class DivergenceLogger:
         row["contact_pairs"] = pairs
 
         self.buf.append(row)
+
+        # Continuous row. Written every call so a freeze that never trips a
+        # trigger still leaves a complete record — the case that made the
+        # trigger-only version misleading. `frozen` flags a non-advancing sim
+        # clock, which is exactly the signature of the singularity gate holding
+        # the arm (mj_forward without mj_step).
+        if self._csv is not None:
+            _frozen = 1 if (self.n_rows > 0 and abs(row["t"] - self.last_t) < 1e-12) else 0
+            _qd = (float(np.nanmax(np.abs(row["qdot_cmd"])))
+                   if np.isfinite(row["qdot_cmd"]).any() else float("nan"))
+            self._csv.write(
+                f'{self.n_rows},{row["t"]:.6f},{row["t_wall"]:.3f},'
+                f'{row["qacc_max"]:.6g},{row["qvel_max"]:.6g},'
+                f'{row["sigma_min"]:.6f},{row["err_max"]:.6f},'
+                f'{_qd:.4f},{row["ncon"]},{_frozen}\n')
+            self.n_rows += 1
+            if self.n_rows % self._flush_every == 0:
+                self._csv.flush()
 
         # Two triggers. The time jump is the reset itself (MuJoCo's BADQACC handler
         # or the viewer's own Reset, both out of band); the magnitude trigger fires
@@ -178,6 +221,55 @@ class DivergenceLogger:
 # Offline inspection
 # ---------------------------------------------------------------------------
 
+def close_note():
+    pass
+
+
+def summarise_csv(path):
+    """Read a continuous run log and report what actually happened.
+
+    Answers the two questions the .npz snapshots could not: did the sim clock
+    ever stop advancing (a freeze), and for how long.
+    """
+    import csv as _csv
+    rows = list(_csv.DictReader(open(path)))
+    if not rows:
+        print(f"{path}: empty")
+        return
+    n = len(rows)
+    fro = [i for i, r in enumerate(rows) if r["frozen"] == "1"]
+    t0, t1 = float(rows[0]["t"]), float(rows[-1]["t"])
+    w0, w1 = float(rows[0]["t_wall"]), float(rows[-1]["t_wall"])
+    print(f"{path}")
+    print(f"  {n} iterations, sim {t0:.2f}..{t1:.2f}s over {w1-w0:.1f}s wall")
+    print(f"  frozen iterations: {len(fro)} ({100.0*len(fro)/n:.0f}%)")
+    if fro:
+        # Contiguous runs of frozen rows — a long one at the end is the latch.
+        runs, start, prev = [], fro[0], fro[0]
+        for i in fro[1:]:
+            if i != prev + 1:
+                runs.append((start, prev))
+                start = i
+            prev = i
+        runs.append((start, prev))
+        runs.sort(key=lambda r: r[1] - r[0], reverse=True)
+        print("  longest frozen spans (row range, length, sigma_min, ncon):")
+        for a, b in runs[:5]:
+            print(f"    {a}-{b}  len={b-a+1:5d}  "
+                  f"sigma_min={float(rows[a]['sigma_min']):.4f}  "
+                  f"ncon={rows[a]['ncon']}")
+        _last = runs[0]
+        if _last[1] >= n - 2:
+            print("  -> the run ENDED frozen: the arm never recovered "
+                  "(latched, not a transient).")
+    _mx = max(rows, key=lambda r: float(r["qacc_max"]))
+    print(f"  peak |qacc| {float(_mx['qacc_max']):.3g} at row {_mx['i']}, "
+          f"ncon={_mx['ncon']}, sigma_min={float(_mx['sigma_min']):.4f}")
+    _mc = max(rows, key=lambda r: int(r["ncon"]))
+    print(f"  peak ncon   {_mc['ncon']} at row {_mc['i']} "
+          f"(normal is ~4: the box resting on the floor)")
+
+
 def inspect(path):
     d = np.load(path, allow_pickle=True)
     t = d["t"]
@@ -221,4 +313,8 @@ def inspect(path):
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit(__doc__)
-    inspect(sys.argv[1])
+    _p = sys.argv[1]
+    if _p.endswith(".csv"):
+        summarise_csv(_p)
+    else:
+        inspect(_p)

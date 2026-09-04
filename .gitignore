@@ -228,3 +228,10 @@ marimo/_lsp/
 __marimo__/
 
 
+
+# RoboCasa kitchen assets (~1.3GB) — downloaded from HuggingFace, NOT committed.
+# See README "RoboCasa assets" for the download command.
+models/robocasa_assets/
+
+# Stray empty file
+wrist

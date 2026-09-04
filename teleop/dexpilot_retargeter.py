@@ -104,11 +104,18 @@ class DexPilotRetargeter:
 
     def __init__(self, model: mj.MjModel, n_arm: int = 7,
                  debug: bool = False, eps: float | None = None,
-                 load_config: bool = True) -> None:
+                 load_config: bool = True, pinch_debounce: bool = True) -> None:
         self._model = model
         self._n_arm = n_arm
         self._n_hand = 16
         self.debug = debug   # print S1 pinch distances vs EPS each frame
+        # Pinch-debounce toggle. True (default): the pinch DECISION is debounced (median +
+        # Schmitt hysteresis + N-frame — see _update_pinch_state), which protects a held
+        # grasp from single-frame fingertip spikes (bad camera view / triangulation jump).
+        # False: raw per-finger threshold (d <= EPS), no median/hysteresis/N-frame — for
+        # clean inputs (e.g. VR) or A/B testing. Toggle from the app via --pinch-debounce
+        # {on,off}. (The output EMA is a SEPARATE toggle, --output-ema, in the controller.)
+        self.pinch_debounce = bool(pinch_debounce)
         self.last_d_s1: list[float] = [float('inf')] * 3   # set on first retarget()
         # Debounced pinch STATE per S1 finger (index/middle/ring). _pinch_hist holds
         # the recent raw d_s1 samples (for the median); _pinched is the latched state
@@ -569,7 +576,18 @@ class DexPilotRetargeter:
         counts (see the PINCH_* constants). Returns the latched per-finger pinch
         booleans and stores the median-filtered distances in last_d_s1_filt. This is
         what protects a held grasp from a single-frame fused-fingertip jump caused by
-        a bad camera view; the continuous d_s1 target is left untouched."""
+        a bad camera view; the continuous d_s1 target is left untouched.
+
+        When pinch_debounce is False (e.g. VR / clean input), ALL debouncing is bypassed:
+        the pinch decision is a raw per-finger threshold (d <= EPS) with no median,
+        hysteresis, or N-frame confirmation, and last_d_s1_filt passes the raw distance
+        through so downstream detection (trial_logger) stays consistent."""
+        if not self.pinch_debounce:
+            enter_th = self.EPS * self.PINCH_ENTER_FRAC
+            for i in range(3):
+                self.last_d_s1_filt[i] = float(d_s1[i])   # raw passthrough
+                self._pinched[i] = float(d_s1[i]) <= enter_th
+            return list(self._pinched)
         n_med = max(1, int(self.PINCH_MEDIAN_N))
         enter_th = self.EPS * self.PINCH_ENTER_FRAC
         exit_th  = self.EPS * self.PINCH_EXIT_FRAC

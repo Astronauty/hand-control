@@ -1,0 +1,24 @@
+<mujocoinclude>
+<!-- RoboCasa-style kitchen counter: the counter's box-geom structure (from robocasa's
+     fixtures/counters/counter) instantiated with real countertop dimensions, using
+     RoboCasa's OWN marble texture (visuals/marble.png, CC-BY-4.0, vendored). RoboCasa's
+     shipped counter is a procedural template (placeholder unit-boxes sized by its Python at
+     runtime) and there is no counter/table in the NVIDIA HF MJCF subset, so we bake sensible
+     dimensions here while keeping the authentic marble material. Texture paths are relative
+     to the MAIN model dir (models/), hence furniture/textures/. -->
+    <!-- The RoboCasa marble texture, TINTED DARK (rgba ~0.22) to a charcoal-granite look for
+         strong contrast against the white Gen3+LEAP (robocasa ships no dark counter texture
+         in its git repo; the tint keeps the authentic marble veining while darkening it). -->
+    <asset>
+        <texture name="tex_counter_top" type="2d" file="furniture/textures/robocasa_marble.png"/>
+        <texture name="tex_counter_base" type="cube" file="furniture/textures/robocasa_marble.png"/>
+        <material name="counter_top"  texture="tex_counter_top"  texrepeat="3 3" texuniform="true" reflectance="0.1" shininess="0.1" rgba="0.22 0.22 0.24 1"/>
+        <material name="counter_base" texture="tex_counter_base" reflectance="0.05" shininess="0.1" rgba="0.20 0.20 0.22 1"/>
+    </asset>
+
+    <default>
+        <default class="counter_col">
+            <geom contype="1" conaffinity="1" group="4"/>
+        </default>
+    </default>
+</mujocoinclude>

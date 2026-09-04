@@ -1,0 +1,84 @@
+<mujoco model="kinova_leap RoboCasa kitchen scene">
+  <include file="scene_kinova_leap_bare.xml"/>
+  <include file="furniture/robocasa_counter_asset.xml"/>
+
+  <!-- Same solver settings as the pick-place scene (elliptic cone + high impratio for
+       stable high-friction grasping). -->
+  <option cone="elliptic" impratio="100"/>
+
+  <worldbody>
+    <!-- RoboCasa-style marble counter. Top surface at z=0.86 = TABLE_TOP_Z (robocasa scene);
+         robot base is mounted on top by the loader. Centered under the workspace, reach +y. -->
+    <body name="counter" pos="0.0 0.25 0.0">
+      <include file="furniture/robocasa_counter_body.xml"/>
+    </body>
+
+    <!-- CLEAR-THE-COUNTER objects. Same object contract as scene_pick_place.xml (obj_* body,
+         <body>_geom, antipodal _c1/_c2 sites, condim=6, freejoint). These primitive stand-ins
+         are placeholders until real RoboCasa object meshes are imported (tools/import_robocasa.py,
+         auto-deriving _c1/_c2 from each mesh's bounding box). Rest z = TABLE_TOP_Z(0.86)+half.
+         Friction/mass vary per object for the parametric deviations. -->
+    <body name="obj_red_box" pos="-0.38 0.30 0.900">
+      <freejoint/>
+      <geom name="obj_red_box_geom" type="box" size="0.040 0.040 0.040"
+        rgba="0.85 0.15 0.15 1" mass="0.25" friction="2.0 0.05 0.005" condim="6"/>
+      <site name="obj_red_box_c1" pos="-0.040 0 0" quat="1 0 0 0"/>
+      <site name="obj_red_box_c2" pos=" 0.040 0 0" quat="0 0 1 0"/>
+    </body>
+
+    <body name="obj_box_lowmu" pos="-0.26 0.30 0.900">
+      <freejoint/>
+      <geom name="obj_box_lowmu_geom" type="box" size="0.040 0.040 0.040"
+        rgba="0.85 0.55 0.15 1" mass="0.25" friction="1.2 0.05 0.005" condim="6"/>
+      <site name="obj_box_lowmu_c1" pos="-0.040 0 0" quat="1 0 0 0"/>
+      <site name="obj_box_lowmu_c2" pos=" 0.040 0 0" quat="0 0 1 0"/>
+    </body>
+
+    <body name="obj_box_heavy" pos="-0.14 0.30 0.900">
+      <freejoint/>
+      <geom name="obj_box_heavy_geom" type="box" size="0.040 0.040 0.040"
+        rgba="0.55 0.15 0.55 1" mass="0.35" friction="2.0 0.05 0.005" condim="6"/>
+      <site name="obj_box_heavy_c1" pos="-0.040 0 0" quat="1 0 0 0"/>
+      <site name="obj_box_heavy_c2" pos=" 0.040 0 0" quat="0 0 1 0"/>
+    </body>
+
+    <body name="obj_red_sphere" pos="-0.02 0.30 0.895">
+      <freejoint/>
+      <geom name="obj_red_sphere_geom" type="sphere" size="0.035"
+        rgba="0.95 0.55 0.15 1" mass="0.25" friction="2.0 0.05 0.005" condim="6"/>
+      <site name="obj_red_sphere_c1" pos="-0.035 0 0" quat="1 0 0 0"/>
+      <site name="obj_red_sphere_c2" pos=" 0.035 0 0" quat="0 0 1 0"/>
+    </body>
+
+    <!-- Bin place target (rectangular open tray) at (0.40, 0.30) on the counter top (z=0.86).
+         Same bowl_* geom names + place_red_site so the collision list and 3D-containment
+         arrival work unchanged. Base top z=0.870; wall top z=0.920. -->
+    <geom name="bowl_base" type="box" pos="0.40 0.30 0.865" size="0.12 0.12 0.005"
+      rgba="0.25 0.35 0.85 1" contype="1" conaffinity="1"/>
+    <geom name="bowl_wall_n" type="box" pos="0.40 0.415 0.895" size="0.12 0.008 0.030"
+      rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
+    <geom name="bowl_wall_s" type="box" pos="0.40 0.185 0.895" size="0.12 0.008 0.030"
+      rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
+    <geom name="bowl_wall_e" type="box" pos="0.515 0.30 0.895" size="0.008 0.12 0.030"
+      rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
+    <geom name="bowl_wall_w" type="box" pos="0.285 0.30 0.895" size="0.008 0.12 0.030"
+      rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
+    <site name="place_red_site" pos="0.40 0.30 0.895" size="0.001"/>
+
+    <!-- Grasp-planner visualization markers (same as scene_pick_place.xml; required by the
+         control loop). cp1/cp2 = GraspPlanner3D verify points; rec1/rec2 = NLP recommendation
+         markers (rec1=thumb green, rec2=index cyan). -->
+    <body name="cp1_body" mocap="true">
+      <geom name="cp1" type="sphere" size="0.006" rgba="1 0.2 0.2 0.6" contype="0" conaffinity="0"/>
+    </body>
+    <body name="cp2_body" mocap="true">
+      <geom name="cp2" type="sphere" size="0.006" rgba="0.2 0.4 1 0.6" contype="0" conaffinity="0"/>
+    </body>
+    <body name="rec1_body" mocap="true">
+      <geom name="rec1" type="sphere" size="0.010" rgba="0.2 1 0.3 0.4" contype="0" conaffinity="0"/>
+    </body>
+    <body name="rec2_body" mocap="true">
+      <geom name="rec2" type="sphere" size="0.010" rgba="0.2 0.9 1 0.4" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+</mujoco>

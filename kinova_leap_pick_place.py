@@ -288,6 +288,15 @@ def make_key_callback(key_queue):
     return _cb
 
 
+# Table top height (metres): the reachy simpleWoodTable top surface. Objects for the
+# clear-the-table task rest on the table (z = TABLE_TOP_Z + half-height), and the robot
+# base_link is mounted at this height (see the loader). MUST match the table body in
+# models/scene_kinova_leap.xml (table pos.z 0.0 + the top geom's pos.z 0.6 + half 0.025).
+# The authored object poses in scene_pick_place.xml bake this in; this constant is also used
+# by _randomize_objects so a randomized respawn drops objects onto the table, not the floor.
+TABLE_TOP_Z = 0.625
+
+
 _RANDOMIZE_OBJ_INFO = [
     # (body_name, geom_name, base_rgb) — pure R/G/B, no colour jitter
     ('obj_red_box',        'obj_red_box_geom',        [1.0, 0.0, 0.0]),
@@ -367,7 +376,9 @@ def _randomize_objects(model, data, rng):
         if jnt_adr < 0:
             continue
         qadr = model.jnt_qposadr[jnt_adr]
-        pos7 = np.array([xy_list[i][0], xy_list[i][1], z_rest, 1.0, 0.0, 0.0, 0.0])
+        # Rest ON THE TABLE (top at TABLE_TOP_Z), not the floor at z=0.
+        pos7 = np.array([xy_list[i][0], xy_list[i][1], TABLE_TOP_Z + z_rest,
+                         1.0, 0.0, 0.0, 0.0])
         data.qpos[qadr:qadr + 7]   = pos7
         model.qpos0[qadr:qadr + 7] = pos7    # preserve across mj_resetData calls
 
@@ -390,6 +401,7 @@ if __name__ == "__main__":
     _arg_parser.add_argument(
         '--mode',
         choices=['contact_aware_autonomous', 'contact_aware_teleop', 'dexpilot',
+                 'anyteleop', 'contact_aware_w_dexpilot', 'contact_aware_w_anyteleop',
                  'rrt'],
         default='contact_aware_teleop',
         help="contact_aware_teleop (default): teleop the wrist (DexPilot mapping) with "
@@ -398,7 +410,13 @@ if __name__ == "__main__":
              "with the NLP's gamma.  | contact_aware_autonomous: autonomous RRT+IK grasp "
              "controller, plans to predefined per-object contact sites ('rrt' is a "
              "deprecated alias).  | dexpilot: live MediaPipe kinematic retargeting "
-             "teleop via ROS 2.")
+             "teleop via ROS 2.  |  ---- Baseline comparison (2x2 of pipeline x finger "
+             "retargeter) ----  | dexpilot: plain teleop + our DexPilot retargeter.  | "
+             "anyteleop: plain teleop + the AnyTeleop (dex-retargeting) backend.  | "
+             "contact_aware_w_dexpilot: OUR contact-aware pipeline + our DexPilot "
+             "(== contact_aware_teleop).  | contact_aware_w_anyteleop: OUR pipeline + the "
+             "AnyTeleop backend. The *_anyteleop modes need the optional dep: "
+             "`uv sync --extra anyteleop` (see anyteleop/README.md).")
     _arg_parser.add_argument(
         '--recommender-grasp', action='store_true',
         help="contact_aware_autonomous: source grasp contacts from the RECOMMENDER instead of "
@@ -511,14 +529,36 @@ if __name__ == "__main__":
              "machine. Omit the flag entirely (default) to disable trial logging: "
              "the tool then behaves exactly as without this flag.")
     _arg_parser.add_argument(
-        '--object', default='obj_red_box',
-        help="Which pickable object body to spawn for this run. All sweep objects are "
-             "defined in scene_pick_place.xml, but only this one survives compile — the "
-             "others are deleted from the spec before compilation (MjSpec.delete), so the "
-             "scene contains exactly one target. Choices are the obj_* body names, e.g. "
-             "obj_red_box (Object 1, baseline), obj_box_lowmu (Object 2, 0.6x friction), "
-             "obj_box_heavy (Object 3, 1.4x mass). Run dir = one object, so trial logs "
-             "and parse_trials_tables.py pool cleanly per condition.")
+        '--objects', default='all',
+        help="Comma-separated pickable object bodies to co-spawn on the table for the "
+             "clear-the-table task, or 'all' (default) to keep every obj_* body defined in "
+             "scene_pick_place.xml. Bodies not listed are deleted from the spec before "
+             "compilation (MjSpec.delete). nq = 23 + 7*N for N kept objects. Choices are the "
+             "obj_* body names, e.g. obj_red_box, obj_box_lowmu (0.6x friction), "
+             "obj_box_heavy (1.4x mass), obj_red_sphere.")
+    _arg_parser.add_argument(
+        '--object', default=None,
+        help="DEPRECATED single-object alias (kept for back-compat). If given, overrides "
+             "--objects and spawns exactly that one body (old single-object behavior). "
+             "Prefer --objects.")
+    _arg_parser.add_argument(
+        '--scene', default='pick_place', choices=['pick_place', 'robocasa'],
+        help="Which scene to load. pick_place (default): the dark-wood table clear-the-table "
+             "scene (models/scene_pick_place.xml, table top z=0.625). robocasa: the RoboCasa "
+             "marble kitchen counter scene (models/scene_robocasa.xml, counter top z=0.86). "
+             "Both share the same multi-object task pipeline; the robot mounts on the surface.")
+    _arg_parser.add_argument(
+        '--pinch-debounce', dest='pinch_debounce', default='on', choices=['on', 'off'],
+        help="DexPilot pinch-state debounce (teleop). on (default): median + Schmitt-"
+             "hysteresis + N-frame filtering of the pinch DECISION — protects a held grasp "
+             "from single-frame fingertip spikes (noisy camera/triangulation). off: raw "
+             "per-finger threshold (d<=EPS), no median/hysteresis/N-frame — for clean input "
+             "like VR (--no-mediapipe / the Vive publisher) or to A/B its effect.")
+    _arg_parser.add_argument(
+        '--output-ema', dest='output_ema', default='on', choices=['on', 'off'],
+        help="DexPilot output EMA smoothing on the 16 hand joints (teleop). on (default): "
+             "EMA (hand_alpha) smooths frame-to-frame joint jitter. off: no smoothing "
+             "(hand_alpha=1.0, raw solved q_hand each frame). Independent of --pinch-debounce.")
     args = _arg_parser.parse_args()
     # In-code defaults for behaviours that used to be always-True CLI flags. These
     # never had a way to turn them OFF from the command line, so they only cluttered
@@ -530,6 +570,20 @@ if __name__ == "__main__":
     args.skeleton_view = True      # orbitable fused-hand skeleton window (teleop modes)
     if args.mode == 'rrt':          # deprecated alias
         args.mode = 'contact_aware_autonomous'
+    # Baseline-comparison modes normalize to a CANONICAL pipeline mode + a finger
+    # retargeter selector, mirroring the rrt alias above. This keeps all downstream
+    # code (which gates on the two canonical values) untouched while exposing the 2x2
+    # of {plain teleop, our contact-aware} x {dexpilot, anyteleop} as four --mode names.
+    # _run_label preserves the ORIGINAL mode so the four conditions stay distinct in
+    # logs/ (the trial-log dir defaults to the mode string, see below).
+    _run_label = args.mode
+    _RETARGETER = 'dexpilot'
+    if args.mode == 'anyteleop':
+        args.mode, _RETARGETER = 'dexpilot', 'anyteleop'
+    elif args.mode == 'contact_aware_w_dexpilot':
+        args.mode = 'contact_aware_teleop'
+    elif args.mode == 'contact_aware_w_anyteleop':
+        args.mode, _RETARGETER = 'contact_aware_teleop', 'anyteleop'
     if args.multicam and args.multicam_auto:
         _arg_parser.error("--multicam and --multicam-auto are mutually exclusive")
     # Multicam fusion is the DEFAULT hand source in teleop modes: a bare run
@@ -587,7 +641,10 @@ if __name__ == "__main__":
     # -> auto-name), or an explicit RUN_DIR string. Resolve '' to a timestamped name
     # BEFORE any check below, so every downstream use just sees None or a real name.
     if args.trial_log == '':
-        args.trial_log = f'{args.mode}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        # Use the ORIGINAL mode name (_run_label) so the four baseline conditions each get
+        # a distinct logs/ dir (contact_aware_w_anyteleop won't collapse into
+        # contact_aware_teleop_* after mode normalization).
+        args.trial_log = f'{_run_label}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
         print(f"[trial-log] no RUN_DIR given — auto-named logs/{args.trial_log}/")
     # --trial-log has two independent halves: (a) the always-on full-state pose trace +
     # phase_enter markers (works in ANY mode — pure logging), and (b) the trial success
@@ -601,36 +658,57 @@ if __name__ == "__main__":
         print(f"[trial-log] mode={args.mode}: logging pose_trace + phase markers only "
               "(no trial success state machine — no attempt trigger for this mode).")
 
-    # Load as an editable spec so we can prune the scene to the single --object body
-    # BEFORE compiling. Deleting the non-selected sweep objects (vs. parking them
-    # off-scene) keeps them out of the compiled model entirely: no stray geoms in the
-    # proximity argmin, no extra contact pairs, and nq stays 30 so the single-object
-    # <keyframe> poses remain valid. Sweep objects share the 'obj_box_' prefix or are
-    # the baseline obj_red_box; all other bodies (robot, markers, mocap) are untouched.
-    _spec = mj.MjSpec.from_file('models/scene_pick_place.xml')
-    _sweep_bodies = [b for b in _spec.bodies
-                     if b.name == 'obj_red_box' or b.name.startswith('obj_box_')]
+    # Load as an editable spec so we can prune the scene to the KEPT --objects set BEFORE
+    # compiling. Deleting the non-kept pickables (vs. parking them off-scene) keeps them out
+    # of the compiled model entirely: no stray geoms in the proximity argmin, no extra
+    # contact pairs. nq = 23 + 7*N for N kept objects. Pickable bodies are all named with the
+    # 'obj_' prefix (box/sphere/cylinder/...); robot, table/bowl, markers, mocap are untouched.
+    # Scene selection: the wood-table pick_place scene (top z=0.625) or the RoboCasa marble
+    # counter scene (top z=0.86). TABLE_TOP_Z (module default 0.625, used by
+    # _randomize_objects) is overridden here to the active scene's surface height so the
+    # base-mount and any randomized respawn match the scene.
+    _SCENE_FILES = {'pick_place': 'models/scene_pick_place.xml',
+                    'robocasa':   'models/scene_robocasa.xml'}
+    _SCENE_TOP_Z = {'pick_place': 0.625, 'robocasa': 0.86}
+    globals()['TABLE_TOP_Z'] = _SCENE_TOP_Z[args.scene]
+    _spec = mj.MjSpec.from_file(_SCENE_FILES[args.scene])
+    _sweep_bodies = [b for b in _spec.bodies if b.name.startswith('obj_')]
     _sweep_names = {b.name for b in _sweep_bodies}
-    if args.object not in _sweep_names:
-        sys.exit(f"--object {args.object!r} is not a pickable object body in the scene; "
-                 f"choose one of: {', '.join(sorted(_sweep_names))}")
-    _to_delete = [b for b in _sweep_bodies if b.name != args.object]
-    if _to_delete:
-        # The <keyframe> poses are 30-vec qpos (23 robot + 7 object) sized for the
-        # single-object scene; they must be dropped BEFORE deleting any object body.
-        # Deleting a body while keyframes still reference the old qpos layout corrupts
-        # the spec's keyframe registry ("repeated name 'pose_00'" on compile), so keys
-        # go first. These keyframes are autonomous-mode test poses only (not used by the
-        # trial/teleop pipeline), so dropping them for a swept run is harmless. To keep
-        # them, snapshot k.qpos, delete, then spec.add_key() them back after the body
-        # deletes — they stay valid since every sweep cube shares obj_red_box's geometry.
-        for _k in list(_spec.keys):
-            _spec.delete(_k)
-        for _b in _to_delete:
-            _spec.delete(_b)
-    print(f"[scene] spawning object '{args.object}' "
-          f"(pruned {len(_to_delete)} other sweep object(s)"
-          f"{'; dropped test keyframes' if _to_delete else ''})")
+    if args.object is not None:
+        # Deprecated single-object path: --object overrides --objects (old behavior).
+        if args.object not in _sweep_names:
+            sys.exit(f"--object {args.object!r} is not a pickable object body in the scene; "
+                     f"choose one of: {', '.join(sorted(_sweep_names))}")
+        _keep = {args.object}
+    elif args.objects == 'all':
+        _keep = set(_sweep_names)
+    else:
+        _keep = {s.strip() for s in args.objects.split(',') if s.strip()}
+        _bad = _keep - _sweep_names
+        if _bad:
+            sys.exit(f"--objects: unknown pickable bodies {sorted(_bad)}; "
+                     f"choose from: {', '.join(sorted(_sweep_names))}")
+    if not _keep:
+        sys.exit("--objects resolved to an empty set; keep at least one obj_* body.")
+    _to_delete = [b for b in _sweep_bodies if b.name not in _keep]
+    # Drop ALL <keyframe> poses first: they are sized for a specific nq (23 + 7*N) and any
+    # object change invalidates them, and deleting a body while keys still reference the old
+    # qpos layout corrupts the keyframe registry ("repeated name" on compile). The scene
+    # ships with no keyframes now (multi-object), but this stays robust if any are re-added.
+    for _k in list(_spec.keys):
+        _spec.delete(_k)
+    for _b in _to_delete:
+        _spec.delete(_b)
+    print(f"[scene] spawning {len(_keep)} object(s): {', '.join(sorted(_keep))} "
+          f"(pruned {len(_to_delete)} other pickable(s))")
+    # Mount the robot ON the table top: raise base_link (the welded world-root of
+    # kinova_leap.xml, authored at the origin) to TABLE_TOP_Z. Base +z is already "up", so
+    # no rotation is needed — the arm rises upright from the tabletop. This is the standard
+    # tabletop-manipulation mount and puts grasps level with the base (the easy IK regime).
+    for _b in _spec.bodies:
+        if _b.name == 'base_link':
+            _b.pos = [0.0, 0.0, TABLE_TOP_Z]
+            break
     model = _spec.compile()
     data  = mj.MjData(model)
 
@@ -693,7 +771,7 @@ if __name__ == "__main__":
 
     STEPS_PER_WP    = 5    # max sim steps before forcing waypoint advance (timeout, 1 step = 1ms)
     WP_REACH_TOL    = 0.02  # joint-space radius to consider a waypoint reached (rad)
-    JOG_VEL         = 0.2  # jog speed while arrow key held (m/s)
+    JOG_VEL         = 0.3  # jog speed while arrow key held (m/s)
     # Singularity-robust DLS jog damping (see the GRASP-branch resolved-rate solve):
     # JOG_SING_EPS is the smallest-singular-value threshold below which damping ramps
     # in; JOG_LAM_MAX caps the peak joint-rate gain at ~1/(2*JOG_LAM_MAX). With
@@ -739,7 +817,7 @@ if __name__ == "__main__":
     # breaking the reset->spike->BADQACC-reset cascade at its source. Matches the DLS
     # damping-onset threshold JOG_SING_EPS so the gate trips exactly where the solve would
     # start amplifying by ~1/lam.
-    DP_SING_FREEZE_EPS  = 0.02  # rad·m sigma_min below which the arm drive freezes (== JOG_SING_EPS)
+    DP_SING_FREEZE_EPS  = 0.005  # rad·m sigma_min below which the arm drive freezes (== JOG_SING_EPS)
     # Ceiling on the open-loop sim-time advanced per control iteration (substeps run at
     # the fixed model.opt.timestep, so each mj_step is already stable at wn*dt=0.2; this
     # only bounds how FAR the zero-damped arm rides open-loop between control corrections).
@@ -750,7 +828,7 @@ if __name__ == "__main__":
     # Cartesian velocity command (1/s). The command is then slew-limited to the NCF accel
     # budget and DLS-mapped to joint rates, so this only sets how briskly the wrist closes
     # a tracking gap; the budget still caps peak acceleration for the no-slip guarantee.
-    WRIST_TRACK_GAIN = 3.0
+    WRIST_TRACK_GAIN = 7.0
 
     # Object definitions: rigid objects only (obj_soft deferred — vertex-level contact,
     # not a rigid grasp-map problem). Each object maps every FINGER_SET finger to the
@@ -816,15 +894,22 @@ if __name__ == "__main__":
         if (any(_bname.startswith(p) for p in _active_body_prefixes)
                 or _bname in ('leap_palm', 'bracelet_link')):
             _robot_geom_names.append(_gname)
-    # 'floor' is the ground plane — keep every checked hand geom above it (both IK and RRT).
+    # Static-obstacle geoms the arm/hand must avoid: the ground plane, the table the objects
+    # sit on, and the bowl (place target) walls/base. Filtered to names that resolve in this
+    # compiled model so a scene rename can't crash the run.
+    _STATIC_OBSTACLE_GEOMS = [
+        g for g in ('floor', 'table', 'bowl_base',
+                    'bowl_wall_n', 'bowl_wall_s', 'bowl_wall_e', 'bowl_wall_w')
+        if mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g) >= 0
+    ]
     # Object geoms the IK/RRT keep clear of. Built from the objects that ACTUALLY survived
-    # the spec prune (each obj's live geom name) plus the floor, rather than a hardcoded
-    # list — so it always names exactly the spawned object(s) and never references a
-    # deleted/commented-out geom. (The spawned --object's own geom is included; the
-    # active-finger 0mm-clearance exemption vs the target is applied separately downstream.)
+    # the spec prune (each obj's live geom name) plus the static obstacles, rather than a
+    # hardcoded list — so it always names exactly the spawned object(s) and never references
+    # a deleted geom. (Each spawned object's own geom is included; the active-finger
+    # 0mm-clearance exemption vs the CURRENT target is applied separately downstream.)
     _OBJ_GEOM_NAMES = [
         mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, o['id_geom']) for o in objects
-    ] + ['floor']
+    ] + _STATIC_OBSTACLE_GEOMS
 
     # Tier-1 collision subset for the grasp RECOMMENDER's NLP (contact_aware_teleop).
     # The recommender historically ran with NO arm/object collision (only the middle/ring
@@ -1007,6 +1092,41 @@ if __name__ == "__main__":
                 print(f"[trial-log] WARNING: place site '{_DEFAULT_PLACE_SITE}' not found "
                       f"in the scene — arrival can never be detected for '{_o['name']}'.")
             _trial_place_sid[_oi] = _sid
+
+    # --- Bowl (3D containment) arrival geometry -------------------------------------------
+    # "Clear the table" success = the object landed IN THE BOWL, not merely over a flat
+    # footprint. Derive the bowl's rim center/radius and z-band from the compiled model so a
+    # scene tweak (moving/resizing the bowl) needs no code change. Containment test:
+    #   object XY within BOWL_RADIUS of the rim center AND BOWL_Z_LO <= object z <= BOWL_Z_HI.
+    # Falls back to None (→ flat-footprint arrival) if the bowl geoms aren't in the scene.
+    def _bowl_geometry():
+        base = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, 'bowl_base')
+        if base < 0:
+            return None
+        c = data.geom_xpos[base].copy()               # bin center (x,y, base-plane z)
+        # BOX base: XY half-extents are the inner footprint half-widths (rim in x/y).
+        hx = float(model.geom_size[base][0])
+        hy = float(model.geom_size[base][1])
+        # z band: from the base plane up to the top of the walls.
+        z_lo = float(c[2])
+        z_hi = z_lo + 0.12                            # fallback if walls absent
+        wn = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, 'bowl_wall_n')
+        if wn >= 0:
+            z_hi = float(data.geom_xpos[wn][2] + model.geom_size[wn][2])
+        return {'xy': c[:2].copy(), 'hx': hx, 'hy': hy, 'z_lo': z_lo, 'z_hi': z_hi}
+
+    _BOWL = _bowl_geometry() if args.trial_log else None
+
+    def _object_in_bowl(obj_idx):
+        """True if objects[obj_idx] is contained in the bin (XY within the box footprint,
+        z between the base top and the wall top)."""
+        if _BOWL is None or not (0 <= obj_idx < len(objects)):
+            return None                              # → caller falls back to flat footprint
+        p = data.geom_xpos[objects[obj_idx]['id_geom']]
+        dx = abs(float(p[0]) - _BOWL['xy'][0]); dy = abs(float(p[1]) - _BOWL['xy'][1])
+        in_xy = dx <= _BOWL['hx'] and dy <= _BOWL['hy']
+        in_z  = _BOWL['z_lo'] <= float(p[2]) <= _BOWL['z_hi']
+        return bool(in_xy and in_z)
 
     def _hand_object_contact_metrics(obj_idx):
         """Scan live contacts once and return
@@ -1350,7 +1470,7 @@ if __name__ == "__main__":
     # (== the spawned --object), not a hardcoded list that could name deleted bodies.
     OBJ_BODIES = [o['name'] for o in objects]
     planner = RRTPlanner(model, _robot_geom_names, OBJ_BODIES,
-                         extra_obj_geom_names=['floor'], n_robot=N_ROBOT,
+                         extra_obj_geom_names=_STATIC_OBSTACLE_GEOMS, n_robot=N_ROBOT,
                          n_plan=7,            # plan only the 7 arm joints; finger DOF fixed at goal
                          clearance=0.005)     # 5mm clearance, matching the IPOPT solves
 
@@ -2188,7 +2308,7 @@ if __name__ == "__main__":
         _cam_kwargs = {
             "R_cam_robot": np.diag([1.0, -1.0, -1.0]),
             "position_mode": "relative",   # press-8 rezeroable; see note below
-            "abs_scale": 3.0,              # 1:1, no amplification
+            "abs_scale": 1.5,              # 1:1, no amplification
             "scale_x": 1.0,                # already metres
             "scale_z": 1.0,
             "identity_orientation": True,  # direct hand->wrist, no press-8 offset
@@ -2265,7 +2385,8 @@ if __name__ == "__main__":
         # Per-iteration wall-time breakdown (opt-in via DP_PROFILE=1), same pattern as
         # GRASP_PROFILE — printed once/sec so a live session can show which section is
         # actually responsible for sim-time falling behind wall-time.
-        DP_PROFILE = os.environ.get('DP_PROFILE', '0') == '1'
+        # DP_PROFILE = os.environ.get('DP_PROFILE', '0') == '1'
+        DP_PROFILE = 1
         _dpp_acc = {'spin_draw': 0.0, 'spin': 0.0, 'skel': 0.0, 'camviews': 0.0,
                     'step': 0.0, 'substeps': 0.0, 'trial_log': 0.0,
                     'viz_sync': 0.0, 'iter': 0.0, 'n': 0}
@@ -2298,7 +2419,7 @@ if __name__ == "__main__":
         # vs EPS and the palm->tip distances — the numbers you read to set EPS/ETA
         # when tuning. On in dexpilot (the tuning mode); off in contact_aware_teleop
         # so it doesn't spam the grasp path.
-        _retarg_debug = (args.mode == 'dexpilot')
+        _retarg_debug = (args.mode == 'dexpilot' and _RETARGETER == 'dexpilot')
         # eps seed in METRES (world-landmark fingertips) — open-hand S1 ~0.07-0.11 m,
         # pinch ~0.01-0.03 m, so ~0.03 sits between the clusters. A saved
         # calibration/retarget_config.json still wins over this seed.
@@ -2313,7 +2434,12 @@ if __name__ == "__main__":
         _cam_kwargs.setdefault("alpha", _dp_arm_alpha)
         _dexpilot_ctrl = DexPilotController(model, q_bias=_Q_BIAS_DP,
             debug=_retarg_debug, eps=0.03, hand_tracking=_hand_tracking,
-            hand_alpha=_dp_hand_alpha, **_cam_kwargs)
+            hand_alpha=_dp_hand_alpha, retargeter=_RETARGETER,
+            pinch_debounce=(args.pinch_debounce == 'on'),
+            output_ema=(args.output_ema == 'on'), **_cam_kwargs)
+        if args.pinch_debounce == 'off' or args.output_ema == 'off':
+            print(f"[retarget] filters: pinch-debounce={args.pinch_debounce}, "
+                  f"output-ema={args.output_ema}.")
         _dexpilot_ctrl.init_home(data)   # snapshots the wrist-down pose as home
         _dexpilot_ctrl.init_ros()
 
@@ -2324,11 +2450,15 @@ if __name__ == "__main__":
         # (BETA/GAMMA/EPS/ETA1/ETA2/S1/S2 gains) in calibration/retarget_config.json
         # and save — dexpilot hot-reloads the file onto the live retargeter each
         # frame (poll_retarget_config, mtime-gated). contact_aware_teleop uses the
-        # saved constants but isn't the live-tuning surface.
-        _tune_retarget = (args.mode == 'dexpilot')
+        # saved constants but isn't the live-tuning surface. Only meaningful for the
+        # hand-rolled DexPilot retargeter (the AnyTeleop backend has its own config).
+        _tune_retarget = (args.mode == 'dexpilot' and _RETARGETER == 'dexpilot')
         if _tune_retarget:
             print("[DexPilot] live tuning: edit calibration/retarget_config.json "
                   "and save — changes hot-reload onto the retargeter.")
+        elif _RETARGETER == 'anyteleop':
+            print("[AnyTeleop] finger retargeting via dex-retargeting "
+                  "(edit calibration/anyteleop_config.json; hot-reloaded each frame).")
 
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")
         print("[DexPilot] Press 8 to start tracking (captures your current wrist "
@@ -3131,6 +3261,7 @@ if __name__ == "__main__":
     for _j in (0, 2, 4, 6):
         _ARM_BOUNDED[_j] = False          # continuous revolute
     _windup_warned = [False]
+    _sing_warned = False
 
     def _clamp_arm_hold(hold):
         """Clamp the integrated arm PD target to the model's joint limits.
@@ -3468,7 +3599,8 @@ if __name__ == "__main__":
                     _spd_tr = float(np.linalg.norm(data.qvel[_da_tr:_da_tr + 3]))
                 _arrived_tr = _trial_runner.step_pick_or_transport(
                     _trial_state, _tnow_tr, trigger_fired=False, trigger_active=False,
-                    height_above_rest=_h_tr, place_xy_offset=_xy_tr, object_speed=_spd_tr)
+                    height_above_rest=_h_tr, place_xy_offset=_xy_tr, object_speed=_spd_tr,
+                    inside_container=_object_in_bowl(active_idx))
                 # Arrival sets outcome=SUCCESS but does NOT write trial_end / save the trace —
                 # the caller must call end_trial. Do so on arrival, or on a timeout.
                 if _arrived_tr:
@@ -3576,8 +3708,10 @@ if __name__ == "__main__":
                     _draw_camera_views()   # per-camera feed grid (no-op unless --camera-views)
                     _teleop_cam_t = _now
                 _check_pipeline_alive()  # warn if the multicam child died
-                if _tune_retarget:
-                    _dexpilot_ctrl.poll_retarget_config()  # hot-reload retarget_config.json edits
+                if _tune_retarget or _RETARGETER == 'anyteleop':
+                    # DexPilot: hot-reload retarget_config.json; AnyTeleop: hot-reload
+                    # anyteleop_config.json (both via the backend's poll_config()).
+                    _dexpilot_ctrl.poll_retarget_config()
                 if TELEOP_PROFILE:
                     _t = time.perf_counter(); _tp_acc['camviews'] += _t - _tp_s; _tp_s = _t
 
@@ -3818,25 +3952,44 @@ if __name__ == "__main__":
                     # Backspace key-handler's _dp_reset_frame path). Tracking resumes
                     # automatically once the arm is re-homed off the singularity.
                     _arm_singular = _sigma_min < DP_SING_FREEZE_EPS
+                    if _arm_singular and not _sing_warned:
+                        _sing_warned = True
+                        print(f"\r\n[teleop] arm FROZEN — near-singular (sigma_min={_sigma_min:.4f} "
+                            f"< {DP_SING_FREEZE_EPS}). Change approach angle.")
+                    elif not _arm_singular and _sing_warned:
+                        _sing_warned = False
+                        print("[teleop] arm released — tracking resumed.")
+
                     _reset_frame  = data.time < _last_sim_time - 1e-12
+
                     if _arm_singular or _reset_frame:
+                        # Do NOT merely hold: re-seeding the hold at the live pose each frame
+                        # latches the arm in the very configuration that triggered the gate
+                        # (measured: 850 iterations / 5.1 s with sim time stopped, never
+                        # recovering). Instead ease the target back toward the wrist-down home,
+                        # which is well-conditioned, so the arm walks itself out of the
+                        # singularity and tracking resumes on its own.
+                        _teleop_arm_hold += 0.02 * (_Q_BIAS_DP[:7] - _teleop_arm_hold)
+                        _clamp_arm_hold(_teleop_arm_hold)
+                        _dp_target[:7] = _teleop_arm_hold
                         _qdot_arm = np.zeros(7)
-                        _teleop_arm_hold = data.qpos[:7].copy()
 
                     _hand_tgt = (_teleop_q[7:] if _teleop_q is not None
                                  else _Q_BIAS_DP[7:])
                     _dp_target[7:N_ROBOT] = _hand_tgt
                     if _arm_singular or _reset_frame:
-                        # FREEZE: hold the arm at its (just re-seeded) live pose and skip
-                        # physics for this frame so the stiff PD is never driven from the
-                        # singular/just-reset pose. Zero arm velocity so nothing integrates;
-                        # leave the hand at its retarget target. mj_forward refreshes derived
-                        # quantities without advancing dynamics.
-                        _dp_target[:7] = _teleop_arm_hold
-                        data.qpos[:7]  = _teleop_arm_hold
-                        data.qvel[:7]  = 0.0
-                        mj.mj_forward(model, data)
-                        _n_sub = 0
+                        # Step physics with the retreating target rather than
+                        # teleporting qpos and skipping mj_step — the latter froze the
+                        # clock for 850 iterations and never recovered.
+                        data.qvel[:7] = 0.0
+                        tau_ctrl[:] = 0.0
+                        _err = _dp_target - data.qpos[:N_ROBOT]
+                        tau_ctrl[:7]        = _dp_Kp_arm * _err[:7]
+                        tau_ctrl[7:N_ROBOT] = Kp[7:] * _err[7:]
+                        data.qfrc_applied[:] = tau_ctrl
+                        data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
+                        mj.mj_step(model, data)
+                        _n_sub = 1
                     elif args.physics:
                         _elapsed = time.time() - step_start
                         # GUARD #3: bound the open-loop sim-time advanced per iteration by
@@ -4062,8 +4215,10 @@ if __name__ == "__main__":
                 if DP_PROFILE:
                     _t = time.perf_counter(); _dpp_acc['camviews'] += _t - _dpp_s
                 _check_pipeline_alive()  # warn if the multicam child died
-                if _tune_retarget:
-                    _dexpilot_ctrl.poll_retarget_config()  # hot-reload retarget_config.json edits
+                if _tune_retarget or _RETARGETER == 'anyteleop':
+                    # DexPilot: hot-reload retarget_config.json; AnyTeleop: hot-reload
+                    # anyteleop_config.json (both via the backend's poll_config()).
+                    _dexpilot_ctrl.poll_retarget_config()
                 if DP_PROFILE:
                     _dpp_acc['spin_draw'] += time.perf_counter() - _dpp_iter0
                 _dp_reset_frame = False   # set by a 'reset' key: skip physics this frame
@@ -4218,13 +4373,37 @@ if __name__ == "__main__":
                         # BADQACC reset — a self-sustaining spike loop. If the arm is at/near
                         # that singularity (or a reset just fired), FREEZE this frame.
                         _arm_singular = _sigma_min < DP_SING_FREEZE_EPS
+                        if _arm_singular and not _sing_warned:
+                            _sing_warned = True
+                            print(f"\r\n[teleop] arm near-singular (sigma_min="
+                                  f"{_sigma_min:.4f}) — easing back toward home.")
+                        elif not _arm_singular and _sing_warned:
+                            _sing_warned = False
+                            print("[teleop] recovered — tracking resumed.")
+
                         _reset_frame  = data.time < _last_sim_time - 1e-12
                         if _arm_singular or _reset_frame:
-                            _teleop_arm_hold = data.qpos[:7].copy()
-                            _dp_target[:7]   = _teleop_arm_hold
-                            data.qvel[:7]    = 0.0
-                            mj.mj_forward(model, data)
-                            _n_sub = 0
+                            # RECOVERABLE freeze. The old version re-seeded the hold from
+                            # data.qpos and skipped mj_step — which LATCHED the arm: it was
+                            # pinned in the very configuration that tripped the gate, and the
+                            # sim clock stopped (measured: 850 iterations, 5.1 s wall, sim
+                            # time stuck at 12.022, never recovering). Instead ease the
+                            # target toward the wrist-down home, which is well-conditioned,
+                            # and KEEP STEPPING so the arm physically walks itself out and
+                            # tracking resumes on its own.
+                            _teleop_arm_hold += 0.02 * (_Q_BIAS_DP[:7] - _teleop_arm_hold)
+                            _clamp_arm_hold(_teleop_arm_hold)
+                            _dp_target[:7] = _teleop_arm_hold
+                            _qdot_arm = np.zeros(7)   # no injection while recovering
+                            data.qvel[:7] = 0.0
+                            tau_ctrl[:] = 0.0
+                            _err = _dp_target - data.qpos[:N_ROBOT]
+                            tau_ctrl[:7]        = _dp_Kp_arm * _err[:7]
+                            tau_ctrl[7:N_ROBOT] = Kp[7:] * _err[7:]
+                            data.qfrc_applied[:] = tau_ctrl
+                            data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
+                            mj.mj_step(model, data)
+                            _n_sub = 1
                         else:
                             # REAL-TIME CATCH-UP: as many substeps as fit the elapsed wall
                             # time (capped). The arm velocity command is held constant across
@@ -4329,7 +4508,8 @@ if __name__ == "__main__":
                         _trial_state, _tnow_dp, trigger_fired=_fired_dp,
                         trigger_active=_active_dp,
                         height_above_rest=_height_above_rest_dp,
-                        place_xy_offset=_xy_off_dp, object_speed=_spd_dp)
+                        place_xy_offset=_xy_off_dp, object_speed=_spd_dp,
+                        inside_container=_object_in_bowl(0))
                     _dp_thumb_sid = id_C[FINGER_SET.index('thumb')]
                     _dp_index_sid = id_C[FINGER_SET.index('index')]
                     _trial_runner.trace.sample(
@@ -5233,9 +5413,13 @@ if __name__ == "__main__":
                     data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
                     data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
                 if _kf_loaded_name is not None:
-                    _bid_kf = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, args.object)
+                    # Keyframes are dropped for the multi-object table scene, so this branch
+                    # is inert (model.nkey == 0). Report the active object's pose rather than
+                    # a single --object body (which no longer exists) if it ever re-fires.
+                    _bid_kf = (objects[active_idx]['id_body']
+                               if 0 <= active_idx < len(objects) else 0)
                     print(f"\r\n[Control] KEYFRAME {_kf_loaded_name} "
-                          f"({_kf_idx + 1}/{model.nkey}) loaded — box at "
+                          f"({_kf_idx + 1}/{model.nkey}) loaded — object at "
                           f"{np.array2string(data.xpos[_bid_kf], precision=3)}, arm+hand at "
                           "the logged config; cached IK kept."
                           + ("  Tracking FROZEN — press 8 to set the offset."
@@ -5602,7 +5786,8 @@ if __name__ == "__main__":
                     _arrived = _trial_runner.step_pick_or_transport(
                         _trial_state, _tnow, trigger_fired=_fired,
                         trigger_active=_active, height_above_rest=_height_above_rest,
-                        place_xy_offset=_xy_off, object_speed=_spd)
+                        place_xy_offset=_xy_off, object_speed=_spd,
+                        inside_container=_object_in_bowl(active_idx))
                     _trial_runner.trace.sample(
                         t=_tnow,
                         p_thumb=data.site_xpos[id_C[FINGER_SET.index('thumb')]].copy(),
