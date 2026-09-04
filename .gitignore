@@ -238,3 +238,10 @@ assets/ycb_uv_atlas/
 assets/kinova_workspace.npz
 # Benchmark run outputs (plots/CSVs from ablation scripts)
 benchmarks/ycb_grasp/out/
+
+# RoboCasa kitchen assets (~1.3GB) — downloaded from HuggingFace, NOT committed.
+# See README "RoboCasa assets" for the download command.
+models/robocasa_assets/
+
+# Stray empty file
+wrist

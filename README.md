@@ -28,7 +28,25 @@ sudo apt-get install libxcb-cursor0
 
 ## Kinova Gen3 + LEAP Hand Pick-and-Place
 
-**Scene:** `models/scene_pick_place.xml` — 7-DOF Gen3 arm + 16-DOF LEAP hand, 6 randomised pickable objects.
+**Scene:** `models/scene_pick_place.xml` — 7-DOF Gen3 arm + 16-DOF LEAP hand, plus a set of pickable objects (see [Object sweep](#object-sweep)).
+
+### Object sweep
+
+The scene defines several pickable object bodies, but each run spawns exactly **one**, chosen with `--object <body>`. All variants are authored in `models/scene_pick_place.xml`; at load time the non-selected ones are **deleted from the `MjSpec` before compilation** (not parked off-scene), so the compiled model contains a single target — no stray geoms in the proximity/collision checks, and `nq` stays fixed so per-object logs pool cleanly. This makes a run directory correspond to exactly one object condition.
+
+The current sweep holds three cubes of **identical geometry** (4 cm half-extent box), varying **one physical property each** relative to the baseline so friction and mass can be studied independently:
+
+| `--object` | Role | Mass | μ (sliding) | I_zz | Notes |
+|---|---|---|---|---|---|
+| `obj_red_box` | Object 1 (baseline) | 250 g | 2.00 | 2667 g·cm² | Default |
+| `obj_box_lowmu` | Object 2 (lower friction) | 250 g | **1.20** | 2667 g·cm² | 0.6× μ, same mass |
+| `obj_box_heavy` | Object 3 (heavier) | **350 g** | 2.00 | **3733 g·cm²** | 1.4× mass, same μ |
+
+`condim=6` and the torsional/rolling friction terms are held fixed across all three, so μ and mass are the only variables. `I_zz` is MuJoCo's principal moment about the vertical axis, computed from the mesh+mass under uniform density. To add a condition, copy one of the `obj_box_*` bodies in the scene XML (keep the shared `obj_box_` name prefix so the loader picks it up), register it in the `object_defs` list in `kinova_leap_pick_place.py`, and it becomes selectable via `--object`.
+
+Each object's actual simulated mass / μ / I_zz is stamped onto the `trial_start` event in the log (see [Trial logging & replay](#trial-logging--replay)), and [`parse_trials_tables.py`](parse_trials_tables.py) auto-fills the object-properties table and keys the completion-time and success tables on the object name.
+
+> **Note:** the scene's autonomous-mode test `<keyframe>` poses are dropped whenever `--object` prunes any body (they are sized for the single-object baseline and are only used by the autonomous replay path, not the trial/teleop pipeline).
 
 `models/kinova_leap.xml` (torque-control, used above) and `models/kinova_leap_pos.xml` (position-servo, used by `kinova_leap_rrt_pos_test.py`) are generated, not hand-written — they merge the Gen3 arm and LEAP hand specs from `mujoco_menagerie/` via MuJoCo's `MjSpec` API. Regenerate them after updating either menagerie submodule or the mount pose/fingertip-site config in the script:
 
@@ -83,16 +101,114 @@ python kinova_leap_pick_place.py --mode dexpilot \
 
 `--multicam-auto` finds every calibrated camera currently plugged in (RealSense auto-flagged) — no indices or names to pass. With explicit `--multicam`, per-camera resolution is read from `camera_intrinsics_<name>.json`, so a bare `NAME:INDEX` is enough. Add `--recalibrate-extrinsics` to re-solve each camera's board pose interactively before teleop starts. See [CLI flags](#cli-flags) and [`teleop/MULTICAM.md`](teleop/MULTICAM.md).
 
+#### AnyTeleop baseline (2×2 comparison)
+
+To compare our approach against [AnyTeleop](https://yzqin.github.io/anyteleop/) (the published teleop system whose retargeting is the [`dex-retargeting`](https://github.com/dexsuite/dex-retargeting) library), the finger retargeter is swappable. This gives a 2×2 of **pipeline × finger retargeter**, exposed as four `--mode` values:
+
+| `--mode` | Pipeline | Finger retargeter |
+|---|---|---|
+| `dexpilot` | plain teleop (no recommender) | our hand-rolled DexPilot |
+| `anyteleop` | plain teleop | dex-retargeting |
+| `contact_aware_w_dexpilot` | Ours (NLP recommender + lock-in) | our hand-rolled DexPilot |
+| `contact_aware_w_anyteleop` | Ours | dex-retargeting |
+
+`contact_aware_w_dexpilot` is identical to `contact_aware_teleop`; the two `*_anyteleop` modes are the new conditions. Everything but the finger retargeter (arm/wrist tracking, recommender, lock-in) is held fixed across a row, and each mode writes a distinct `logs/<mode>_<timestamp>/` dir.
+
+The `*_anyteleop` modes need the optional dependency (installs `dex-retargeting==0.4.6` + a CPU torch build; leaves the base env untouched):
+
+```bash
+uv sync --extra anyteleop
+python kinova_leap_pick_place.py --mode anyteleop --camera 0
+python kinova_leap_pick_place.py --mode contact_aware_w_anyteleop --camera 0
+```
+
+Select the dex-retargeting optimizer (`vector` or `dexpilot`) and hand in `calibration/anyteleop_config.json` (hot-reloaded each frame). The backend is fully self-contained in [`anyteleop/`](anyteleop/README.md) — see its README for how it works and how to remove it.
+
+---
+
+### Scenes (`--scene`)
+
+The clear-the-table task runs in one of two scenes; the robot mounts on the work surface and moves objects (on the **left**) into a bin (on the **right**). Both share the same multi-object task pipeline (proximity target selection, 3D-containment arrival, trial metrics).
+
+| `--scene` | Surface | Notes |
+|---|---|---|
+| `pick_place` (default) | dark-wood table (`models/scene_pick_place.xml`, top z=0.625) | vendored reachy2/furniture_sim table, box collision |
+| `robocasa` | RoboCasa-style marble counter (`models/scene_robocasa.xml`, top z=0.86) | dark-tinted RoboCasa marble; real RoboCasa object meshes optional (see below) |
+
+```bash
+python kinova_leap_pick_place.py --mode contact_aware_teleop                  # wood table
+python kinova_leap_pick_place.py --mode contact_aware_teleop --scene robocasa # RoboCasa counter
+# via the VR workflow (flags pass through the `sim` command):
+./start_teleop.sh sim contact_aware_w_dexpilot --scene robocasa
+```
+
+#### RoboCasa assets (optional, not committed)
+
+The RoboCasa scene works out of the box with primitive object stand-ins. To use **real RoboCasa kitchen object meshes**, download the NVIDIA MJCF asset subset (~1.3 GB, CC-BY-4.0) — it is **git-ignored** (`models/robocasa_assets/`), not committed:
+
+```bash
+pip install huggingface_hub
+hf download nvidia/PhysicalAI-Robotics-Manipulation-Objects-Kitchen-MJCF \
+  --repo-type dataset --local-dir models/robocasa_assets
+# then unzip the object categories you want, e.g.:
+#   unzip models/robocasa_assets/objects_lightwheel/<category>.zip -d models/robocasa_assets/objects_lightwheel/
+```
+
+Each object is a self-contained MJCF (`model.xml` + `collision/`/`visual/` meshes + textures). The importer that wraps these into the scene's object contract (adds a freejoint, renames to `obj_*`, fixes mesh paths, and auto-derives the antipodal `_c1`/`_c2` grasp sites from each mesh's bounding box) is a follow-up; the primitive stand-ins are the current default.
+
+The counter's marble texture (`models/furniture/textures/robocasa_marble.png`, from RoboCasa, CC-BY-4.0) and the wood-table assets (`models/furniture/`, from reachy2_mujoco_assets / Vikash Kumar's furniture_sim, Apache-2.0) **are** vendored/committed.
+
+---
+
+### Trial logging & replay
+
+Add `--trial-log` to a `dexpilot` or `contact_aware_teleop` run to record it under `logs/<run>/`:
+
+```bash
+python kinova_leap_pick_place.py --mode contact_aware_teleop --trial-log          # auto-named logs/<mode>_<timestamp>/
+python kinova_leap_pick_place.py --mode contact_aware_teleop --trial-log my_run   # named logs/my_run/
+
+# one object per run for a friction/mass sweep (see Object sweep above):
+python kinova_leap_pick_place.py --mode dexpilot --trial-log --object obj_box_lowmu
+python kinova_leap_pick_place.py --mode dexpilot --trial-log --object obj_box_heavy
+```
+
+Each run directory holds three correlated streams (see [`trial_logger.py`](trial_logger.py) for the full state machine):
+
+- `events.jsonl` — sparse per-trial/phase/attempt event stream (trial_start, phase_enter, attempt_start/result, pick_confirmed, drop, arrival, contact_violation, trial_end), each carrying `trial_id` + sim-time `t` so it joins against the traces by time. The `trial_start` event also stamps the target object's ground-truth physical properties (`mass_kg`, `mu`, `mu_tors`, `condim`, `shape`, `size`, `izz_gcm2`) read straight from the compiled model, so completion time / success / phase can be correlated with object physics offline — [`parse_trials_tables.py`](parse_trials_tables.py) uses these to auto-fill the object-properties table.
+- `pose_trace.npz` — an always-on ~50 Hz **full-state** trace across all phases: the complete MuJoCo state (`qpos`/`qvel`/`act`/`ctrl` + force channels), body poses, and per-finger contact forces.
+- `trial_<id>_<method>_<object>_<outcome>.npz` — per-`mj_step` trial trace (fingertip pos/force, object pose/vel), one per trial.
+
+A new trial starts on each target selection (`Ctrl+<digit>`; dexpilot: pressing `8`) and ends on arrival at the matching place site, a 60 s timeout, or an abandoned mid-trial target switch.
+
+#### Replaying a logged run
+
+[`replay_pose_trace.py`](replay_pose_trace.py) ingests a run directory and **kinematically replays** it in the MuJoCo viewer — for each recorded row it writes the logged full `qpos` and calls `mj_forward` (no `mj_step`, no controllers, no operator input), reproducing exactly what the arm/hand/object did against the fixed `models/scene_pick_place.xml` scene. `events.jsonl` is joined in as a printed timeline overlay.
+
+```bash
+python replay_pose_trace.py logs/<run>                    # real-time viewer
+python replay_pose_trace.py logs/<run> --fps 20           # slower
+python replay_pose_trace.py logs/<run> --phase APPROACH   # isolate one phase (APPROACH/PICK/TRANSPORT/PLACE)
+python replay_pose_trace.py logs/<run> --start 30         # skip to sim-time 30 s
+python replay_pose_trace.py logs/<run> --dump frames/     # headless: render PNGs (+ the ffmpeg encode line)
+```
+
+Playback defaults to `--pace index` (a constant `--fps` row rate, default 50), because the kinematic RRT-reach phase advances `data.time` very little — its motion is compressed into a short sim-time span, so `--pace sim` (true physics rate) would whoosh past the approach. Index pacing plays every row at a visible, controllable cadence. `--speed` scales whichever clock is active; `--loop` repeats.
+
+This is *kinematic* replay — it re-plays the recorded state, it does not re-simulate physics or re-run the operator's live teleop.
+
 ---
 
 ### CLI flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mode {contact_aware_autonomous,contact_aware_teleop,dexpilot}` | `contact_aware_autonomous` | **contact_aware_autonomous**: autonomous RRT+IK grasp to predefined per-object contact sites (`rrt` is a deprecated alias). **contact_aware_teleop**: wrist+finger teleop with a live NLP grasp recommender, lock-in → RRT → grasp. **dexpilot**: live MediaPipe retargeting teleop via ROS 2, no recommender. |
+| `--mode {contact_aware_autonomous,contact_aware_teleop,dexpilot,anyteleop,contact_aware_w_dexpilot,contact_aware_w_anyteleop}` | `contact_aware_teleop` | **contact_aware_autonomous**: autonomous RRT+IK grasp to predefined per-object contact sites (`rrt` is a deprecated alias). **contact_aware_teleop**: wrist+finger teleop with a live NLP grasp recommender, lock-in → RRT → grasp. **dexpilot**: live MediaPipe retargeting teleop via ROS 2, no recommender. **Baseline 2×2** (see [AnyTeleop baseline](#anyteleop-baseline-22-comparison)): `dexpilot` / `anyteleop` = plain teleop with our DexPilot / the dex-retargeting backend; `contact_aware_w_dexpilot` (= `contact_aware_teleop`) / `contact_aware_w_anyteleop` = our contact-aware pipeline with each backend. The `*_anyteleop` modes need `uv sync --extra anyteleop`. |
 | `--ik-solver {sqp,ipopt}` | `sqp` | IK solver backend (see below). |
 | `--dashboard` | off | Launch a live pyqtgraph metrics dashboard (separate process): planning mode, proximity-based active object, scrolling fingertip→object distances, net hand→object wrench, per-finger contact normal forces, a combined RRT+IK planner solution log, and — in `contact_aware_teleop` — a **grasp-recommender panel** with per-solve statistics (status, seeds converged, solve time, γ_min, wrench feasibility, IK error) plus a rolling session summary. |
 | `--viz-only` | off | Debug mode: disables arm/hand collision physics and never calls `mj_step`. REACH and GRASP phases hold their IK solution kinematically so you can inspect the IK/RRT result without dynamics interference. |
+| `--trial-log [RUN_DIR]` | off | *(dexpilot / contact_aware_teleop)* Record the run under `logs/<RUN_DIR>/` (auto-named `<mode>_<timestamp>` if omitted): `events.jsonl` + `pose_trace.npz` + per-trial `.npz`. Replay with [`replay_pose_trace.py`](replay_pose_trace.py). See [Trial logging & replay](#trial-logging--replay). |
+| `--object BODY` | `obj_red_box` | Which pickable object body to spawn. All sweep objects are defined in `models/scene_pick_place.xml`, but only this one survives compile — the others are deleted from the `MjSpec` before compilation, so the scene contains exactly one target (run dir = one object). See [Object sweep](#object-sweep) for the available bodies and their properties. |
 | `--seed N` | none | RNG seed for object randomization — the same seed reproduces the same layout (positions and sizes). Default: fresh entropy every run. Ignored with `--no-randomize`. |
 | `--no-randomize` | off | Skip object randomization entirely: objects keep the positions, sizes, and colors authored in `models/scene_pick_place.xml`. |
 | `--camera N` | auto | *(teleop modes only)* Camera index forwarded to the built-in single-camera MediaPipe publisher. Defaults to auto-select (prefers external/USB camera at index ≥ 1). Run `python teleop/ui.py --list-cameras` to see available indices. |

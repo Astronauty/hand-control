@@ -20,10 +20,13 @@ Message protocol (plain dicts put on the queue):
                         'min_slack_mm': float|None,
                         'dls_ms': float|None, 'ipopt_ms': float|None}
     {'type': 'trial_time',                            # trial countdown, pushed each
-                        'remaining': float|None,      #   frame; None clears the timer
-                        'elapsed': float|None,        #   (no active trial). remaining =
-                        'trial_id': int|None}         #   TRIAL_TIMEOUT_S - elapsed sim-time
+                        'remaining': float|None,      #   frame; None clears the timer (no
+                        'elapsed': float|None,        #   active trial). remaining =
+                        'elapsed_wall': float|None,   #   TRIAL_TIMEOUT_S - elapsed WALL time
+                        'trial_id': int|None}         #   (matches the timeout); elapsed=sim,
+                                                       #   elapsed_wall=operator real time
     {'type': 'event',   'trial_id': int, 't': float,  # mirror of one events.jsonl row;
+                        't_wall': float,              #   t=sim-time, t_wall=wall-clock;
                         'event': str, ...}            #   teed by EventLogger.log(). Extra
                         #   event-specific fields pass through and render inline. Panel is
                         #   cleared on 'trial_start' (scoped to the current trial).
@@ -39,6 +42,13 @@ Message protocol (plain dicts put on the queue):
         'gamma_min': float|None, 'wrench_feasible': bool,     #   one per completed solve.
         'ik_thumb_mm': float|None, 'ik_index_mm': float|None,
         'n_converged': int, 'n_seeds': int}
+    {'type': 'rec_status',                            # live recommender ACTIVITY, not the
+        'state': str, 'object': str|None,             #   result. state in {solving, waiting,
+        'fresh': bool|None}                           #   preview, unsupported, held}. fresh:
+                                                      #   True=shown rec valid for the object's
+                                                      #   live pose, False=STALE (box moved),
+                                                      #   None=no candidate. change-gated
+                                                      #   (one msg per (state,object,fresh)).
     {'type': 'tip_err',                               # per-stage tip-error attribution
         'object': str, 'fingers': [str],              #   (contact_aware_teleop lock-in);
         'nlp': [float]|None,                          #   overwrites a fixed readout.
@@ -80,12 +90,31 @@ def _time_gradient_rgba(n, base_rgb):
     return rgba
 
 
+def _rescale_axis(axis, axis_txt, pts):
+    """Size the GLAxisItem triad to span the wrench-cone verts and pin the three
+    axis-label GLTextItems just past each arm's tip. `pts` is the cone's (n,3) vertices;
+    the triad arm on each axis is the max |coordinate| the cone reaches on that axis
+    (floored at 1 unit so the triad never collapses when the cone is tiny/absent).
+    Labels sit at 1.15x the arm length so they land slightly OUTSIDE the cone rather than
+    on its surface; their fixed pixel font keeps them readable at any zoom, and re-pinning
+    here keeps them attached to the tips as the cone changes."""
+    if pts.size == 0:
+        return
+    ext = np.abs(pts).max(axis=0)                      # per-axis cone reach
+    arm = np.maximum(ext, 1.0).astype(float)           # floor each arm at 1 unit
+    axis.setSize(x=arm[0], y=arm[1], z=arm[2])
+    tip = arm * 1.15                                    # labels sit just outside the cone
+    axis_txt[0].setData(pos=(tip[0], 0.0, 0.0))
+    axis_txt[1].setData(pos=(0.0, tip[1], 0.0))
+    axis_txt[2].setData(pos=(0.0, 0.0, tip[2]))
+
+
 def _run(queue, fingers, horizon_s, dt_hint):
     """Dashboard process entry point. Imports Qt lazily so the parent never loads it."""
     from collections import deque
     import pyqtgraph as pg
     import pyqtgraph.opengl as gl
-    from pyqtgraph.Qt import QtWidgets, QtCore
+    from pyqtgraph.Qt import QtWidgets, QtCore, QtGui
 
     app = pg.mkQApp("hand-control dashboard")
     pg.setConfigOptions(antialias=True)
@@ -99,6 +128,15 @@ def _run(queue, fingers, horizon_s, dt_hint):
     mode_lbl.setStyleSheet("font-size: 30px; font-weight: bold;")
     target_lbl = QtWidgets.QLabel("target: —")
     target_lbl.setStyleSheet("font-size: 12px; color: #999999;")
+    # Live recommender activity (contact_aware_teleop), shown directly under the mode so
+    # 'Approach' says whether the NLP is actually planning. Fed by 'rec_status' messages.
+    # Green pulse while solving, amber if paused/held, grey/neutral when waiting or off.
+    _RECST_SOLVE_STYLE = "font-size: 13px; font-weight: bold; color: #55cc88;"
+    _RECST_WAIT_STYLE  = "font-size: 13px; color: #7799cc;"
+    _RECST_HOLD_STYLE  = "font-size: 13px; color: #ff9944;"
+    _RECST_OFF_STYLE   = "font-size: 13px; color: #777777;"
+    rec_state_lbl = QtWidgets.QLabel("recommender: —")
+    rec_state_lbl.setStyleSheet(_RECST_OFF_STYLE)
     active_obj_lbl = QtWidgets.QLabel("active object: —")
     active_obj_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #55cc88;")
     _SQUEEZE_OFF_STYLE = "font-size: 16px; font-weight: bold; color: #777777;"
@@ -116,6 +154,7 @@ def _run(queue, fingers, horizon_s, dt_hint):
     mode_box = QtWidgets.QVBoxLayout()
     mode_box.addWidget(mode_lbl)
     mode_box.addWidget(target_lbl)
+    mode_box.addWidget(rec_state_lbl)
     # Trial countdown: TRIAL_TIMEOUT_S minus elapsed sim-time, fed by 'trial_time'
     # messages. Neutral until a trial is active; amber under 10 s, red under 3 s.
     _TIME_IDLE_STYLE = "font-size: 30px; font-weight: bold; color: #777777;"
@@ -180,7 +219,7 @@ def _run(queue, fingers, horizon_s, dt_hint):
     # vectors plotted as a persistent trajectory in 3D over the SAME horizon_s window
     # as the 2D plots, with a colour gradient (dim/old -> bright/new) showing the
     # recent path of the applied force/moment. ---
-    def _wrench_view(title, base_rgb):
+    def _wrench_view(title, base_rgb, axis_labels):
         box = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(box)
         v.setContentsMargins(0, 0, 0, 0)
@@ -189,10 +228,24 @@ def _run(queue, fingers, horizon_s, dt_hint):
         lbl.setAlignment(QtCore.Qt.AlignCenter)
         w = gl.GLViewWidget()
         w.setCameraPosition(distance=3.0, elevation=22, azimuth=-60)
-        w.addItem(gl.GLGridItem())          # xy reference grid at the origin
+        # No reference grid (removed): the labelled axis triad below is the only spatial
+        # reference, which keeps the force/torque set uncluttered at any zoom.
         axis = gl.GLAxisItem()
-        axis.setSize(1, 1, 1)               # unit x/y/z axis triad (R/G/B by convention)
+        axis.setSize(1, 1, 1)               # x/y/z axis triad (R/G/B by convention);
+                                            # rescaled per-frame in drain() to the data extent
         w.addItem(axis)
+        # Per-axis text labels at the triad tips. GLTextItem renders at a FIXED pixel font
+        # size independent of camera distance, so the labels stay legible regardless of
+        # zoom; their world positions are re-pinned to the (rescaled) axis tips each frame.
+        # x=red, y=green, z=blue to match GLAxisItem's convention.
+        _axis_cols = ((255, 90, 90), (90, 220, 90), (110, 150, 255))
+        _axis_tip0 = ((1.08, 0.0, 0.0), (0.0, 1.08, 0.0), (0.0, 0.0, 1.08))
+        axis_txt = []
+        for name, col, pos0 in zip(axis_labels, _axis_cols, _axis_tip0):
+            t = gl.GLTextItem(text=name, color=col, pos=pos0,
+                              font=QtGui.QFont('Helvetica', 11))
+            w.addItem(t)
+            axis_txt.append(t)
         # Composite wrench-cone hull as a WIREFRAME cage (the feasible force/torque set
         # the solved gamma assumes): the live trace staying inside the cage means the
         # grasp can supply the applied wrench. Wireframe (GLLinePlotItem) rather than a
@@ -208,12 +261,14 @@ def _run(queue, fingers, horizon_s, dt_hint):
         w.addItem(head)
         v.addWidget(lbl)
         v.addWidget(w, 1)
-        return box, line, head, cone
+        return box, line, head, cone, axis, axis_txt
 
-    force_box,  force_line,  force_head,  force_cone  = _wrench_view(
-        "Net hand → object force  (Fx,Fy,Fz world, N)",        (1.0, 0.55, 0.2))
-    torque_box, torque_line, torque_head, torque_cone = _wrench_view(
-        "Net hand → object torque  (τx,τy,τz about COM, N·m)", (0.4, 0.7, 1.0))
+    force_box,  force_line,  force_head,  force_cone,  force_axis,  force_axis_txt  = \
+        _wrench_view("Net hand → object force  (Fx,Fy,Fz world, N)",
+                     (1.0, 0.55, 0.2), ('+Fx', '+Fy', '+Fz'))
+    torque_box, torque_line, torque_head, torque_cone, torque_axis, torque_axis_txt = \
+        _wrench_view("Net hand → object torque  (τx,τy,τz about COM, N·m)",
+                     (0.4, 0.7, 1.0), ('+τx', '+τy', '+τz'))
     _FORCE_RGB  = np.array([1.0, 0.55, 0.2], dtype=np.float32)
     _TORQUE_RGB = np.array([0.4, 0.7, 1.0], dtype=np.float32)
 
@@ -368,8 +423,19 @@ def _run(queue, fingers, horizon_s, dt_hint):
                         _TIME_CRIT_STYLE if rem < 3.0
                         else _TIME_WARN_STYLE if rem < 10.0
                         else _TIME_OK_STYLE)
-                    el = msg.get('elapsed')
-                    el_s = "" if el is None else f"   elapsed {float(el):0.1f}s"
+                    # Show WALL-clock elapsed (the operator's real time, the clock the
+                    # logged completion time AND the countdown/timeout now use). Sim-time
+                    # elapsed is appended in parentheses for reference.
+                    elw = msg.get('elapsed_wall')
+                    el  = msg.get('elapsed')
+                    if elw is not None:
+                        el_s = f"   elapsed {float(elw):0.1f}s"
+                        if el is not None:
+                            el_s += f" (sim {float(el):0.1f}s)"
+                    elif el is not None:
+                        el_s = f"   elapsed {float(el):0.1f}s"
+                    else:
+                        el_s = ""
                     time_sub_lbl.setText(
                         f"trial {tid} — remaining{el_s}" if tid is not None
                         else f"remaining{el_s}")
@@ -392,6 +458,38 @@ def _run(queue, fingers, horizon_s, dt_hint):
                 target_lbl.setText(f"target: {msg.get('target', '—')}")
             elif mt == 'active_obj':
                 active_obj_lbl.setText(f"active object: {msg.get('name', '—')}")
+            elif mt == 'rec_status':
+                # Live recommender activity (change-gated on the sim side). Distinguishes
+                # 'actively planning' from a paused/held/stalled recommender so a grasp
+                # that never re-arms after release is visible at a glance.
+                st  = msg.get('state', '—')
+                obj = msg.get('object')
+                _obj_sfx = f"  ({obj})" if obj else ""
+                _RECST_TXT = {
+                    'solving':     ("recommender: ● planning" + _obj_sfx, _RECST_SOLVE_STYLE),
+                    'waiting':     ("recommender: waiting for next solve" + _obj_sfx,
+                                    _RECST_WAIT_STYLE),
+                    'preview':     ("recommender: paused (preview held)" + _obj_sfx,
+                                    _RECST_HOLD_STYLE),
+                    'unsupported': ("recommender: off (object unsupported)" + _obj_sfx,
+                                    _RECST_OFF_STYLE),
+                    'held':        ("recommender: idle (grasp committed)" + _obj_sfx,
+                                    _RECST_OFF_STYLE),
+                }
+                _txt, _sty = _RECST_TXT.get(st, (f"recommender: {st}", _RECST_OFF_STYLE))
+                # Freshness badge: is the currently-shown grasp rec valid for the object's
+                # CURRENT pose? True=fresh (markers match the box), False=STALE (box moved
+                # since the rec was solved; a re-solve is pending), None=no candidate to judge.
+                # A STALE badge overrides the colour to the warn hue so it stands out even
+                # while the line otherwise reads 'planning'/'waiting'.
+                _fresh = msg.get('fresh')
+                if _fresh is True:
+                    _txt += "   — rec FRESH"
+                elif _fresh is False:
+                    _txt += "   — rec STALE (box moved)"
+                    _sty = _RECST_HOLD_STYLE
+                rec_state_lbl.setText(_txt)
+                rec_state_lbl.setStyleSheet(_sty)
             elif mt == 'squeeze':
                 if msg.get('on'):
                     squeeze_lbl.setText(
@@ -405,7 +503,7 @@ def _run(queue, fingers, horizon_s, dt_hint):
                 # Composite grasp wrench cone at the solved gamma, precomputed in the sim
                 # process (verts + triangle faces per subspace). Rendered as a wireframe:
                 # expand each triangle's 3 edges into a line-segment list. None clears it.
-                def _set_cone(item, key):
+                def _set_cone(item, key, axis, axis_txt):
                     payload = msg.get(key)
                     if payload is None:
                         item.setData(pos=np.zeros((0, 3), np.float32))
@@ -420,8 +518,13 @@ def _run(queue, fingers, horizon_s, dt_hint):
                     e = np.unique(np.sort(e, axis=1), axis=0)
                     seg = verts[e.reshape(-1)]          # (2*n_edges, 3) line-segment pairs
                     item.setData(pos=seg)
-                _set_cone(force_cone,  'force')
-                _set_cone(torque_cone, 'torque')
+                    # Size the axis triad to the CONE extent (the feasible set), not the
+                    # live force trace, so the labelled axes frame the cone and sit just
+                    # outside it — a stable reference that doesn't jitter with the applied
+                    # wrench.
+                    _rescale_axis(axis, axis_txt, verts)
+                _set_cone(force_cone,  'force',  force_axis,  force_axis_txt)
+                _set_cone(torque_cone, 'torque', torque_axis, torque_axis_txt)
             elif mt == 'grasp_rec':
                 status = msg.get('status', '?')
                 solve_ms = msg.get('solve_ms', float('nan'))

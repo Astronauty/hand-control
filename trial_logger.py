@@ -26,11 +26,12 @@ State machine (settled spec — see conversation record, not re-derived here):
              holds LIFT_HEIGHT_M above its rest height continuously for DWELL_S. A dip
              below threshold before DWELL_S elapses resets the dwell timer WITHOUT
              ending the attempt, as long as the trigger condition is still active.
-  Transport: entered at pick_confirmed, reusing LIFT_HEIGHT_M as the same boundary.
-             Falling back below it counts a drop (phase reverts to Pick, awaiting the
-             next trigger edge for a new attempt). Arrival = object XY within the
-             place-site marker footprint AND |v| < ARRIVAL_SPEED_M_S while still above
-             the height threshold -> trial success.
+  Transport: entered at pick_confirmed. Arrival is a SET-IN-PLACE check: object XY within
+             the place-site marker footprint AND |v| < ARRIVAL_SPEED_M_S (settled), whether
+             held clear over the target or set down into it -> trial success. Falling below
+             LIFT_HEIGHT_M *outside* the footprint counts a drop (phase reverts to Pick,
+             awaiting the next trigger edge); falling below it *inside* the footprint is a
+             placement in progress (stay in Transport until it settles), not a drop.
 """
 import json
 import time
@@ -41,7 +42,7 @@ import numpy as np
 
 
 # ── Tunable constants (all settled in the design conversation) ────────────────────────
-LIFT_HEIGHT_M      = 0.03   # object clearance above rest height counted as "lifted"
+LIFT_HEIGHT_M      = 0.01  # object clearance above rest height counted as "lifted"
 DWELL_S             = 1.0    # continuous sim-time above LIFT_HEIGHT_M to confirm a pick
 CONTACT_PENETRATION_M = 0.0005  # min penetration depth to count as a real contact (not solver margin)
 CONTACT_EPISODE_COOLDOWN_S = 0.5  # min sim-time gap between counted episodes — a
@@ -67,6 +68,37 @@ GEOM_TYPE_SPHERE   = 2
 GEOM_TYPE_CAPSULE  = 3
 GEOM_TYPE_CYLINDER = 5
 GEOM_TYPE_BOX      = 6
+
+
+def object_props_from_model(model, body_id: int, geom_id: int) -> dict:
+    """Ground-truth physical properties of a target object, read straight from the
+    compiled MuJoCo model (no mj_* calls — pure array access, so this stays import-light).
+
+    Stamped onto trial_start (see TrialRunner.start_trial) so each trial records the ACTUAL
+    simulated physics of its object — not the XML intent — letting the sweep conditions be
+    correlated with completion time / success / phase durations in parse_trials_tables.py.
+
+      mass_kg   body_mass (post-compile; for a single-geom object == the geom's mass)
+      mu        tangential (sliding) friction, geom_friction[:,0]
+      mu_tors   torsional friction, geom_friction[:,1] (held fixed across the sweep)
+      condim    contact dimensionality (6 for the pads/objects here)
+      shape     geom type id (GEOM_TYPE_BOX etc. above) — feeds the table's Shape column
+      size      geom_size (half-extents / radius, shape-dependent)
+      izz_gcm2  principal moment about the body's local z under uniform density
+                (MuJoCo computes body_inertia from mesh+mass), converted kg·m² -> g·cm².
+                Matches the paper's I_zz footnote-c definition. NOTE: this is the principal
+                z; for a non-z-symmetric object MuJoCo may reorder principal axes, so treat
+                it as "principal moment near vertical" rather than exactly world-z.
+    """
+    return {
+        'mass_kg':  float(model.body_mass[body_id]),
+        'mu':       float(model.geom_friction[geom_id, 0]),
+        'mu_tors':  float(model.geom_friction[geom_id, 1]),
+        'condim':   int(model.geom_condim[geom_id]),
+        'shape':    int(model.geom_type[geom_id]),
+        'size':     model.geom_size[geom_id].tolist(),
+        'izz_gcm2': float(model.body_inertia[body_id, 2] * 1e7),
+    }
 
 
 def rest_half_height(geom_type: int, geom_size: np.ndarray) -> float:
@@ -96,20 +128,43 @@ class EventLogger:
         # is non-blocking and drops on a full queue, so it can never stall logging.
         self._dashboard = dashboard
 
-    def log(self, trial_id: int, t: float, event: str, **fields):
-        row = {'trial_id': trial_id, 't': round(float(t), 6), 'event': event, **fields}
+    def log(self, trial_id: int, t: float, event: str, t_wall: float | None = None,
+            **fields):
+        # Drop None-valued fields so optional annotations (e.g. approach_sub, which is
+        # None outside APPROACH; prev/prev_sub on the first marker) neither clutter the
+        # JSONL nor render as literal "key=None" in the dashboard's inline event log.
+        fields = {k: v for k, v in fields.items() if v is not None}
+        # Every event carries BOTH clocks: `t` is sim-time (data.time) for joining against
+        # the pose trace and for the physics-coupled state machine; `t_wall` is wall-clock
+        # (time.time()), the operator's real elapsed time — the clock the experiment
+        # metrics (durations) and the dashboard use, since sim runs slower than real-time.
+        # t_wall defaults to now() when the caller doesn't supply one, which is correct for
+        # main-thread events; solve events on background threads pass their own captured
+        # wall time (and a sim-time t) explicitly.
+        if t_wall is None:
+            t_wall = time.time()
+        row = {'trial_id': trial_id, 't': round(float(t), 6),
+               't_wall': round(float(t_wall), 6), 'event': event, **fields}
         self._fh.write(json.dumps(row, default=_json_default) + '\n')
         self._fh.flush()   # trials are minutes apart; flush cost is negligible
         if self._dashboard is not None:
             self._dashboard.push({'type': 'event', **row})
 
-    def log_solve(self, trial_id: int, t: float, component: str, ms: float, **extra):
+    def log_solve(self, trial_id: int, component: str, ms: float,
+                  t: float = 0.0, t_wall: float | None = None, **extra):
         """component: 'rrt' | 'ik_dls' | 'ik_ipopt' | 'grasp_rec'. extra: whatever
         solve-specific fields the call site already has (status, n_waypoints,
         gamma_min, ...) — passed through as-is, same pattern as the existing
-        dash.push(...) calls this wraps."""
-        self.log(trial_id, t, 'solve', component=component, ms=round(float(ms), 3),
-                  **extra)
+        dash.push(...) calls this wraps.
+
+        Solves run on BACKGROUND threads where data.time (sim-time) is not meaningfully
+        readable, so `t` (sim-time) defaults to 0.0 and the real timestamp goes in
+        t_wall (defaulting to now()). This keeps the invariant that `t` is always sim-time
+        and `t_wall` is always wall-clock — previously solves put wall-clock in `t`,
+        breaking joins against the sim-time trace. `ms` is a measured duration, unaffected.
+        Pass an explicit sim-time `t` if the call site has a valid data.time snapshot."""
+        self.log(trial_id, t, 'solve', t_wall=t_wall, component=component,
+                 ms=round(float(ms), 3), **extra)
 
     def close(self):
         self._fh.close()
@@ -251,23 +306,56 @@ class ContactEpisodeCounter:
 
 # ── Trial state machine (Pick + Transport) ──────────────────────────────────────────────
 
+class ApproachSub:
+    """Sub-label rendered under APPROACH (dash + logged on the phase_enter event), so a
+    single phase name still conveys what the operator is doing before the grasp:
+      TELEOP    — free teleop wrist-tracking, BEFORE lock-in (before L is pressed).
+      PLANNING  — from lock-in (L) onward: BOTH the background RRT/IK plan AND the
+                  kinematic waypoint replay toward the pregrasp pose fold into this one
+                  sub-label (the operator sees the arm 'getting into position').
+    """
+    TELEOP   = 'teleop'
+    PLANNING = 'planning'
+
+
 class TrialPhase:
-    """Standardized phase names (see the pipeline stages):
-      APPROACH  — teleop, BEFORE the RRT is invoked (pre-lock-in). Not a trial phase in
-                  practice (trials start at lock-in), kept for completeness / external use.
-      PICK      — RRT + grasp controller invoked: planning, waypoint replay, and the grasp
-                  attempts all happen here (the old PLAN/REACH/GRASP collapse into PICK).
+    """Standardized phase names — the SINGLE logged vocabulary (see from_control). The
+    control loop keeps its own finer state strings ('PLAN'/'REACH'/'GRASP', plus the
+    pre-lock-in teleop period); from_control() maps those onto this set so events.jsonl
+    and the pose trace speak one language.
+
+      APPROACH  — everything BEFORE the operator commits the grasp (first Enter). Carries
+                  an ApproachSub sub-label: TELEOP (pre-lock-in teleop) or PLANNING
+                  (RRT plan + kinematic replay, i.e. control 'PLAN'/'REACH').
+      PICK      — grasp committed (control 'GRASP', entered on the first Enter): grasp
+                  posture + squeeze + lift attempts all happen here.
       TRANSPORT — object successfully picked and lifted (entered at pick_confirmed).
       PLACE     — object placed; the trial finishes.
     """
     APPROACH  = 'APPROACH'
-    PICK      = 'PICK'        # RRT plan + replay + grasp attempts all happen here
+    PICK      = 'PICK'        # grasp committed (control 'GRASP'): posture + squeeze + lift
     TRANSPORT = 'TRANSPORT'   # entered at pick_confirmed
     PLACE     = 'PLACE'       # object placed; trial done
-    # Back-compat aliases (old names) → new phases, so external log readers don't break.
-    PLAN      = 'PICK'
-    REACH     = 'PICK'
-    GRASP     = 'PICK'
+
+    @staticmethod
+    def from_control(control_phase: str, teleop_active: bool) -> tuple[str, str | None]:
+        """Map a control-loop state onto (phase, approach_sub) in the standardized
+        vocabulary. approach_sub is None for any non-APPROACH phase.
+
+        control_phase: the main loop's 'PLAN' | 'REACH' | 'GRASP' string.
+        teleop_active: True while in pre-lock-in teleop (before L) — takes precedence
+                       over control_phase, which sits at its 'REACH' init value then.
+
+        TRANSPORT / PLACE are NOT produced here: they are owned by the success state
+        machine (TrialRunner), which advances the trial's own `phase` past PICK on
+        pick_confirmed / arrival. from_control only classifies the pre-grasp control
+        states, so it never regresses a lifted object back to APPROACH/PICK."""
+        if teleop_active:
+            return TrialPhase.APPROACH, ApproachSub.TELEOP
+        if control_phase in ('PLAN', 'REACH'):
+            return TrialPhase.APPROACH, ApproachSub.PLANNING
+        # 'GRASP' (first Enter committed the grasp) and any fallthrough → PICK
+        return TrialPhase.PICK, None
 
 
 class TrialOutcome:
@@ -283,12 +371,20 @@ class TrialState:
     trial_id: int
     method: str            # 'dexpilot' | 'contact_aware_teleop'
     object_name: str
-    t_start: float
-    phase: str = TrialPhase.PICK   # trials start at lock-in, i.e. once RRT is invoked
+    t_start: float                     # sim-time (data.time) at trial start
+    t_start_wall: float = 0.0          # wall-clock (time.time()) at trial start — the
+                                        # clock the reported completion time is measured in
+                                        # (sim runs slower than real-time; the operator's
+                                        # real elapsed time is what the experiment reports)
+    phase: str = TrialPhase.APPROACH   # trials start at lock-in (control 'PLAN'), which
+                                        # is APPROACH/planning; advances to PICK when the
+                                        # operator commits the grasp (control 'GRASP')
     attempt_id: int = 0
     attempt_active: bool = False   # trigger condition currently engaged (pinch/squeeze)
     dwell_t0: float | None = None  # sim-time the current continuous lift began
     pick_confirmed: bool = False
+    pick_logged: bool = False   # forward phase_enter PICK emitted for the current PICK entry
+                                 # (reset on a drop so a re-pick logs PICK again)
     n_inadvertent_contacts: int = 0
     n_drops: int = 0
     max_slip_mm: float = 0.0       # diagnostic only, does not gate drop counting
@@ -325,20 +421,36 @@ class TrialRunner:
     # -- lifecycle -----------------------------------------------------------------
 
     def start_trial(self, trial_id: int, method: str, object_name: str,
-                     t_now: float) -> TrialState:
+                     t_now: float, props: dict | None = None) -> TrialState:
+        """props: optional physical-property snapshot of the target object (mass, mu,
+        I_zz, ...), stamped onto the trial_start event so the object's ground-truth
+        physics can be correlated with completion time / success / phase offline. Built
+        with object_props_from_model() at the call site; None keeps the old schema."""
         self.contact_counter.reset()
         self.trace = TraceBuffer()
+        t_start_wall = time.time()   # experiment clock anchor (see TrialState.t_start_wall)
         state = TrialState(trial_id=trial_id, method=method, object_name=object_name,
-                            t_start=t_now)
-        self.events.log(trial_id, t_now, 'trial_start', method=method,
-                         object=object_name)
-        self.events.log(trial_id, t_now, 'phase_enter', phase=TrialPhase.PICK)
+                            t_start=t_now, t_start_wall=t_start_wall)
+        self.events.log(trial_id, t_now, 'trial_start', t_wall=t_start_wall,
+                         method=method, object=object_name, **(props or {}))
+        # No phase_enter here: a trial starts at lock-in (control 'PLAN') → APPROACH,
+        # and the caller's marker site already emits that transition from control_phase
+        # (teleop→planning→PICK). TrialState.phase defaults to APPROACH to match, so the
+        # trial machine's own phase never regresses. Emitting here too would duplicate
+        # the marker site's APPROACH row on the lock-in step.
         return state
 
     def check_timeout(self, state: TrialState, t_now: float) -> bool:
         """Call once per step; returns True (and marks outcome) if the trial has timed
-        out. Caller is responsible for calling end_trial() immediately after."""
-        if t_now - state.t_start >= TRIAL_TIMEOUT_S and state.outcome is None:
+        out. Caller is responsible for calling end_trial() immediately after.
+
+        Timeout is measured in WALL-CLOCK (the operator's real elapsed time) so it agrees
+        with the reported completion time (duration_s) and the dashboard countdown, and so
+        TRIAL_TIMEOUT_S means the same real seconds regardless of the sim's real-time factor.
+        Wall time is also monotonic across sim resets (data.time snapping to 0), so t_now is
+        no longer used for the timeout decision."""
+        if (time.time() - state.t_start_wall >= TRIAL_TIMEOUT_S
+                and state.outcome is None):
             state.outcome = TrialOutcome.TIMEOUT
             return True
         return False
@@ -353,11 +465,19 @@ class TrialRunner:
         state.t_end = t_now
         if state.outcome is None:
             state.outcome = TrialOutcome.TIMEOUT
-        self.events.log(state.trial_id, t_now, 'trial_end', outcome=state.outcome,
+        # Completion time is reported in WALL-CLOCK — the operator's real elapsed time,
+        # the experiment's metric of interest. Sim runs slower than real-time, so the
+        # sim-time span (duration_sim_s, kept for reference / trace joins) understates it.
+        # Wall clock is monotonic across sim resets, so no clamp is needed here.
+        t_end_wall = time.time()
+        duration_wall_s = max(0.0, t_end_wall - state.t_start_wall)
+        self.events.log(state.trial_id, t_now, 'trial_end', t_wall=t_end_wall,
+                         outcome=state.outcome,
                          n_inadvertent_contacts=state.n_inadvertent_contacts,
                          n_drops=state.n_drops, n_attempts=state.attempt_id,
                          max_slip_mm=state.max_slip_mm,
-                         duration_s=round(t_now - state.t_start, 3))
+                         duration_s=round(duration_wall_s, 3),
+                         duration_sim_s=round(t_now - state.t_start, 3))
         trace_path = self.trace_dir / f'{self._trace_filename(state)}.npz'
         self.trace.save(trace_path)
 
@@ -408,7 +528,8 @@ class TrialRunner:
                                 height_above_rest: float,
                                 place_xy_offset: float | None = None,
                                 object_speed: float | None = None,
-                                place_marker_half_extent: float = 0.15):
+                                place_marker_half_extent: float = 0.15,
+                                inside_container: bool | None = None):
         """Call every step once REACH has ended (GRASP begins). Drives the attempt /
         dwell / confirm / transport / drop / arrival state machine.
 
@@ -423,13 +544,40 @@ class TrialRunner:
                          relevant (e.g. still in GRASP, not TRANSPORT).
         object_speed:    object linear speed (m/s), for the arrival settle check.
 
+        inside_container: optional 3D-containment predicate for a BOWL/container target
+                         (object XY within the rim AND z between the bowl floor and rim).
+                         When provided (not None) it REPLACES the flat XY-footprint test —
+                         "in place" == inside the container. When None, the legacy flat
+                         footprint check (place_xy_offset <= place_marker_half_extent) is
+                         used, so existing flat place-site callers are unaffected.
+
+        Arrival is a SET-IN-PLACE check: success once the object is "in place" (inside the
+        container if inside_container is given, else inside the flat footprint) AND settled
+        (speed < ARRIVAL_SPEED_M_S), whether held clear over the target OR set down into it.
+        A descent below LIFT_HEIGHT_M while in place is a placement-in-progress (stay in
+        TRANSPORT until it settles), NOT a drop; only a descent while NOT in place counts a
+        drop and reverts to PICK.
+
         Returns True if the trial reached arrival (success) this step.
         """
         if state.phase not in (TrialPhase.PICK, TrialPhase.TRANSPORT):
-            self.set_phase(state, t_now, TrialPhase.PICK)
+            # Advance internal state to PICK SILENTLY (needed for the attempt logic below),
+            # but do NOT log phase_enter here: this method is called every step from t=0 in
+            # dexpilot, so logging on first-call would stamp PICK at APPROACH before any
+            # grasp. The forward PICK is logged instead on the first attempt_start (below) —
+            # the meaningful "grasp attempt begins" moment, correct for BOTH modes.
+            state.phase = TrialPhase.PICK
 
         if state.phase == TrialPhase.PICK:
             if trigger_fired and not state.attempt_active:
+                # Log the forward APPROACH→PICK entry on the FIRST attempt (idempotent via
+                # set_phase; state.phase is already PICK so we force the log with a small
+                # helper). Single owner of PICK logging for all modes — the control-loop
+                # marker no longer logs PICK (it never could for dexpilot: no 'GRASP').
+                if not state.pick_logged:
+                    state.pick_logged = True
+                    self.events.log(state.trial_id, t_now, 'phase_enter',
+                                     phase=TrialPhase.PICK)
                 state.attempt_id += 1
                 state.attempt_active = True
                 state.dwell_t0 = None
@@ -458,24 +606,52 @@ class TrialRunner:
                     state.dwell_t0 = None   # reset dwell, SAME attempt continues
 
         elif state.phase == TrialPhase.TRANSPORT:
+            # SET-IN-PLACE arrival. Two success paths, both requiring the object be inside
+            # the place footprint and settled (speed < ARRIVAL_SPEED_M_S):
+            #   (a) held-clear hover: settled while still lifted (height > LIFT_HEIGHT_M) —
+            #       the operator hovers the object over the target and holds it still.
+            #   (b) set down in target: the object is lowered/released INTO the target and
+            #       comes to rest there (height <= LIFT_HEIGHT_M). This is how a human
+            #       actually places — carry over, set down, let go — and is why teleop runs
+            #       that clearly placed the box never scored under the old held-clear-only
+            #       rule (the object was still moving whenever it was above the threshold,
+            #       and the moment it descended it was counted as a drop instead).
+            # A descent to/below the threshold OUTSIDE the footprint is still a drop.
+            # "in place" = inside the 3D container when given (bowl task), else inside the
+            # flat XY footprint (legacy place-site task).
+            if inside_container is not None:
+                in_place = bool(inside_container)
+            else:
+                in_place = (place_xy_offset is not None
+                            and place_xy_offset <= place_marker_half_extent)
+            settled = (object_speed is not None and object_speed < ARRIVAL_SPEED_M_S)
+            if in_place and settled:
+                self.set_phase(state, t_now, TrialPhase.PLACE)   # object placed → finish
+                self.events.log(state.trial_id, t_now, 'arrival',
+                                 attempt=state.attempt_id,
+                                 xy_offset_m=round(place_xy_offset, 4),
+                                 set_down=bool(height_above_rest <= LIFT_HEIGHT_M))
+                state.outcome = TrialOutcome.SUCCESS
+                return True
+
             if height_above_rest <= LIFT_HEIGHT_M:
+                # Descended out of the carry. If it came down INSIDE the footprint we do
+                # NOT count a drop or revert to PICK — it is a placement in progress that
+                # just hasn't settled yet (still moving as it's released); stay in TRANSPORT
+                # so the settled-in-place check above fires once it comes to rest. Only a
+                # descent OUTSIDE the footprint is a genuine drop.
+                if in_place:
+                    return False
                 state.n_drops += 1
                 self.events.log(state.trial_id, t_now, 'drop', count=state.n_drops)
                 state.attempt_active = False
                 state.dwell_t0 = None
                 state.pick_confirmed = False
+                # set_phase logs the TRANSPORT→PICK phase_enter itself; mark pick_logged so
+                # the next attempt_start doesn't emit a second PICK for this same entry.
                 self.set_phase(state, t_now, TrialPhase.PICK)
+                state.pick_logged = True
                 return False
-
-            if (place_xy_offset is not None and object_speed is not None
-                    and place_xy_offset <= place_marker_half_extent
-                    and object_speed < ARRIVAL_SPEED_M_S):
-                self.set_phase(state, t_now, TrialPhase.PLACE)   # object placed → finish
-                self.events.log(state.trial_id, t_now, 'arrival',
-                                 attempt=state.attempt_id,
-                                 xy_offset_m=round(place_xy_offset, 4))
-                state.outcome = TrialOutcome.SUCCESS
-                return True
 
         return False
 

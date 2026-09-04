@@ -12,13 +12,18 @@ import numpy as np
 
 def randomize_primitive(model, data, body_name: str, geom_name: str,
                         base_rgb, xy: np.ndarray, rng: np.random.Generator,
-                        size_range: tuple[float, float] = (0.88, 1.12)) -> None:
+                        size_range: tuple[float, float] = (0.88, 1.12),
+                        surface_z: float = 0.0) -> None:
     """Randomize one primitive object's size, color, and rest pose in place.
 
     Must be called after MjData creation and before the first mj_forward. Updates
     both data.qpos and model.qpos0 so mj_resetData preserves the randomized object
     position throughout any IK precomputation loop. No-ops if body_name/geom_name
     aren't present in the model (object commented out of the scene XML).
+
+    surface_z: height of the surface the object rests ON (default 0.0 = floor). For the
+    clear-the-table scenes the robot and objects sit on a table/counter, so this is the
+    table-top height (TABLE_TOP_Z) — the object is placed at surface_z + its half-height.
     """
     bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, body_name)
     gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, geom_name)
@@ -57,6 +62,7 @@ def randomize_primitive(model, data, body_name: str, geom_name: str,
     if jnt_adr < 0:
         return
     qadr = model.jnt_qposadr[jnt_adr]
-    pos7 = np.array([xy[0], xy[1], z_rest, 1.0, 0.0, 0.0, 0.0])
+    # Rest ON the surface (table/counter top at surface_z; 0.0 = floor).
+    pos7 = np.array([xy[0], xy[1], surface_z + z_rest, 1.0, 0.0, 0.0, 0.0])
     data.qpos[qadr:qadr + 7]   = pos7
     model.qpos0[qadr:qadr + 7] = pos7    # preserve across mj_resetData calls

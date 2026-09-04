@@ -1,0 +1,13 @@
+{
+  "_comment": "AnyTeleop (dex-retargeting) finger-retargeting backend. Used only when --mode anyteleop or contact_aware_w_anyteleop is selected. See anyteleop/README.md.",
+  "_comment_retargeting_type": "'vector' (real-time video retargeting AnyTeleop uses live) or 'dexpilot' (DexPilot-style pinch-aware optimizer). Both LEAP-supported.",
+  "retargeting_type": "vector",
+  "hand_type": "right",
+  "_comment_output_alpha": "Extra EMA smoothing our wrapper applies on top of dex-retargeting's own low_pass_alpha. 1.0 = none.",
+  "output_alpha": 1.0,
+  "_comment_finger_knobs": "dex-retargeting's OWN finger-retargeting knobs, overriding the vendored LEAP YAML so you can tune them here instead of editing anyteleop/assets/.../leap_hand_right*.yml. null = keep the YAML value (scaling_factor 1.6, low_pass_alpha 0.2). Hot-reloaded (rebuilds the solver).",
+  "_comment_scaling_factor": "Robot-to-human hand-size gain. Higher = more finger curl/reach.",
+  "scaling_factor": null,
+  "_comment_low_pass_alpha": "dex-retargeting's internal low-pass. Smaller = smoother but laggier (0..1); <0 disables.",
+  "low_pass_alpha": null
+}

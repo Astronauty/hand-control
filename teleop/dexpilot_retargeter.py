@@ -47,9 +47,31 @@ class DexPilotRetargeter:
     S1_GAIN = 200.0   # S1 (pinch) cost weight when a primary tip is near the thumb
     S2_GAIN = 400.0   # S2 cost weight when both involved primaries are pinching
 
+    # --- Pinch-STATE debounce (multi-view fusion robustness) ------------------
+    # The pinch decision (d_s1 <= EPS -> close the fingers) is driven by the FUSED
+    # triangulated fingertip, which can jump for a single frame when one camera view
+    # reprojects the fingertip badly (high reproj error) — the fingertip spikes, the
+    # pinch drops, and the grasp opens even though the operator never unpinched (the
+    # wrist, a different landmark, stays fine). So the pinch STATE is debounced:
+    #   - median-filter d_s1 over PINCH_MEDIAN_N frames (rejects lone spikes), then
+    #   - Schmitt-trigger with separate enter/exit thresholds (hysteresis), and
+    #   - require PINCH_ENTER_N / PINCH_EXIT_N consecutive frames past the threshold
+    #     to CHANGE state.
+    # The continuous d_s1 (the S1 cost's distance TARGET when open) is left raw so
+    # finger tracking stays responsive; only the on/off DECISION is filtered. Exit is
+    # intentionally easier than enter is hard (short PINCH_EXIT_N) so a real release is
+    # still snappy — the debounce protects the HELD pinch, not the release.
+    PINCH_MEDIAN_N = 5      # frames in the rolling median (odd)
+    PINCH_ENTER_FRAC = 1.0  # enter pinch when median d <= EPS * this (== EPS)
+    PINCH_EXIT_FRAC  = 1.6  # exit only when median d > EPS * this (hysteresis band)
+    PINCH_ENTER_N = 2       # consecutive frames below enter-threshold to latch pinch
+    PINCH_EXIT_N  = 3       # consecutive frames above exit-threshold to release
+
     # Attribute names the tuner sweeps, in slider order. Kept here so the tuner
     # and any config file agree on exactly which fields are tunable.
-    TUNABLE = ('BETA', 'GAMMA', 'EPS', 'ETA1', 'ETA2', 'S1_GAIN', 'S2_GAIN')
+    TUNABLE = ('BETA', 'GAMMA', 'EPS', 'ETA1', 'ETA2', 'S1_GAIN', 'S2_GAIN',
+               'PINCH_MEDIAN_N', 'PINCH_ENTER_FRAC', 'PINCH_EXIT_FRAC',
+               'PINCH_ENTER_N', 'PINCH_EXIT_N')
 
     # MediaPipe landmark indices
     _LM_WRIST   = 0
@@ -82,12 +104,29 @@ class DexPilotRetargeter:
 
     def __init__(self, model: mj.MjModel, n_arm: int = 7,
                  debug: bool = False, eps: float | None = None,
-                 load_config: bool = True) -> None:
+                 load_config: bool = True, pinch_debounce: bool = True) -> None:
         self._model = model
         self._n_arm = n_arm
         self._n_hand = 16
         self.debug = debug   # print S1 pinch distances vs EPS each frame
+        # Pinch-debounce toggle. True (default): the pinch DECISION is debounced (median +
+        # Schmitt hysteresis + N-frame — see _update_pinch_state), which protects a held
+        # grasp from single-frame fingertip spikes (bad camera view / triangulation jump).
+        # False: raw per-finger threshold (d <= EPS), no median/hysteresis/N-frame — for
+        # clean inputs (e.g. VR) or A/B testing. Toggle from the app via --pinch-debounce
+        # {on,off}. (The output EMA is a SEPARATE toggle, --output-ema, in the controller.)
+        self.pinch_debounce = bool(pinch_debounce)
         self.last_d_s1: list[float] = [float('inf')] * 3   # set on first retarget()
+        # Debounced pinch STATE per S1 finger (index/middle/ring). _pinch_hist holds
+        # the recent raw d_s1 samples (for the median); _pinched is the latched state
+        # _switching consults; _enter/_exit_run count consecutive frames past a
+        # threshold. See the PINCH_* constants above. last_d_s1_filt exposes the
+        # median-filtered distance for downstream pinch detection (trial_logger).
+        self._pinch_hist: list[list[float]] = [[], [], []]
+        self._pinched:    list[bool] = [False, False, False]
+        self._enter_run:  list[int]  = [0, 0, 0]
+        self._exit_run:   list[int]  = [0, 0, 0]
+        self.last_d_s1_filt: list[float] = [float('inf')] * 3
 
         # Promote the class-attribute defaults to per-instance fields so the live
         # tuner (and the eps override / saved config below) mutate only this
@@ -363,13 +402,14 @@ class DexPilotRetargeter:
     # ------------------------------------------------------------------
 
     def _switching(
-        self, hv: dict, d_s1: list[float]
+        self, hv: dict, d_s1: list[float], pinch: list[bool]
     ) -> tuple[float, float]:
         """Return (s, f) for one human vector entry.
 
         Args:
-            hv:   One element from _human_vectors().
-            d_s1: Distances [d_if→th, d_mf→th, d_rf→th] from the S1 vectors.
+            hv:    One element from _human_vectors().
+            d_s1:  Distances [d_if→th, d_mf→th, d_rf→th] from the S1 vectors.
+            pinch: Debounced per-finger pinch booleans [index, middle, ring].
         """
         vtype = hv['type']
         d = float(np.linalg.norm(hv['r']))
@@ -378,13 +418,16 @@ class DexPilotRetargeter:
             return 1.0, self.BETA * d
 
         if vtype == 's1':
-            if d <= self.EPS:
+            # Pinch cost keyed off the DEBOUNCED per-finger state, not the raw d <= EPS —
+            # so a bad-view fingertip spike can't flip it off mid-grasp. hv['primary'] is
+            # the S1 finger index (0=index,1=middle,2=ring).
+            if pinch[hv['primary']]:
                 return self.S1_GAIN, self.ETA1
             return 1.0, self.BETA * d
 
-        # s2: active only when BOTH involved primary fingers are in S1 pinch
+        # s2: active only when BOTH involved primary fingers are in the (debounced) pinch
         si, sj = hv['s1_dep']
-        if d_s1[si] <= self.EPS and d_s1[sj] <= self.EPS:
+        if pinch[si] and pinch[sj]:
             return self.S2_GAIN, self.ETA2
         return 1.0, self.BETA * d
 
@@ -397,11 +440,12 @@ class DexPilotRetargeter:
         q_hand: np.ndarray,
         human_vecs: list[dict],
         d_s1: list[float],
+        pinch: list[bool],
     ) -> float:
         robot_vecs = self._robot_vectors(q_hand)
         c = self.GAMMA * float(np.dot(q_hand, q_hand))
         for rv, hv in zip(robot_vecs, human_vecs):
-            s, f = self._switching(hv, d_s1)
+            s, f = self._switching(hv, d_s1, pinch)
             d = float(np.linalg.norm(hv['r']))
             r_h_hat = hv['r'] / (d + 1e-9)
             diff = rv - f * r_h_hat
@@ -434,8 +478,12 @@ class DexPilotRetargeter:
         """
         human_vecs = self._human_vectors(world_lm, tip_lm=image_lm)
         d_s1 = [float(np.linalg.norm(human_vecs[4 + i]['r'])) for i in range(3)]
-        self.last_d_s1 = d_s1   # exposed for pinch-trigger detection (trial_logger.py);
-                                 # index/middle/ring tip -> thumb tip distances (m)
+        self.last_d_s1 = d_s1   # RAW index/middle/ring tip -> thumb tip distances (m)
+        # Debounced per-finger pinch DECISION (median + hysteresis + N-frame). The
+        # optimiser's pinch cost keys off THIS latched state, not the raw d_s1, so a
+        # single-frame fused-fingertip jump can't drop a held pinch. last_d_s1_filt is
+        # the median-filtered distance for downstream detection (trial_logger).
+        pinch = self._update_pinch_state(d_s1)
 
         x0 = (q_prev if q_prev is not None
                else (self._q_prev if self._q_prev is not None
@@ -443,7 +491,7 @@ class DexPilotRetargeter:
 
         result = scipy.optimize.minimize(
             self._cost, x0,
-            args=(human_vecs, d_s1),
+            args=(human_vecs, d_s1, pinch),
             method='SLSQP',
             bounds=self._bounds,
             constraints=self._constraints,
@@ -467,8 +515,9 @@ class DexPilotRetargeter:
         AUTHORITATIVE one that actually gates the pinch cost. Falls back to plain
         scrolling prints if stdout isn't a TTY (piped/logged)."""
         d_palm = [float(np.linalg.norm(human_vecs[i]['r'])) for i in range(4)]
-        # Per-finger pinch state — the exact d <= EPS decision driving the fingers.
-        pinch = ['PINCH' if d <= self.EPS else 'open ' for d in d_s1]
+        # Per-finger pinch state — the DEBOUNCED latched state that actually gates the
+        # pinch cost (self._pinched), plus the median-filtered distance it decides on.
+        pinch = ['PINCH' if p else 'open ' for p in self._pinched]
         splay = [round(float(q[b + 1]), 2) for b in (0, 4, 8)]        # if,mf,rf rot
         curl  = [round(float(q[b] + q[b + 2]), 2) for b in (0, 4, 8)]  # mcp+pip
         # palm->tip target vectors (palm frame: x=along fingers, y=across, z=out).
@@ -477,8 +526,11 @@ class DexPilotRetargeter:
         lines = [
             "[retarget] ── live (updates in place) "
             + "─" * 20,
-            f"  PINCH  if:{pinch[0]}  mf:{pinch[1]}  rf:{pinch[2]}   (EPS={self.EPS:.3f})",
-            f"  S1 d   if,mf,rf→th = {[round(d,3) for d in d_s1]}",
+            f"  PINCH  if:{pinch[0]}  mf:{pinch[1]}  rf:{pinch[2]}   "
+            f"(EPS={self.EPS:.3f} enter={self.EPS*self.PINCH_ENTER_FRAC:.3f} "
+            f"exit={self.EPS*self.PINCH_EXIT_FRAC:.3f})",
+            f"  S1 d   raw={[round(d,3) for d in d_s1]}  "
+            f"med={[round(d,3) for d in self.last_d_s1_filt]}",
             f"  palm→tip           = {[round(d,3) for d in d_palm]}",
             f"  target vecs  if={self._fmt_vec(tv[0])} "
             f"mf={self._fmt_vec(tv[1])} rf={self._fmt_vec(tv[2])}",
@@ -505,9 +557,67 @@ class DexPilotRetargeter:
     def reset(self) -> None:
         """Clear warm-start state (call when hand tracking is lost)."""
         self._q_prev = None
+        # Clear the pinch-debounce state so a re-acquired hand starts un-pinched
+        # (stale history from before the gap would otherwise bias the first frames).
+        self._pinch_hist = [[], [], []]
+        self._pinched   = [False, False, False]
+        self._enter_run = [0, 0, 0]
+        self._exit_run  = [0, 0, 0]
+        self.last_d_s1_filt = [float('inf')] * 3
         # Re-anchor the in-place debug block on the next frame (a fresh print
         # instead of overwriting stale lines after a tracking gap).
         self._dbg_drawn = False
+
+    def _update_pinch_state(self, d_s1: list[float]) -> list[bool]:
+        """Debounce the per-finger pinch DECISION from the raw (possibly spiky) d_s1.
+
+        Median-filters each finger's distance over a short window, then runs a
+        Schmitt trigger with separate enter/exit thresholds and consecutive-frame
+        counts (see the PINCH_* constants). Returns the latched per-finger pinch
+        booleans and stores the median-filtered distances in last_d_s1_filt. This is
+        what protects a held grasp from a single-frame fused-fingertip jump caused by
+        a bad camera view; the continuous d_s1 target is left untouched.
+
+        When pinch_debounce is False (e.g. VR / clean input), ALL debouncing is bypassed:
+        the pinch decision is a raw per-finger threshold (d <= EPS) with no median,
+        hysteresis, or N-frame confirmation, and last_d_s1_filt passes the raw distance
+        through so downstream detection (trial_logger) stays consistent."""
+        if not self.pinch_debounce:
+            enter_th = self.EPS * self.PINCH_ENTER_FRAC
+            for i in range(3):
+                self.last_d_s1_filt[i] = float(d_s1[i])   # raw passthrough
+                self._pinched[i] = float(d_s1[i]) <= enter_th
+            return list(self._pinched)
+        n_med = max(1, int(self.PINCH_MEDIAN_N))
+        enter_th = self.EPS * self.PINCH_ENTER_FRAC
+        exit_th  = self.EPS * self.PINCH_EXIT_FRAC
+        for i in range(3):
+            hist = self._pinch_hist[i]
+            hist.append(float(d_s1[i]))
+            if len(hist) > n_med:
+                del hist[0]
+            d_med = float(np.median(hist))
+            self.last_d_s1_filt[i] = d_med
+            if not self._pinched[i]:
+                # Currently open: latch pinch after ENTER_N frames at/below enter_th.
+                if d_med <= enter_th:
+                    self._enter_run[i] += 1
+                    if self._enter_run[i] >= self.PINCH_ENTER_N:
+                        self._pinched[i] = True
+                        self._exit_run[i] = 0
+                else:
+                    self._enter_run[i] = 0
+            else:
+                # Currently pinched: release only after EXIT_N frames above exit_th
+                # (hysteresis band enter_th..exit_th holds the pinch through jitter).
+                if d_med > exit_th:
+                    self._exit_run[i] += 1
+                    if self._exit_run[i] >= self.PINCH_EXIT_N:
+                        self._pinched[i] = False
+                        self._enter_run[i] = 0
+                else:
+                    self._exit_run[i] = 0
+        return list(self._pinched)
 
     # ------------------------------------------------------------------
     # Live-tuning config: edit teleop/calibration/retarget_config.json; poll_config()
