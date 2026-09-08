@@ -1287,19 +1287,42 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     # radius -- lets a flat direction (e.g. along a nearby edge) keep nearly
     # all of t_bound_max while a sharply-curved direction (toward the edge)
     # shrinks on its own.
-    t_bound_0 = _sdf_axis_bound_np(mesh_entry, seed_l, axis0_l, t_bound_max, tol=sdf_err_tol)
-    t_bound_1 = _sdf_axis_bound_np(mesh_entry, seed_l, axis1_l, t_bound_max, tol=sdf_err_tol)
-    # Symmetric search along +axis only (surface is locally symmetric to
-    # leading order in the quadratic model); also probe -axis in case the
-    # object's true asymmetry (e.g. a seed near a corner, not just an edge)
-    # makes one side tighter than the other, and take the tighter of the two
-    # so the shared box bound never overstates safety on the looser side.
-    t_bound_0 = min(t_bound_0, _sdf_axis_bound_np(mesh_entry, seed_l, -axis0_l, t_bound_max, tol=sdf_err_tol))
-    t_bound_1 = min(t_bound_1, _sdf_axis_bound_np(mesh_entry, seed_l, -axis1_l, t_bound_max, tol=sdf_err_tol))
+    # ASYMMETRIC per-axis, per-SIDE bounds. Each of the four directions
+    # (+/-axis0, +/-axis1) gets its own search, and each becomes that side's
+    # box limit directly.
+    #
+    # This previously took min(+side, -side) and applied it symmetrically, on
+    # the reasoning that a shared box must never overstate safety on the looser
+    # side. That is true but throws away most of the patch: the tighter side is
+    # usually tight because the seed happens to sit near ONE face edge, and
+    # collapsing both sides to that distance discards the entire rest of the
+    # face. Measured on 036_wood_block mid-face (planar fit, so the surrogate is
+    # exact): +axis0 is good to 31.5mm and -axis0 to 4.6mm, and the symmetric
+    # rule gave [-4.6, +4.6] -- 9mm of a 104mm-wide face, with 27mm of verified-
+    # good surface on the positive side simply discarded. Asymmetric bounds give
+    # [-4.6, +31.5], which is the actual measured validity region and lets a
+    # contact traverse the face it is standing on.
+    #
+    # Nothing about the surrogate requires symmetry: h(t) is evaluated at
+    # whatever t the optimizer picks, and each side's bound is an independent
+    # measurement of how far the model stays within sdf_err_tol in THAT
+    # direction. The old symmetric form was a conservative simplification, not a
+    # correctness requirement.
+    t_lo_0 = -_sdf_axis_bound_np(mesh_entry, seed_l, -axis0_l, t_bound_max, tol=sdf_err_tol)
+    t_hi_0 = _sdf_axis_bound_np(mesh_entry, seed_l, axis0_l, t_bound_max, tol=sdf_err_tol)
+    t_lo_1 = -_sdf_axis_bound_np(mesh_entry, seed_l, -axis1_l, t_bound_max, tol=sdf_err_tol)
+    t_hi_1 = _sdf_axis_bound_np(mesh_entry, seed_l, axis1_l, t_bound_max, tol=sdf_err_tol)
+
+    # Reported bound stays the SYMMETRIC half-width (the smaller side), since
+    # that is what the Picard loop's pinned-at-trust-region test and the
+    # edge-margin cost both interpret as "how much room this axis has". Callers
+    # wanting the true asymmetric interval read t_lo_*/t_hi_* from the frame.
+    t_bound_0 = min(-t_lo_0, t_hi_0)
+    t_bound_1 = min(-t_lo_1, t_hi_1)
 
     t_var = opti.variable(2)
-    opti.subject_to(opti.bounded(-t_bound_0, t_var[0], t_bound_0))
-    opti.subject_to(opti.bounded(-t_bound_1, t_var[1], t_bound_1))
+    opti.subject_to(opti.bounded(t_lo_0, t_var[0], t_hi_0))
+    opti.subject_to(opti.bounded(t_lo_1, t_var[1], t_hi_1))
     opti.set_initial(t_var, np.zeros(2))
 
     # h(t1,t2): leading-order implicit-function solution of f(seed + t.axis_hat
@@ -1322,7 +1345,8 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     # for a viz that wants to show a little of the invalid region too).
     frame = dict(seed_l=seed_l, axis0_l=axis0_l, axis1_l=axis1_l, n_l=n_l,
                 kappa0=kappa0, kappa1=kappa1, grad_norm=grad_norm,
-                t_bound_0=t_bound_0, t_bound_1=t_bound_1)
+                t_bound_0=t_bound_0, t_bound_1=t_bound_1,
+                t_lo_0=t_lo_0, t_hi_0=t_hi_0, t_lo_1=t_lo_1, t_hi_1=t_hi_1)
     return t_var, p_world, (t_bound_0, t_bound_1), frame
 
 
