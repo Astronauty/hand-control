@@ -26,23 +26,37 @@ arrow-key jog uses, validating grasp stability by checking the object tracks the
 palm's motion and neither fingertip's contact force drops to zero). Fully
 automatic in both headless and --view modes.
 
+Every run writes three artifacts into out/<object>/: the final-pose PNG, an MP4
+of the whole run, and the local-quadratic contact-fit iso views.
+
 Status: 017_orange lifts reliably (3/3 seeds tested, object tracking the palm to
-within 4-7mm of a 100mm rise, contact never lost). 036_wood_block does NOT yet
-lift on any seed tested, for two separate reasons that are both upstream of this
-script: some seeds get grasps whose contact normals are too poorly opposed to be
-holdable at any finite force (see the w_align/orient_weight note below), and the
-one seed that does get a good grasp establishes a solid ~6N grip and then loses
-it partway through the jog. Finger PD stiffness was ruled out as the cause of the
-latter (stiffening it monotonically REDUCES grip force, since the PD then fights
-the squeeze -- which is what squeeze_pd_scale exists to prevent).
+within 4-7mm of a 100mm rise, contact never lost). 036_wood_block does NOT lift
+on any seed tested: the grasp is simply not strong enough to carry it.
+
+Measured, with the floor's collision DISABLED so the grasp alone bears the load
+(the check to run -- an object still standing on the floor reads plausible
+contact forces while the floor silently carries the weight, which is how an
+earlier read of this mistook the failure for the block rotating out of the
+pinch): the 0.729kg block (7.15N) falls straight through the fingers within
+~0.5s at BOTH gamma=5.7 and gamma=12, i.e. at 3N and at 7N of measured normal
+force. At the moment of release the TANGENTIAL force is only ~1.8-2.3N per
+contact against a 7.15N weight -- roughly half what is needed -- even though
+mu=1.0 and 7N of normal force should permit up to 14N. The friction-cone
+utilization |ft|/(mu*fn) sits at 0.19-0.71, never saturating, so this is not
+cone-limited sliding: the contacts never develop the tangential force required
+before the object accelerates away. Raising gamma scales normal force cleanly
+(3.3N -> 7.4N) without fixing it, and impratio 20/50/100 makes no difference.
+
+Two things previously suspected and RULED OUT, recorded so they are not re-tried:
+finger PD stiffness (sweeping Kp 0.8->20 monotonically REDUCES grip force, since
+the stiffened PD fights the squeeze -- what squeeze_pd_scale exists to prevent),
+and the object tipping about the grasp axis (the rotation seen in the lift trace
+happens after the block is already sliding down, and the block never left the
+floor during it).
 
     python benchmarks/ycb_grasp/pick_from_floor.py                       # default: 017_orange, seed 0
     python benchmarks/ycb_grasp/pick_from_floor.py --object 036_wood_block --seed 3
     python benchmarks/ycb_grasp/pick_from_floor.py --view                # interactive viewer
-    python benchmarks/ycb_grasp/pick_from_floor.py --gws --n-seeds 3 --render
-    python benchmarks/ycb_grasp/pick_from_floor.py --video --quad-plot   # MP4 of the run +
-                                                                          # the local-quadratic
-                                                                          # contact-fit plot
     python benchmarks/ycb_grasp/pick_from_floor.py --no-lift             # skip the lift-jog check
     # the settings the orange results above were measured with:
     python benchmarks/ycb_grasp/pick_from_floor.py --object 017_orange --seed 4 \
@@ -831,13 +845,8 @@ def main():
                     help="use the tangent-plane mesh contact model instead of the "
                          "local-quadratic (SDF) one")
     ap.add_argument("--view", action="store_true", help="interactive viewer")
-    ap.add_argument("--render", action="store_true", help="save a PNG of the final pose")
-    ap.add_argument("--video", action="store_true",
-                    help="save an MP4 of the whole APPROACH->HOLD->SQUEEZE->LIFT run")
-    ap.add_argument("--quad-plot", dest="quad_plot", action="store_true",
-                    help="save the local-quadratic contact-fit visualization "
-                         "(plot_quadratic_path.py) for this solve — requires "
-                         "use_quadratic_contact (default on; see --tangent-plane)")
+    # --render/--video/--quad-plot used to gate these; every run now writes all
+    # three into out/<object>/, so the flags are gone rather than kept as no-ops.
     ap.add_argument("--no-lift", dest="do_lift", action="store_false",
                     help="skip the post-squeeze vertical lift-jog stability check")
     ap.add_argument("--w-edge-curvature", type=float, default=0.0,
@@ -856,13 +865,17 @@ def main():
     ap.add_argument("--out", default=str(REPO / "benchmarks" / "ycb_grasp" / "out" / "pick_from_floor"))
     args = ap.parse_args()
 
-    out_dir = Path(args.out)
-    if args.render or args.video or args.quad_plot:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    tag = f"{args.object}_seed{args.seed}"
-    render_path = str(out_dir / f"{tag}.png") if args.render else None
-    video_path = str(out_dir / f"{tag}.mp4") if args.video else None
-    quad_plot_path = str(out_dir / f"{tag}_quadratic_path.png") if args.quad_plot else None
+    # One subfolder per YCB object, so runs group by object rather than piling
+    # every objectxseed artifact into one flat directory. All three artifacts
+    # (final-pose PNG, run MP4, quadratic-path iso views) are ALWAYS produced --
+    # a run you cannot look at afterwards is not worth much, and the flags that
+    # used to gate them only ever saved a few seconds.
+    out_dir = Path(args.out) / args.object
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"seed{args.seed}"
+    render_path = str(out_dir / f"{tag}.png")
+    video_path = str(out_dir / f"{tag}.mp4")
+    quad_plot_path = str(out_dir / f"{tag}_quadratic_path.png")
 
     run_pick(args.object, args.seed, n_seeds=args.n_seeds, n_relin=args.n_relin,
             gws=args.gws, w_gws=args.w_gws, w_span=args.w_span,
