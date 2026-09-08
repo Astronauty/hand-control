@@ -348,11 +348,23 @@ def _mesh_sdf_entry(model, body_id: int) -> dict:
     # object_sdf.body_hull_halfspaces does, for _minor_axis_local's SVD (the
     # table/hulls themselves don't carry a vertex array).
     _hulls_v, _verts = _object_sdf.body_hull_halfspaces(model, body_id)
+    _grad_fn = _object_sdf.casadi_grad_fn(fn, name=f"{_tag}_grad")
+    # 3x3 Hessian of fn (grad_fn differentiated again), for the local-quadratic
+    # mesh contact (_mesh_quadratic_contact_ca) and seed curvature gating
+    # (_mesh_surface_kappa_max_np). MUST be cached here, not rebuilt per call
+    # (_sdf_hessian_np used to do exactly that): fn is a B-spline over the
+    # full SDF lattice, and ca.jacobian of its gradient graph is expensive to
+    # CONSTRUCT (not just evaluate) — rebuilding it ~O(seed candidates x
+    # Picard stages) times per solve (up to a few hundred) turned a
+    # sub-second op into a multi-minute stall. Built once per (model, body).
+    _hess_x = ca.MX.sym("x", 3)
+    _hessian_fn = ca.Function(f"{_tag}_hess", [_hess_x],
+                              [ca.jacobian(_grad_fn(_hess_x), _hess_x)])
     entry = dict(
         table=table,
         verts=_verts,
         fn=fn,
-        grad_fn=_object_sdf.casadi_grad_fn(fn, name=f"{_tag}_grad"),
+        grad_fn=_grad_fn,
         normal_fn=_object_sdf.casadi_normal_fn(fn, name=f"{_tag}_normal"),
         # Full-length projector (k=5, object_sdf's own default) for seeding —
         # _seed_pair/_march_sdf_np start from points a bbox-radius or more
@@ -365,6 +377,7 @@ def _mesh_sdf_entry(model, body_id: int) -> dict:
         # object_sdf.surface_project's docstring on why more iters doesn't
         # strictly help anyway (oscillates at creases past k~5).
         project_fn_short=_object_sdf.surface_project(fn, k=2, name=f"{_tag}_proj2"),
+        hessian_fn=_hessian_fn,
     )
     _MESH_SDF_CACHE[cache_key] = entry
     return entry
@@ -918,6 +931,252 @@ def _mesh_uv_local_contact_ca(opti, seed_world: np.ndarray, center_np, mat_np,
     return uv_var, p_world
 
 
+def _sdf_hessian_np(mesh_entry: dict, p_local: np.ndarray) -> np.ndarray:
+    """3x3 Hessian of the object-local SDF at p_local, numpy — evaluates the
+    CasADi Function cached as mesh_entry['hessian_fn'] (built once in
+    _mesh_sdf_entry). MUST use the cached Function: constructing
+    ca.jacobian(grad_fn(x), x) from scratch is expensive (differentiating a
+    B-spline interpolant graph twice), and this is called O(seed candidates x
+    Picard stages) times per solve — a previous per-call-rebuild version of
+    this function turned a sub-second op into a multi-minute stall.
+    """
+    return np.asarray(mesh_entry["hessian_fn"](np.asarray(p_local, float))).reshape(3, 3)
+
+
+def _mesh_surface_kappa_max_np(mesh_entry: dict, p_local: np.ndarray) -> float:
+    """Largest-magnitude principal curvature of the SDF's zero level set at
+    p_local (object-local), via the Hessian restricted to the tangent plane.
+
+    Used to steer seed SAMPLING away from edges/corners (see _seed_pair's
+    caller in solve()'s seed-generation loop): a seed placed right at a near-
+    corner point forces _mesh_quadratic_contact_ca's per-axis SDF-comparison
+    bound down to near-zero along the edge-approaching direction (verified:
+    kappa up to ~190 on a box corner collapses that axis's bound below 1mm),
+    which is the geometrically CORRECT answer for that representation but a
+    bad place to have seeded a grasp attempt in the first place — flat
+    regions give more usable tangential search room under ANY contact
+    representation, not just the quadratic one, so this is a seeding
+    improvement independent of which representation is active.
+    """
+    grad_l = np.asarray(mesh_entry["grad_fn"](p_local), float).reshape(3)
+    gnorm = float(np.linalg.norm(grad_l)) + 1e-9
+    n_hat = grad_l / gnorm
+    t1_l, t2_l = _tangent_basis_np(n_hat)
+    H = _sdf_hessian_np(mesh_entry, p_local)
+    T = np.stack([t1_l, t2_l], axis=1)
+    H_tt = T.T @ H @ T
+    return float(np.max(np.abs(np.linalg.eigvalsh(H_tt))))
+
+
+def _principal_curvature_axes_np(H_tt: np.ndarray, t1_l: np.ndarray, t2_l: np.ndarray):
+    """Eigendecompose H_tt (2x2, SDF Hessian restricted to an arbitrary tangent
+    basis) and return the two principal-curvature directions in OBJECT-LOCAL
+    R^3 (unit vectors) plus their curvatures, sorted ascending by |curvature|
+    (axis 0 = flattest direction, axis 1 = most-curved direction).
+
+    Aligning the free variables to these directions (rather than the arbitrary
+    _tangent_basis_np pair) is what makes an anisotropic per-axis bound
+    possible: a seed near an edge has one nearly-flat direction (along the
+    edge) and one sharply-curved direction (toward the edge) -- bounding both
+    by the worst eigenvalue (as an isotropic bound must) throws away all the
+    safe search room in the flat direction. See module docstring context.
+    """
+    eigvals, eigvecs = np.linalg.eigh(H_tt)     # ascending by value; eigh assumes symmetric
+    order = np.argsort(np.abs(eigvals))
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+    T = np.stack([t1_l, t2_l], axis=1)          # 3x2, maps 2D tangent coords -> R^3
+    axes_l = T @ eigvecs                        # 3x2, columns are unit (T orthonormal, eigvecs orthonormal)
+    return axes_l[:, 0], axes_l[:, 1], float(eigvals[0]), float(eigvals[1])
+
+
+def _sdf_axis_bound_np(mesh_entry: dict, seed_l: np.ndarray, axis_l: np.ndarray,
+                       t_bound_max: float, tol: float = 5e-4, n_steps: int = 8,
+                       n_refine: int = 6) -> float:
+    """How far along axis_l (unit, object-local) can a tangent offset go before
+    the TRUE SDF value at that point departs from its seed-time value by more
+    than `tol` (metres) -- i.e. before the seed's tangent-plane approximation
+    departs from the real surface by more than tol. Directly measures
+    surrogate validity instead of inferring it from a curvature magnitude, so
+    it can't be fooled by a curvature estimate that over- or under-predicts
+    actual model error (e.g. near a knot of the SDF's B-spline interpolant, or
+    higher-order terms the quadratic drops).
+
+    NOT a binary search: |fn(seed + t*axis)| is not monotonic in t in general
+    -- near a corner, walking toward one adjacent face can dip |fn| back down
+    before it rises again on the far side, and a binary search's implicit
+    monotonicity assumption would silently accept that far side as "in
+    tolerance" despite having crossed a face it shouldn't have. A forward
+    march that stops at the FIRST violation has no such blind spot.
+
+    Compares against fn(seed_l) rather than an absolute-zero baseline: seed_l
+    is the previous Picard stage's solved point re-used as this stage's seed,
+    not always a freshly SDF-projected point (see solve()'s relinearization
+    loop), so it can sit a little off the true surface itself -- anchoring to
+    its own value keeps the bound measuring "how far can the quadratic model
+    depart from what the seed already sees" rather than being spuriously
+    collapsed to 0 whenever the seed carries a small pre-existing residual.
+
+    Two-phase: a coarse forward march (n_steps, size t_bound_max/n_steps)
+    finds the first step that VIOLATES tolerance -- preserving the "stop at
+    first violation, no monotonicity assumed across the whole range" property
+    above, since each coarse step only trusts what it directly measures.
+    Within that one bracketing [t_ok, t_violate] interval (width exactly one
+    coarse step), a bounded bisection refines the boundary -- this recovers
+    resolution the coarse grid alone cannot reach: a true bound of, say, 5mm
+    sitting inside a first coarse step of 6.25mm (t_bound_max/n_steps with
+    n_steps=8, t_bound_max=50mm) would otherwise be reported as exactly 0mm,
+    needlessly discarding real, valid search room (confirmed on
+    036_wood_block: a seed with a genuine ~5mm safe bound reported 0mm from
+    the coarse march alone, collapsing that axis's trust region to a
+    degenerate point for no reason -- verified the SDF value only exceeds
+    tolerance between 5mm and 6.25mm, not before). Bisection is safe WITHIN
+    this one bracket even though the full function isn't globally monotonic:
+    the bracket is small (one coarse step), and the search still only trusts
+    values it measures, converging to the true crossing point in that
+    interval rather than assuming one.
+
+    n_steps forward march + n_refine bisection steps, cheap: n_steps +
+    n_refine calls to mesh_entry['fn'] (a CasADi Function, already fast) --
+    run once per contact per Picard stage, the same frequency _sdf_hessian_np
+    already runs at.
+    """
+    f0 = float(mesh_entry["fn"](seed_l))
+
+    def _in_tol(t: float) -> bool:
+        return abs(float(mesh_entry["fn"](seed_l + t * axis_l)) - f0) <= tol
+
+    step = t_bound_max / n_steps
+    t_ok, t_bad = 0.0, None
+    for i in range(1, n_steps + 1):
+        t = i * step
+        if not _in_tol(t):
+            t_bad = t
+            break
+        t_ok = t
+    if t_bad is None:
+        return t_ok   # every coarse step stayed in tolerance -- flat out to t_bound_max
+
+    lo, hi = t_ok, t_bad   # _in_tol(lo) True (or lo==0, trivially true), _in_tol(hi) False
+    for _ in range(n_refine):
+        mid = 0.5 * (lo + hi)
+        if _in_tol(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np.ndarray,
+                               center_np, mat_np, mesh_entry: dict,
+                               t_bound_max: float = 0.05, sdf_err_tol: float = 5e-4):
+    """Mesh contact as a 2-DOF offset along the two PRINCIPAL CURVATURE AXES at
+    the seed, placed on a LOCAL QUADRATIC (paraboloid) surrogate of the
+    surface fit from the SDF's own gradient + Hessian -- no per-candidate SDF
+    projection call.
+
+        h(t1,t2) = -(t1,t2) H_tt' (t1,t2)^T / (2 ||grad f(seed)||)
+        p(t1,t2) = seed + t1*axis0_hat + t2*axis1_hat + h(t1,t2)*n_hat
+
+    derived from the second-order Taylor expansion of the SDF f about the
+    seed, imposing f=0 and keeping only the leading (quadratic) term of the
+    implicit relationship this defines for h(t1,t2). H_tt' here is H_tt
+    re-expressed in the principal-axis basis, i.e. diagonal: H_tt' =
+    diag(kappa0, kappa1).
+
+    This is exactly differentiable (a degree-2 polynomial in t1,t2) with no
+    oscillating-residual failure mode near creases, UNLIKE surface_project --
+    but unlike surface_project it has NO correction mechanism if (t1,t2)
+    strays past where the quadratic model is accurate, so each axis's bound is
+    sized independently by _sdf_axis_bound_np: a direct binary search on the
+    TRUE SDF value along that axis, not a curvature-magnitude proxy. This
+    matters specifically near an edge/corner, where curvature is anisotropic
+    -- one axis (along the edge) can stay near t_bound_max while the other
+    (toward the edge) shrinks sharply; an isotropic bound would needlessly
+    shrink both and strand the optimizer near a poor seed. This bound is
+    load-bearing, not a tuning knob -- see module docstring context.
+
+    Same call signature/frame convention as _mesh_tangent_contact_ca
+    (seed_world is WORLD frame; center_np/mat_np are the object's world pose).
+    Return contract is EXTENDED (4-tuple, not 2): (t_var, p_world, bounds, frame)
+    where bounds = (t_bound_0, t_bound_1) in metres (needed by the Picard loop
+    to detect a solution pinned at its trust region -- see solve()'s
+    relinearization loop) and frame is a dict of the object-local paraboloid
+    parameters (seed_l, axis0_l, axis1_l, n_l, kappa0, kappa1, grad_norm,
+    t_bound_0, t_bound_1) letting a caller reconstruct/draw p_local(t1,t2) =
+    seed_l + t1*axis0_l + t2*axis1_l + h(t1,t2)*n_l post-hoc (e.g. for the
+    quadratic-fit visualizer, analogous to plot_uv_path.py for the UV atlas).
+
+    sdf_err_tol : max allowed |SDF value| (metres) at the edge of the bound
+        along each axis -- the model-validity tolerance _sdf_axis_bound_np
+        searches for. Independent of t_bound_max, which is only a hard cap
+        for directions where the surface stays flat well past a useful range.
+    """
+    t1, t2 = _tangent_basis_np(seed_normal_out)
+    seed_l = mat_np.T @ (np.asarray(seed_world, float) - np.asarray(center_np, float))
+    t1_l   = mat_np.T @ t1
+    t2_l   = mat_np.T @ t2
+
+    grad_l  = np.asarray(mesh_entry["grad_fn"](seed_l), float).reshape(3)
+    # Floor, not just an epsilon against exact zero: ||grad f|| sags near a
+    # crease (object_sdf.surface_project's own docstring measures it down to
+    # ~0.01 there) rather than only hitting exactly 0. h = -(...)/(2*grad_norm)
+    # amplifies inversely with this floor, so an un-floored near-zero value
+    # would blow h up by ~100x right where the seed is least trustworthy —
+    # floor it at the same order of magnitude object_sdf already treats as
+    # "crease regime" so h stays bounded even there (the SDF-comparison bound
+    # search below still independently catches an unsafe result; this just
+    # keeps h itself from being numerically wild going in).
+    grad_norm = max(float(np.linalg.norm(grad_l)), 1e-2)
+    H       = _sdf_hessian_np(mesh_entry, seed_l)
+    T       = np.stack([t1_l, t2_l], axis=1)          # 3x2
+    H_tt    = T.T @ H @ T                              # 2x2, curvature restricted to tangent plane
+
+    axis0_l, axis1_l, kappa0, kappa1 = _principal_curvature_axes_np(H_tt, t1_l, t2_l)
+
+    # Per-axis bound via direct SDF comparison, not a shared curvature-derived
+    # radius -- lets a flat direction (e.g. along a nearby edge) keep nearly
+    # all of t_bound_max while a sharply-curved direction (toward the edge)
+    # shrinks on its own.
+    t_bound_0 = _sdf_axis_bound_np(mesh_entry, seed_l, axis0_l, t_bound_max, tol=sdf_err_tol)
+    t_bound_1 = _sdf_axis_bound_np(mesh_entry, seed_l, axis1_l, t_bound_max, tol=sdf_err_tol)
+    # Symmetric search along +axis only (surface is locally symmetric to
+    # leading order in the quadratic model); also probe -axis in case the
+    # object's true asymmetry (e.g. a seed near a corner, not just an edge)
+    # makes one side tighter than the other, and take the tighter of the two
+    # so the shared box bound never overstates safety on the looser side.
+    t_bound_0 = min(t_bound_0, _sdf_axis_bound_np(mesh_entry, seed_l, -axis0_l, t_bound_max, tol=sdf_err_tol))
+    t_bound_1 = min(t_bound_1, _sdf_axis_bound_np(mesh_entry, seed_l, -axis1_l, t_bound_max, tol=sdf_err_tol))
+
+    t_var = opti.variable(2)
+    opti.subject_to(opti.bounded(-t_bound_0, t_var[0], t_bound_0))
+    opti.subject_to(opti.bounded(-t_bound_1, t_var[1], t_bound_1))
+    opti.set_initial(t_var, np.zeros(2))
+
+    # h(t1,t2): leading-order implicit-function solution of f(seed + t.axis_hat
+    # + h*n_hat) = 0 for h, from the SDF's 2nd-order Taylor expansion at seed.
+    # Diagonal because t_var is expressed directly in the eigenbasis. Uses the
+    # FLOORED grad_norm (the Taylor-expansion denominator, where a near-zero
+    # true value would blow h up) -- n_l below is unit-length regardless,
+    # normalized by the true (unfloored) gradient magnitude, since it's a
+    # direction, not a denominator, and flooring it would make it non-unit.
+    h = -(kappa0 * t_var[0]**2 + kappa1 * t_var[1]**2) / (2.0 * grad_norm)
+    n_l = grad_l / (float(np.linalg.norm(grad_l)) + 1e-9)
+    p_surf_l = ca.DM(seed_l) + t_var[0] * ca.DM(axis0_l) + t_var[1] * ca.DM(axis1_l) + h * ca.DM(n_l)
+    p_world  = ca.DM(center_np) + ca.DM(mat_np) @ p_surf_l
+    # Everything a caller needs to independently RECONSTRUCT and DRAW this
+    # paraboloid patch post-hoc (e.g. the local-quadratic visualizer) without
+    # re-deriving it from mesh_entry -- object-local frame throughout, matching
+    # how obj_center/obj_mat are already saved by _save_iter_npz. p_local(t) =
+    # seed_l + t[0]*axis0_l + t[1]*axis1_l + h(t)*n_l reproduces p_surf_l above
+    # exactly for any (t0,t1), including OUTSIDE (t_bound_0,t_bound_1) (useful
+    # for a viz that wants to show a little of the invalid region too).
+    frame = dict(seed_l=seed_l, axis0_l=axis0_l, axis1_l=axis1_l, n_l=n_l,
+                kappa0=kappa0, kappa1=kappa1, grad_norm=grad_norm,
+                t_bound_0=t_bound_0, t_bound_1=t_bound_1)
+    return t_var, p_world, (t_bound_0, t_bound_1), frame
+
+
 def _friction_cone_verts(mu: float) -> np.ndarray:
     """5-vertex linearized Coulomb cone in the LOCAL contact frame [n_in|t1|t2]
     (origin + 4 unit-normal-force edges at ±mu tangential). Shared by the
@@ -1316,6 +1575,39 @@ class UVAtlasConfig:
     uv_atlas_min_chart_frac: float = _object_uv_atlas.DEFAULT_MIN_CHART_AREA_FRAC \
                                      if _object_uv_atlas is not None else 0.01
 
+    # Third mesh-contact ablation arm: _mesh_quadratic_contact_ca. Independent
+    # of use_uv_atlas_contact (checked first in _run_stage if both are somehow
+    # set) — places the contact on a local paraboloid fit from the SDF's own
+    # gradient+Hessian at the seed instead of projecting a tangent-plane point
+    # through object_sdf.surface_project. No chart/xatlas machinery involved,
+    # so this does NOT interact with the chart-pair antipodal seeding gated on
+    # use_uv_atlas_contact elsewhere (_seed_pair, last_chart_rank_table).
+    use_quadratic_contact: bool = False
+    quadratic_t_bound_max:  float = 0.05    # metres, cap even where the surface stays flat
+    quadratic_sdf_err_tol:  float = 5e-4    # metres, max surrogate-vs-true-SDF gap per axis
+    # If a stage's solved (t1,t2) sits within this fraction of its own
+    # per-axis bound, the Picard loop treats it as PINNED (trust region ran
+    # out, not a converged interior optimum) and keeps relinearizing even if
+    # the usual position/normal-mismatch convergence check would pass — see
+    # solve()'s relinearization loop.
+    quadratic_pin_frac:     float = 0.9
+
+    # Edge-avoidance cost for the quadratic-contact path (use_quadratic_contact
+    # only): penalizes the paraboloid's own height function h(t1,t2) = -(kappa0*t1^2
+    # + kappa1*t2^2)/(2*grad_norm) at the SOLVED (t1,t2) -- kappa0/kappa1/grad_norm
+    # are the seed's frozen curvature (numpy floats, fixed for this Picard stage,
+    # from _mesh_quadratic_contact_ca's `frame` dict), but t1/t2 are the live NLP
+    # variables, so h(t_var) IS differentiable in t_var even though its coefficients
+    # aren't. On a flat seed (kappa0=kappa1=0) this is identically zero -- free
+    # movement in any tangential direction. Near an edge (one or both curvatures
+    # large), moving toward the high-curvature direction costs quadratically more
+    # than moving along the flat direction, so the optimizer is steered toward the
+    # face and away from the edge FROM WITHIN the same solve -- unlike a penalty on
+    # kappa0/kappa1 alone (which are constants at a fixed seed and only bias which
+    # stage/seed looks best after the fact, not what a single stage's optimizer
+    # does). 0.0 = off.
+    w_edge_curvature:       float = 0.0
+
 
 @dataclass
 class CollisionConfig:
@@ -1397,6 +1689,29 @@ class MultiStartConfig:
     n_normal_relinearize: int  = 1
     verbose_profile:      bool = False
 
+    # DIRECTIONAL fingertip radius for the IK offset, refrozen each Picard stage
+    # from the previous stage's q and that stage's contact normal (see
+    # GraspPlanner3D._tip_support_along). The default isotropic r_tip is
+    # max||V - site|| over every direction -- a bounding sphere around an
+    # elongated pad -- so the IK target contact + r_tip*n_out sits several mm
+    # proud of the surface: measured 5.9mm (thumb) / 4.8mm (index) of pure
+    # geometric slack on 036_wood_block against an IK residual of 0.02-0.05mm,
+    # i.e. essentially the ENTIRE observed pre-squeeze gap. Using the support
+    # distance along the actual contact normal removes that slack without making
+    # the (non-smooth) support function a symbolic function of q -- it is a
+    # per-stage constant, exactly like the frozen normal itself.
+    # False = prior behavior (isotropic r_tip everywhere).
+    directional_r_tip:    bool = False
+
+    # Extra safety margin (m) ADDED to the directional radius. The support
+    # distance targets a nominally ZERO gap, but the pad-vs-object contact is
+    # mesh-vs-mesh and the stage's normal is frozen, so aiming at exactly zero
+    # risks landing on the PENETRATING side -- the asymmetric failure
+    # _tip_radius's own comment warns about (penetration is unrecoverable for
+    # the squeeze; a small gap is not). A ~1mm cushion keeps the target on the
+    # safe side while still closing the bulk of the 5-6mm isotropic overshoot.
+    directional_r_tip_margin_m: float = 0.001
+
     # Antipodal-march jitter (deg): _seed_pair marches from contact 1 along its inward
     # normal rotated by up to +/- this angle to find contact 2. Large values (the old 45)
     # let the march exit through an ADJACENT box face ~half the time; since each contact
@@ -1404,6 +1719,17 @@ class MultiStartConfig:
     # w_align cannot rescue. A smaller angle keeps contact 2 on the opposing face while
     # still allowing some obliqueness.
     seed_march_jitter_deg: float = 15.0
+
+    # Mesh-object seed curvature gate: reject a _seed_pair draw if either
+    # contact's largest-magnitude principal curvature (SDF Hessian restricted
+    # to the tangent plane, see _mesh_surface_kappa_max_np) exceeds this —
+    # i.e. resample rather than accept a seed sitting at/near an edge or
+    # corner. Measured on 036_wood_block: genuinely flat face interior ~0-3,
+    # near-edge ~20-190. 40 rejects clear edges/corners while keeping mildly
+    # curved (rounded-edge) regions available. 0 disables the check (accept
+    # any surface point, the pre-refactor behaviour). No-op for analytic
+    # primitives (box/sphere/cylinder), which have exact closed-form surfaces.
+    seed_kappa_max_reject: float = 40.0
 
     # q_ref (arm-pose) restart perturbation — matches ablate_ik.py's RESTART_SIGMA
     # pattern: seed 0 uses q_ref exactly as given (the operator's actual retargeted
@@ -1766,6 +2092,31 @@ class GraspPlanner3D:
             f"(geom types: thumb={int(model.geom_type[self._thumb_gid])}  "
             f"index={int(model.geom_type[self._index_gid])})")
 
+        # Tip mesh vertices expressed in the tip SITE's own frame, cached once —
+        # the raw material for the DIRECTIONAL tip radius (_tip_support_along).
+        # Site-local (not geom-local) because the support query needs to rotate
+        # with the site frame the IK actually targets. None for a non-mesh tip
+        # or a tip whose geom carries no mesh data, in which case the caller
+        # falls back to the isotropic cfg.r_* value.
+        def _tip_verts_site_local(gid, sid):
+            if int(model.geom_type[gid]) != 7:      # not mjGEOM_MESH
+                return None
+            did = int(model.geom_dataid[gid])
+            if did < 0:
+                return None
+            vadr = int(model.mesh_vertadr[did])
+            vnum = int(model.mesh_vertnum[did])
+            V = model.mesh_vert[vadr:vadr + vnum].reshape(-1, 3)   # mesh/geom local
+            _d0 = mj.MjData(model)
+            mj.mj_forward(model, _d0)
+            gpos, gmat = _d0.geom_xpos[gid], _d0.geom_xmat[gid].reshape(3, 3)
+            spos, smat = _d0.site_xpos[sid], _d0.site_xmat[sid].reshape(3, 3)
+            # geom-local vertex -> world (at qpos0) -> site-local
+            V_world = gpos + V @ gmat.T
+            return (V_world - spos) @ smat
+        self._thumb_verts_sl = _tip_verts_site_local(self._thumb_gid, self._thumb_sid)
+        self._index_verts_sl = _tip_verts_site_local(self._index_gid, self._index_sid)
+
         def _maybe_mocap(bname):
             bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, bname)
             if bid == -1:
@@ -1876,6 +2227,48 @@ class GraspPlanner3D:
 
         self._dls_ik   = SpatialIKSolver(n_robot=n_act)
         self._dls_data = mj.MjData(model)
+        # Separate scratch MjData for _tip_support_along -- _dls_data's qpos is
+        # live state for the DLS seeding path, not safe to stomp mid-solve.
+        self._tip_data = mj.MjData(model)
+
+    def _tip_support_along(self, which: str, q: np.ndarray, n_out: np.ndarray,
+                           r_fallback: float) -> float:
+        """DIRECTIONAL tip radius: how far the pad surface actually extends from
+        the tip site ALONG n_out (world, unit, pointing out of the object), with
+        the tip oriented as it is at configuration `q`.
+
+        The isotropic cfg.r_thumb/r_index is max||V - site|| over ALL directions
+        -- a bounding sphere. A LEAP fingertip is an elongated pad, so the vertex
+        facing the object is several mm closer than the farthest one anywhere,
+        and an IK target of contact + r_iso*n_out parks the pad that much short
+        of the surface (measured on 036_wood_block: 5.9mm thumb / 4.8mm index of
+        pure geometric slack, against an IK residual of only 0.02-0.05mm -- i.e.
+        essentially ALL of the observed pre-squeeze gap, none of it solver
+        error). The support function max_i <V_i, n_out> is the honest answer for
+        one direction.
+
+        Evaluated in NUMPY at a FIXED q -- the previous Picard stage's solution --
+        never symbolically inside the NLP. That is the whole point: a support
+        function is non-smooth (the argmax vertex switches), so making it a
+        function of the decision variable q would degrade convergence, which is
+        exactly why _tip_radius's own comment declined to do this. Frozen per
+        stage it is just a constant, structurally identical to how the contact
+        normal (_d1_lp/_d2_lp) and the paraboloid curvature are already refrozen
+        each stage.
+
+        Falls back to r_fallback (the isotropic radius) for a non-mesh tip.
+        """
+        verts_sl = (self._thumb_verts_sl if which == 'thumb' else self._index_verts_sl)
+        if verts_sl is None:
+            return float(r_fallback)
+        sid = self._thumb_sid if which == 'thumb' else self._index_sid
+        d = self._tip_data
+        d.qpos[:len(q)] = q
+        mj.mj_forward(self.model, d)
+        smat = d.site_xmat[sid].reshape(3, 3)
+        # Site-local vertices -> world directions, then support along n_out.
+        n_site = smat.T @ np.asarray(n_out, float)      # n_out in the site frame
+        return float(np.max(verts_sl @ n_site))
 
     # ── public API ─────────────────────────────────────────────────────────────
 
@@ -2071,7 +2464,9 @@ class GraspPlanner3D:
                        max_iter_override: int | None = None,
                        stage_label: str = '',
                        iter_callback=None,
-                       update_normals_in_callback: bool = False) -> dict:
+                       update_normals_in_callback: bool = False,
+                       r1_override: float | None = None,
+                       r2_override: float | None = None) -> dict:
 
             _t_stage_start = time.perf_counter()
             _uid = id(q_ws)
@@ -2108,6 +2503,8 @@ class GraspPlanner3D:
             _q  = _opti.variable(n_act)
             _is_mesh = (geom_type == _GEOM_TYPE_MESH and self._mesh_entry is not None)
             _t1_var = _t2_var = None   # set below iff a mesh 2-DOF contact var is built
+            _t1_bounds = _t2_bounds = None   # set below iff use_quadratic_contact (per-axis trust region)
+            _t1_frame = _t2_frame = None     # set below iff use_quadratic_contact (paraboloid params, for viz)
             if cfg.fixed_contacts:
                 # Staging/diagnostic mode: p1/p2 are CONSTANTS at the seed value, not
                 # decision variables — same NLP shape as ConstrainedIKSolver's
@@ -2134,6 +2531,28 @@ class GraspPlanner3D:
                 _t2_var, _p2 = _mesh_uv_local_contact_ca(
                     _opti, p2_ws, obj_center_np, obj_R_np, self._mesh_entry,
                     self._uv_atlas["atlas"], _p2_chart_id, rings=cfg.uv_atlas_rings)
+            elif _is_mesh and cfg.use_quadratic_contact:
+                # Local-quadratic (paraboloid) parameterization: p1/p2 become
+                # 2-DOF expressions placed directly on a surface model fit
+                # from the SDF's gradient+Hessian at the seed — no per-
+                # candidate surface_project call, no mesh/chart lookup. See
+                # _mesh_quadratic_contact_ca. Re-centered every call the same
+                # way _mesh_tangent_contact_ca is, so the Picard loop's
+                # between-stage re-seeding applies unchanged.
+                _n1_seed_out = -np.asarray(d1_lp, float) if d1_lp is not None else \
+                    _geom_normal_np(p1_ws, geom_type, obj_center_np, obj_R_np, geom_size,
+                                    mesh_entry=self._mesh_entry)
+                _n2_seed_out = -np.asarray(d2_lp, float) if d2_lp is not None else \
+                    _geom_normal_np(p2_ws, geom_type, obj_center_np, obj_R_np, geom_size,
+                                    mesh_entry=self._mesh_entry)
+                _t1_var, _p1, _t1_bounds, _t1_frame = _mesh_quadratic_contact_ca(
+                    _opti, p1_ws, _n1_seed_out, obj_center_np, obj_R_np, self._mesh_entry,
+                    t_bound_max=cfg.quadratic_t_bound_max,
+                    sdf_err_tol=cfg.quadratic_sdf_err_tol)
+                _t2_var, _p2, _t2_bounds, _t2_frame = _mesh_quadratic_contact_ca(
+                    _opti, p2_ws, _n2_seed_out, obj_center_np, obj_R_np, self._mesh_entry,
+                    t_bound_max=cfg.quadratic_t_bound_max,
+                    sdf_err_tol=cfg.quadratic_sdf_err_tol)
             elif _is_mesh:
                 # Tangent-plane parameterization: p1/p2 become 2-DOF expressions
                 # (offset in the local tangent plane at the seed, reprojected
@@ -2159,8 +2578,19 @@ class GraspPlanner3D:
             _tp2   = index_cb(_q)
             # IK cost: fingertip center should be at contact point + r_tip * outward_normal.
             # Without the offset the tip sphere embeds r_tip mm into the object surface.
-            _tp1_tgt = _p1 + ca.DM(float(cfg.r_thumb) * d1_lp)
-            _tp2_tgt = _p2 + ca.DM(float(cfg.r_index) * d2_lp)
+            # r*_override (when set) is the DIRECTIONAL support distance along
+            # this stage's frozen normal, from the previous stage's q -- see
+            # _tip_support_along. It replaces the isotropic bounding-sphere
+            # radius HERE ONLY: this is the target that decides how far off the
+            # surface the pad parks, and the isotropic value overshoots it by
+            # several mm on an elongated pad. The ground-clearance constraint in
+            # section 5b deliberately keeps using cfg.r_* -- that one wants a
+            # true bounding sphere (the tip can approach the floor from any
+            # direction, not just along the contact normal).
+            _r1_ik = float(cfg.r_thumb if r1_override is None else r1_override)
+            _r2_ik = float(cfg.r_index if r2_override is None else r2_override)
+            _tp1_tgt = _p1 + ca.DM(_r1_ik * d1_lp)
+            _tp2_tgt = _p2 + ca.DM(_r2_ik * d2_lp)
             _d1_sq = ca.sumsqr(_tp1 - _tp1_tgt)   # m²
             _d2_sq = ca.sumsqr(_tp2 - _tp2_tgt)   # m²
 
@@ -2234,7 +2664,28 @@ class GraspPlanner3D:
                 _cost = _cost + cfg.orient_weight * _cost_orient
 
             # Edge margin is now a HARD constraint (tightened tangential face bounds in
-            # _sym_geom_surface_con via cfg.edge_margin_m) — no cost term needed.
+            # _sym_geom_surface_con via cfg.edge_margin_m) — no cost term needed. BOX
+            # only, though (see _sym_geom_surface_con) — mesh contacts get no hard
+            # edge keep-out at all, hence the soft curvature penalty below.
+
+            # ── Edge-avoidance curvature penalty (quadratic mesh contact only) ──
+            # Penalize the paraboloid's own height h(t_var) at each contact's SOLVED
+            # (t1,t2) -- kappa0/kappa1/grad_norm are frozen numpy floats from this
+            # stage's seed (_mesh_quadratic_contact_ca's `frame`), but t_var is the
+            # live NLP variable, so this is truly differentiable in t_var: moving
+            # toward a high-curvature direction (edge) costs quadratically more than
+            # moving along a flat one (face), steering the SAME stage's optimizer
+            # away from the edge rather than only penalizing curvature after the
+            # fact at a fixed point. Zero on a flat seed (kappa0=kappa1=0).
+            if cfg.w_edge_curvature > 0.0:
+                _cost_edge = ca.DM(0.0)
+                for _t_var, _frame in ((_t1_var, _t1_frame), (_t2_var, _t2_frame)):
+                    if _t_var is None or _frame is None:
+                        continue
+                    _h = -(_frame['kappa0'] * _t_var[0]**2 + _frame['kappa1'] * _t_var[1]**2) \
+                        / (2.0 * _frame['grad_norm'])
+                    _cost_edge = _cost_edge + _h**2
+                _cost = _cost + cfg.w_edge_curvature * _cost_edge
 
             # ── 1. Joint limits (vectorized) ──────────────────────────────
             if cfg.joint_limits:
@@ -2809,6 +3260,20 @@ class GraspPlanner3D:
                     if 'uv1' in _iter_rec[0]:
                         _out['uv1'] = np.stack([r['uv1'] for r in _iter_rec])
                         _out['uv2'] = np.stack([r['uv2'] for r in _iter_rec])
+                    # Local-quadratic paraboloid params (use_quadratic_contact
+                    # only) — one frame per contact per STAGE (same per-stage
+                    # scoping as uv1/uv2 above: Picard relinearization rebuilds
+                    # the whole paraboloid fit at each stage's new seed, so
+                    # these are only valid for reconstructing THIS file's
+                    # p1/p2 trajectory, not across stages). Flattened with a
+                    # 'quad1_'/'quad2_' prefix per frame key rather than one
+                    # nested dict, since np.savez only stores flat arrays.
+                    if _t1_frame is not None:
+                        for _k, _v in _t1_frame.items():
+                            _out[f'quad1_{_k}'] = np.asarray(_v, float)
+                    if _t2_frame is not None:
+                        for _k, _v in _t2_frame.items():
+                            _out[f'quad2_{_k}'] = np.asarray(_v, float)
                     np.savez(npz_path, **_out)
                     self.log.info(f"[{stage_label}] iter trace saved -> {npz_path}")
                 except Exception as _e_npz:
@@ -2847,6 +3312,38 @@ class GraspPlanner3D:
                     f"std={_st['ik_if_mm_std']:.2f}]"
                 )
 
+            def _quad_pinned(value_fn) -> bool:
+                """True if either mesh contact's solved (t1,t2) sits within
+                cfg.quadratic_pin_frac of its own per-axis SDF-derived bound —
+                i.e. the local-quadratic trust region ran out before the
+                solver was done pushing that contact, not a freely-converged
+                interior optimum. Only meaningful under use_quadratic_contact
+                (both _t*_bounds are None otherwise, always returns False).
+                Consumed by the Picard relinearization loop below to force
+                another stage (fresh seed -> fresh bound) even when position/
+                normal-mismatch convergence alone would call it done.
+                """
+                if _t1_bounds is None and _t2_bounds is None:
+                    return False
+                frac = float(cfg.quadratic_pin_frac)
+                # A bound of ~0 means that axis was given NO freedom to begin
+                # with (the seed itself was already at the edge of what
+                # _sdf_axis_bound_np considers valid) — not an optimizer that
+                # pushed against and used up a real trust region. Comparing
+                # |tv| >= frac*bound there is degenerate (0 >= 0 is always
+                # true), which would mark every such stage pinned forever and
+                # defeat the Picard loop's early-exit unconditionally. Treat
+                # a near-zero bound as "nothing to be pinned against" instead.
+                _bound_eps = 1e-6
+                for var, bounds in ((_t1_var, _t1_bounds), (_t2_var, _t2_bounds)):
+                    if var is None or bounds is None:
+                        continue
+                    tv = np.asarray(value_fn(var), float).reshape(2)
+                    for i in range(2):
+                        if bounds[i] > _bound_eps and abs(tv[i]) >= frac * bounds[i]:
+                            return True
+                return False
+
             try:
                 _sol = _opti.solve()
                 _plog(_sol.stats())
@@ -2874,6 +3371,7 @@ class GraspPlanner3D:
                     'n2_frozen':     _n2_in.tolist() if _n2_in is not None else None,
                     'stability_last20': _stab,
                     'gws_beta':      float(_sol.value(_gws_beta)) if _gws_beta is not None else None,
+                    'quad_pinned':   _quad_pinned(_sol.value),
                 }
             except Exception as _e:
                 self.log.warning(f"GraspPlanner3D._run_stage({stage_label}): {_e}")
@@ -2906,6 +3404,7 @@ class GraspPlanner3D:
                         'stability_last20': _stab,
                         'gws_beta':      (float(_opti.debug.value(_gws_beta))
                                            if _gws_beta is not None else None),
+                        'quad_pinned':   _quad_pinned(_opti.debug.value),
                     }
                 except Exception as _e2:
                     self.log.error(f"GraspPlanner3D debug extraction: {_e2}")
@@ -2914,7 +3413,7 @@ class GraspPlanner3D:
                             'cost': None, 'iterations': None, 'status': 'failed',
                             'return_status': None,
                             'gamma_nlp': None, 'slack_norms': None, 'max_slack_norm': None,
-                            'gws_beta': None}
+                            'gws_beta': None, 'quad_pinned': False}
 
         # ── Run optimisation ─────────────────────────────────────────────────
         # Outer re-linearisation loop.  Contact normals are frozen per NLP solve
@@ -2930,6 +3429,7 @@ class GraspPlanner3D:
         _p1_ws, _p2_ws, _q_ws = p1_seed, p2_seed, q_dls
         _tol_p_m   = 5e-4    # 0.5 mm position shift → converged
         _tol_deg   = 2.0     # 2° normal mismatch → normals are accurate enough
+        _tol_r_m   = 5e-4    # 0.5 mm directional-r_tip shift → radius is self-consistent
         res = {}
         _best_res  = {}      # best stage result by cost (Picard has no descent guarantee)
         # Box (geom_type 6) needs NO Picard relinearization: the face-pin surface
@@ -2939,6 +3439,21 @@ class GraspPlanner3D:
         # (sphere/cylinder) still relinearize since their normals genuinely turn with p.
         _n_relin = 0 if geom_type == 6 else cfg.n_normal_relinearize
         for _ri in range(_n_relin + 1):
+            # Directional tip radii, refrozen from the CURRENT warm-start q and
+            # this stage's frozen normals (both are constants for the solve about
+            # to run, so the support function never enters the NLP symbolically).
+            # -d*_lp is the OUTWARD direction: _d*_lp is the object's outward
+            # surface normal used as the IK offset direction, and the pad extends
+            # from the site back toward the finger, i.e. along -n_out.
+            _r1_ov = _r2_ov = None
+            if cfg.directional_r_tip:
+                _m = float(cfg.directional_r_tip_margin_m)
+                _r1_ov = self._tip_support_along('thumb', _q_ws, -_d1_lp, cfg.r_thumb) + _m
+                _r2_ov = self._tip_support_along('index', _q_ws, -_d2_lp, cfg.r_index) + _m
+                self.log.info(
+                    f"[S{_ri+1}|r_tip] directional thumb={_r1_ov*1e3:.2f}mm "
+                    f"index={_r2_ov*1e3:.2f}mm  (isotropic {cfg.r_thumb*1e3:.2f}/"
+                    f"{cfg.r_index*1e3:.2f}mm, margin {_m*1e3:.1f}mm)")
             res = _run_stage(_q_ws, _p1_ws, _p2_ws,
                              include_surface=True,
                              d1_lp=_d1_lp,
@@ -2946,7 +3461,8 @@ class GraspPlanner3D:
                              max_iter_override=cfg.max_iter,
                              stage_label=f'S{_ri+1}',
                              iter_callback=iter_callback,
-                             update_normals_in_callback=update_normals_in_callback)
+                             update_normals_in_callback=update_normals_in_callback,
+                             r1_override=_r1_ov, r2_override=_r2_ov)
             # Keep the cheapest stage result — relinearization has no descent guarantee.
             if (res.get('cost') is not None and
                     (not _best_res or res['cost'] < _best_res.get('cost', float('inf')))):
@@ -2973,14 +3489,46 @@ class GraspPlanner3D:
             _mismatch_deg = max(np.degrees(np.arccos(_cos1)),
                                 np.degrees(np.arccos(_cos2)))
 
+            # 3. Trust-region pin (use_quadratic_contact only): the solved
+            #    (t1,t2) sat at/near its per-axis SDF-derived bound this
+            #    stage. Small dp/mismatch alone can't distinguish "found an
+            #    interior optimum" from "the local quadratic ran out of room
+            #    and the wall stopped the search" — treat a pin as NOT
+            #    converged even if position/normal checks pass, so the next
+            #    stage re-seeds at the pinned point and rebuilds a fresh
+            #    (generally larger, since it's moved off the tight direction)
+            #    bound there. See GraspConfig3D.quadratic_pin_frac.
+            _pinned = bool(res.get('quad_pinned'))
+
+            # 4. Directional-r_tip self-consistency: the radius this stage USED
+            #    was computed from the PREVIOUS stage's q, but the pad's
+            #    orientation moved during the solve, so the radius its own answer
+            #    implies can differ. Measured swings of ~8mm between S1 and S2
+            #    (S1's radius comes off the crude DLS seed pose, where the finger
+            #    is nowhere near its final orientation) -- converging on a stale
+            #    radius reintroduces exactly the gap this feature removes, just
+            #    with a different sign. Treat a material shift as NOT converged,
+            #    the same way a trust-region pin is, so the next stage re-solves
+            #    against the corrected radius. Fixed point: r used == r implied.
+            _dr = 0.0
+            if cfg.directional_r_tip and res.get('q') is not None and _r1_ov is not None:
+                _m = float(cfg.directional_r_tip_margin_m)
+                _qr = np.asarray(res['q'])
+                _r1_new = self._tip_support_along('thumb', _qr, -_n1_actual, cfg.r_thumb) + _m
+                _r2_new = self._tip_support_along('index', _qr, -_n2_actual, cfg.r_index) + _m
+                _dr = max(abs(_r1_new - _r1_ov), abs(_r2_new - _r2_ov))
+
             self.log.info(
                 f"[relinearize S{_ri+1}→S{_ri+2}] "
-                f"dp={_dp*1e3:.2f}mm  mismatch={_mismatch_deg:.1f}°")
+                f"dp={_dp*1e3:.2f}mm  mismatch={_mismatch_deg:.1f}°  pinned={_pinned}"
+                + (f"  dr_tip={_dr*1e3:.2f}mm" if cfg.directional_r_tip else ""))
 
-            if _dp < _tol_p_m and _mismatch_deg < _tol_deg:
+            if (_dp < _tol_p_m and _mismatch_deg < _tol_deg and not _pinned
+                    and _dr < _tol_r_m):
                 self.log.info(
                     f"[relinearize] converged after S{_ri+1} "
-                    f"(dp={_dp*1e3:.2f}mm, mismatch={_mismatch_deg:.1f}°)")
+                    f"(dp={_dp*1e3:.2f}mm, mismatch={_mismatch_deg:.1f}°, "
+                    f"dr_tip={_dr*1e3:.2f}mm)")
                 break
 
             # Update normals and warm-start for next solve
@@ -3384,17 +3932,33 @@ class MultiStartGraspPlanner3D:
         # geometry (measured 2-6x worse DLS residual than the minor-axis
         # choice on several YCB objects) — this gives every solve one
         # well-conditioned attempt before falling back to random exploration.
+        def _seed_kappa_ok(s) -> bool:
+            """True unless this seed pair fails the mesh curvature gate (see
+            seed_kappa_max_reject docstring) — shared by every seed source
+            (fixed minor-axis, chart-pair, random _seed_pair) so a near-
+            edge/corner point can't slip through whichever source happens to
+            fill the n_seeds budget first."""
+            if not (geom_type == _GEOM_TYPE_MESH and self._planner._mesh_entry is not None
+                    and cfg.seed_kappa_max_reject > 0):
+                return True
+            p1s_l = obj_R_np.T @ (s['p1s'] - obj_center_np)
+            p2s_l = obj_R_np.T @ (s['p2s'] - obj_center_np)
+            k1 = _mesh_surface_kappa_max_np(self._planner._mesh_entry, p1s_l)
+            k2 = _mesh_surface_kappa_max_np(self._planner._mesh_entry, p2s_l)
+            return max(k1, k2) <= cfg.seed_kappa_max_reject
+
         seeds, attempts, rejected = [], 0, 0
         _axis_local = _minor_axis_local(geom_type, geom_size, mesh_entry=self._mesh_entry)
         _fs = _fixed_antipodal_seed(geom_type, geom_size, c, obj_R_np, _axis_local,
                                     mesh_entry=self._mesh_entry)
         if (_reachable_contact(_fs['p1s'], _ground_z, _r_tip_min) and
-                _reachable_contact(_fs['p2s'], _ground_z, _r_tip_min)):
+                _reachable_contact(_fs['p2s'], _ground_z, _r_tip_min) and
+                _seed_kappa_ok(_fs)):
             _assign_seed_by_finger(_fs, _live_th, _live_if)
             seeds.append(_fs)
         else:
             log.debug(f"[seed_gen] minor-axis seed (local axis {_axis_local.tolist()}) "
-                      f"unreachable — skipped")
+                      f"unreachable or too-curved — skipped")
 
         # ── Chart-aware antipodal seeds (mesh + use_uv_atlas_contact only) ──
         # Ranked by chart-normal antipodality (see _chart_pair_seeds docstring
@@ -3429,6 +3993,18 @@ class MultiStartGraspPlanner3D:
             for _cs in _chart_cands:
                 if not (_reachable_contact(_cs['p1s'], _ground_z, _r_tip_min) and
                         _reachable_contact(_cs['p2s'], _ground_z, _r_tip_min)):
+                    continue
+                # Same curvature gate as the fixed minor-axis and random
+                # _seed_pair sources (_seed_kappa_ok, defined above) — chart-
+                # pair candidates are otherwise ranked only by antipodality +
+                # DLS-IK residual, neither of which screens for a centroid
+                # sitting at/near a mesh edge or corner. Checked here (not
+                # only had it been left to use_quadratic_contact's own
+                # per-stage trust region) because these are the HIGHEST-
+                # priority seeds (tried before the random fallback), so an
+                # ungated near-corner chart-pair seed would be the most
+                # likely one to actually win the seed budget.
+                if not _seed_kappa_ok(_cs):
                     continue
                 # Finger assignment (thumb vs index) BEFORE scoring, not after —
                 # _assign_seed_by_finger can swap which physical contact is p1
@@ -3493,6 +4069,19 @@ class MultiStartGraspPlanner3D:
             n1_out = -s['n1_in'];  n2_out = -s['n2_in']
             if (not _reachable_contact(s['p1s'], _ground_z, _r_tip_min) or
                     not _reachable_contact(s['p2s'], _ground_z, _r_tip_min)):
+                rejected += 1
+                continue
+            # Curvature check (mesh only) — reject seeds landing at/near an
+            # edge or corner of the SDF's zero level set, where the surface
+            # genuinely can't be well-approximated locally regardless of which
+            # contact representation is used downstream (analytic primitives
+            # have exact closed-form surfaces with no such collapse, so this
+            # is skipped for them). See _mesh_surface_kappa_max_np's docstring
+            # for how this was found: a near-corner seed left the
+            # use_quadratic_contact trust region correctly but uselessly
+            # small (<1mm) along the edge-approaching axis, which a better
+            # seed avoids by construction rather than needing a larger box.
+            if not _seed_kappa_ok(s):
                 rejected += 1
                 continue
             _assign_seed_by_finger(s, _live_th, _live_if)
