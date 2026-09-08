@@ -279,6 +279,20 @@ if __name__ == "__main__":
         help="DexPilot output EMA smoothing on the 16 hand joints (teleop). on (default): "
              "EMA (hand_alpha) smooths frame-to-frame joint jitter. off: no smoothing "
              "(hand_alpha=1.0, raw solved q_hand each frame). Independent of --pinch-debounce.")
+    _arg_parser.add_argument(
+        '--record', dest='record', default='on', choices=['on', 'off'],
+        help="With --trial-log: record MP4 video of the run from the 3rd-person `overview` "
+             "camera and the 1st-person `wrist` camera, saved as <run>_overview.mp4 / "
+             "<run>_wrist.mp4 in the trial-log dir. on (default): record when --trial-log is "
+             "set. off: skip video (keep the event/trace logging). No effect without --trial-log.")
+    _arg_parser.add_argument(
+        '--record-fps', dest='record_fps', type=float, default=30.0,
+        help="Video frame rate for --record (default 30). Independent of the sim/spin rate.")
+    _arg_parser.add_argument(
+        '--record-size', dest='record_size', default='1280x960', metavar='WxH',
+        help="Recorded video resolution for --record, as WxH (default 1280x960). Must be "
+             "<= the scene's <global offwidth/offheight> (1280x960) or the render errors; "
+             "raise those in models/scene_kinova_leap*.xml to go higher.")
     args = _arg_parser.parse_args()
     # In-code defaults for behaviours that used to be always-True CLI flags. These
     # never had a way to turn them OFF from the command line, so they only cluttered
@@ -394,43 +408,92 @@ if __name__ == "__main__":
     _spec = mj.MjSpec.from_file(_SCENE_FILES[args.scene])
     _sweep_bodies = [b for b in _spec.bodies if b.name.startswith('obj_')]
     _sweep_names = {b.name for b in _sweep_bodies}
-    if args.object is not None:
-        # Deprecated single-object path: --object overrides --objects (old behavior).
-        if args.object not in _sweep_names:
-            sys.exit(f"--object {args.object!r} is not a pickable object body in the scene; "
-                     f"choose one of: {', '.join(sorted(_sweep_names))}")
-        _keep = {args.object}
-    elif args.objects == 'all':
-        _keep = set(_sweep_names)
+
+    # Object selection precedence:
+    #   1. --object <body>  (deprecated single primitive; overrides everything)
+    #   2. --objects <list> (explicit primitive subset from the scene XML)
+    #   3. per-scene config (models/scene_objects.json) -> YCB MESH objects
+    #   4. --objects all / default -> every primitive obj_* body in the scene XML
+    # The config-driven YCB path replaces the primitive stand-ins with real mesh objects
+    # (dexpilot / anyteleop only — see the contact-aware guard below). --objects/--object
+    # on the CLI always override the config.
+    from environments import scene_objects as _scene_objs
+    _ycb_placed = []                       # [(body_name, xy)] for post-compile placement
+    _cli_objects = (args.object is not None) or (args.objects != 'all')
+    _scene_cfg = None if _cli_objects else _scene_objs.load_scene_objects(args.scene)
+
+    if _scene_cfg:
+        # Config path: attach the listed YCB objects, prune ALL primitive obj_* bodies.
+        for _k in list(_spec.keys):
+            _spec.delete(_k)
+        for _b in _sweep_bodies:
+            _spec.delete(_b)
+        for _entry in _scene_cfg:
+            _oid = _entry['id']
+            try:
+                _bn = _scene_objs.attach_ycb_object(
+                    _spec, _oid, _entry.get('xy', [0.5, 0.3]),
+                    mass=_entry.get('mass'),
+                    friction=tuple(_entry['friction']) if 'friction' in _entry else (2.0, 0.05, 0.005),
+                    quat=tuple(_entry['quat']) if 'quat' in _entry else (1.0, 0.0, 0.0, 0.0))
+            except FileNotFoundError as _e:
+                sys.exit(f"[scene] {_e}")
+            _ycb_placed.append((_bn, _entry.get('xy', [0.5, 0.3])))
+        print(f"[scene] spawning {len(_ycb_placed)} YCB object(s) from "
+              f"{_scene_objs.config_path()} [{args.scene}]: "
+              f"{', '.join(bn for bn, _ in _ycb_placed)}")
     else:
-        _keep = {s.strip() for s in args.objects.split(',') if s.strip()}
-        _bad = _keep - _sweep_names
-        if _bad:
-            sys.exit(f"--objects: unknown pickable bodies {sorted(_bad)}; "
-                     f"choose from: {', '.join(sorted(_sweep_names))}")
-    if not _keep:
-        sys.exit("--objects resolved to an empty set; keep at least one obj_* body.")
-    _to_delete = [b for b in _sweep_bodies if b.name not in _keep]
-    # Drop ALL <keyframe> poses first: they are sized for a specific nq (23 + 7*N) and any
-    # object change invalidates them, and deleting a body while keys still reference the old
-    # qpos layout corrupts the keyframe registry ("repeated name" on compile). The scene
-    # ships with no keyframes now (multi-object), but this stays robust if any are re-added.
-    for _k in list(_spec.keys):
-        _spec.delete(_k)
-    for _b in _to_delete:
-        _spec.delete(_b)
-    print(f"[scene] spawning {len(_keep)} object(s): {', '.join(sorted(_keep))} "
-          f"(pruned {len(_to_delete)} other pickable(s))")
+        # Primitive path (scene-XML obj_* bodies): --object / --objects / all.
+        if args.object is not None:
+            if args.object not in _sweep_names:
+                sys.exit(f"--object {args.object!r} is not a pickable object body in the "
+                         f"scene; choose one of: {', '.join(sorted(_sweep_names))}")
+            _keep = {args.object}
+        elif args.objects == 'all':
+            _keep = set(_sweep_names)
+        else:
+            _keep = {s.strip() for s in args.objects.split(',') if s.strip()}
+            _bad = _keep - _sweep_names
+            if _bad:
+                sys.exit(f"--objects: unknown pickable bodies {sorted(_bad)}; "
+                         f"choose from: {', '.join(sorted(_sweep_names))}")
+        if not _keep:
+            sys.exit("--objects resolved to an empty set; keep at least one obj_* body.")
+        _to_delete = [b for b in _sweep_bodies if b.name not in _keep]
+        # Drop ALL <keyframe> poses first: they are sized for a specific nq (23 + 7*N) and
+        # any object change invalidates them, and deleting a body while keys still reference
+        # the old qpos layout corrupts the keyframe registry ("repeated name" on compile).
+        for _k in list(_spec.keys):
+            _spec.delete(_k)
+        for _b in _to_delete:
+            _spec.delete(_b)
+        print(f"[scene] spawning {len(_keep)} object(s): {', '.join(sorted(_keep))} "
+              f"(pruned {len(_to_delete)} other pickable(s))")
     # Mount the robot ON the table top: raise base_link (the welded world-root of
-    # kinova_leap.xml, authored at the origin) to TABLE_TOP_Z. Base +z is already "up", so
-    # no rotation is needed — the arm rises upright from the tabletop. This is the standard
-    # tabletop-manipulation mount and puts grasps level with the base (the easy IK regime).
+    # kinova_leap.xml, authored at the origin) to TABLE_TOP_Z, and YAW it 90 deg CCW about
+    # world +z. The gen3 arm reaches naturally along its shoulder axis, which is +x at yaw=0
+    # (the table LENGTH); yawing +90 deg turns that reach to +y so the arm works ACROSS the
+    # table WIDTH (the reachable width side, since the table spans y in [-0.125,0.625]).
+    # quat = (w,x,y,z) = (cos45, 0, 0, sin45). The home/teleop poses below are re-solved for
+    # this orientation, and the operator->robot mapping (publisher --yaw in start_teleop.sh)
+    # is set so operator left<->right (table length) matches the robot's left<->right.
+    # Moved BACK toward the near (-y) table edge along the length center line (x=0): the arm
+    # reaches +y, so sitting at y=-0.15 (0.10 m from the enlarged table's -0.25 edge) opens up
+    # the +y workspace over more of the table without overhanging the edge. Max object reach is
+    # ~0.54 m (within the comfortable envelope); home stays collision-free.
+    _s = 0.7071067811865476  # cos(45 deg) = sin(45 deg)
     for _b in _spec.bodies:
         if _b.name == 'base_link':
-            _b.pos = [0.0, 0.0, TABLE_TOP_Z]
+            _b.pos = [0.0, -0.15, TABLE_TOP_Z]
+            _b.quat = [_s, 0.0, 0.0, _s]
             break
     model = _spec.compile()
     data  = mj.MjData(model)
+
+    # Place each attached YCB object on the table top (its collision-geom half-height needs
+    # the compiled model, so this is done post-compile via the freejoint qpos z).
+    for _bn, _xy in _ycb_placed:
+        _scene_objs.place_on_surface(model, data, _bn, TABLE_TOP_Z)
 
     N_ROBOT = 23  # joint_1..7 (Gen3 arm) + 16 LEAP finger joints; object joints follow
     # Gen3's odd joints (1,3,5,7 -> indices 0,2,4,6) are continuous revolute with no
@@ -568,33 +631,53 @@ if __name__ == "__main__":
         ({'index': 'obj_green_cylinder_c2', 'thumb': 'obj_green_cylinder_c1'}, 'obj_green_cylinder'),
     ]
     # Keep only object defs whose body actually survived the spec prune (deleted sweep
-    # objects — and any commented-out categories — resolve to id -1). In practice this
-    # leaves exactly the one --object body for a swept run.
+    # objects — and any commented-out categories — resolve to id -1).
     object_defs = [(cs, bn) for (cs, bn) in object_defs
                    if mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, bn) >= 0]
+    # AUTO-REGISTER any surviving obj_* body not in the hard-coded object_defs (e.g. attached
+    # YCB mesh objects) with EMPTY contact sites. Such objects still appear in `objects` for
+    # proximity selection, collision lists, and trial logging, but carry no _c1/_c2 grasp
+    # sites — the contact-aware recommender (which consumes id_S) is _CAT_MODE-gated and
+    # never runs for them (a guard below rejects contact-aware modes on site-less objects).
+    _defined = {bn for _, bn in object_defs}
+    for _bid in range(model.nbody):
+        _bn = mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, _bid)
+        if _bn and _bn.startswith('obj_') and _bn not in _defined:
+            object_defs.append(({}, _bn))   # empty contact-site map
     objects = []
     for contact_sites, body_name in object_defs:
-        missing = [f for f in FINGER_SET if f not in contact_sites]
-        assert not missing, (
-            f"{body_name} has no contact site mapped for finger(s) {missing}")
+        # id_S resolves only the fingers that HAVE a mapped contact site (YCB objects have
+        # none, so id_S is empty). No assert — a missing site is only a problem for the
+        # contact-aware recommender, guarded separately.
+        id_S = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, contact_sites[f])
+                for f in FINGER_SET if f in contact_sites]
         obj = {
             'name':    body_name,
-            'id_S':    [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, contact_sites[f])
-                        for f in FINGER_SET],
+            'id_S':    id_S,
             'id_body': mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, body_name),
             'id_geom': mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, body_name + '_geom'),
+            'has_grasp_sites': bool(id_S),
         }
-        # Initial values only — _run_ik refreshes both from the object's live pose at
-        # solve time (the contact sites are children of the object body, so they move
-        # with it).
-        obj['p_S_W'] = [data.site_xpos[sid].copy() for sid in obj['id_S']]
-        # Inward surface normal at each contact site (the site's world-frame local
-        # x-axis, per the scene XML convention) — the direction each fingerpad normal is
-        # driven to align with in the constrained-IK orientation cost. Read from the same
-        # FK state as p_S_W so the two stay consistent.
+        # Initial values only — _run_ik refreshes both from the object's live pose at solve
+        # time. Empty for site-less (YCB) objects; the recommender path never reads them.
+        obj['p_S_W'] = [data.site_xpos[sid].copy() for sid in id_S]
         obj['inward_S_W'] = [data.site_xmat[sid].reshape(3, 3)[:, 0].copy()
-                             for sid in obj['id_S']]
+                             for sid in id_S]
         objects.append(obj)
+
+    # Contact-aware guard: the NLP grasp recommender needs per-object _c1/_c2 contact sites,
+    # which mesh (YCB) objects don't have. Reject contact-aware modes when any spawned object
+    # lacks them — mesh objects are for plain teleop (dexpilot / anyteleop) for now.
+    _needs_sites = (args.mode in ('contact_aware_teleop', 'contact_aware_autonomous')
+                    or getattr(args, 'recommender_grasp', False))
+    _siteless = [o['name'] for o in objects if not o['has_grasp_sites']]
+    if _needs_sites and _siteless:
+        sys.exit(
+            f"[scene] mode {args.mode!r} uses the contact-aware grasp recommender, which "
+            f"needs per-object _c1/_c2 grasp sites, but these object(s) have none: "
+            f"{', '.join(_siteless)}. Mesh/YCB objects are supported for plain teleop only "
+            f"(--mode dexpilot / anyteleop) right now; use a primitive object, or one of "
+            f"those modes.")
 
     dls_ik = SpatialIKSolver(n_robot=N_ROBOT)
 
@@ -745,6 +828,7 @@ if __name__ == "__main__":
     _trial_runner  = None
     _trial_state   = None
     _trial_events  = None
+    _scene_recorder = None   # SceneRecorder, set below when --trial-log + --record on
     _trial_rest_hh = {}   # obj_idx -> rest half-height (m), for the lift-height check
     _dp_trigger    = None   # DexPilotAttemptTrigger, mode == 'dexpilot'
     _cat_trigger   = None   # ContactAwareAttemptTrigger, mode == 'contact_aware_teleop'
@@ -759,6 +843,19 @@ if __name__ == "__main__":
         # correlated timestamps), so it's created in every mode. The TrialRunner + attempt
         # trigger (the success state machine) only exist where a trigger is defined.
         _trial_events = EventLogger(Path('logs') / args.trial_log)
+        # Video recording (3rd-person `overview` + 1st-person `wrist`), tied to --trial-log.
+        # Best-effort: a GL/codec failure disables it with a warning, run continues.
+        _scene_recorder = None
+        if args.record == 'on':
+            from environments.scene_recorder import SceneRecorder
+            try:
+                _rw, _rh = (int(v) for v in str(args.record_size).lower().split('x'))
+            except ValueError:
+                print(f"[record] bad --record-size {args.record_size!r}; using 1280x960.")
+                _rw, _rh = 1280, 960
+            _scene_recorder = SceneRecorder(
+                model, Path('logs') / args.trial_log, args.trial_log,
+                cameras=('overview', 'wrist'), fps=args.record_fps, size=(_rw, _rh))
         if _trial_sm_supported:
             _trial_runner = TrialRunner(_trial_events, Path('logs') / args.trial_log)
             if args.mode == 'dexpilot':
@@ -1015,10 +1112,13 @@ if __name__ == "__main__":
         print("\r\n[Squeeze] " + "  |  ".join(parts))
     _squeeze_diag.last = 0.0
 
-    # Arm home pose from gen3.xml's "home" keyframe (the composite model has its keyframes
-    # stripped in build_kinova_leap.py, since a 7-DOF arm keyframe no longer fits the larger
-    # composite nq — so read it from the source arm model instead of hardcoding).
-    HOME_ARM = mj.MjModel.from_xml_path(GEN3_XML).key('home').qpos[:7].copy()
+    # Arm home / null-space bias pose (autonomous modes). Re-solved for the base yawed +90 deg
+    # so the elbow-bent reach points +y (across the table WIDTH, matching the mount), with the
+    # pinch_site ~0.45 m above the tabletop over the length center (x=0). The gen3 "home"
+    # keyframe reached +x (the pre-rotation length axis), so it's replaced with this IK pose.
+    # Re-solve via the position-only ikpos snippet if the base yaw changes.
+    #   HOME_ARM_GEN3 = mj.MjModel.from_xml_path(GEN3_XML).key('home').qpos[:7].copy()
+    HOME_ARM = np.array([0.0055, 0.1208, 3.1387, -2.4034, -0.0018, 0.9762, 1.5708])
 
     # Null-space bias: HOME_ARM pulls the 7 arm joints toward a natural elbow-bent
     # reach-forward pose (gen3.xml "home" keyframe), producing a lateral/forward approach
@@ -2040,18 +2140,16 @@ if __name__ == "__main__":
 
 
 
-        # Palm-DOWN home for teleop: pinch_site palm NORMAL (+X) points down
-        # (world -Z) and FINGERS (+Z) point FORWARD (world +X) — palm flat over
-        # the table, fingers reaching away. Natural neutral (hold your palm down,
-        # fingers forward, press 8). Solved via IK for pinch_site at ~(0.55,0,0.15)
-        # — LOWERED from z=0.40 so the sim wrist STARTS near the table: relative
-        # positioning then needs only ~0.15 m of descent, so the operator reaches
-        # the sim table well within real vertical travel at modest abs_scale (the
-        # old 0.40 m start forced high gain / was unreachable). Same orientation
-        # (normal=world -Z, fingers=world +X); ori err 0.1deg, manip ~0.07, limited
-        # joints 2/4/6 within range (margins >=0.5 rad).
-        _HOME_WRIST_DOWN = np.array([-0.217, 1.144, 3.44, -2.011,
-                                     -0.087, 1.541, 2.872])
+        # Palm-DOWN home for teleop, solved for the base yawed +90 deg (arm reaching across
+        # the table WIDTH, +y). pinch_site palm NORMAL (site +X) points down (world -Z) and
+        # FINGERS (site +Z) point +Y (across the width, reaching away from the operator) —
+        # palm flat over the table. Natural neutral (hold your palm down, fingers forward,
+        # press 8). Placed at pinch_site (0, 0.45, TABLE_TOP_Z + 0.32): ELEVATED 0.32 m above
+        # the tabletop and centered along the table length (x=0). Verified: pos err ~0, ori
+        # err 0deg, within joint limits, collision-free at rest with objects present. Re-solve
+        # via the ik6 palm-down snippet (fingers->+y) if the base yaw or home height changes.
+        _HOME_WRIST_DOWN = np.array([0.0045, 0.6033, 3.1416, -2.3985,
+                                     0.0048, 1.431, 3.1407])
 
         # Multi-pose orientation calibration: 4 distinct, IK-solved wrist
         # orientations (all reachable, within limits). During calibration (key M)
@@ -3234,6 +3332,7 @@ if __name__ == "__main__":
                             scn.ngeom += 1
                 _draw_bspheres(scn)
                 _draw_active_marker(scn)
+            if _scene_recorder is not None: _scene_recorder.capture(data, data.time)
             viewer.sync()
             time.sleep(model.opt.timestep)
 
@@ -3879,6 +3978,7 @@ if __name__ == "__main__":
                     viewer.user_scn.ngeom = 0
                     _draw_active_marker(viewer.user_scn)
                     _draw_bspheres(viewer.user_scn)   # 7-toggle: IK collision spheres
+                if _scene_recorder is not None: _scene_recorder.capture(data, data.time)
                 viewer.sync()
                 if TELEOP_PROFILE:
                     _t = time.perf_counter()
@@ -4274,6 +4374,7 @@ if __name__ == "__main__":
                     _draw_frame(_wrist_pos,
                                 data.site_xmat[_psid].reshape(3, 3).copy(),
                                 0.06, 0.004)
+                if _scene_recorder is not None: _scene_recorder.capture(data, data.time)
                 viewer.sync()
                 # Trial countdown to the dashboard. The dexpilot branch has its own
                 # viewer.sync()+continue and never falls through to the shared dashboard
@@ -5162,6 +5263,7 @@ if __name__ == "__main__":
                     viewer.user_scn.ngeom = 0   # suppress ghost markers; arm pose is the vis
                     _draw_bspheres(viewer.user_scn)
                     _draw_active_marker(viewer.user_scn)
+                if _scene_recorder is not None: _scene_recorder.capture(data, data.time)
                 viewer.sync()
                 time.sleep(model.opt.timestep)
                 continue
@@ -5559,6 +5661,7 @@ if __name__ == "__main__":
                 _draw_active_marker(scn)
 
             _t_viz0 = time.perf_counter() if GRASP_PROFILE else 0.0
+            if _scene_recorder is not None: _scene_recorder.capture(data, data.time)
             viewer.sync()
             if GRASP_PROFILE and control_phase == 'GRASP':
                 _gp_acc['viz'] += time.perf_counter() - _t_viz0
@@ -5571,6 +5674,8 @@ if __name__ == "__main__":
         _pose_n = len(_pose_trace)
         _pose_trace.save(_pose_path)
         print(f"[pose-trace] saved {_pose_path} ({_pose_n} rows)")
+    if _scene_recorder is not None:
+        _scene_recorder.close()   # finalize the overview + wrist MP4s
     if dash is not None:
         dash.close()
     # (retargeting sliders live in the MediaPipe subprocess window; it cleans up

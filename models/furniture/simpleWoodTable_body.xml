@@ -10,21 +10,25 @@
     <!-- simpleWoodTable -©vk©-  (legs extended up to z=0.575 to meet the top underside and
          close the original leg/top gap; local edits marked). -->
     <body name="simpleWoodTable" pos="0 0 0"  childclass="body_simpleTable" >
-        <!-- VISUAL geoms (viz_ class: no collision). Top at z=0.6 (top surface 0.625). -->
-        <geom class="viz_simpleWoodTable" type="box" size=".6 .375 .025" pos="0 0 0.6"/>
-        <geom class="viz_simpleWoodTable" type="box" size="0.59 0.26 .05" pos="0 0 0.525"/>
-        <geom class="viz_simpleWoodTable" type="box" size="0.03 0.03 0.2875" pos="-0.565 0.235 0.2875"/>
-        <geom class="viz_simpleWoodTable" type="box" size="0.03 0.03 0.2875" pos="-0.565 -0.235 0.2875"/>
-        <geom class="viz_simpleWoodTable" type="box" size="0.03 0.03 0.2875" pos="0.565 0.235 0.2875"/>
-        <geom class="viz_simpleWoodTable" type="box" size="0.03 0.03 0.2875" pos="0.565 -0.235 0.2875"/>
+        <!-- VISUAL geoms (viz_ class: no collision). Top at z=0.6 (top surface 0.625).
+             ENLARGED to 1.4 x 1.0 m (half 0.7 x 0.5, was 1.2 x 0.75) so objects/bin have a
+             wide margin to the edges and don't roll off during pick-and-place. Apron and legs
+             moved out to match the bigger top. -->
+        <geom class="viz_simpleWoodTable" type="box" size=".7 .5 .025" pos="0 0 0.6"/>
+        <geom class="viz_simpleWoodTable" type="box" size="0.69 0.385 .05" pos="0 0 0.525"/>
+        <geom class="viz_simpleWoodTable" type="box" size="0.03 0.03 0.2875" pos="-0.665 0.36 0.2875"/>
+        <geom class="viz_simpleWoodTable" type="box" size="0.03 0.03 0.2875" pos="-0.665 -0.36 0.2875"/>
+        <geom class="viz_simpleWoodTable" type="box" size="0.03 0.03 0.2875" pos="0.665 0.36 0.2875"/>
+        <geom class="viz_simpleWoodTable" type="box" size="0.03 0.03 0.2875" pos="0.665 -0.36 0.2875"/>
 
         <!-- COLLISION geoms. Only the tabletop is named `table` (the arm's collision list
-             references it); the apron/legs are unnamed collision boxes. -->
-        <geom name="table" type="box" size=".6 .375 .025" pos="0 0 0.6" mass="40" />
-        <geom type="box" size="0.59 0.26 .05" pos="0 0 0.525"/>
-        <geom type="box" size="0.03 0.03 0.2875" pos="-0.565 0.235 0.2875"/>
-        <geom type="box" size="0.03 0.03 0.2875" pos="-0.565 -0.235 0.2875"/>
-        <geom type="box" size="0.03 0.03 0.2875" pos="0.565 0.235 0.2875"/>
-        <geom type="box" size="0.03 0.03 0.2875" pos="0.565 -0.235 0.2875"/>
+             references it); the apron/legs are unnamed collision boxes. Sizes/positions mirror
+             the visual geoms above (enlarged to 1.4 x 1.0). -->
+        <geom name="table" type="box" size=".7 .5 .025" pos="0 0 0.6" mass="40" />
+        <geom type="box" size="0.69 0.385 .05" pos="0 0 0.525"/>
+        <geom type="box" size="0.03 0.03 0.2875" pos="-0.665 0.36 0.2875"/>
+        <geom type="box" size="0.03 0.03 0.2875" pos="-0.665 -0.36 0.2875"/>
+        <geom type="box" size="0.03 0.03 0.2875" pos="0.665 0.36 0.2875"/>
+        <geom type="box" size="0.03 0.03 0.2875" pos="0.665 -0.36 0.2875"/>
     </body>
 </mujocoinclude>

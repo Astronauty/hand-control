@@ -209,7 +209,26 @@ The scenes work out of the box with **primitive object stand-ins** (box variants
   #   unzip models/robocasa_assets/objects_lightwheel/<category>.zip -d models/robocasa_assets/objects_lightwheel/
   ```
 
-**Status:** wiring these mesh objects into the clear-table scenes is a **follow-up** (a load-time loader that attaches a chosen mesh object — reusing `benchmarks/ycb_grasp/scene.py`'s `MjSpec` attach path — names it `obj_<id>`, and auto-registers it in the object list). Scope note: mesh objects are for the **plain-teleop `dexpilot` / `anyteleop`** modes (which grasp by hand physics and don't need per-object contact sites); the **contact-aware** methods need per-object grasp-contact handling for meshes, which is being updated separately, so they stay on the primitive stand-ins for now.
+#### Per-scene object config (`models/scene_objects.json`)
+
+Each scene loads a list of YCB mesh objects declared in `models/scene_objects.json`, keyed by `--scene` (≤5 objects typical). Once you've built the YCB assets (above), a run picks up the config's objects automatically:
+
+```json
+{
+  "pick_place": [
+    {"id": "009_gelatin_box", "xy": [-0.38, 0.30]},
+    {"id": "036_wood_block",  "xy": [-0.22, 0.30]},
+    {"id": "017_orange",      "xy": [-0.06, 0.30]}
+  ],
+  "robocasa": [ ... ]
+}
+```
+
+Each entry is a YCB `id` (built in `assets/ycb_mjcf/`) + a table-top `xy` (z is auto-derived from the object's collision half-height + the scene's table top); optional `quat`, `mass`, `friction` overrides. The loader (`environments/scene_objects.py`) attaches each object into the scene as `obj_<slug>` with a `<freejoint/>`, `condim=6` grasp friction, and the object's published YCB mass, reusing the `benchmarks/ycb_grasp/scene.py` MjSpec attach path.
+
+**Precedence:** `--objects <list>` / `--object <body>` (primitives) **override** the config; a missing config file/entry falls back to the primitive `obj_*` bodies in the scene XML.
+
+**Scope:** YCB mesh objects are for the **plain-teleop `dexpilot` / `anyteleop`** modes (they grasp by hand physics and carry no `_c1`/`_c2` grasp sites). The **contact-aware** methods need per-object grasp-contact sites, which is being updated separately, so a contact-aware run with mesh objects exits with a message directing you to a primitive object or a plain-teleop mode.
 
 The committed/vendored surface assets: the counter's marble texture (`models/furniture/textures/robocasa_marble.png`, from RoboCasa, CC-BY-4.0) and the wood-table assets (`models/furniture/`, from reachy2_mujoco_assets / Vikash Kumar's furniture_sim, Apache-2.0).
 

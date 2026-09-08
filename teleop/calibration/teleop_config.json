@@ -5,7 +5,7 @@
     "mode": "relative",
     "_comment_abs_scale": "Uniform position gain (applies to BOTH relative and absolute). 1.0 = 1:1 metres. >1 amplifies reach.",
     "abs_scale": 2.0,
-    "_comment_world_from_board": "3x3 rotation remapping board axes -> robot world axes (applied to the position/displacement only). Identity = board==robot world; flip/swap columns to invert or swap axes. Set to SWAP x<->y so the operator-table LENGTH maps to the robot-table LENGTH (operator & robot tables had x-y inverted): board-x -> robot-y, board-y -> robot-x.",
+    "_comment_world_from_board": "3x3 rotation remapping board axes -> robot world axes (applied to the position/displacement only). Identity = board==robot world; flip/swap columns to invert or swap axes. Set to SWAP x<->y so the operator-table LENGTH maps to the robot-table LENGTH (operator & robot tables had x-y inverted): board-x -> robot-y, board-y -> robot-x. NOTE: this remap is used by the MEDIAPIPE/webcam path; the VR/Vive path builds the controller WITHOUT world_from_board (defaults to identity) and does the operator<->robot table-orientation match in the PUBLISHER via `--yaw` in start_teleop.sh instead.",
     "world_from_board": [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
   }
 }

@@ -148,7 +148,7 @@
                     <geom class="collision" mesh="bracelet_with_vision_link"/>
                     <site name="pinch_site" pos="0 0 -0.061525" quat="0 1 0 0"/>
                     <site name="hand_mount" pos="-0.1 -0.05 -0.17" quat="0.707107 0 0.707107 0"/>
-                    <camera name="wrist" pos="0 -0.05639 -0.058475" quat="0 0 0 1" resolution="640 480" fovy="41.8379"/>
+                    <camera name="wrist" pos="0 -0.05639 -0.058475" quat="0 0 0 1" resolution="1280 960" fovy="41.8379"/>
                     <body name="leap_palm" pos="0 -0.05 -0.17" quat="0 0.707107 0 -0.707107">
                       <inertial pos="-0.049542 -0.042914 -0.010227" quat="0.565586 0.427629 -0.574956 0.408254" mass="0.237" diaginertia="0.000407345 0.000304759 0.000180736"/>
                       <geom name="leap_palm_visual" class="leap_visual" pos="-0.02 0.02575 -0.0347" quat="1 0 0 0" material="leap_black" mesh="leap_palm"/>

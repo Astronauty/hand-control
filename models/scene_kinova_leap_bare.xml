@@ -6,7 +6,7 @@
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0 0 0"/>
     <rgba haze="0.15 0.25 0.35 1"/>
-    <global azimuth="120" elevation="-20"/>
+    <global azimuth="120" elevation="-20" offwidth="1280" offheight="960"/>
   </visual>
 
   <asset>
@@ -28,6 +28,11 @@
        share one robot base. -->
   <worldbody>
     <light pos="0 0 1.5" directional="true"/>
+    <!-- 3rd-person overview camera for recording (see SceneRecorder / --trial-log). Fixed
+         front-elevated view; the robocasa counter top is higher (z~0.86), so this sits a bit
+         higher than the pick_place overview. Arm faces +y, objects in front. 1280x960. -->
+    <camera name="overview" pos="0.0 -0.85 1.65" xyaxes="1 0 0 0 0.6 0.8"
+            resolution="1280 960" fovy="55"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
   </worldbody>
 </mujoco>

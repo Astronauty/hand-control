@@ -6,7 +6,7 @@
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0 0 0"/>
     <rgba haze="0.15 0.25 0.35 1"/>
-    <global azimuth="120" elevation="-20"/>
+    <global azimuth="120" elevation="-20" offwidth="1280" offheight="960"/>
   </visual>
 
   <asset>
@@ -33,6 +33,12 @@
 
   <worldbody>
     <light pos="0 0 1.5" directional="true"/>
+    <!-- 3rd-person overview camera for recording (see SceneRecorder / --trial-log). Fixed
+         front-elevated view of the table workspace: the arm (base at origin, facing +y) and
+         the objects in front of it, framed from -y looking toward +y. 1280x960 (see <global
+         offwidth/offheight>). -->
+    <camera name="overview" pos="0.0 -0.75 1.35" xyaxes="1 0 0 0 0.6 0.8"
+            resolution="1280 960" fovy="55"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
     <!-- Table centered under the robot workspace (arm base at ~(0,0), reaches +y forward). -->
     <body name="table" pos="0.0 0.25 0.0">

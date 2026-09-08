@@ -67,7 +67,13 @@ logs)
 
 hands)
 	ros_env
-	exec python3 teleop/vive_hand_publisher.py --hand "${2:-right}" --frame mujoco --yaw 270
+	# --yaw aligns the operator's hand motion to the robot table frame. The base is yawed +90
+	# (arm reaches +y across the table WIDTH); robot-table LENGTH = world X, WIDTH = world Y.
+	# yaw 0 maps hand-right -> robot +X (so operator LEFT<->RIGHT matches the robot's
+	# left<->right along the LENGTH) and hand-forward -> robot +Y (reach across the width) —
+	# verified via `--check-yaw`. If left/right or forward/back comes out reversed, run
+	# `python3 teleop/vive_hand_publisher.py --check-yaw` and pick the matching row (0/90/180/270).
+	exec python3 teleop/vive_hand_publisher.py --hand "${2:-right}" --frame mujoco --yaw 0
 	;;
 
 sim)
