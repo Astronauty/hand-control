@@ -478,7 +478,7 @@ def _gamma_stability_ceiling(model, obj_body_id, tip_geom_ids):
 def run_pick(object_id, seed, n_seeds=1, n_relin=None, gws=False, w_gws=5.0,
             w_span=1.0, use_quadratic=True, view=False, render_path=None,
             video_path=None, quad_plot_path=None, do_lift=True, max_iter=200,
-            w_edge_curvature=0.0, directional_r_tip=False,
+            w_edge_margin=0.0, directional_r_tip=False,
             directional_r_tip_margin_m=0.001):
     rng = np.random.default_rng(seed)
 
@@ -517,7 +517,7 @@ def run_pick(object_id, seed, n_seeds=1, n_relin=None, gws=False, w_gws=5.0,
     cfg_kw = dict(n_seeds=n_seeds, max_iter=max_iter, arm_geom_names=rgeoms,
                  obj_clearance_by_geom=obj_clr, col_clearance_m=DEFAULT_COL_CLEARANCE_M,
                  use_quadratic_contact=use_quadratic,
-                 w_edge_curvature=w_edge_curvature,
+                 w_edge_margin=w_edge_margin,
                  directional_r_tip=directional_r_tip,
                  directional_r_tip_margin_m=directional_r_tip_margin_m,
                  # Grasp-axis + fingerpad alignment, matching the production
@@ -849,11 +849,13 @@ def main():
     # three into out/<object>/, so the flags are gone rather than kept as no-ops.
     ap.add_argument("--no-lift", dest="do_lift", action="store_false",
                     help="skip the post-squeeze vertical lift-jog stability check")
-    ap.add_argument("--w-edge-curvature", type=float, default=0.0,
-                    help="penalize the quadratic-contact patch's own curvature-driven "
-                         "height at the solved (t1,t2) -- steers contacts away from mesh "
-                         "edges/corners toward flat faces (0.0 = off, matching prior "
-                         "behavior; see GraspConfig3D.w_edge_curvature docstring)")
+    ap.add_argument("--w-edge-margin", type=float, default=0.0,
+                    help="penalize a contact that comes within edge_margin_sdf_m of a "
+                         "trust-region bound set by a MEASURED SDF divergence (a real "
+                         "surface boundary), ignoring bounds at quadratic_t_bound_max "
+                         "which only mean 'flat as far as the search looked'. Replaces "
+                         "the old curvature-based penalty, which was blind on flat faces "
+                         "and mis-fired on genuinely round objects (0.0 = off)")
     ap.add_argument("--directional-r-tip", action="store_true",
                     help="size the IK fingertip offset by the pad's support distance along "
                          "the contact normal (refrozen per Picard stage) instead of the "
@@ -881,7 +883,7 @@ def main():
             gws=args.gws, w_gws=args.w_gws, w_span=args.w_span,
             use_quadratic=args.use_quadratic, view=args.view, render_path=render_path,
             video_path=video_path, quad_plot_path=quad_plot_path, do_lift=args.do_lift,
-            w_edge_curvature=args.w_edge_curvature,
+            w_edge_margin=args.w_edge_margin,
             directional_r_tip=args.directional_r_tip,
             directional_r_tip_margin_m=args.r_tip_margin_mm / 1000.0)
 

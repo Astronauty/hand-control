@@ -48,6 +48,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "benchmarks"))
 
 from simulation.grasp_planner_3d import GraspConfig3D, MultiStartGraspPlanner3D  # noqa: E402
+from ycb_grasp.plot_uv_path import _view_cam_dir                                # noqa: E402
 from ycb_grasp import scene as S, workspace as W                                # noqa: E402
 from ycb_grasp.ik_demo import (clearance_by_geom, home_bias, place_objects,     # noqa: E402
                                render, robot_geom_names)
@@ -56,7 +57,6 @@ from grasp_control import object_uv_atlas as oua                                
 # Reuse plot_uv_path.py's camera-framing helpers rather than re-derive them --
 # see that module for the mplot3d depth-sort / antipodal-pair framing notes
 # these encode; nothing about them is UV-atlas-specific.
-from ycb_grasp.plot_uv_path import _facing_view, _view_cam_dir                  # noqa: E402
 
 N_ROBOT = 23
 DEFAULT_COL_CLEARANCE_M = 0.002
@@ -224,7 +224,9 @@ def _draw_mesh_3d(ax, V, F, color="#dcdcdc", alpha=None, edge_color="#333333", e
 
 
 def _draw_paraboloid_patch(ax, frame: dict, offset_mag: float, color: str,
-                           label: str | None = None, stage_num: int | None = None):
+                           label: str | None = None, stage_num: int | None = None,
+                           num_offset: float | None = None,
+                           cam_dir: np.ndarray | None = None):
     """One stage's paraboloid patch, rendered ONLY over the trust region
     itself (see _paraboloid_patch_mesh) and pushed outward along the patch's
     own normal for the same mplot3d depth-sort reason plot_uv_path.py's
@@ -282,13 +284,50 @@ def _draw_paraboloid_patch(ax, frame: dict, offset_mag: float, color: str,
                   zorder=9, depthshade=False, label=label)
 
     if stage_num is not None:
-        # Text label pushed further off-surface than the patch itself so it
-        # doesn't get buried by the patch's own triangles under mplot3d's
-        # per-collection depth sort.
-        label_pt = frame["seed_l"] + n_l * offset_mag * 2.5
+        # Text label pushed off-surface along the patch normal. The push is
+        # sized from the OBJECT (num_offset, a fraction of the object span),
+        # not from offset_mag: offset_mag is derived from the patch's own
+        # t_bound, which near an edge collapses to a couple of mm, so
+        # offset_mag*2.5 left the number sitting essentially ON the surface --
+        # where mplot3d's per-collection depth sort buries it behind the
+        # object mesh in every view whose camera is on the far side. Sizing
+        # the push to the object instead keeps every stage number clear of
+        # the mesh regardless of how small its patch got.
+        # Fixed outward push (no per-stage radial fan): fanning along the
+        # normal moved later stages progressively further from the object,
+        # which in projection sent them off the mesh and into the panel title.
+        push = float(num_offset) if num_offset is not None else offset_mag * 2.5
+        # NO far-side cull: every stage number is drawn in every view. A
+        # contact on the far side of a thin object is only centimetres behind
+        # the surface, and seeing where it sits is the entire point of the
+        # panel -- hiding it left views showing fewer than the full set of
+        # stages, which reads as missing data rather than as occlusion.
+        # Far-side numbers are drawn at reduced alpha instead, so they are
+        # still identifiable as being behind the object.
+        facing = (1.0 if cam_dir is None
+                  else float(np.dot(n_l, np.asarray(cam_dir, float))))
+        num_alpha = 1.0 if facing > 0.0 else 0.45
+        # Stages whose seeds nearly coincide (036_wood_block seed 4's stages 3
+        # and 4 differ by ~1.4mm) are separated VERTICALLY, not radially: the
+        # circle is lifted along the object's own z by a per-stage step, so
+        # consecutive stages stack in a readable column beside the contact
+        # while staying next to the surface rather than drifting off it.
+        z_fan = 0.0 if num_offset is None else float(num_offset) * 1.15 * (stage_num - 1)
+        label_pt = frame["seed_l"] + n_l * push + np.array([0.0, 0.0, z_fan])
+        # Leader line from the seed out to the number: consecutive Picard
+        # stages can land a millimetre apart (036_wood_block seed 4's stages 3
+        # and 4 differ by ~1.4mm in z), so their circles overlap almost exactly
+        # and read as one marker. The leader ties each circle back to the point
+        # it actually belongs to, and the per-stage fan below separates the
+        # circles themselves.
+        seed_pt = frame["seed_l"] + n_l * offset_mag
+        ax.plot([seed_pt[0], label_pt[0]], [seed_pt[1], label_pt[1]],
+               [seed_pt[2], label_pt[2]], "-", color=color, linewidth=0.8,
+               alpha=num_alpha * 0.8, zorder=19)
         ax.text(*label_pt, str(stage_num), color="white", fontsize=9,
-               fontweight="bold", zorder=20, ha="center", va="center",
-               bbox=dict(boxstyle="circle,pad=0.25", facecolor=color, edgecolor="k", linewidth=0.8))
+               fontweight="bold", zorder=20, ha="center", va="center", alpha=num_alpha,
+               bbox=dict(boxstyle="circle,pad=0.25", facecolor=color, edgecolor="k",
+                         linewidth=0.8, alpha=num_alpha))
     return P_draw
 
 
@@ -411,68 +450,51 @@ def plot_quadratic_path(V: np.ndarray, F: np.ndarray, stages: list[dict],
     obj_span = (positions.max(0) - positions.min(0)).max()
     off_floor = obj_span * 0.004
     off_cap = obj_span * 0.02
-
-    # Final stage's seed (= final solved point) sets the camera target, same
-    # convention as plot_uv_path.py using the trajectory's last point.
     last = stages[-1]
-    p1_final_local = obj_mat.T @ (last["p1"][-1] - obj_center_world)
-    p2_final_local = obj_mat.T @ (last["p2"][-1] - obj_center_world)
-    p_final_local = {1: p1_final_local, 2: p2_final_local}
 
-    # ONE shared camera pair for the whole object/both contacts (previously
-    # each of 4 panels got its OWN camera derived from that one contact's
-    # mean surface normal -- consistent per-panel but with no shared
-    # reference between panels, and each contact's normal could point
-    # anywhere, so the 4 resulting angles had no predictable relationship
-    # to each other or to "where the grasp is," making the whole layout hard
-    # to read as one scene). Instead: derive the p1->p2 contact AXIS, place
-    # both cameras on the plane perpendicular to it (so both contacts are
-    # always seen roughly side-on, not one behind the other), 180deg apart,
-    # each tilted down slightly -- i.e. exactly "two iso views on opposite
-    # sides, looking down slightly."
-    grasp_axis = p2_final_local - p1_final_local
-    grasp_axis_n = np.linalg.norm(grasp_axis)
-    if grasp_axis_n > 1e-9:
-        grasp_axis = grasp_axis / grasp_axis_n
-    else:
-        grasp_axis = np.array([1.0, 0.0, 0.0])
-    # A seed vector not parallel to grasp_axis, made perpendicular to it via
-    # Gram-Schmidt, gives a horizontal-ish direction on the plane
-    # perpendicular to the grasp axis -- both cameras sit on this direction
-    # (one on it, one on its antipode), so both always view the p1-p2 axis
-    # roughly side-on. World Z is the seed, falling back to world X only if
-    # the grasp axis IS (near-)vertical.
-    seed = np.array([0.0, 0.0, 1.0])
-    if abs(np.dot(seed, grasp_axis)) > 0.98:
-        seed = np.array([1.0, 0.0, 0.0])
-    perp1 = seed - np.dot(seed, grasp_axis) * grasp_axis
-    perp1 = perp1 / np.linalg.norm(perp1)
-    grasp_mid_local = 0.5 * (p1_final_local + p2_final_local)
-    TILT_DEG = 22.0   # "looking down slightly" -- a fixed downward pitch, not
-                      # derived per-object, so both views tilt the same way
+    # PER-CONTACT panels (one per contact), each viewed from that contact's
+    # OWN side. Two earlier layouts were tried and both proved unreadable for
+    # the question these panels exist to answer -- "where on the object does
+    # this contact sit, and how did it move across Picard stages?":
+    #
+    #   * a grasp-axis-derived iso pair: the angle depended on where the
+    #     contacts landed, so no two seeds were comparable;
+    #   * four fixed object-frame isometrics: comparable across runs, but BOTH
+    #     contacts' stage numbers were drawn in all four panels, so eight
+    #     circles competed for the same screen space and thumb/index at the
+    #     same stage overlapped each other.
+    #
+    # One panel per contact removes the overlap at its source: only that
+    # contact's stages appear, so N stages means exactly N numbers. The camera
+    # faces the contact along its own mean outward normal (averaged over
+    # stages, since a contact that migrates keeps roughly the same face), with
+    # a small downward tilt so the object still reads as a solid.
+    ELEV_DEG = 18.0          # fixed downward tilt for every contact panel
+    contact_ids = sorted({ci for st in stages for ci in st["contact"]})
 
-    def _iso_pair():
-        # Camera DIRECTIONS (unit vectors from target toward the camera):
-        # perp1 and its antipode -perp1 (exactly opposite sides of the
-        # object, symmetric about the grasp axis), each with its world-z
-        # component reduced by sin(TILT_DEG) and renormalized -- "looking
-        # down slightly" means a lower elevation angle for BOTH cameras,
-        # regardless of how perp1/grasp_axis happen to sit relative to
-        # world z for this particular object pose.
-        tilt = np.radians(TILT_DEG)
-        dir_a = perp1.copy()
-        dir_a[2] -= np.sin(tilt)
-        dir_a = dir_a / np.linalg.norm(dir_a)
-        dir_b = -perp1.copy()
-        dir_b[2] -= np.sin(tilt)
-        dir_b = dir_b / np.linalg.norm(dir_b)
-        view_a = _facing_view(grasp_mid_local, grasp_mid_local + dir_a)
-        view_b = _facing_view(grasp_mid_local, grasp_mid_local + dir_b)
-        return view_a, view_b
+    def _contact_view(ci: int):
+        """(elev, azim) looking at contact ci along its own mean outward
+        normal, tilted down slightly."""
+        ns = [st["contact"][ci]["n_l"] for st in stages if ci in st["contact"]]
+        if not ns:
+            return (25.0, 45.0)
+        n = np.mean(np.asarray(ns, float), axis=0)
+        nn = np.linalg.norm(n)
+        n = n / nn if nn > 1e-9 else np.array([1.0, 0.0, 0.0])
+        # Azimuth comes from the contact's own normal (so the panel faces the
+        # contact); ELEVATION is fixed, not derived. Deriving it from the
+        # normal put the camera BELOW the horizon whenever a contact normal
+        # tilted downward (036_wood_block seed 4's index contact came out at
+        # elev=-14, i.e. looking UP at the block from underneath -- the object
+        # read as edge-on and every stage bunched against the top edge). A
+        # fixed modest downward tilt keeps the object a readable solid and
+        # keeps the bottom face hidden, in every panel and for every object.
+        azim = np.degrees(np.arctan2(n[1], n[0]))
+        return (ELEV_DEG, float(azim))
 
-    view_a, view_b = _iso_pair()
-
-    def _draw_all_stages(ax, ci: int, cmap: str, label_stages: bool = True):
+    def _draw_all_stages(ax, ci: int, cmap: str, label_stages: bool = True,
+                         num_offset: float | None = None,
+                         cam_dir: np.ndarray | None = None):
         """Draw every stage's patch/wireframe/trajectory for ONE contact
         index into ax. Returns the drawn (off-surface) PATCH points only
         (not the trajectory) across all stages, concatenated -- used by the
@@ -500,45 +522,47 @@ def plot_quadratic_path(V: np.ndarray, F: np.ndarray, stages: list[dict],
             patch_draw = _draw_paraboloid_patch(
                 ax, frame, offset_mag, scolor,
                 label=(f"{finger_name} stage {si+1} ({stage['stage_label']})" if label_stages else None),
-                stage_num=si + 1)
+                stage_num=si + 1, num_offset=num_offset, cam_dir=cam_dir)
             _draw_stage_trajectory(ax, frame, p_traj, obj_center_world, obj_mat,
                                   offset_mag, scolor, cmap)
             all_patch_draw.append(patch_draw.reshape(-1, 3))
         return np.concatenate(all_patch_draw, axis=0) if all_patch_draw else np.zeros((0, 3))
 
-    fig = plt.figure(figsize=(16, 12))
+    fig = plt.figure(figsize=(14, 12))
 
-    # 2 panels total: view A / view B, opposite sides of the grasp axis,
-    # each showing BOTH contacts together (replaces the earlier 4-panel
-    # per-contact layout -- two shared object-level views are enough once
-    # the camera pair is derived from the actual p1-p2 axis rather than
-    # from either contact's own normal in isolation).
-    panels = [(view_a, "view A"), (view_b, "view B (opposite side)")]
+    # One panel per CONTACT, each from that contact's own facing view.
+    panels = [(ci, _contact_view(ci), ("thumb" if ci == 1 else "index"))
+              for ci in contact_ids]
     wrench_offset = float(np.clip(obj_span * 0.006, off_floor, off_cap))
-    # 2x4 grid: each top-row view spans 2 of the 4 columns, and the hand
-    # panel below is centered on the middle 2 -- same proportions as when
-    # there were 4 top-row panels, but now split 2-and-2 instead of 1-each.
-    gs = fig.add_gridspec(2, 4)
+    gs = fig.add_gridspec(2, max(len(panels), 2))
 
-    # ── Row 1: full-object context (2 opposite-side views) ──────────────
-    for col, (view, label) in enumerate(panels):
-        ax = fig.add_subplot(gs[0, 2 * col:2 * col + 2], projection="3d")
+    # ── Row 1: one full-object view per contact ─────────────────────────
+    for col, (ci, view, fname) in enumerate(panels):
+        ax = fig.add_subplot(gs[0, col], projection="3d")
         _draw_mesh_3d(ax, V, F, alpha=None)
-        _draw_all_stages(ax, 1, "viridis", label_stages=(col == 0))
-        _draw_all_stages(ax, 2, "plasma", label_stages=(col == 0))
+        # ONLY this contact's stages -- that is what keeps the numbering
+        # readable (N stages -> exactly N circles in this panel).
+        cmap = "viridis" if ci == 1 else "plasma"
+        _draw_all_stages(ax, ci, cmap, label_stages=True,
+                         num_offset=obj_span * 0.03, cam_dir=_view_cam_dir(view))
         _draw_wrench_arrows(ax, verify_info, stages, obj_center_world, obj_mat, wrench_offset)
         lo, hi = positions.min(0), positions.max(0)
         ax.set_xlim(lo[0], hi[0]); ax.set_ylim(lo[1], hi[1]); ax.set_zlim(lo[2], hi[2])
         ax.set_box_aspect(np.maximum(hi - lo, 1e-6))
         ax.view_init(elev=view[0], azim=view[1])
-        ax.set_title(f"Full object: {label}", fontsize=9, pad=16)
+        ax.set_title(f"{fname} contact  (elev {view[0]:.0f}, azim {view[1]:.0f})",
+                     fontsize=9, pad=12)
         ax.tick_params(labelsize=5, pad=0)
-        ax.legend(loc="upper left", fontsize=5)
+        # Legend OUTSIDE the axes: the stage numbers drift toward the upper
+        # part of the panel (contacts on this object sit high), and an
+        # in-axes legend sat on top of them.
+        ax.legend(loc="upper left", bbox_to_anchor=(-0.08, 1.02), fontsize=6,
+                  framealpha=0.85)
 
     # ── Row 2: one panel -- solved hand pose + found wrench summary --
     # narrower than the full figure width (a full-width axes made the hand
     # render much larger/more prominent than the mesh panels above it).
-    ax_hand = fig.add_subplot(gs[1, 1:3])
+    ax_hand = fig.add_subplot(gs[1, :])
     if hand_rgb is not None:
         ax_hand.imshow(hand_rgb)
     else:

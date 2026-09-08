@@ -638,7 +638,8 @@ def _minor_axis_local(geom_type, size, mesh_entry=None):
 def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis, mesh_entry=None):
     """
     One deterministic, perfectly antipodal seed pair along a fixed axis
-    (given in the OBJECT's local frame) through the object center — zero
+    (given in the OBJECT's local frame) through the object's hull CENTROID
+    (see the centroid note below) — zero
     angular jitter, unlike _seed_pair's randomized march direction.
 
     Tried FIRST by MultiStartGraspPlanner3D.solve(), ahead of the randomized
@@ -648,6 +649,26 @@ def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis, mesh_ent
 
     local_axis : (3,) unit vector in the object's local frame, e.g. [1,0,0].
 
+    The ray is cast through the mesh's HULL CENTROID, not through the geom
+    frame's origin. Those coincide for the primitive shapes but NOT for YCB
+    meshes: the scans are authored with the origin wherever the capture rig
+    put it, commonly at the object's base. 036_wood_block is the clear case --
+    its MJCF carries <inertial pos="... 0.1027">, i.e. the true centre of mass
+    sits 103mm ABOVE the body origin on a 207mm-tall block. Raying through the
+    origin there exits at the bottom RIM, so both seed contacts land on an
+    edge (measured kappa_max 536 against the seed_kappa_max_reject limit of
+    40), the whole minor-axis pair is discarded by solve()'s curvature gate,
+    and the solve falls back to _seed_pair's randomized search -- which starts
+    high on the object and, because each Picard stage re-seeds from the
+    previous stage's solution, ratchets upward to the top edge (measured:
+    every configuration converged to z~205mm on a 207.7mm block, regardless of
+    which cost term or collision constraint was ablated). Centroid-raying
+    removes that whole failure chain at its source.
+
+    The centroid is used ONLY as the ray origin. Every SDF/normal call still
+    takes the geom frame's own centre, since that is the frame those functions
+    are defined in.
+
     Returns the same dict schema as _seed_pair (offsets=(0,0), delta_deg=0
     since both contacts land exactly on the surface with no jitter).
     """
@@ -656,9 +677,17 @@ def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis, mesh_ent
     d_world /= np.linalg.norm(d_world) + 1e-12
     bbox_r = float(np.max(size)) * 2.5
 
-    p1s = _project_to_surface_np(c + d_world * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    # Ray origin: hull centroid in WORLD, falling back to the geom centre when
+    # no mesh vertices are available (primitives, where the two coincide).
+    c_ray = c
+    if mesh_entry is not None:
+        _V = mesh_entry.get("verts")
+        if _V is not None and len(_V) >= 3:
+            c_ray = c + obj_mat @ np.asarray(_V, float).mean(0)
+
+    p1s = _project_to_surface_np(c_ray + d_world * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
     n1_in = -_geom_normal_np(p1s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
-    p2s = _project_to_surface_np(c - d_world * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    p2s = _project_to_surface_np(c_ray - d_world * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
     n2_in = -_geom_normal_np(p2s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
 
     return {
@@ -1606,7 +1635,21 @@ class UVAtlasConfig:
     # kappa0/kappa1 alone (which are constants at a fixed seed and only bias which
     # stage/seed looks best after the fact, not what a single stage's optimizer
     # does). 0.0 = off.
-    w_edge_curvature:       float = 0.0
+    # Edge-MARGIN penalty (replaces the earlier curvature-based w_edge_curvature;
+    # see the _run_stage comment for why curvature was the wrong signal). Penalizes
+    # a contact that comes within edge_margin_m of a trust-region bound that was set
+    # by a MEASURED SDF divergence -- i.e. a real surface boundary -- and ignores
+    # bounds sitting at quadratic_t_bound_max, which only mean "flat as far as the
+    # search looked".
+    w_edge_margin:          float = 0.0
+    # How much surface to keep in reserve between the contact and a measured edge.
+    # Deliberately small relative to a face: the trust region on a flat face is
+    # meant to span most of that face, so this only trims the last few mm.
+    # NAMED DISTINCTLY from edge_margin_m (the BOX keep-out band, a hard
+    # constraint in _sym_geom_surface_con) -- different mechanism, different
+    # units of meaning, and one shadowing the other silently would be a
+    # nasty bug.
+    edge_margin_sdf_m:      float = 0.005
 
 
 @dataclass
@@ -2668,24 +2711,61 @@ class GraspPlanner3D:
             # only, though (see _sym_geom_surface_con) — mesh contacts get no hard
             # edge keep-out at all, hence the soft curvature penalty below.
 
-            # ── Edge-avoidance curvature penalty (quadratic mesh contact only) ──
-            # Penalize the paraboloid's own height h(t_var) at each contact's SOLVED
-            # (t1,t2) -- kappa0/kappa1/grad_norm are frozen numpy floats from this
-            # stage's seed (_mesh_quadratic_contact_ca's `frame`), but t_var is the
-            # live NLP variable, so this is truly differentiable in t_var: moving
-            # toward a high-curvature direction (edge) costs quadratically more than
-            # moving along a flat one (face), steering the SAME stage's optimizer
-            # away from the edge rather than only penalizing curvature after the
-            # fact at a fixed point. Zero on a flat seed (kappa0=kappa1=0).
-            if cfg.w_edge_curvature > 0.0:
+            # ── Edge-margin penalty (quadratic mesh contact only) ──────────────
+            # Keep each contact a margin away from where the surface actually
+            # RUNS OUT, measured by the trust-region bound search rather than by
+            # local curvature.
+            #
+            # This replaces an earlier curvature-based version that penalized the
+            # paraboloid height h(t_var) = -(kappa0*t0^2 + kappa1*t1^2)/(2|grad|).
+            # Curvature is the wrong signal for "near an edge" because it
+            # conflates two independent things: a genuinely ROUND object (apple,
+            # bottle shoulder) has large kappa everywhere and would be penalized
+            # for its own true shape, while a FLAT-faced object has kappa ~ 0
+            # across the whole face and gets no penalty at all -- right up to the
+            # edge it is about to fall off. Measured on 036_wood_block: the
+            # curvature term contributed ~1e-6 to the vertical cost gradient
+            # (against ~-579 from the IK term) at every stage until the contact
+            # was ALREADY on the top edge, i.e. it could only object after the
+            # fact, never steer. Ablating it changed the solved contact by 0mm.
+            #
+            # _sdf_axis_bound_np measures the right thing directly: how far along
+            # each principal axis the tangent offset can go before the TRUE SDF
+            # departs from its seed value by more than quadratic_sdf_err_tol.
+            # That is a statement about the surface's EXTENT, independent of how
+            # curved it is, so it fires on a flat face near its boundary and
+            # stays quiet in the middle of a round one.
+            #
+            # Only axes whose bound came from a MEASURED divergence are
+            # penalized. An axis that ran the whole search without ever exceeding
+            # tolerance is returned at exactly t_bound_max -- that is the hard
+            # cap, meaning "flat as far as we looked", NOT an edge. Penalizing
+            # proximity to that cap would push contacts away from the middle of
+            # large flat faces for no reason (the case this term exists to allow).
+            #
+            # Shape: a one-sided quadratic hinge, zero until |t| passes
+            # (bound - margin), then growing as the square of the excess. NOT a
+            # barrier: the box constraint on t_var is already hard (and Ipopt
+            # applies its own barrier to it), the margin is a robustness
+            # heuristic rather than a physical limit, and a finite price lets the
+            # solver still take a near-edge contact when that is the only option
+            # instead of turning the problem infeasible. Zero gradient in the
+            # interior also means it perturbs only the grasps that need it.
+            if cfg.w_edge_margin > 0.0:
                 _cost_edge = ca.DM(0.0)
+                _margin = float(cfg.edge_margin_sdf_m)
+                _cap = float(cfg.quadratic_t_bound_max)
                 for _t_var, _frame in ((_t1_var, _t1_frame), (_t2_var, _t2_frame)):
                     if _t_var is None or _frame is None:
                         continue
-                    _h = -(_frame['kappa0'] * _t_var[0]**2 + _frame['kappa1'] * _t_var[1]**2) \
-                        / (2.0 * _frame['grad_norm'])
-                    _cost_edge = _cost_edge + _h**2
-                _cost = _cost + cfg.w_edge_curvature * _cost_edge
+                    for _i, _key in ((0, 't_bound_0'), (1, 't_bound_1')):
+                        _tb = float(_frame[_key])
+                        if _tb >= _cap - 1e-9:
+                            continue          # capped => flat, no edge found
+                        _safe = max(_tb - _margin, 0.0)
+                        _excess = ca.fmax(0.0, ca.fabs(_t_var[_i]) - _safe)
+                        _cost_edge = _cost_edge + _excess**2
+                _cost = _cost + cfg.w_edge_margin * _cost_edge
 
             # ── 1. Joint limits (vectorized) ──────────────────────────────
             if cfg.joint_limits:
@@ -2928,6 +3008,65 @@ class GraspPlanner3D:
                 for name, term in _grad_terms.items()
             }
             _grad_norm_total = ca.norm_2(ca.gradient(_opti.f, _opti.x))
+
+            # ── Per-term VERTICAL gradient (diagnostic; PFF_GRAD_Z=1) ─────────
+            # A gradient NORM says how hard a term pushes, not WHICH WAY. To
+            # answer "what drives contacts up the object?" what is needed is
+            # the signed derivative of each term w.r.t. the contact's world
+            # HEIGHT: d(cost_i)/dz < 0 means term i is lowered by moving the
+            # contact UP, i.e. that term prefers a higher contact.
+            #
+            # Reported both RAW (d(cost_i)/dz with the configured weight
+            # divided back out) and WEIGHTED (w_i * d(cost_i)/dz). The raw
+            # number says what the term intrinsically prefers, independent of
+            # how it happens to be weighted in this config; the weighted one
+            # says what actually moves this solve. A term can be intrinsically
+            # height-hungry yet irrelevant because its weight is small, or
+            # nearly height-neutral yet dominant because its weight is large --
+            # only reporting both separates those.
+            _grad_z_exprs = {}
+            _grad_z_pending = {}
+            if os.environ.get("PFF_GRAD_Z") and _is_mesh and _t1_var is not None:
+                _z_dirs = []
+                for _pv, _tv in ((_p1, _t1_var), (_p2, _t2_var)):
+                    if _tv is None:
+                        continue
+                    # d(contact world z)/d(t_var) -- the 2 tangent DOFs are the
+                    # only way this stage can move the contact at all.
+                    _z_dirs.append((_pv[2], _tv))
+                _named = dict(_grad_terms)
+                _named['align']  = (cfg.w_align * locals()['_cost_align']
+                                    if cfg.w_align > 0.0 and '_cost_align' in locals()
+                                    else ca.DM(0.0))
+                _named['orient'] = (cfg.orient_weight * locals()['_cost_orient']
+                                    if cfg.orient_weight > 0.0 and '_cost_orient' in locals()
+                                    else ca.DM(0.0))
+                _named['edge']   = (cfg.w_edge_margin * locals()['_cost_edge']
+                                    if cfg.w_edge_margin > 0.0 and '_cost_edge' in locals()
+                                    else ca.DM(0.0))
+                _wts = {'ik': cfg.w_ik, 'reg': cfg.w_reg, 'gamma': cfg.w_gamma,
+                        'y': cfg.w_y, 'slack': (cfg.w_slack or 0.0),
+                        'align': cfg.w_align, 'orient': cfg.orient_weight,
+                        'edge': cfg.w_edge_margin}
+                for _nm, _term in _named.items():
+                    _acc = ca.DM(0.0)
+                    for _zexpr, _tv in _z_dirs:
+                        _gt = ca.gradient(_term, _tv)      # d(term)/d(t_var), 2x1
+                        _gz = ca.gradient(_zexpr, _tv)     # d(z)/d(t_var),    2x1
+                        _den = ca.dot(_gz, _gz) + 1e-12
+                        # least-squares projection: the component of the term's
+                        # tangent-space gradient that lies along the direction
+                        # which actually changes height
+                        _acc = _acc + ca.dot(_gt, _gz) / _den
+                    _grad_z_exprs[_nm] = _acc
+                    _w = float(_wts.get(_nm, 0.0) or 0.0)
+                    _grad_z_exprs[_nm + '_raw'] = _acc / _w if _w > 1e-12 else ca.DM(0.0)
+                # Evaluated at the seed AFTER the solve, via _opti.debug.value
+                # (the expressions depend on q and the wrench variables too, not
+                # on t_var alone, so they cannot be lambdified over t_var by
+                # itself -- debug.value resolves the whole variable vector).
+                # Stashed for the caller to log once the stage has run.
+                _grad_z_pending = dict(_grad_z_exprs)
 
             # ── 5a. Full-arm collision (geometry-appropriate softplus SDF) ─
             _ground_n = ca.DM([0.0, 0.0, 1.0])
@@ -3312,6 +3451,20 @@ class GraspPlanner3D:
                     f"std={_st['ik_if_mm_std']:.2f}]"
                 )
 
+            def _eval_grad_z(value_fn):
+                """Per-term d(cost)/d(contact world z) at the solution, or {}.
+                Negative => that term is REDUCED by moving the contact UP, i.e.
+                it prefers a higher contact. See the _grad_z_exprs comment."""
+                if not _grad_z_pending:
+                    return {}
+                out = {}
+                for _nm, _ex in _grad_z_pending.items():
+                    try:
+                        out[_nm] = float(np.asarray(value_fn(_ex)).squeeze())
+                    except Exception:
+                        pass
+                return out
+
             def _quad_pinned(value_fn) -> bool:
                 """True if either mesh contact's solved (t1,t2) sits within
                 cfg.quadratic_pin_frac of its own per-axis SDF-derived bound —
@@ -3372,6 +3525,7 @@ class GraspPlanner3D:
                     'stability_last20': _stab,
                     'gws_beta':      float(_sol.value(_gws_beta)) if _gws_beta is not None else None,
                     'quad_pinned':   _quad_pinned(_sol.value),
+                    'grad_z':        _eval_grad_z(_sol.value),
                 }
             except Exception as _e:
                 self.log.warning(f"GraspPlanner3D._run_stage({stage_label}): {_e}")
@@ -3405,6 +3559,7 @@ class GraspPlanner3D:
                         'gws_beta':      (float(_opti.debug.value(_gws_beta))
                                            if _gws_beta is not None else None),
                         'quad_pinned':   _quad_pinned(_opti.debug.value),
+                        'grad_z':        _eval_grad_z(_opti.debug.value),
                     }
                 except Exception as _e2:
                     self.log.error(f"GraspPlanner3D debug extraction: {_e2}")
@@ -3521,6 +3676,9 @@ class GraspPlanner3D:
             self.log.info(
                 f"[relinearize S{_ri+1}→S{_ri+2}] "
                 f"dp={_dp*1e3:.2f}mm  mismatch={_mismatch_deg:.1f}°  pinned={_pinned}"
+                + (("  gradz[" + " ".join(
+                    f"{k}={v:+.3g}" for k, v in sorted((res.get('grad_z') or {}).items())
+                    if abs(v) > 1e-9) + "]") if res.get('grad_z') else "")
                 + (f"  dr_tip={_dr*1e3:.2f}mm" if cfg.directional_r_tip else ""))
 
             if (_dp < _tol_p_m and _mismatch_deg < _tol_deg and not _pinned
