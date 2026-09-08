@@ -360,9 +360,24 @@ def _mesh_sdf_entry(model, body_id: int) -> dict:
     _hess_x = ca.MX.sym("x", 3)
     _hessian_fn = ca.Function(f"{_tag}_hess", [_hess_x],
                               [ca.jacobian(_grad_fn(_hess_x), _hess_x)])
+    # Dense VISUAL mesh vertices, for the local surface fit
+    # (_mesh_local_surface_fit_np). The collision hull above is a convex
+    # decomposition -- 466 verts for 036_wood_block, i.e. a handful of large
+    # triangles per box face, far too coarse for a local least-squares fit
+    # (measured: 0-3 verts within 50mm of a mid-face seed). The visual mesh is
+    # the actual scan: 8194 verts for the same object. body_visual_mesh folds
+    # geom_pos/geom_quat the same way body_hull_halfspaces does, so both live
+    # in the same body frame as the SDF table.
+    _vis_verts = None
+    try:
+        from grasp_control import object_uv_atlas as _oua
+        _vis_verts = np.asarray(_oua.body_visual_mesh(model, body_id)[0], float)
+    except Exception:
+        pass          # visual mesh is optional; the fit falls back to the SDF
     entry = dict(
         table=table,
         verts=_verts,
+        visual_verts=_vis_verts,
         fn=fn,
         grad_fn=_grad_fn,
         normal_fn=_object_sdf.casadi_normal_fn(fn, name=f"{_tag}_normal"),
@@ -1096,9 +1111,97 @@ def _sdf_axis_bound_np(mesh_entry: dict, seed_l: np.ndarray, axis_l: np.ndarray,
     return lo
 
 
+def _mesh_local_surface_fit_np(mesh_entry: dict, seed_l: np.ndarray,
+                               t1_l: np.ndarray, t2_l: np.ndarray, n_l: np.ndarray,
+                               radius: float = 0.04, band: float = 0.004,
+                               min_pts: int = 12,
+                               quad_gain_min: float = 0.5):
+    """Local surface curvature at seed_l fitted DIRECTLY to nearby mesh
+    vertices, with a plane-vs-quadratic model-selection test.
+
+    Returns (kappa0, kappa1, axis0_l, axis1_l, info) in the same convention as
+    _principal_curvature_axes_np, or None when the mesh cannot support a fit
+    (too few vertices in range) and the caller should fall back to the SDF
+    Hessian.
+
+    WHY NOT THE SDF HESSIAN. An SDF encodes distance to the WHOLE shape, so its
+    second derivative is a global quantity: near any feature it reports
+    curvature that belongs to that feature, not to the local patch. Measured on
+    036_wood_block, mid-face on a flat 104x206mm side: the SDF Hessian gives
+    kappa=(+0.002, -12.330), the -12.3 coming from the vertical corner ~50mm
+    away bleeding into the field. That fake curvature makes the paraboloid
+    surrogate bend away from a genuinely flat face immediately, so
+    _sdf_axis_bound_np correctly caps the trust region at 4.6mm -- on a face
+    with ~50mm of usable surface in that direction. Mesh vertices ARE the
+    surface, so a fit to them cannot be contaminated by geometry that is not
+    in the sample.
+
+    WHY THE MODEL-SELECTION TEST. A raw mesh fit is not trustworthy either. The
+    YCB meshes are scans: the block's "flat" face carries ~1mm of bimodal
+    structure (tessellation/scan relief, NOT random noise -- it does not average
+    out, plane RMS stays 0.72-0.79mm from n=64 to n=479 samples). A quadratic
+    fitted to that absorbs the offset, giving kappa that scales as ~1/r with the
+    fit radius: measured -35.5, -15.5, -6.1, -2.4 at r=15,25,40,60mm, i.e. no
+    converged value at any radius. So curvature is accepted only when the
+    quadratic beats the plane by quad_gain_min in RMS residual -- a real model
+    comparison rather than a tuned curvature threshold. The separation is wide:
+    on 017_orange the quadratic improves RMS by 91% at EVERY radius with kappa
+    stable at -32.2 across a 4x sweep (real curvature), while on the block's
+    face it manages only 15-34% (fitting relief). Below the gate, kappa is
+    returned as exactly 0 -- a planar patch, whose validity bound is then set
+    by _sdf_axis_bound_np's direct SDF search rather than by a fake curvature.
+
+    radius : tangent-plane sampling radius (m). Sized to span a useful fraction
+        of a face rather than a few mm, since the whole point is a patch that
+        covers the graspable region.
+    band   : max |offset along the normal| (m) for an included vertex. Keeps
+        points that have wrapped onto an ADJACENT face out of the fit -- without
+        it a seed near an edge mixes two faces into one quadratic.
+    """
+    V = mesh_entry.get("visual_verts")
+    if V is None or len(V) < min_pts:
+        return None
+    d = np.asarray(V, float) - np.asarray(seed_l, float)
+    u = d @ t1_l
+    v = d @ t2_l
+    w = d @ n_l
+    m = ((u * u + v * v) <= radius * radius) & (np.abs(w) <= band)
+    n_sel = int(m.sum())
+    if n_sel < min_pts:
+        return None
+    U, Vv, W = u[m], v[m], w[m]
+
+    ones = np.ones(n_sel)
+    A_pl = np.stack([U, Vv, ones], axis=1)
+    c_pl, *_ = np.linalg.lstsq(A_pl, W, rcond=None)
+    rms_pl = float(np.sqrt(((W - A_pl @ c_pl) ** 2).mean()))
+
+    A_q = np.stack([U * U, U * Vv, Vv * Vv, U, Vv, ones], axis=1)
+    c_q, *_ = np.linalg.lstsq(A_q, W, rcond=None)
+    rms_q = float(np.sqrt(((W - A_q @ c_q) ** 2).mean()))
+
+    gain = 1.0 - (rms_q / rms_pl) if rms_pl > 1e-12 else 0.0
+    info = dict(n=n_sel, rms_plane=rms_pl, rms_quad=rms_q, gain=gain,
+                radius=radius, planar=bool(gain < quad_gain_min))
+
+    if gain < quad_gain_min:
+        # Planar: keep the seed's own tangent axes, zero curvature. Return
+        # order matches _principal_curvature_axes_np: (axis0, axis1, k0, k1).
+        return (np.asarray(t1_l, float), np.asarray(t2_l, float), 0.0, 0.0, info)
+
+    # w = a u^2 + b uv + c v^2 + ... -> the surface Hessian in (t1,t2) is
+    # [[2a, b], [b, 2c]]; eigen-decompose for principal axes/curvatures, same
+    # convention _principal_curvature_axes_np returns.
+    H_tt = np.array([[2.0 * c_q[0], c_q[1]],
+                     [c_q[1], 2.0 * c_q[2]]], float)
+    return _principal_curvature_axes_np(H_tt, t1_l, t2_l) + (info,)
+
+
 def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np.ndarray,
                                center_np, mat_np, mesh_entry: dict,
-                               t_bound_max: float = 0.05, sdf_err_tol: float = 5e-4):
+                               t_bound_max: float = 0.05, sdf_err_tol: float = 5e-4,
+                               mesh_fit: bool = False, mesh_fit_radius: float = 0.04,
+                               mesh_fit_quad_gain_min: float = 0.5):
     """Mesh contact as a 2-DOF offset along the two PRINCIPAL CURVATURE AXES at
     the seed, placed on a LOCAL QUADRATIC (paraboloid) surrogate of the
     surface fit from the SDF's own gradient + Hessian -- no per-candidate SDF
@@ -1157,11 +1260,28 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     # search below still independently catches an unsafe result; this just
     # keeps h itself from being numerically wild going in).
     grad_norm = max(float(np.linalg.norm(grad_l)), 1e-2)
+    # True (unfloored) unit normal -- needed by the mesh fit below to measure
+    # each sampled vertex's height above the seed's tangent plane. Distinct
+    # from grad_norm, which is a denominator and therefore floored.
+    n_l_unit = grad_l / (float(np.linalg.norm(grad_l)) + 1e-9)
     H       = _sdf_hessian_np(mesh_entry, seed_l)
     T       = np.stack([t1_l, t2_l], axis=1)          # 3x2
     H_tt    = T.T @ H @ T                              # 2x2, curvature restricted to tangent plane
 
     axis0_l, axis1_l, kappa0, kappa1 = _principal_curvature_axes_np(H_tt, t1_l, t2_l)
+
+    # Prefer curvature fitted directly to the MESH over the SDF Hessian's --
+    # the SDF's second derivative is contaminated by geometry that is not local
+    # (a corner 50mm away shows up as kappa=-12.3 on a flat face), which
+    # collapses the trust region on exactly the large flat regions a grasp
+    # wants. _mesh_local_surface_fit_np returns None when the mesh is too
+    # sparse to fit, in which case the SDF Hessian above stands.
+    if mesh_fit:
+        _fit = _mesh_local_surface_fit_np(
+            mesh_entry, seed_l, t1_l, t2_l, n_l_unit,
+            radius=mesh_fit_radius, quad_gain_min=mesh_fit_quad_gain_min)
+        if _fit is not None:
+            axis0_l, axis1_l, kappa0, kappa1, _fit_info = _fit
 
     # Per-axis bound via direct SDF comparison, not a shared curvature-derived
     # radius -- lets a flat direction (e.g. along a nearby edge) keep nearly
@@ -1614,6 +1734,20 @@ class UVAtlasConfig:
     use_quadratic_contact: bool = False
     quadratic_t_bound_max:  float = 0.05    # metres, cap even where the surface stays flat
     quadratic_sdf_err_tol:  float = 5e-4    # metres, max surrogate-vs-true-SDF gap per axis
+    # Fit the local patch's curvature to the VISUAL MESH vertices around the
+    # seed instead of to the SDF Hessian. The SDF's second derivative is a
+    # global quantity and reports curvature belonging to nearby features rather
+    # than to the patch (measured: kappa=-12.3 mid-face on a flat side of
+    # 036_wood_block, from the corner 50mm away), which collapses the trust
+    # region to a few mm on large flat faces. See _mesh_local_surface_fit_np.
+    quadratic_mesh_fit:          bool  = False
+    quadratic_mesh_fit_radius:   float = 0.04   # m, tangent sampling radius
+    # Minimum RMS-residual improvement of the quadratic over a plane before any
+    # curvature is accepted; below this the patch is treated as planar
+    # (kappa=0). Measured separation is wide -- 0.91 on 017_orange, 0.15-0.34
+    # on the wood block's flat face -- so this is a real model comparison, not
+    # a tuned threshold.
+    quadratic_mesh_fit_gain_min: float = 0.5
     # If a stage's solved (t1,t2) sits within this fraction of its own
     # per-axis bound, the Picard loop treats it as PINNED (trust region ran
     # out, not a converged interior optimum) and keeps relinearizing even if
@@ -2591,11 +2725,17 @@ class GraspPlanner3D:
                 _t1_var, _p1, _t1_bounds, _t1_frame = _mesh_quadratic_contact_ca(
                     _opti, p1_ws, _n1_seed_out, obj_center_np, obj_R_np, self._mesh_entry,
                     t_bound_max=cfg.quadratic_t_bound_max,
-                    sdf_err_tol=cfg.quadratic_sdf_err_tol)
+                    sdf_err_tol=cfg.quadratic_sdf_err_tol,
+                    mesh_fit=cfg.quadratic_mesh_fit,
+                    mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
+                    mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min)
                 _t2_var, _p2, _t2_bounds, _t2_frame = _mesh_quadratic_contact_ca(
                     _opti, p2_ws, _n2_seed_out, obj_center_np, obj_R_np, self._mesh_entry,
                     t_bound_max=cfg.quadratic_t_bound_max,
-                    sdf_err_tol=cfg.quadratic_sdf_err_tol)
+                    sdf_err_tol=cfg.quadratic_sdf_err_tol,
+                    mesh_fit=cfg.quadratic_mesh_fit,
+                    mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
+                    mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min)
             elif _is_mesh:
                 # Tangent-plane parameterization: p1/p2 become 2-DOF expressions
                 # (offset in the local tangent plane at the seed, reprojected
