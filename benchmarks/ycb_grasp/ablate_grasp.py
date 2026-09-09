@@ -42,6 +42,7 @@ sys.path.insert(0, str(REPO / "benchmarks"))
 from simulation.grasp_planner_3d import (GraspConfig3D, MultiStartGraspPlanner3D,  # noqa: E402
                                          _geom_normal_np)
 from simulation.grasp_config_builder import for_ablation_default                # noqa: E402
+from ycb_grasp import out_paths as OP                                           # noqa: E402
 from ycb_grasp import scene as S, workspace as W                                # noqa: E402
 from ycb_grasp.ik_demo import (clearance_by_geom, home_bias, place_objects,     # noqa: E402
                                render, robot_geom_names)
@@ -142,10 +143,10 @@ def main():
                     help="uv_atlas_rings — local-neighborhood size in face-adjacency hops. "
                          "Only meaningful with --uv-atlas.")
     ap.add_argument("--render", action="store_true", help="save one PNG per solve")
-    ap.add_argument("--out", default=str(REPO / "benchmarks" / "ycb_grasp" / "out"))
+    OP.add_out_args(ap, OP.FLOOR)
     args = ap.parse_args()
 
-    out = Path(args.out)
+    out = OP.resolve_out(args, OP.FLOOR)
     out.mkdir(parents=True, exist_ok=True)
     render_dir = out / "renders"
     if args.render:

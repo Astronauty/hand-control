@@ -49,6 +49,7 @@ sys.path.insert(0, str(REPO / "benchmarks"))
 
 from simulation.grasp_planner_3d import GraspConfig3D, MultiStartGraspPlanner3D  # noqa: E402
 from ycb_grasp.plot_uv_path import _view_cam_dir                                # noqa: E402
+from ycb_grasp import out_paths as OP                                           # noqa: E402
 from ycb_grasp import scene as S, workspace as W                                # noqa: E402
 from ycb_grasp.ik_demo import (clearance_by_geom, home_bias, place_objects,     # noqa: E402
                                render, robot_geom_names)
@@ -677,7 +678,7 @@ def main():
     ap.add_argument("--render", action="store_true",
                     help="also save a SEPARATE standalone PNG of the final arm+hand pose "
                          "(the hand pose is already embedded in the main figure by default)")
-    ap.add_argument("--out-root", default=str(REPO / "benchmarks" / "ycb_grasp" / "out" / "quadratic_path"),
+    ap.add_argument("--out-root", default=str(OP.analysis_dir("quadratic_path")),
                     help="output root; results are grouped per object as "
                          "<out-root>/<object_id>/seed<N>.png")
     args = ap.parse_args()

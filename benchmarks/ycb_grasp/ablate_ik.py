@@ -30,6 +30,7 @@ sys.path.insert(0, str(REPO / "benchmarks"))
 import grasp_control.constrained_ik as cik                      # noqa: E402
 from grasp_control import ConstrainedIKSolver, SpatialIKSolver  # noqa: E402
 from kinova_common.constants import FINGER_SET, FINGER_TIP_SITES  # noqa: E402
+from ycb_grasp import out_paths as OP                           # noqa: E402
 from ycb_grasp import scene as S, workspace as W                # noqa: E402
 from ycb_grasp.ik_demo import (clearance_by_geom, home_bias,    # noqa: E402
                                object_hull_verts, pinch_targets_from,
@@ -170,8 +171,7 @@ def main():
                       f"{str(m.get('status'))[:26]}", flush=True)
 
     import csv
-    out = REPO / "benchmarks" / "ycb_grasp" / "out" / "ablate_ik.csv"
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out = OP.analysis_dir() / "ablate_ik.csv"
     keys = sorted({k for r in rows for k in r})
     with open(out, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=keys, extrasaction="ignore")

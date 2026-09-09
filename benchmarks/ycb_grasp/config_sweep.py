@@ -29,6 +29,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "benchmarks"))
 
 from simulation.grasp_planner_3d import GraspConfig3D, MultiStartGraspPlanner3D  # noqa: E402
+from ycb_grasp import out_paths as OP                                           # noqa: E402
 from ycb_grasp import scene as S, workspace as W                                # noqa: E402
 
 N_ROBOT = 23
@@ -130,10 +131,10 @@ def main():
     ap.add_argument("--n-seeds", type=int, default=3,
                     help="contact seeds per arm config (MultiStart's own budget)")
     ap.add_argument("--max-iter", type=int, default=150)
-    ap.add_argument("--out", default=str(REPO / "benchmarks" / "ycb_grasp" / "out"))
+    OP.add_out_args(ap, OP.FLOOR)
     args = ap.parse_args()
 
-    out = Path(args.out)
+    out = OP.resolve_out(args, OP.FLOOR)
     out.mkdir(parents=True, exist_ok=True)
 
     rows = run_sweep(args.object, n=args.n, seed=args.seed,

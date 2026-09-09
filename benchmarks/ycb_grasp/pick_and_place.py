@@ -37,7 +37,9 @@ MODES
       CONTACT-PLANNING step calls the same planner this script exercises, while
       the dexpilot and anyteleop baselines stay untouched.
 
-Every run writes into out/pick_and_place/<object>/:
+Every run writes into out/tabletop/<--out-tag>/<object>/ (see out_paths.py --
+artifacts are grouped by ENVIRONMENT, and a tagged sweep nests under it rather
+than creating a sibling top-level folder):
   seed<N>.png                  final-pose render
   seed<N>.mp4                  the whole run
   seed<N>_quadratic_path.png   per-contact local-quadratic fit + wrench summary
@@ -68,6 +70,7 @@ from kinova_common.constants import FINGER_CODE, FINGER_SET, FINGER_TIP_SITES   
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
 from simulation.grasp_config_builder import for_ablation_default                # noqa: E402
 from simulation.grasp_planner_3d import MultiStartGraspPlanner3D                # noqa: E402
+from ycb_grasp import out_paths as OP                                           # noqa: E402
 from ycb_grasp import plot_quadratic_path as QP                                 # noqa: E402
 from ycb_grasp import table_scene as TS                                         # noqa: E402
 from ycb_grasp.ik_demo import clearance_by_geom, render, robot_geom_names       # noqa: E402
@@ -148,7 +151,8 @@ def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
 def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                    w_span=1.0, view=False, out_dir=None, do_transport=True,
                    max_iter=200, w_edge_margin=0.0, directional_r_tip=True,
-                   mesh_fit=True, impratio=None, gamma_override=None):
+                   mesh_fit=True, impratio=None, gamma_override=None,
+                   squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05):
     """Plan + execute one grasp on one object, then carry it to the bin."""
     rng = np.random.default_rng(seed)
     t_build = time.time()
@@ -197,7 +201,14 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
         shutil.rmtree(log_dir, ignore_errors=True)
         os.makedirs(log_dir, exist_ok=True)
 
-    planner = MultiStartGraspPlanner3D(model, data, cfg, log_dir=log_dir)
+    # The seed drives the PLANNER's multi-start RNG, not the start pose. This
+    # benchmark always launches from HOME (that is the point -- it characterizes
+    # the grasp, not IK from an arbitrary posture), so the only legitimate source
+    # of run-to-run variation is the planner's own restart jitter
+    # (qref_restart_sigma_*). Leaving this unset made every --seed produce a
+    # byte-identical trajectory, which silently turned a 3-seed sweep into one
+    # sample repeated three times.
+    planner = MultiStartGraspPlanner3D(model, data, cfg, log_dir=log_dir, seed=seed)
     t0 = time.time()
     res = planner.solve(q_home, np.asarray(pos, float), max_seeds=n_seeds)
     t_solve = time.time() - t0
@@ -246,17 +257,31 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
     pad_offset = {f: _pad_surface_offset(model, data, f, tip_site_ids[i], tip_geom_ids[i])
                   for i, f in enumerate(FINGER_SET)}
 
+    if os.environ.get("PFF_CONTACT_TRACE"):
+        # The disturbance LP's feasibility is decided by the contact GEOMETRY,
+        # not by the object's mass -- two near-parallel inward normals cannot
+        # resist a transverse wrench at any gamma, and the LP then returns None
+        # and the caller silently substitutes GAMMA_FALLBACK. Dump the geometry
+        # that actually went in, so an "infeasible" is diagnosable.
+        _n1, _n2 = np.asarray(n1_in, float), np.asarray(n2_in, float)
+        print(f"[contact] p1={np.round(res['p1'], 4).tolist()} "
+              f"p2={np.round(res['p2'], 4).tolist()}")
+        print(f"[contact] n1_in={np.round(_n1, 3).tolist()} "
+              f"n2_in={np.round(_n2, 3).tolist()} "
+              f"n1.n2={float(_n1 @ _n2):+.3f} "
+              f"span={np.linalg.norm(np.asarray(res['p2'], float) - np.asarray(res['p1'], float)) * 1000:.1f}mm")
+
     gamma_live = _solve_gamma(model, data, obj_bid, R_WO, rec_local,
                               planner._planner._obj_gid, tip_geom_ids,
                               gamma_override)
     result["gamma"] = gamma_live
 
-    Kp = np.concatenate([np.full(7, 40.0), np.full(16, 0.8)])
-    Kd = np.concatenate([np.full(7, 4.0), np.full(16, 0.05)])
+    Kp = np.concatenate([np.full(7, 40.0), np.full(16, finger_kp)])
+    Kd = np.concatenate([np.full(7, 4.0), np.full(16, finger_kd)])
     ctrl = GraspController(
         model, N_ROBOT, tip_site_ids=tip_site_ids, obj_site_ids=None,
         obj_body_id=obj_bid, kp=Kp, kd=Kd,
-        gamma=gamma_live, squeeze_pd_scale=0.25, support_weight=True,
+        gamma=gamma_live, squeeze_pd_scale=squeeze_pd_scale, support_weight=True,
         pad_offsets=[pad_offset[f] for f in FINGER_SET],
         obj_contact_provider=make_object_contact_provider(rec_local, obj_bid))
 
@@ -328,6 +353,16 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                     + ctrl.internal_force_torques(data, scale=scale))
             mj.mj_step(model, data)
             _sync()
+            # PFF_SQUEEZE_TRACE=1 samples the gap and the measured force through
+            # the ramp. The design assumption (see pick_from_floor's
+            # CONTACT_GAP_TOL_M comment) is that the squeeze CLOSES the gap the
+            # IK deliberately leaves; this is how you check that it actually does
+            # on a given object rather than assuming it.
+            if os.environ.get("PFF_SQUEEZE_TRACE") and i % 100 == 0:
+                _g = _tip_gaps_mm(model, data, tip_geom_ids, obj_gid, obj_gids)
+                _f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+                print(f"[squeeze] i={i:4d} scale={scale:.2f} "
+                      f"gap={np.round(_g, 2).tolist()} f={np.round(_f, 2).tolist()}")
         f_meas = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
         result["squeeze_forces_N"] = dict(zip(FINGER_SET, np.round(f_meas, 3).tolist()))
         result["phase_log"].append("squeeze_done")
@@ -461,8 +496,13 @@ def main():
                          "the floor-pick benchmark measured 20 as best)")
     ap.add_argument("--gamma", type=float, default=None,
                     help="override the solved internal-force scale")
-    ap.add_argument("--out", default=str(REPO / "benchmarks" / "ycb_grasp" / "out"
-                                         / "pick_and_place"))
+    ap.add_argument("--squeeze-pd-scale", type=float, default=0.25,
+                    help="finger PD multiplier DURING the squeeze ramp. Lower lets the "
+                         "internal-force term win against the finger PD; too low and the "
+                         "measured force falls short of the commanded gamma.")
+    ap.add_argument("--finger-kp", type=float, default=0.8)
+    ap.add_argument("--finger-kd", type=float, default=0.05)
+    OP.add_out_args(ap, OP.TABLETOP)
     args = ap.parse_args()
 
     if args.teleop_cmd:
@@ -493,13 +533,15 @@ def main():
         print(f"  impratio   {model.opt.impratio}")
         return
 
-    out_dir = Path(args.out) / args.object
+    out_dir = OP.resolve_out(args, OP.TABLETOP) / args.object
     out_dir.mkdir(parents=True, exist_ok=True)
     _, result = run_pick_place(
         args.object, args.seed, n_seeds=args.n_seeds, n_relin=args.n_relin,
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
-        impratio=args.impratio, gamma_override=args.gamma)
+        impratio=args.impratio, gamma_override=args.gamma,
+        squeeze_pd_scale=args.squeeze_pd_scale,
+        finger_kp=args.finger_kp, finger_kd=args.finger_kd)
     print("\n=== RESULT ===")
     for k, v in result.items():
         print(f"  {k}: {v}")

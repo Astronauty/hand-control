@@ -32,6 +32,7 @@ from grasp_control import ConstrainedIKSolver, SpatialIKSolver      # noqa: E402
 from grasp_control.constrained_ik import configure_sqp              # noqa: E402
 from kinova_common.constants import (FINGER_CODE, FINGER_SET,       # noqa: E402
                                      FINGER_TIP_SITES, GEN3_XML)
+from ycb_grasp import out_paths as OP                                           # noqa: E402
 from ycb_grasp import scene as S, workspace as W                    # noqa: E402
 
 N_ROBOT = 23
@@ -239,10 +240,10 @@ def main():
                     help="sdf: one precomputed distance table per object. "
                          "hulls: per-hull bounding spheres (the old fallback).")
     ap.add_argument("--view", action="store_true")
-    ap.add_argument("--out", default=str(REPO / "benchmarks" / "ycb_grasp" / "out"))
+    OP.add_out_args(ap, OP.FLOOR)
     args = ap.parse_args()
 
-    out = Path(args.out)
+    out = OP.resolve_out(args, OP.FLOOR)
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 

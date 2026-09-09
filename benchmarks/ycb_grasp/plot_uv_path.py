@@ -41,6 +41,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "benchmarks"))
 
 from simulation.grasp_planner_3d import GraspConfig3D, MultiStartGraspPlanner3D  # noqa: E402
+from ycb_grasp import out_paths as OP                                           # noqa: E402
 from ycb_grasp import scene as S, workspace as W                                # noqa: E402
 from ycb_grasp.ik_demo import (clearance_by_geom, home_bias, place_objects,     # noqa: E402
                                render, robot_geom_names)
@@ -513,7 +514,7 @@ def main():
                          "plus up to this many chart-pair/random seeds are tried per solve)")
     ap.add_argument("--render", action="store_true",
                     help="also save a PNG of the final arm+hand pose alongside the UV path figure")
-    ap.add_argument("--out", default=str(REPO / "benchmarks" / "ycb_grasp" / "out" / "uv_atlas_prototype"))
+    ap.add_argument("--out", default=str(OP.analysis_dir("uv_atlas")))
     args = ap.parse_args()
 
     out_dir = Path(args.out)

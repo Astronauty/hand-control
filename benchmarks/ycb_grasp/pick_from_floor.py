@@ -84,6 +84,7 @@ from kinova_common.constants import FINGER_CODE, FINGER_SET, FINGER_TIP_SITES   
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
 from simulation.grasp_config_builder import for_ablation_default                # noqa: E402
 from simulation.grasp_planner_3d import MultiStartGraspPlanner3D, _geom_normal_np  # noqa: E402
+from ycb_grasp import out_paths as OP                                           # noqa: E402
 from ycb_grasp import plot_quadratic_path as QP                                 # noqa: E402
 from ycb_grasp import scene as S, workspace as W                                # noqa: E402
 from ycb_grasp.ik_demo import (clearance_by_geom, home_bias, object_hull_verts,  # noqa: E402
@@ -881,7 +882,7 @@ def main():
     ap.add_argument("--r-tip-margin-mm", type=float, default=1.0,
                     help="safety cushion added to the directional radius (mm), keeping the "
                          "target on the non-penetrating side")
-    ap.add_argument("--out", default=str(REPO / "benchmarks" / "ycb_grasp" / "out" / "pick_from_floor"))
+    OP.add_out_args(ap, OP.FLOOR)
     args = ap.parse_args()
 
     # One subfolder per YCB object, so runs group by object rather than piling
@@ -889,7 +890,7 @@ def main():
     # (final-pose PNG, run MP4, quadratic-path iso views) are ALWAYS produced --
     # a run you cannot look at afterwards is not worth much, and the flags that
     # used to gate them only ever saved a few seconds.
-    out_dir = Path(args.out) / args.object
+    out_dir = OP.resolve_out(args, OP.FLOOR) / args.object
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = f"seed{args.seed}"
     render_path = str(out_dir / f"{tag}.png")
