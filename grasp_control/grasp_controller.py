@@ -21,7 +21,7 @@ from grasp_control.force_control import GraspForceAllocator
 
 class GraspController:
     def __init__(self, model, n_robot, tip_site_ids, obj_site_ids, obj_body_id,
-                 kp, kd, gamma=5.0, squeeze_pd_scale=1.0,
+                 kp, kd, gamma=5.0, squeeze_pd_scale=1.0, transport_pd_scale=1.0,
                  active_joint_slices=((7, 11), (19, 23)),
                  support_weight=False, pad_offsets=None,
                  grasp_map_computer=None, allocator=None,
@@ -49,6 +49,11 @@ class GraspController:
             squeeze_pd_scale: multiplier on kp/kd over active_joint_slices while
                 squeezing — lower it (e.g. 0.25) if the finger PD fights the
                 squeeze and measured contact force falls short of gamma/sqrt(2).
+            transport_pd_scale: multiplier used INSTEAD once set_transporting(True)
+                is called — i.e. while the grasp is bearing load rather than
+                closing. Defaults to 1.0 (full gains), because a softened finger
+                PD is back-driven by the object's weight and bleeds normal force
+                until the pinch fails. See effective_gains for the measurements.
             active_joint_slices: (start, stop) qpos slices of the grasping
                 fingers' joints (default: LEAP index 7:11 and thumb 19:23).
             support_weight: when True, allocate w_des = the wrench that statically
@@ -75,6 +80,8 @@ class GraspController:
         self.kp = np.asarray(kp, dtype=float).copy()
         self.kd = np.asarray(kd, dtype=float).copy()
         self.squeeze_pd_scale = squeeze_pd_scale
+        self.transport_pd_scale = transport_pd_scale
+        self.transporting = False
         self.active_joint_slices = tuple(active_joint_slices)
         self.support_weight = bool(support_weight)
         self.pad_offsets = (list(pad_offsets) if pad_offsets is not None
@@ -97,17 +104,62 @@ class GraspController:
         if not on:
             self.last_f_c = None
 
+    def set_transporting(self, on):
+        """Switch the finger joints from CLOSING gains to HOLDING gains.
+
+        Call this once the squeeze has converged and the grasp starts bearing
+        load (a lift/transport jog). See effective_gains for why the two phases
+        need opposite gains.
+        """
+        self.transporting = bool(on)
+
     def effective_gains(self):
-        """kp/kd with squeeze_pd_scale applied over active_joint_slices while
-        squeezing. Public so callers that hand-roll their own PD (e.g.
-        kinova_leap_pick_place's GRASP phase) can still get the softened gains
-        without going through compute()."""
-        if not self.squeeze or self.squeeze_pd_scale == 1.0:
+        """kp/kd with the finger-joint gains scaled over active_joint_slices.
+
+        The CLOSING and HOLDING phases of a grasp want OPPOSITE gains, and this
+        picks between them:
+
+        * Closing (squeeze): stiff finger gains fight the squeeze -- the PD is
+          holding the fingers at the planned pre-contact posture while
+          internal_force_torques tries to drive them inward, so a high kp
+          suppresses the very motion that closes the gap. Measured: sweeping kp
+          0.8 -> 20 monotonically REDUCED grip force 6.03 -> 1.28 N. This is
+          what squeeze_pd_scale (0.25) exists for.
+
+        * Holding (transport): the object's weight now acts THROUGH the
+          fingertips, back-driving those same joints. Softened gains lose ground
+          to it, the fingers open, penetration drops and normal force bleeds
+          away. Measured on 036_wood_block seed 2 (7.15 N object) during the
+          lift: fn decayed 8.20 -> 6.71 N over ~200ms with the squeeze command
+          held constant, finger position error creeping 2.83 -> 3.55 deg, and
+          the object began falling while both contacts were still present.
+          Sweeping the lift-phase scale:
+
+              scale  peak rise   contact lost   final carry
+              0.25    27.98mm      2.50s          -0.6%
+              0.5     48.20mm      3.05s          44.5%
+              1.0     69.58mm      never          71.9%
+              2.0     75.78mm      never          78.4%
+
+          017_orange improves too (87.5% -> 95.3% carry at 1.0), so this is not
+          a heavy-object special case.
+
+        transport_pd_scale therefore defaults to 1.0 (full gains): a grasp that
+        is holding should hold. Note this does NOT re-litigate the closing-phase
+        tuning above -- that measurement was of grip force DURING the squeeze,
+        which is a different quantity from force RETENTION under load.
+
+        Public so callers that hand-roll their own PD (e.g.
+        kinova_leap_pick_place's GRASP phase) get the same gains compute() uses.
+        """
+        scale = (self.transport_pd_scale if self.transporting
+                 else self.squeeze_pd_scale if self.squeeze else 1.0)
+        if scale == 1.0:
             return self.kp, self.kd
         kp, kd = self.kp.copy(), self.kd.copy()
         for lo, hi in self.active_joint_slices:
-            kp[lo:hi] *= self.squeeze_pd_scale
-            kd[lo:hi] *= self.squeeze_pd_scale
+            kp[lo:hi] *= scale
+            kd[lo:hi] *= scale
         return kp, kd
 
     def _live_contacts(self, data):

@@ -87,6 +87,22 @@ def build(placements, workspace=None, target_sites=()):
     spec.visual.global_.offwidth = 1280
     spec.visual.global_.offheight = 960
 
+    # Grasping contact model (scene_pick_place.xml sets the same pair in XML --
+    # see its comment). MuJoCo's defaults (pyramidal cone, impratio=1) make the
+    # TANGENTIAL friction constraints as soft as the normal ones, so a firmly
+    # gripped object slides straight down between the fingers: the hand lifts
+    # and the object stays put.
+    #
+    # BOTH are needed -- elliptic at impratio=1 still drops it. Swept on the
+    # lift pipeline over 017_orange seeds 2/4/7 (object rise against a ~100mm
+    # palm rise): pyramidal imp=1 dropped all three; elliptic imp=1 dropped all
+    # three; imp=10 lifted ~90-93mm; imp=20 lifted 93-97mm, the only value in
+    # the top tier on every seed; imp>=50 went non-monotonic and dropped one
+    # seed outright. Measured grip force was ~1.1-1.35 N in EVERY row including
+    # the drops, so this is purely about transmitting that force tangentially.
+    spec.option.cone = mj.mjtCone.mjCONE_ELLIPTIC
+    spec.option.impratio = 20.0
+
     body_names = []
     for i, (obj_id, pos, quat) in enumerate(placements):
         body_names.append(_attach_object(spec, obj_id, pos, quat, f"o{i}_"))
