@@ -316,6 +316,13 @@ def _run_lift_jog(model, data, ctrl, obj_bid, tip_geom_ids, obj_gid, q_target, _
     the final object-to-palm-motion tracking error, and the achieved lift
     height.
     """
+    # Switch the finger joints from CLOSING gains to HOLDING gains: the squeeze
+    # has converged and the grasp is about to bear the object's weight, which
+    # back-drives the softened joints and bleeds normal force away (measured on
+    # 036_wood_block seed 2: fn 8.20 -> 6.71N over ~200ms, object falling while
+    # both contacts were still present). See GraspController.effective_gains.
+    ctrl.set_transporting(True)
+
     palm_bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, palm_body)
     n = model.nv
     dt = model.opt.timestep

@@ -1772,6 +1772,11 @@ class UVAtlasConfig:
     # on the wood block's flat face -- so this is a real model comparison, not
     # a tuned threshold.
     quadratic_mesh_fit_gain_min: float = 0.5
+    # DIAGNOSTIC: pull contacts toward the object's COM plane. Blunt and
+    # object-specific (wrong for a mug rim or bottle neck) -- exists to test
+    # whether a mid-height grasp makes 036_wood_block liftable at all. Needs a
+    # LARGE weight to register against the IK term. See the _run_stage comment.
+    w_contact_height:            float = 0.0
     # If a stage's solved (t1,t2) sits within this fraction of its own
     # per-axis bound, the Picard loop treats it as PINNED (trust region ran
     # out, not a converged interior optimum) and keeps relinearizing even if
@@ -2874,6 +2879,37 @@ class GraspPlanner3D:
             # _sym_geom_surface_con via cfg.edge_margin_m) — no cost term needed. BOX
             # only, though (see _sym_geom_surface_con) — mesh contacts get no hard
             # edge keep-out at all, hence the soft curvature penalty below.
+
+            # ── Contact-height / COM-proximity penalty (DIAGNOSTIC) ────────────
+            # Pull contacts toward the object's centroid plane. This is a blunt
+            # object-specific heuristic, NOT a general edge-avoidance rule -- it
+            # encodes "grasp near the middle", which is wrong for objects you
+            # should grasp high (a mug by its rim, a bottle by its neck). It
+            # exists to answer one question the investigation has not yet
+            # settled: does a mid-height grasp actually make 036_wood_block
+            # liftable? Everything so far shows contacts are driven to the top
+            # edge (IK cost gradient d(cost)/dz ~= -579 at the stage-1 seed,
+            # against -0.4 for alignment), but not that fixing that is
+            # sufficient. If the block still fails with contacts forced to the
+            # COM plane, edge-avoidance is the wrong direction entirely and no
+            # amount of principled regularization will help.
+            #
+            # Weight has to be LARGE to register: the IK term dominates every
+            # geometric term by ~1400x, which is why the old curvature penalty
+            # at w=100 moved the solution 0mm.
+            if cfg.w_contact_height > 0.0 and _is_mesh:
+                # COM world height: xipos is the body's inertial (COM) frame
+                # origin, which for these YCB bodies is genuinely offset from
+                # the body origin (036_wood_block: +103mm on a 207mm block).
+                _com_w_z = float(data_cb.xipos[self._obj_bid][2])
+                _cost_height = ca.DM(0.0)
+                for _pv in (_p1, _p2):
+                    if _pv is None:
+                        continue
+                    # world-frame height of the contact vs the object's COM
+                    _dz = _pv[2] - float(_com_w_z)
+                    _cost_height = _cost_height + _dz**2
+                _cost = _cost + cfg.w_contact_height * _cost_height
 
             # ── Edge-margin penalty (quadratic mesh contact only) ──────────────
             # Keep each contact a margin away from where the surface actually
