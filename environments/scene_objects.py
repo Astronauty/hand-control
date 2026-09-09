@@ -127,19 +127,27 @@ def attach_ycb_object(spec, obj_id: str, xy, *, mass: float | None = None,
             pass
 
     # Name geoms to the contract + set grasp contact params on the collision geoms.
-    first_col = True
+    # Collision hulls are numbered by ENUMERATION ORDER, not by id(g): CPython
+    # reuses the address of a freed temporary, so id(g) & 0xffff collided as soon
+    # as an object had more than a couple of hulls and compile failed with
+    # "repeated name". Concave YCB objects hit this immediately -- 065-a_cups
+    # decomposes into 35 hulls.
+    n_col = 0
+    n_vis = 0
     for g in body.geoms:
         is_col = (g.contype != 0 or g.conaffinity != 0) and g.group == 3
         if is_col:
             g.condim = condim
             g.friction = list(friction)
-            if first_col:
+            if n_col == 0:
                 g.name = f"{name}_geom"   # <body>_geom, the pipeline's derived name
-                first_col = False
             else:
-                g.name = f"{name}_col_{id(g) & 0xffff}"
+                g.name = f"{name}_col_{n_col}"
+            n_col += 1
         else:
-            g.name = f"{name}_vis"
+            # Visual geoms need distinct names too, for the same reason.
+            g.name = f"{name}_vis" if n_vis == 0 else f"{name}_vis_{n_vis}"
+            n_vis += 1
 
     # attach_body renames children in place; a frame lets us prefix cleanly.
     spec.worldbody.add_frame().attach_body(body, "", "")
@@ -166,23 +174,31 @@ def place_on_surface(model, data, body_name: str, surface_z: float, clearance: f
     if jadr < 0:
         return
     qadr = model.jnt_qposadr[jadr]
-    # Its collision geom (the one named <body>_geom) drives the rest height.
-    gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, f"{body_name}_geom")
-    if gid < 0:
-        # No named collision geom — fall back to the old unoriented half-height estimate.
+    # EVERY collision hull of the body drives the rest height, not just the one
+    # named <body>_geom. A convex decomposition splits a concave object into many
+    # hulls (065-a_cups: 35), and the first one covers only part of the shape --
+    # using it alone placed the cup ~60mm BELOW the table top, its rim poking
+    # through, because that hull's AABB is not the object's extent.
+    gids = [g for g in range(model.ngeom)
+            if model.geom_bodyid[g] == bid and model.geom_group[g] == 3
+            and (model.geom_contype[g] != 0 or model.geom_conaffinity[g] != 0)]
+    if not gids:
+        # No collision geoms — fall back to a safe gap above the surface.
         data.qpos[qadr + 2] = surface_z + 0.02
         model.qpos0[qadr + 2] = surface_z + 0.02
         return
 
-    # Lift well clear, resolve the geom's world pose, find its lowest oriented-AABB corner.
+    # Lift well clear, resolve world poses, find the lowest oriented-AABB corner
+    # over all hulls.
     data.qpos[qadr + 2] = surface_z + 0.25
     mj.mj_forward(model, data)
-    c = model.geom_aabb[gid][:3]      # AABB center in the geom's local frame
-    h = model.geom_aabb[gid][3:]      # AABB half-sizes (local)
-    R = data.geom_xmat[gid].reshape(3, 3)
-    origin = data.geom_xpos[gid]
     lowest = min(
-        (origin + R @ (c + np.array([sx * h[0], sy * h[1], sz * h[2]])))[2]
+        (data.geom_xpos[gid] + data.geom_xmat[gid].reshape(3, 3)
+         @ (model.geom_aabb[gid][:3]
+            + np.array([sx * model.geom_aabb[gid][3],
+                        sy * model.geom_aabb[gid][4],
+                        sz * model.geom_aabb[gid][5]])))[2]
+        for gid in gids
         for sx in (-1.0, 1.0) for sy in (-1.0, 1.0) for sz in (-1.0, 1.0)
     )
     # Drop so the lowest corner rests just above the surface.
