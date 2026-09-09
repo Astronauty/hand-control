@@ -412,7 +412,7 @@ def settle_object_on_floor(model, data, obj_bid, n_steps=400):
     return pos, quat
 
 
-def _tip_gaps_mm(model, data, tip_geom_ids, obj_geom_id):
+def _tip_gaps_mm(model, data, tip_geom_ids, obj_geom_id, obj_geom_ids=None):
     """True fingertip-geom-to-object gap (mm) via mj_geomDistance, one per
     finger (tip_geom_ids order) -- the mechanical reality check the NLP's
     site-based IK cost doesn't itself guarantee: a mesh object's IK residual
@@ -422,9 +422,19 @@ def _tip_gaps_mm(model, data, tip_geom_ids, obj_geom_id):
     touching sends the grasp map an unbalanced (non-antipodal) force, which
     the arm PD cannot resist -- confirmed empirically (an 8.9mm untouched
     index-finger gap here launched the object ~700mm on one seed's squeeze).
+
+    obj_geom_ids : all of the object's collision hulls, when it has more than
+        one. A concave YCB object is a V-HACD decomposition (065-a_cups: 35
+        hulls), and the distance to any SINGLE hull is not the distance to the
+        object -- a fingertip touching the cup's rim can be tens of mm from
+        whichever hull happens to be named <body>_geom, which would abort the
+        squeeze on a perfectly good grasp. The true gap is the MINIMUM over
+        hulls. Defaults to [obj_geom_id] (the single-hull objects behave exactly
+        as before).
     """
-    return [mj.mj_geomDistance(model, data, tg, obj_geom_id, 0.1, None) * 1000
-           for tg in tip_geom_ids]
+    gids = list(obj_geom_ids) if obj_geom_ids else [obj_geom_id]
+    return [min(mj.mj_geomDistance(model, data, tg, og, 0.1, None) for og in gids) * 1000
+            for tg in tip_geom_ids]
 
 
 # Internal force (N) validated as stable at the reference contact softness

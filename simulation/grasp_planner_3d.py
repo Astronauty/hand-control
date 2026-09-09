@@ -369,15 +369,30 @@ def _mesh_sdf_entry(model, body_id: int) -> dict:
     # geom_pos/geom_quat the same way body_hull_halfspaces does, so both live
     # in the same body frame as the SDF table.
     _vis_verts = None
+    _vis_normals = None
     try:
         from grasp_control import object_uv_atlas as _oua
-        _vis_verts = np.asarray(_oua.body_visual_mesh(model, body_id)[0], float)
+        _vv, _vf = _oua.body_visual_mesh(model, body_id)
+        _vis_verts = np.asarray(_vv, float)
+        # Area-weighted per-vertex normals, accumulated from the faces. Used by
+        # the local surface fit to reject vertices facing the other way -- the
+        # inner surface of a thin shell (a cup wall is ~2-3mm) otherwise lands
+        # inside the fit's distance band and corrupts the quadratic.
+        _vf = np.asarray(_vf, int)
+        _fn = np.cross(_vis_verts[_vf[:, 1]] - _vis_verts[_vf[:, 0]],
+                       _vis_verts[_vf[:, 2]] - _vis_verts[_vf[:, 0]])
+        _vis_normals = np.zeros_like(_vis_verts)
+        for _k in range(3):
+            np.add.at(_vis_normals, _vf[:, _k], _fn)
+        _nn = np.linalg.norm(_vis_normals, axis=1, keepdims=True)
+        _vis_normals = _vis_normals / np.maximum(_nn, 1e-12)
     except Exception:
         pass          # visual mesh is optional; the fit falls back to the SDF
     entry = dict(
         table=table,
         verts=_verts,
         visual_verts=_vis_verts,
+        visual_normals=_vis_normals,
         fn=fn,
         grad_fn=_grad_fn,
         normal_fn=_object_sdf.casadi_normal_fn(fn, name=f"{_tag}_normal"),
@@ -1114,6 +1129,8 @@ def _sdf_axis_bound_np(mesh_entry: dict, seed_l: np.ndarray, axis_l: np.ndarray,
 def _mesh_local_surface_fit_np(mesh_entry: dict, seed_l: np.ndarray,
                                t1_l: np.ndarray, t2_l: np.ndarray, n_l: np.ndarray,
                                radius: float = 0.04, band: float = 0.004,
+                               band_inward: float | None = None,
+                               normal_agree_min: float = 0.5,
                                min_pts: int = 12,
                                quad_gain_min: float = 0.5):
     """Local surface curvature at seed_l fitted DIRECTLY to nearby mesh
@@ -1157,15 +1174,47 @@ def _mesh_local_surface_fit_np(mesh_entry: dict, seed_l: np.ndarray,
     band   : max |offset along the normal| (m) for an included vertex. Keeps
         points that have wrapped onto an ADJACENT face out of the fit -- without
         it a seed near an edge mixes two faces into one quadratic.
+
+        For a THIN-SHELL object this band must also exclude the far side of the
+        shell. A YCB cup's wall is only ~2-3mm thick, so a symmetric 4mm band
+        centred on the outer surface reaches straight through it and pulls the
+        INNER surface into the same fit -- two roughly parallel sheets whose
+        least-squares quadratic is meaningless. The band is therefore applied
+        ASYMMETRICALLY: vertices are kept from band_out on the outward side to
+        band_in on the inward side, with band_in defaulting to a fraction of
+        band so a thin wall's inner surface falls outside it. Vertices are also
+        rejected when their own surface normal disagrees with the seed's, which
+        catches the inner surface even when it sits within the distance band.
     """
     V = mesh_entry.get("visual_verts")
     if V is None or len(V) < min_pts:
         return None
+    # Cap the sampling radius by the OBJECT's own size. A quadratic can only
+    # describe a patch that subtends a modest angle: on 065-a_cups (outer radius
+    # ~29mm) the default 40mm radius wraps most of the way around the wall and
+    # the fit collapses (gain 0.25, kappa drifting), while r=10-20mm recovers a
+    # stable kappa=(0, -45.3) at gain 0.95-0.97 -- correct for a cylinder, and
+    # consistent across a 2x radius sweep. The default was tuned on the wood
+    # block's 104mm face and is simply too large for small objects, so scale it
+    # to a fraction of the object's smallest extent.
+    _ext = np.asarray(V, float).max(0) - np.asarray(V, float).min(0)
+    radius = float(min(radius, 0.35 * float(np.min(_ext))))
     d = np.asarray(V, float) - np.asarray(seed_l, float)
     u = d @ t1_l
     v = d @ t2_l
     w = d @ n_l
-    m = ((u * u + v * v) <= radius * radius) & (np.abs(w) <= band)
+    # Asymmetric band (see the `band` note): generous outward, tight inward, so a
+    # thin shell's far surface is excluded rather than fitted alongside the near
+    # one. band_in defaults to a third of band -- below a YCB cup's ~2-3mm wall.
+    band_in = band if band_inward is None else band_inward
+    m = ((u * u + v * v) <= radius * radius) & (w <= band) & (w >= -band_in)
+    # Normal agreement: reject vertices whose own outward normal opposes the
+    # seed's. On a thin wall the inner surface faces the other way, so this
+    # removes it even where it falls inside the distance band; on a solid object
+    # it is a no-op for anything the band already admits.
+    nrm = mesh_entry.get("visual_normals")
+    if nrm is not None and len(nrm) == len(V):
+        m &= (np.asarray(nrm, float) @ np.asarray(n_l, float)) >= normal_agree_min
     n_sel = int(m.sum())
     if n_sel < min_pts:
         return None
