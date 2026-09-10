@@ -310,17 +310,41 @@ def draw_seed_rays(ax, sc, rec):
         o, d, L = ray["origin"], ray["dir"], ray["length"]
         e1 = o + d * L
         ax.plot(*np.array([o, e1]).T, color=col, ls=":", lw=0.9, alpha=a, zorder=4)
+        ax.scatter(*o, color=col, marker="+", s=60, alpha=a, zorder=5)
         ax.scatter(*e1, facecolor="none", edgecolor=col, s=28, lw=1.0, alpha=a, zorder=5)
         _arrow(ax, e1, s["p1s"], col, a)
-        # march leg: p1s -> p2s (the jittered antipodal direction)
-        ax.plot(*np.array([s["p1s"], s["p2s"]]).T, color=col, ls="-.", lw=1.0,
-                alpha=a * 0.8, zorder=4)
 
-    # Landed surface footprints
-    for p, key in ((s["p1s"], "thumb"), (s["p2s"], "index")):
+    # PAIRING: the chord joining this seed's two footprints. Drawn for BOTH
+    # seed kinds -- for a random seed it is also the physical march leg
+    # (_march_sdf_np's path from p1s through the object to p2s), for the
+    # minor-axis seed it coincides with the ray. Its job in either case is to
+    # make "these two contacts are one pair" unambiguous within the panel.
+    ax.plot(*np.array([s["p1s"], s["p2s"]]).T, color=col, ls="-.", lw=1.2,
+            alpha=a * 0.85, zorder=4)
+
+    # Landed surface footprints, labelled p1s/p2s so the thumb/index assignment
+    # (_assign_seed_by_finger's output) can be read off directly.
+    # Offset each label OUTWARD along the pair's own chord, so the two tags
+    # separate even when the footprints project close together on a small panel.
+    chord = np.asarray(s["p2s"], float) - np.asarray(s["p1s"], float)
+    chord = chord / (np.linalg.norm(chord) + 1e-12)
+    # Outward offset along the chord: scaled to the pair's separation, and large
+    # enough that the tag clears its own marker rather than sitting on top of it.
+    off = 0.22 * float(np.linalg.norm(np.asarray(s["p2s"]) - np.asarray(s["p1s"]))) + 0.010
+    for p, key, tag, sgn in ((s["p1s"], "thumb", "p1s", -1.0),
+                             (s["p2s"], "index", "p2s", +1.0)):
         c_in, _ = FINGER_COLORS[key]
-        ax.scatter(*p, color=c_in if ok else "#cb181d", s=42,
-                   edgecolor="k", lw=0.4, alpha=1.0 if ok else 0.5, zorder=6)
+        ax.scatter(*p, color=c_in if ok else "#cb181d", s=52,
+                   edgecolor="k", lw=0.5, alpha=1.0 if ok else 0.55, zorder=6)
+        lp = np.asarray(p, float) + sgn * off * chord
+        ax.text(*lp, f"{tag} ({key})", fontsize=7.5, zorder=7, fontweight="bold",
+                ha="center", color=c_in if ok else "#cb181d")
+
+
+def s_pts(rec):
+    """This seed's two surface footprints, as a (2,3) array -- the points a ray
+    panel must keep in frame regardless of how far out the ray itself starts."""
+    return np.array([rec["seed"]["p1s"], rec["seed"]["p2s"]], float)
 
 
 def _arrow(ax, a, b, color, alpha):
@@ -400,40 +424,56 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
     # rejected seeds are then the whole story, so --show-rejected draws their
     # patches too, marked as such: it shows exactly what the gate is refusing.
     panel_recs = accepted if (accepted and not show_rejected) else recs
-    # Layout: column 0 is the whole-object seed-ray overview (spanning both
-    # rows); then one COLUMN per accepted seed with the THUMB patch on the top
-    # row and the INDEX patch below it. Separate axes per contact because the
-    # two contacts of a pair sit on opposite sides of the object -- framing both
-    # in one panel forces an object-scale zoom, which is exactly what makes a
-    # 6mm trust region (017_orange) unreadable.
-    n_cols = 1 + len(panel_recs)
-    fig = plt.figure(figsize=(6.0 * n_cols, 10.2))
-    gs = fig.add_gridspec(2, n_cols)
+    # Layout: ONE COLUMN PER SEED, read top to bottom --
+    #   row 0: that seed's OWN ray + projection panel, whole-object framing
+    #   row 1: its thumb paraboloid   row 2: its index paraboloid
+    # Every seed gets its own ray panel rather than sharing one overview,
+    # because an overview draws every pair in the same style and gives no way
+    # to tell WHICH two footprints belong to the same pair -- the pairing is
+    # the thing being inspected. One pair per axes makes it unambiguous, and
+    # the two footprints are additionally tied together by the connecting
+    # chord and a matching p1s/p2s annotation.
+    # Patches get separate axes from the rays (and from each other) because a
+    # pair's two contacts sit on opposite sides of the object: framing both in
+    # one panel forces an object-scale zoom, which is what makes a 6mm trust
+    # region (017_orange) unreadable.
+    n_cols = len(panel_recs)
+    # Width scales with the column count but has a FLOOR: at one accepted
+    # seed (017_orange) a purely proportional width leaves no room for the
+    # suptitle or the legend, both of which are figure-wide.
+    fig = plt.figure(figsize=(max(4.6 * n_cols, 11.0), 12.4))
+    gs = fig.add_gridspec(3, n_cols, height_ratios=[1.05, 1.0, 1.0])
     fit_tag = "mesh-fit curvature" if mesh_fit else "SDF-Hessian curvature"
+    n_rej = len(recs) - len(accepted)
     fig.suptitle(
         f"{obj}  —  seeding strategy and local quadratic surrogate  ({fit_tag})\n"
-        "left: all seed rays → surface projections   |   "
-        "right: per-seed paraboloid (thumb above, index below), "
-        "saturated = measured trust region, pale wireframe = extrapolation",
-        fontsize=11)
+        f"{len(accepted)}/{len(recs)} seeds accepted, {n_rej} rejected "
+        f"(kappa gate {cfg.seed_kappa_max_reject:.0f})\n"
+        "one column per seed: ray → projection, then its thumb and index paraboloid"
+        "  —  saturated = measured trust region, pale = extrapolation",
+        fontsize=10.5)
 
-    # ── Panel 0: every seed ray + projection, over the transparent mesh ─────
-    ax = fig.add_subplot(gs[:, 0], projection="3d")
-    Vw = draw_mesh(ax, sc)
-    for rec in recs:
-        draw_seed_rays(ax, sc, rec)
-    _equal_axes(ax, np.vstack([Vw] + [np.array([r["ray"]["origin"] + r["ray"]["dir"] * r["ray"]["length"],
-                                                r["ray"]["origin"] - r["ray"]["dir"] * r["ray"]["length"]])
-                                      for r in recs]))
-    n_rej = len(recs) - len(accepted)
-    ax.set_title(f"1. seed rays → projection\n"
-                 f"{len(accepted)}/{len(recs)} accepted, {n_rej} rejected "
-                 f"(kappa gate {cfg.seed_kappa_max_reject:.0f})", fontsize=9)
-    ax.view_init(elev=elev, azim=azim)
-    ax.set_xlabel("x (m)", fontsize=7); ax.set_ylabel("y (m)", fontsize=7)
-    ax.set_zlabel("z (m)", fontsize=7); ax.tick_params(labelsize=6)
+    # ── Row 0: each seed's own ray + projection, over the transparent mesh ──
+    for i, rec in enumerate(panel_recs):
+        axr = fig.add_subplot(gs[0, i], projection="3d")
+        Vw = draw_mesh(axr, sc)
+        draw_seed_rays(axr, sc, rec)
+        # Frame on the OBJECT (plus a small margin), not on the ray extent.
+        # A seed ray starts 2.5*max(geom_size) out, so including its far tail
+        # in an equal-aspect cube shrinks the object to a blob in the middle
+        # and pushes the footprints on top of each other. The ray tails simply
+        # clip at the panel edge, which costs nothing -- the informative part
+        # is the last stretch where the ray meets the surface.
+        _equal_axes(axr, np.vstack([Vw, s_pts(rec)]), pad=0.03)
+        _rej = "" if rec["ok"] else f"\nREJECTED: {rec['why']}"
+        axr.set_title(f"seed {i} ({rec['kind']}) — ray → projection"
+                      f"{_rej}", fontsize=8.5,
+                      color="k" if rec["ok"] else "#cb181d")
+        axr.view_init(elev=elev, azim=azim)
+        axr.set_xlabel("x (m)", fontsize=7); axr.set_ylabel("y (m)", fontsize=7)
+        axr.set_zlabel("z (m)", fontsize=7); axr.tick_params(labelsize=6)
 
-    # ── Panels 1..n: one accepted seed each, both contacts' paraboloids ─────
+    # ── Rows 1-2: that same seed's two contacts' paraboloids ───────────────
     # Framed on the PATCHES, not the object: a trust region is ~5-30mm on a
     # 60-200mm object, so an object-framed view renders it as a few pixels.
     # The mesh is still drawn (clipped by the zoom) so the patch is read
@@ -443,7 +483,7 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
         s = rec["seed"]
         for row, (p, n_in, key) in enumerate(((s["p1s"], s["n1_in"], "thumb"),
                                               (s["p2s"], s["n2_in"], "index"))):
-            axq = fig.add_subplot(gs[row, 1 + i], projection="3d")
+            axq = fig.add_subplot(gs[1 + row, i], projection="3d")
             draw_mesh(axq, sc, alpha=0.12)
             fr = quad_frame(sc, p, n_in, cfg)
             axq.scatter(*p, color=FINGER_COLORS[key][0], s=48, edgecolor="k",
@@ -497,8 +537,8 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"seedquad_{obj}{'' if mesh_fit else '_sdfhess'}.png"
-    fig.subplots_adjust(left=0.02, right=0.98, top=0.87, bottom=0.09,
-                        wspace=0.18, hspace=0.30)
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.06,
+                        wspace=0.14, hspace=0.24)
     fig.savefig(out, dpi=115)
     plt.close(fig)
 
