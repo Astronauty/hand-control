@@ -1,0 +1,323 @@
+% =====================================================================
+%  Contact-aware grasp synthesis and execution
+%  Draft section for an ICRA-format paper.
+%
+%  Notation follows the paper's symbol table (Drake monogram). Symbols
+%  introduced here that are NOT yet in that table are collected in
+%  Sec.~\ref{sec:new-symbols} at the end of this file so they can be
+%  merged in.
+%
+%  Requires: amsmath, amssymb, bm, algorithm, algpseudocode.
+% =====================================================================
+
+\section{Method}
+\label{sec:method}
+
+We formulate grasp synthesis as a single nonlinear program that couples
+kinematic reachability, contact placement on the object surface, and
+wrench feasibility, and we solve it by a sequence of relinearized
+subproblems. The resulting contact set is then executed by an internal-force
+controller whose commanded squeeze is certified against an explicit
+disturbance budget, and whose motion is rate-limited so that the budget
+holds by construction.
+
+\subsection{Contact parameterization}
+\label{sec:contact-param}
+
+Let the object be represented by a triangulated surface mesh with vertices
+$\bm{v}_m \in \mathbb{R}^3$ expressed in $\mathcal{O}_k$. Given a seed contact
+$\bm{p}_i^0$ and an outward normal $\bm{n}_i$, we extract the vertices in a
+neighbourhood
+%
+\begin{equation}
+  \mathcal{N}_i = \bigl\{ \bm{v}_m : \lVert \bm{P}_i (\bm{v}_m - \bm{p}_i^0) \rVert \le \rho,\;
+                   \lvert \bm{n}_i^{\top}(\bm{v}_m - \bm{p}_i^0) \rvert \le \beta_{\mathrm{band}} \bigr\},
+\end{equation}
+%
+where $\bm{P}_i = \bm{I} - \bm{n}_i \bm{n}_i^{\top}$ projects onto the tangent
+plane, $\rho$ is the patch radius and $\beta_{\mathrm{band}}$ a thickness
+tolerance, and fit both a plane and a quadratic height field to
+$\mathcal{N}_i$ in least-squares. Writing the tangential coordinates
+$\bm{t}_i = (t_{i,1}, t_{i,2})$, the retained model is
+%
+\begin{equation}
+  h_i(\bm{t}_i) \;=\; -\frac{\kappa_{i,1} t_{i,1}^2 + \kappa_{i,2} t_{i,2}^2}{2 \lVert \nabla \phi_i \rVert},
+  \label{eq:patch-height}
+\end{equation}
+%
+with principal curvatures $\kappa_{i,1}, \kappa_{i,2}$ obtained from the
+eigendecomposition of the fitted Hessian restricted to the tangent plane, and
+$\phi$ the object signed-distance field. The quadratic is accepted only when it
+reduces the RMS residual over the planar fit by a factor $\eta$; otherwise
+$\kappa_{i,1} = \kappa_{i,2} = 0$ and the patch is treated as locally flat. This
+model-selection step matters because scanned meshes carry surface relief that a
+curvature estimate will otherwise interpret as genuine geometry.
+
+Each contact then contributes exactly two decision variables,
+%
+\begin{equation}
+  \bm{p}_i(\bm{t}_i) \;=\; \bm{p}_i^0 + t_{i,1}\, \bm{a}_{i,1} + t_{i,2}\, \bm{a}_{i,2} + h_i(\bm{t}_i)\, \bm{n}_i ,
+  \label{eq:patch}
+\end{equation}
+%
+where $\bm{a}_{i,1}, \bm{a}_{i,2}$ are the fitted principal axes. Contacts
+parameterized this way lie on the surface by construction, so no surface
+equality constraint is required and the optimizer cannot leave the object.
+
+\paragraph{Trust region.}
+The quadratic \eqref{eq:patch-height} is a local model, and its validity is
+bounded by the extent over which it agrees with $\phi$. For each axis and each
+direction we march outward until the surrogate departs from the true
+signed-distance value by more than $\varepsilon_\phi$, giving asymmetric bounds
+%
+\begin{equation}
+  \underline{t}_{i,d} \le t_{i,d} \le \overline{t}_{i,d}, \qquad d \in \{1,2\},
+  \label{eq:trust}
+\end{equation}
+%
+which are tight near an edge and saturate at a user cap on a flat face. Using
+one symmetric bound $\min(\lvert \underline{t} \rvert, \overline{t})$ instead
+discards usable surface on any patch that is not centred in its face.
+
+\subsection{Grasp synthesis program}
+\label{sec:nlp}
+
+Let $\bm{q}^r$ denote the robot configuration and
+$\bm{t} = (\bm{t}_1,\dots,\bm{t}_n)$ the stacked contact coordinates. We solve
+%
+\begin{equation}
+\begin{aligned}
+  \min_{\bm{q}^r,\, \bm{t},\, \gamma,\, \bm{y}} \quad
+    & w_{\mathrm{ik}} J_{\mathrm{ik}} + w_{\mathrm{reg}} J_{\mathrm{reg}}
+      + w_{\gamma} J_{\gamma} + w_{y} J_{y} \\[-1pt]
+    & \qquad + w_{\alpha} J_{\mathrm{align}} + w_{o} J_{\mathrm{orient}}
+      + w_{g} J_{\mathrm{gws}} + w_{s} J_{\mathrm{span}} \\
+  \text{s.t.}\quad
+    & \bm{q}^r_{\min} \le \bm{q}^r \le \bm{q}^r_{\max}, \\
+    & \eqref{eq:trust}, \\
+    & \text{wrench feasibility } \eqref{eq:wrench-lp}, \\
+    & \mathrm{SDF}(b, o) \ge \epsilon
+      \quad \forall\, b \in \mathcal{B}_{\mathrm{collision}} \setminus \mathcal{D},\; o \in \mathcal{O}.
+\end{aligned}
+\label{eq:nlp}
+\end{equation}
+%
+Each cost term is normalized so that it is of order unity at its reference
+level, which lets the weights be read as relative priorities rather than as
+unit conversions.
+
+\paragraph{Reachability.}
+With $\bm{s}_i(\bm{q}^r)$ the fingertip position at contact $i$ and $r_i$ its
+effective pad radius,
+%
+\begin{equation}
+  J_{\mathrm{ik}} = \frac{1}{2 d_{\mathrm{ref}}^2} \sum_{i=1}^{n}
+    \bigl\lVert \bm{s}_i(\bm{q}^r) - \bigl(\bm{p}_i(\bm{t}_i) + r_i \bm{n}_i \bigr) \bigr\rVert^2 ,
+\end{equation}
+%
+with $d_{\mathrm{ref}}$ the residual considered acceptable. The target is offset
+along the inward normal by the \emph{maximum} pad--mesh offset rather than the
+mean, so the converged solution leaves a small positive gap that the squeeze
+closes, rather than placing half the contacts in penetration.
+
+\paragraph{Posture.}
+$J_{\mathrm{reg}} = \frac{1}{n_{\mathrm{dof}}}
+ \lVert \bm{q}^r - \bm{q}_{\mathrm{ref}} \rVert_{\bm{Q}}^2$
+ties the solution to the retargeted operator pose, acting as a tie-breaker among
+kinematically equivalent grasps and keeping the synthesized configuration close
+to the one the operator commanded.
+
+\paragraph{Wrench feasibility.}
+We linearize each Coulomb cone with the five generators
+%
+\begin{equation}
+  \bm{f}_{i,j} \in \bigl\{ \bm{0},\;
+    (1, \pm\mu_i, 0),\; (1, 0, \pm\mu_i) \bigr\},
+  \qquad j = 1,\dots,5,
+\end{equation}
+%
+expressed in $\mathcal{C}_i$, and map them into $\mathcal{O}_k$ as wrench-cone
+vertices
+%
+\begin{equation}
+  \bm{F}_{i,j} =
+  \begin{bmatrix} \bm{p}_i \times \bm{R}_i \bm{f}_{i,j} \\ \bm{R}_i \bm{f}_{i,j} \end{bmatrix}
+  \in \mathbb{R}^6 .
+\end{equation}
+%
+The task disturbance is specified as an acceleration budget rather than a single
+wrench: given linear and angular budgets $\bm{a}_{\max}$, $\bm{\alpha}_{\max}$,
+object mass $m_k$ and principal inertia $\bm{I}_k$, the induced wrench set is the
+box
+%
+\begin{equation}
+  \mathcal{W} = \bigl\{ \bm{w} : \lvert \bm{w}_{\tau} \rvert \le \bm{I}_k \bm{\alpha}_{\max},\;
+                   \lvert \bm{w}_{f} \rvert \le m_k \bm{a}_{\max} \bigr\},
+  \label{eq:budget}
+\end{equation}
+%
+whose $2^6$ vertices $\bm{w}_\ell$ we enumerate. Gravity enters as a constant
+wrench added to every vertex. Feasibility requires that each vertex be
+reproducible by cone forces at squeeze $\gamma$:
+%
+\begin{equation}
+\begin{aligned}
+  & \bm{V}(1)\, \bm{y}_\ell - \gamma\, \bm{w}_{\mathrm{tan}} = \bm{w}_\ell,
+    && \forall \ell, \\
+  & \textstyle\sum_{j} y_{\ell,ij} \le \gamma, \quad \bm{y}_\ell \ge \bm{0},
+    && \forall \ell, i,
+\end{aligned}
+\label{eq:wrench-lp}
+\end{equation}
+%
+where the substitution $\bm{y} = \gamma \bm{x}$ renders the condition linear in
+$(\bm{y}, \gamma)$, exploiting $\bm{V}(\gamma) = \gamma \bm{V}(1)$. Because the
+constraint is embedded in \eqref{eq:nlp} rather than solved as a nested program,
+the solver's KKT system couples $\gamma$ directly to $\bm{q}^r$ and $\bm{t}$ and
+supplies exact gradients. We penalize $J_\gamma = \gamma / \gamma_{\mathrm{ref}}$
+to prefer the least squeeze that certifies the budget, and
+$J_y = \sum_\ell \lVert \bm{y}_\ell \rVert^2$ to distribute load across
+generators. A per-vertex slack $\bm{s}_\ell$ may be admitted so that a single
+geometrically unreachable corner does not render the program infeasible, in
+which case feasibility is adjudicated post hoc on $\lVert \bm{s}_\ell \rVert$.
+
+\paragraph{Closure quality.}
+Optionally we include the min-weight metric of FRoGGeR~\cite{frogger}. With
+$\bm{W} \in \mathbb{R}^{6 \times 5n}$ the matrix of primitive wrenches,
+%
+\begin{equation}
+  J_{\mathrm{gws}} = -\beta^\star, \qquad
+  \begin{aligned}
+    \beta^\star = \max_{\bm{\alpha}, \beta} \;\; & \beta \\
+    \text{s.t.}\;\; & \bm{W}\bm{\alpha} = \bm{0}, \quad
+                      \textstyle\sum_j \alpha_j = 1, \\
+                    & \bm{\alpha} \ge \beta \bm{1}.
+  \end{aligned}
+  \label{eq:minweight}
+\end{equation}
+%
+Here $\bm{\alpha}$ is a convex combination of primitive wrenches that cancels to
+zero net wrench, and $\beta$ is the smallest weight it requires; $\beta > 0$ iff
+the wrench-space origin lies in the interior of the grasp wrench set, and its
+magnitude measures how robustly. We deliberately do \emph{not} impose
+$\bm{\alpha} \ge \bm{0}$: for a configuration not yet in closure, the correct
+value is $\beta < 0$ with some $\alpha_j < 0$, and leaving the sign free keeps
+the metric smooth and ascendable from infeasible starts rather than making the
+program infeasible. As \eqref{eq:minweight} is embedded in the same program, no
+outer loop or subgradient is needed. A companion term
+$J_{\mathrm{span}} = -\log\det(\bm{W}\bm{W}^{\top} + \delta \bm{I})$ discourages
+rank collapse, which a two-contact pinch approaches whenever the contacts become
+collinear.
+
+\paragraph{Geometric conditioning.}
+$J_{\mathrm{align}} = \lVert \hat{\bm{g}} - \bm{n}_1 \rVert^2$ with
+$\hat{\bm{g}} = (\bm{p}_2 - \bm{p}_1)/\lVert \bm{p}_2 - \bm{p}_1 \rVert$ rewards
+antipodal opposition, and $J_{\mathrm{orient}}$ penalizes deviation between each
+pad axis and its inward contact normal so the pad meets the surface flush.
+
+\paragraph{Collision.}
+Robot--object and robot--environment clearances use a smooth (softplus)
+sphere--primitive distance so the constraint is differentiable. The fingertips
+$\mathcal{D}$ are excluded from the object clearance constraint, since they are
+required to touch, but retain the support-surface constraint so they cannot be
+driven through it.
+
+\subsection{Relinearization}
+\label{sec:picard}
+
+Contact normals and the frames $\bm{R}_i$ are held fixed within a solve, which
+keeps \eqref{eq:nlp} smooth. We therefore iterate: solve, re-anchor each seed at
+the returned contact, refit \eqref{eq:patch-height}, and repeat for a fixed
+number of stages. Convergence is assessed by whether contacts remain interior to
+\eqref{eq:trust}; a solution resting on a trust-region bound indicates that the
+local model, not the objective, is limiting the step.
+
+\subsection{Execution}
+\label{sec:execution}
+
+The synthesized contacts are executed in five phases: kinematic approach, settle,
+squeeze, transport, and release.
+
+\paragraph{Certified squeeze.}
+The squeeze commanded at run time is \emph{not} the program's internal $\gamma$.
+Once the hand is in contact we re-measure the achieved contact geometry
+$(\bm{p}_i, \bm{R}_i)$ and re-solve \eqref{eq:wrench-lp} as a linear program
+over the realized configuration, obtaining $\gamma^\star$, the least squeeze
+that renders every vertex of \eqref{eq:budget} resistible. Under zero
+disturbance this reduces to $\gamma^\star = m_k g / (2\mu)$ for an antipodal
+pinch, i.e.\ exactly the friction required to carry the object's weight.
+Infeasibility of any vertex is reported rather than absorbed.
+
+\paragraph{Budget enforcement.}
+The certificate $\gamma^\star$ is meaningful only if the executed motion remains
+inside \eqref{eq:budget}. We therefore rate-limit the commanded end-effector
+twist so that
+%
+\begin{equation}
+  \bm{v}^{c}_{k+1} = \bm{v}^{c}_{k} +
+    \mathrm{clip}\bigl( \bm{v}^{d}_{k} - \bm{v}^{c}_{k},\; \pm \bm{a}_{\max} \Delta t \bigr),
+  \label{eq:slew}
+\end{equation}
+%
+with $\bm{v}^d$ the desired and $\bm{v}^c$ the commanded twist. The commanded
+acceleration is then bounded by $\bm{a}_{\max}$ by construction, so the budget
+the squeeze was certified against is enforced rather than assumed. This is what
+permits the traverse speed to be raised without renegotiating the grasp
+force: peak speed sets the duration of the transfer, while \eqref{eq:slew} sets
+what the grasp must survive. Joint rates follow from a damped least-squares
+resolved-rate law with damping raised near kinematic singularities.
+
+\paragraph{Phase-dependent compliance.}
+Closing and holding impose opposing requirements on finger impedance. During
+closing a compliant finger lets the internal-force term dominate and seat the
+contacts; under load the same compliance is back-driven and bleeds normal force
+until the pinch fails. We therefore switch the finger gains at the transition
+from squeeze to transport.
+
+% =====================================================================
+\subsection*{Symbols to add to the notation table}
+\label{sec:new-symbols}
+% =====================================================================
+% Suggested rows, following the existing Drake-monogram convention.
+%
+% --- Contacts -------------------------------------------------------
+%   $\bm{t}_i \in \mathbb{R}^2$        Tangential patch coordinates of contact $i$
+%   $\bm{a}_{i,1}, \bm{a}_{i,2}$       Principal axes of the fitted patch at contact $i$
+%   $\kappa_{i,1}, \kappa_{i,2}$       Principal curvatures of the fitted patch
+%   $h_i(\bm{t}_i)$                    Local surface height field, Eq. (2)
+%   $\bm{n}_i \in \mathbb{S}^2$        Outward surface normal at contact $i$
+%   $r_i$                              Effective fingertip pad radius at contact $i$
+%   $\phi(\cdot)$                      Object signed-distance field
+%   $\rho, \beta_{\mathrm{band}}$      Patch fit radius / band thickness
+%   $\eta$                             Plane-vs-quadratic RMS gain threshold
+%   $\varepsilon_\phi$                 Surrogate--SDF agreement tolerance
+%   $\underline{t}_{i,d}, \overline{t}_{i,d}$  Asymmetric trust-region bounds
+%
+% --- Task / feasibility ---------------------------------------------
+%   $\bm{a}_{\max}, \bm{\alpha}_{\max}$  Linear / angular acceleration budget
+%   $m_k, \bm{I}_k$                    Mass and principal inertia of object $k$
+%   $\mathcal{W}$                      Task wrench box, Eq. (9)
+%   $\bm{w}_\ell$                      Vertex $\ell$ of $\mathcal{W}$
+%   $\bm{s}_\ell \in \mathbb{R}^6$     Per-vertex wrench slack
+%   $\gamma^\star$                     Certified squeeze from the realized grasp
+%   $\bm{W} \in \mathbb{R}^{6\times 5n}$  Primitive wrench matrix
+%   $\bm{\alpha}, \beta$               Min-weight LP variables, Eq. (11)
+%   $\beta^\star$                      Min-weight metric value
+%   $\delta$                           Span-term regularizer
+%
+% --- Costs ----------------------------------------------------------
+%   $J_{(\cdot)}$                      Normalized cost terms
+%   $w_{(\cdot)}$                      Corresponding weights
+%   $d_{\mathrm{ref}}$                 Reference IK residual
+%   $\gamma_{\mathrm{ref}}$            Reference squeeze (task load)
+%
+% --- Execution ------------------------------------------------------
+%   $\bm{v}^{d}, \bm{v}^{c}$           Desired / commanded end-effector twist
+%   $\Delta t$                         Control period
+%
+% NOTE ON A COLLISION: the table already uses $\bm{\tau}_i$ for the tangential
+% internal force at contact $i$, and $\gamma$ for the squeeze factor. Above,
+% $\bm{w}_\tau$ denotes the torque block of a wrench -- consider renaming that
+% to $\bm{w}_{m}$ (moment) to avoid overloading $\tau$. Likewise the table's
+% $\mathcal{O}$ is the set of scene objects while $\mathcal{O}_k$ is a body
+% frame; that is workable but worth a footnote.

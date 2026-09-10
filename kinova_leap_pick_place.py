@@ -9,7 +9,9 @@ used in the grasp is configurable via FINGER_SET (see below) — the controller 
 contacts generically rather than hardcoding 2.
 """
 import argparse
+import glob
 import json
+import shutil
 import numpy as np
 import cv2   # camera-feed grid (--camera-views) + post-recalibration GUI reset
 import subprocess
@@ -46,7 +48,7 @@ from trial_logger import (EventLogger, TrialRunner, TrialPhase, TraceBuffer,
 # _geom_normal_np gives the outward surface normal used to build inward contact frames.
 sys.path.insert(0, __file__.rsplit('/', 1)[0] + '/simulation')
 from grasp_planner_3d import (GraspConfig3D, MultiStartGraspPlanner3D,  # noqa: E402
-                              _geom_normal_np, _geom_sdf_np)
+                              _geom_normal_np, _geom_sdf_np, _mesh_sdf_entry)
 import simulation.grasp_config_builder as _grasp_config_builder  # noqa: E402
 
 from kinova_common.constants import (FINGER_TIP_SITES, FINGER_CODE, FINGER_SET,
@@ -267,6 +269,25 @@ if __name__ == "__main__":
              "scene (models/scene_pick_place.xml, table top z=0.625). robocasa: the RoboCasa "
              "marble kitchen counter scene (models/scene_robocasa.xml, counter top z=0.86). "
              "Both share the same multi-object task pipeline; the robot mounts on the surface.")
+    _arg_parser.add_argument(
+        '--rec-log-dir', dest='rec_log_dir', default=None, metavar='DIR',
+        help="contact-aware modes: write the grasp recommender's per-Picard-stage NLP "
+             "traces under DIR/<object>/ and, on each L lock-in, render the grasp "
+             "analysis figure (quadratic surface patch + per-stage contact movement) "
+             "next to them. OFF by default: enabling the trace also turns on per-term "
+             "gradient-norm logging, which is full-vector reverse-mode AD and is not "
+             "meant for a live 2 s solve cadence. Use it for analysis runs.")
+    _arg_parser.add_argument(
+        '--contact-profile', dest='contact_profile', default='stock',
+        choices=['stock', 'tuned'],
+        help="Contact/solver settings. stock (default): whatever the scene XML compiles "
+             "to (impratio=100, noslip_iterations=0, fingertip solref=[0.004,1.0]). "
+             "tuned: apply benchmarks/ycb_grasp/contact_tuning.py's measured settings "
+             "(fingertip solref=[0.02,2.0], noslip_iterations=5). REJECTED for the "
+             "dexpilot / anyteleop baselines, which must stay stock so they remain "
+             "comparable. Note contact_tuning pairs noslip=5 with a FIXED gamma=10.0, "
+             "while teleop derives gamma from solve_gamma_live — see the plan doc; "
+             "validate pick AND release before trusting this.")
     _arg_parser.add_argument(
         '--pinch-debounce', dest='pinch_debounce', default='on', choices=['on', 'off'],
         help="DexPilot pinch-state debounce (teleop). on (default): median + Schmitt-"
@@ -526,6 +547,40 @@ if __name__ == "__main__":
     if not args.no_randomize:
         _randomize_objects(model, data, np.random.default_rng(args.seed))
 
+    # --- Contact profile -------------------------------------------------------
+    # Applied to the COMPILED model, and ONLY for the contact-aware modes: dexpilot
+    # and anyteleop are the paper's baselines and must stay on whatever the scene XML
+    # compiles to, or they stop being comparable. Asking for 'tuned' on a baseline is
+    # an ERROR rather than a silent no-op, so "the baselines are stock" is a checked
+    # invariant instead of a convention.
+    #
+    # The numbers live in benchmarks/ycb_grasp/contact_tuning.py (measured on the
+    # tabletop sweep, scored on BOTH grasp force AND release velocity). Two things
+    # worth knowing before turning this on:
+    #   - MuJoCo combines an unpaired contact's solref by taking the MIN of the two
+    #     geoms, so softening the OBJECT does nothing while the fingertip sits at
+    #     tau=0.004 (2 timesteps at dt=0.002). The edit is fingertip-scoped for that
+    #     reason; softening every geom silently softens the fingertip too.
+    #   - noslip_iterations=5 and gamma are a PAIR in that sweep: noslip fixes the
+    #     release but removes the tangential compliance a heavy object leans on, and
+    #     the benchmark compensates with a FIXED gamma=10.0. Teleop does NOT have a
+    #     fixed gamma — it certifies one per grasp via solve_gamma_live against its
+    #     20 m/s^2 budget. So this profile deliberately applies only the model-side
+    #     settings and leaves the force contract alone. Validate pick AND release.
+    if args.contact_profile == 'tuned':
+        if args.mode not in ('contact_aware_teleop', 'contact_aware_autonomous'):
+            sys.exit(f"--contact-profile tuned is only valid for the contact-aware "
+                     f"modes; {args.mode!r} is a baseline and must stay stock.")
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        'benchmarks'))
+        from ycb_grasp import contact_tuning as _contact_tuning
+        _applied = _contact_tuning.apply_to_model(model)
+        print(f"[contact] tuned profile: {_applied}")
+    else:
+        print(f"[contact] stock profile: impratio={model.opt.impratio:g} "
+              f"noslip_iterations={model.opt.noslip_iterations} "
+              f"timestep={model.opt.timestep:g}")
+
     mj.mj_forward(model, data)
 
     # Snapshot the compiled contype BEFORE --viz-only may zero the robot geoms' contype
@@ -665,19 +720,46 @@ if __name__ == "__main__":
                              for sid in id_S]
         objects.append(obj)
 
-    # Contact-aware guard: the NLP grasp recommender needs per-object _c1/_c2 contact sites,
-    # which mesh (YCB) objects don't have. Reject contact-aware modes when any spawned object
-    # lacks them — mesh objects are for plain teleop (dexpilot / anyteleop) for now.
-    _needs_sites = (args.mode in ('contact_aware_teleop', 'contact_aware_autonomous')
-                    or getattr(args, 'recommender_grasp', False))
-    _siteless = [o['name'] for o in objects if not o['has_grasp_sites']]
-    if _needs_sites and _siteless:
-        sys.exit(
-            f"[scene] mode {args.mode!r} uses the contact-aware grasp recommender, which "
-            f"needs per-object _c1/_c2 grasp sites, but these object(s) have none: "
-            f"{', '.join(_siteless)}. Mesh/YCB objects are supported for plain teleop only "
-            f"(--mode dexpilot / anyteleop) right now; use a primitive object, or one of "
-            f"those modes.")
+    # Contact-aware capability gate + EAGER SDF BAKE.
+    #
+    # The _c1/_c2 grasp-site requirement that used to live here was STALE for the
+    # recommender path: _setup_recommended_contact_frames OVERWRITES p_S_W/inward_S_W
+    # from the recommender's own p1/p2 and never reads id_S. Only the LEGACY
+    # site-driven _run_ik path consumes the sites. So a mesh object with no sites is
+    # perfectly usable by the recommender, and the old guard was rejecting it for a
+    # dependency the code path does not have.
+    #
+    # What the recommender ACTUALLY needs from a mesh object is a bakeable SDF. So the
+    # gate is now a capability test, and it is evaluated HERE, EAGERLY, before the
+    # viewer opens — never lazily inside the 2 s background solve. _mesh_sdf_entry
+    # bakes + caches (and persists to disk via object_sdf.load_or_bake); doing that
+    # first-touch inside the recommender thread stalls that solve for seconds and makes
+    # the stall look like a planner failure. An object whose SDF will not bake is marked
+    # unsupported rather than aborting the run — the other objects stay usable.
+    _CONTACT_AWARE_MODE = (args.mode in ('contact_aware_teleop', 'contact_aware_autonomous')
+                           or getattr(args, 'recommender_grasp', False))
+    _cat_mesh_entry = {}    # obj_idx -> mesh_entry (mesh objects) or None (primitive/unsupported)
+    _cat_supported  = set()  # obj_idx values the recommender will solve for
+    if _CONTACT_AWARE_MODE:
+        for _oi, _o in enumerate(objects):
+            _gt = int(model.geom_type[_o['id_geom']])
+            if _gt in (2, 5, 6):        # SPHERE / CYLINDER / BOX — analytic, no bake
+                _cat_supported.add(_oi)
+                _cat_mesh_entry[_oi] = None
+                continue
+            _t0 = time.time()
+            try:
+                _cat_mesh_entry[_oi] = _mesh_sdf_entry(model, _o['id_body'])
+                _cat_supported.add(_oi)
+                print(f"[sdf] {_o['name']}: baked in {(time.time() - _t0) * 1e3:.0f} ms")
+            except Exception as _e_sdf:
+                _cat_mesh_entry[_oi] = None
+                print(f"[sdf] {_o['name']}: UNSUPPORTED — {_e_sdf}")
+        if not _cat_supported:
+            sys.exit(f"[scene] mode {args.mode!r} uses the contact-aware grasp "
+                     f"recommender, but no spawned object has a usable surface model "
+                     f"(see the [sdf] lines above).")
+        print(f"[sdf] recommender supports {len(_cat_supported)}/{len(objects)} object(s)")
 
     dls_ik = SpatialIKSolver(n_robot=N_ROBOT)
 
@@ -2425,6 +2507,17 @@ if __name__ == "__main__":
     # So the remaining _CAT_MODE-only gates below are exactly the wrist/DexPilot/preview bits;
     # everywhere the behavior is shared the gate is (_CAT_MODE or _AUTO_REC).
     _AUTO_REC       = (args.mode == 'contact_aware_autonomous' and args.recommender_grasp)
+    # --rec-log-dir root, or None. When set, each planner gets log_dir=<root>/<object>/
+    # (per-Picard-stage npz traces) and every L lock-in renders the analysis figure.
+    _REC_LOG_ROOT = args.rec_log_dir
+    if _REC_LOG_ROOT is not None:
+        if not (_CAT_MODE or _AUTO_REC):
+            sys.exit("--rec-log-dir only applies to the contact-aware grasp "
+                     "recommender (contact_aware_teleop / contact_aware_autonomous "
+                     "--recommender-grasp).")
+        os.makedirs(_REC_LOG_ROOT, exist_ok=True)
+        print(f"[rec] NLP traces + lock-in analysis figures -> {_REC_LOG_ROOT}/")
+    _rec_lockin_n  = [0]      # lock-in counter, for the per-commit figure subdirectory
     _REC_INTERVAL_S = 2.0     # fixed re-solve cadence (NLP solve ~0.5-2s, runs in a thread)
     _REC_NC         = 5       # planner seeds per solve (was 3; ~60% per-seed IK-convergence
                               # -> 5 seeds gives ~99% chance of >=1 converged vs 3 seeds' ~94%.
@@ -2495,9 +2588,10 @@ if __name__ == "__main__":
         _n_recorded[0] += 1
         return _n_recorded[0]
 
-    # Objects the NLP recommender supports (box-like first, per the plan). The planner
-    # is shape-aware but validated on boxes; extend this set as other shapes are proven.
-    _CAT_SUPPORTED = {'obj_red_box', 'obj_green_box', 'obj_box_lowmu', 'obj_box_heavy'}
+    # Objects the NLP recommender supports. This used to be a hardcoded name allowlist
+    # of four primitive boxes; it is now the CAPABILITY set computed at startup by the
+    # eager-bake block above (primitives are analytic; meshes must have baked an SDF).
+    # Indexed by obj_idx, not by name, so two instances of the same YCB id are distinct.
 
     # Actuated-joint qpos indices (planner.solve wants q_ref as the nu-length actuated
     # vector, in actuator order) — same as GraspPlanner3D._act_idx.
@@ -2600,9 +2694,34 @@ if __name__ == "__main__":
                 # alignment:reachability ratio (~14:1) starved the IK term; w_ik=5.0 lifts
                 # seed convergence 56%->94%, NLP 9/10->10/10 keyframes, holds wrench-feasible,
                 # and ~halves solve time. (The builder's GraspConfig3D default is still 0.70.)
-                w_ik=5.0)
+                w_ik=5.0,
+                # MESH CONTACTS: parameterize each contact by 2 tangential coords on a
+                # local quadratic (paraboloid) patch, exactly as the tabletop benchmark
+                # does. Two reasons, and the second is not optional:
+                #   1. the contact is then ON THE SURFACE BY CONSTRUCTION (no surface
+                #      equality constraint), with an asymmetric per-axis trust region;
+                #   2. it is the ONLY path that records the paraboloid frame, which is
+                #      what the analysis figures are drawn from. The returned solve dict
+                #      carries no patch data at all — see kinova_common/grasp_plots.py.
+                # No-op for primitive geoms (the planner gates it on _is_mesh).
+                use_quadratic_contact=True,
+                quadratic_mesh_fit=True,
+                # Fingertips must clear the TABLE, not the world floor: the objects rest
+                # on the table top, so a floor-relative clearance would let a contact be
+                # driven straight through the table surface. TABLE_TOP_Z is already
+                # overridden per --scene above (0.625 pick_place / 0.86 robocasa).
+                ground_z=TABLE_TOP_Z)
             # Own MjData so the background solve never races the viewer's data.
-            p = MultiStartGraspPlanner3D(model, mj.MjData(model), cfg)
+            # log_dir is None unless --rec-log-dir was given. It is NOT free: the planner
+            # gates the per-term gradient-norm series behind it, and those are full-vector
+            # reverse-mode AD evaluations over ~110 DOF, which the planner's own comment
+            # marks as "not on every production solve (e.g. a live loop)". This recommender
+            # IS such a live loop, so logging stays opt-in.
+            _ldir = None
+            if _REC_LOG_ROOT is not None:
+                _ldir = os.path.join(_REC_LOG_ROOT, o['name'])
+                os.makedirs(_ldir, exist_ok=True)
+            p = MultiStartGraspPlanner3D(model, mj.MjData(model), cfg, log_dir=_ldir)
             _cat_planners[obj_idx] = p
             return p
 
@@ -2639,6 +2758,27 @@ if __name__ == "__main__":
             except Exception:
                 traceback.print_exc()
             _wf = bool(_vinfo.get('wrench_feasible', False))
+
+            # SNAPSHOT this solve's npz trace. Every solve for an object reuses that
+            # object's single log_dir, so the NEXT solve (2 s later) would otherwise
+            # overwrite/interleave the trace the operator is about to lock in. Move the
+            # files aside into a per-solve directory the candidate carries with it.
+            # Moved, not copied, so the shared log_dir stays clean for the next solve.
+            _trace_dir = None
+            if _REC_LOG_ROOT is not None:
+                try:
+                    _src = os.path.join(_REC_LOG_ROOT, objects[obj_idx]['name'])
+                    _npz = sorted(glob.glob(os.path.join(_src, 'grasp3d_iter_*.npz')))
+                    if _npz:
+                        _trace_dir = os.path.join(_src, f"solve_{time.strftime('%H%M%S')}_"
+                                                        f"{int(time.time() * 1e3) % 1000:03d}")
+                        os.makedirs(_trace_dir, exist_ok=True)
+                        for _f in _npz:
+                            shutil.move(_f, os.path.join(_trace_dir, os.path.basename(_f)))
+                except Exception:
+                    traceback.print_exc()
+                    _trace_dir = None
+
             _new_cost = res.get('cost')
             _new_p1 = np.asarray(res['p1'], float).copy()
             _new_p2 = np.asarray(res['p2'], float).copy()
@@ -2681,6 +2821,16 @@ if __name__ == "__main__":
                         'cost': _new_cost,
                         'obj_pos': np.asarray(obj_pos, float).copy(),
                         'wrench_feasible': _wf,
+                        # Kept ONLY for the analysis figure (--rec-log-dir). `res` is
+                        # what lets kinova_common.grasp_plots match the WINNING attempt
+                        # out of the n_seeds attempts that all logged into one log_dir:
+                        # it matches on res['p1_seed']/['p2_seed'], the exact pre-NLP
+                        # seed points. Without it the writer silently falls back to the
+                        # LAST attempt and would draw a DISCARDED candidate's trust
+                        # regions as if they were the committed grasp's.
+                        'res':      res if _REC_LOG_ROOT is not None else None,
+                        'verify':   _vinfo if _REC_LOG_ROOT is not None else None,
+                        'trace_dir': _trace_dir,
                     }
                     _rec_result['obj_idx'] = obj_idx
 
@@ -2739,7 +2889,7 @@ if __name__ == "__main__":
         _push_rec_status."""
         global _rec_thread, _rec_last_solve
         name = objects[prox_idx]['name']
-        _supported = name in _CAT_SUPPORTED
+        _supported = prox_idx in _cat_supported
         _rec_idle  = (_rec_thread is None) or (not _rec_thread.is_alive())
 
         # Current WF-gated candidate for this object (thread-written) — read FIRST so the
@@ -2800,15 +2950,21 @@ if __name__ == "__main__":
 
     def _recommended_inward_normals(obj_idx, p1, p2):
         """Outward->inward surface normals at p1/p2 for the object's live geom pose,
-        using the planner's shape-aware _geom_normal_np. Returns (n1_in, n2_in)."""
+        using the planner's shape-aware _geom_normal_np. Returns (n1_in, n2_in).
+
+        mesh_entry is REQUIRED for a mesh geom — _geom_normal_np falls through to a
+        zero/garbage normal without it, which would silently produce a contact frame
+        pointing nowhere. It comes from the eager startup bake, never a lazy first
+        touch on this (solver-thread) call path."""
         o = objects[obj_idx]
         gid = o['id_geom']
         gtype = int(model.geom_type[gid])
         c   = data.geom_xpos[gid].copy()
         R   = data.geom_xmat[gid].reshape(3, 3).copy()
         size = model.geom_size[gid]
-        n1_out = _geom_normal_np(p1, gtype, c, R, size)
-        n2_out = _geom_normal_np(p2, gtype, c, R, size)
+        _me = _cat_mesh_entry.get(obj_idx)
+        n1_out = _geom_normal_np(p1, gtype, c, R, size, mesh_entry=_me)
+        n2_out = _geom_normal_np(p2, gtype, c, R, size, mesh_entry=_me)
         return -n1_out, -n2_out
 
     if _CAT_MODE:

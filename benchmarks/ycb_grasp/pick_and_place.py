@@ -197,7 +197,8 @@ def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
 
 def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                    w_span=1.0, view=False, out_dir=None, do_transport=True,
-                   max_iter=200, w_edge_margin=0.0, directional_r_tip=True,
+                   max_iter=int(os.environ.get("PFF_MAXITER", 200)),
+                   w_edge_margin=0.0, directional_r_tip=True,
                    mesh_fit=True, sdf_err_tol=None, quadratic_path=False,
                    quad_sym_normals=False, seed_rank_pool=1,
                    impratio=None, gamma_override=None,
@@ -231,7 +232,8 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                   quadratic_mesh_fit=mesh_fit,
                   w_edge_margin=w_edge_margin,
                   directional_r_tip=directional_r_tip,
-                  w_align=10.0, orient_weight=2.0,
+                  w_align=float(os.environ.get("PFF_ALIGN_W", 10.0)),
+                  orient_weight=float(os.environ.get("PFF_ORIENT_W", 2.0)),
                   # Fingertips must clear the TABLE, not the floor: the object
                   # rests on the table top, so a floor-relative clearance would
                   # permit contacts driven straight through the table surface.
