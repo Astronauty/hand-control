@@ -86,9 +86,30 @@ N_ROBOT = TS.N_ROBOT
 DEFAULT_COL_CLEARANCE_M = 0.002
 APPROACH_STEPS = 300
 LIFT_DISTANCE_M = 0.12          # clear the table before traversing
-LIFT_SPEED_MPS = 0.02
-TRANSPORT_SPEED_MPS = 0.05      # lateral carry to the bin, faster than the lift
+LIFT_SPEED_MPS = 0.06           # was 0.02 -- see JOG_RAMP_S on why this is safe
+TRANSPORT_SPEED_MPS = 0.15      # lateral carry to the bin, faster than the lift
 RELEASE_SETTLE_STEPS = 400
+
+# Cartesian ACCELERATION slew limit on the commanded palm twist, adopted from
+# the teleop stack (kinova_leap_pick_place.NCF_ACCEL_BUDGET_XYZ). This is not
+# merely a smoothing nicety -- it is what makes the no-slip guarantee true.
+#
+# solve_gamma_live sizes the squeeze force for a disturbance BOX expressed as an
+# acceleration budget, converting it to a force box via the object's own mass
+# (f = m*a). That guarantee is only valid if the executed motion actually stays
+# inside the box. The jog previously applied its full commanded twist on step 0,
+# so the palm went from rest to the commanded speed in a single 2 ms timestep --
+# an unbounded acceleration, i.e. a disturbance far outside the box gamma was
+# solved for, at the exact moment the grasp is most fragile.
+#
+# Clamping the per-step CHANGE in commanded velocity to ACCEL_BUDGET*dt makes
+# the budget "ENFORCED by construction" in the teleop comment's words, so the
+# executed acceleration cannot exceed what the squeeze force was sized for --
+# regardless of the cruise speed. That decoupling is what makes raising the
+# speeds safe: peak speed sets how long the carry takes, the slew limit sets
+# what the grasp has to survive.
+JOG_ACCEL_BUDGET_MPS2 = 20.0    # teleop's NCF_ACCEL_BUDGET_XYZ (m/s^2)
+JOG_VEL_MAX_MPS = 0.3           # teleop's JOG_VEL peak-speed cap (m/s)
 
 
 def _obj_hull_geom_ids(model, body_name):
@@ -99,6 +120,21 @@ def _obj_hull_geom_ids(model, body_name):
     return [g for g in range(model.ngeom)
             if model.geom_bodyid[g] == bid and model.geom_group[g] == 3
             and (model.geom_contype[g] != 0 or model.geom_conaffinity[g] != 0)]
+
+
+def _jog_steps(distance_m, speed_mps, dt):
+    """Steps needed to travel distance_m at speed_mps under the slew limiter.
+
+    The limiter spends v/a seconds ramping up and the same again ramping down,
+    losing v^2/a of distance against a square velocity profile, so a naive
+    distance/speed/dt stops the phase short -- the lift would clear less than
+    LIFT_DISTANCE_M and the carry would land short of the bin.
+    """
+    v = min(max(speed_mps, 1e-9), JOG_VEL_MAX_MPS)
+    n_ramp = int(np.ceil(v / JOG_ACCEL_BUDGET_MPS2 / dt))
+    lost = v * v / JOG_ACCEL_BUDGET_MPS2          # ramp-up + ramp-down shortfall
+    n_flat = max(int((distance_m + lost) / v / dt), 1)
+    return n_flat + 2 * n_ramp
 
 
 def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
@@ -113,8 +149,20 @@ def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
     n = model.nv
     dt = model.opt.timestep
     contact_lost = {f: False for f in FINGER_SET}
+    # Slew-limited velocity command, exactly as the teleop GRASP branch drives
+    # it (kinova_leap_pick_place.py ~:5449): clip the TARGET to the peak-speed
+    # cap, then move the COMMAND toward it by at most ACCEL*dt per step, and
+    # ramp back to zero over the tail so the phase ends without a jolt either.
+    dv_max = JOG_ACCEL_BUDGET_MPS2 * dt
+    v_cmd = np.zeros(6)
+    n_stop = int(np.ceil(JOG_VEL_MAX_MPS / JOG_ACCEL_BUDGET_MPS2 / dt))
     for i in range(n_steps):
-        v6 = v6_fn(i)
+        v_tgt = np.asarray(v6_fn(i), float).copy()
+        v_tgt[:3] = np.clip(v_tgt[:3], -JOG_VEL_MAX_MPS, JOG_VEL_MAX_MPS)
+        if i >= n_steps - n_stop:
+            v_tgt[:] = 0.0                    # decelerate into the phase end
+        v_cmd = v_cmd + np.clip(v_tgt - v_cmd, -dv_max, dv_max)
+        v6 = v_cmd
         Jp = np.zeros((3, n))
         Jr = np.zeros((3, n))
         mj.mj_jacBody(model, data, Jp, Jr, palm_bid)
@@ -152,7 +200,8 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                    w_span=1.0, view=False, out_dir=None, do_transport=True,
                    max_iter=200, w_edge_margin=0.0, directional_r_tip=True,
                    mesh_fit=True, impratio=None, gamma_override=None,
-                   squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05):
+                   squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05,
+                   lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS):
     """Plan + execute one grasp on one object, then carry it to the bin."""
     rng = np.random.default_rng(seed)
     t_build = time.time()
@@ -296,8 +345,19 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
     viewer = viewer_cm.__enter__() if viewer_cm is not None else None
     if viewer is not None:
         viewer.opt.flags[mj.mjtVisFlag.mjVIS_CONTACTPOINT] = True
+    # Frame the WHOLE task, not just the pick. The camera is static, so aiming
+    # it at the object's spawn position (lookat=pos, dist=0.9) let the object
+    # leave frame during transport -- the block is carried 0.70 m but that
+    # framing only covers ~0.37 m from the lookat point, so the clip looked like
+    # it stopped after the lift. Centre on the midpoint of the carry and pull
+    # back far enough to hold both ends plus the lift height.
+    _cam_lookat = np.array([0.5 * (pos[0] + TS.BIN_CENTER[0]),
+                            0.5 * (pos[1] + TS.BIN_CENTER[1]),
+                            pos[2] + 0.5 * LIFT_DISTANCE_M])
+    _span = float(np.linalg.norm(np.asarray(TS.BIN_CENTER) - np.asarray(pos)[:2]))
+    _cam_dist = max(0.9, 1.4 * _span + LIFT_DISTANCE_M)
     recorder = (VideoRecorder(str(Path(out_dir) / f"seed{seed}.mp4"),
-                             lookat=pos, dist=0.9, elev=-25)
+                              lookat=_cam_lookat, dist=_cam_dist, elev=-25)
                 if out_dir is not None else None)
     VIDEO_STRIDE = 4
     frame_i = [0]
@@ -375,9 +435,9 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
 
         # LIFT: straight up, clear of the table.
         dt = model.opt.timestep
-        n_lift = max(int(LIFT_DISTANCE_M / LIFT_SPEED_MPS / dt), 1)
+        n_lift = _jog_steps(LIFT_DISTANCE_M, lift_speed, dt)
         q_cmd, lost_lift = _jog_to(
-            model, data, ctrl, q_cmd, lambda i: np.array([0, 0, LIFT_SPEED_MPS, 0, 0, 0.]),
+            model, data, ctrl, q_cmd, lambda i: np.array([0, 0, lift_speed, 0, 0, 0.]),
             n_lift, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="lift")
         result["lift_obj_dz_mm"] = (float(data.xpos[obj_bid][2]) - obj_z0) * 1000
         result["lift_contact_lost"] = lost_lift
@@ -388,12 +448,12 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
             # TRANSPORT: lateral toward the bin centre, holding height.
             delta = TS.BIN_CENTER - data.xpos[obj_bid][:2]
             dist = float(np.linalg.norm(delta))
-            n_tr = max(int(dist / TRANSPORT_SPEED_MPS / dt), 1)
+            n_tr = _jog_steps(dist, transport_speed, dt)
             dirn = delta / max(dist, 1e-9)
             q_cmd, lost_tr = _jog_to(
                 model, data, ctrl, q_cmd,
-                lambda i: np.array([dirn[0] * TRANSPORT_SPEED_MPS,
-                                    dirn[1] * TRANSPORT_SPEED_MPS, 0, 0, 0, 0.]),
+                lambda i: np.array([dirn[0] * transport_speed,
+                                    dirn[1] * transport_speed, 0, 0, 0, 0.]),
                 n_tr, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="transport")
             result["transport_contact_lost"] = lost_tr
             result["phase_log"].append("transport_done")
@@ -502,6 +562,11 @@ def main():
                          "measured force falls short of the commanded gamma.")
     ap.add_argument("--finger-kp", type=float, default=0.8)
     ap.add_argument("--finger-kd", type=float, default=0.05)
+    ap.add_argument("--lift-speed", type=float, default=LIFT_SPEED_MPS,
+                    help=f"vertical lift speed m/s (default {LIFT_SPEED_MPS}). The jog "
+                         "eases in/out over JOG_RAMP_S, so this is the cruise speed.")
+    ap.add_argument("--transport-speed", type=float, default=TRANSPORT_SPEED_MPS,
+                    help=f"lateral carry speed m/s (default {TRANSPORT_SPEED_MPS})")
     OP.add_out_args(ap, OP.TABLETOP)
     args = ap.parse_args()
 
@@ -541,7 +606,8 @@ def main():
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
         impratio=args.impratio, gamma_override=args.gamma,
         squeeze_pd_scale=args.squeeze_pd_scale,
-        finger_kp=args.finger_kp, finger_kd=args.finger_kd)
+        finger_kp=args.finger_kp, finger_kd=args.finger_kd,
+        lift_speed=args.lift_speed, transport_speed=args.transport_speed)
     print("\n=== RESULT ===")
     for k, v in result.items():
         print(f"  {k}: {v}")
