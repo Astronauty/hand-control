@@ -2156,6 +2156,16 @@ class MultiStartConfig:
     # curved (rounded-edge) regions available. 0 disables the check (accept
     # any surface point, the pre-refactor behaviour). No-op for analytic
     # primitives (box/sphere/cylinder), which have exact closed-form surfaces.
+    # Over-generation factor for DLS-IK seed ranking. 1 = off (take the first
+    # n_seeds that pass the geometric gates, the historical behavior). k > 1
+    # generates k*n_seeds candidates and keeps the n_seeds with the smallest
+    # damped-least-squares fingertip residual, i.e. the ones the ARM can
+    # actually reach. The geometric gates (_reachable_contact, seed_kappa_max_
+    # reject) screen the SURFACE; this screens the KINEMATICS, and measurement
+    # puts the dominant contact error there -- planned contacts sit sub-mm from
+    # the surface while fingertip geoms stop 3-9mm short. Costs one DLS solve
+    # per candidate (milliseconds) against a multi-second NLP per seed.
+    seed_dls_rank_pool: int = 1
     seed_kappa_max_reject: float = 40.0
 
     # q_ref (arm-pose) restart perturbation — matches ablate_ik.py's RESTART_SIGMA
@@ -4413,6 +4423,7 @@ class MultiStartGraspPlanner3D:
         self._seed_rng_const = _SEED_RNG_CONST if seed is None else int(seed)
         self._rng           = np.random.default_rng(self._seed_rng_const)
         self.last_chart_rank_table = []   # set by solve() when use_uv_atlas_contact chart-pair seeding runs
+        self.last_seed_rank_table = []    # set by solve() when seed_dls_rank_pool > 1
         # Fingertip effective radii (r_thumb/r_index/r_middle/r_ring) are
         # measured from model geometry inside GraspPlanner3D.__init__ above —
         # nothing left to do here.
@@ -4553,6 +4564,39 @@ class MultiStartGraspPlanner3D:
             k2 = _mesh_surface_kappa_max_np(self._planner._mesh_entry, p2s_l)
             return max(k1, k2) <= cfg.seed_kappa_max_reject
 
+        def _dls_residual(s) -> float:
+            """Cheap reachability score for one seed pair: the worst fingertip
+            residual a damped-least-squares IK leaves when asked to put both
+            tips on this pair's contacts. Milliseconds, no NLP.
+
+            This is the ONLY seed screen that knows about the ARM. The other
+            two (_reachable_contact, _seed_kappa_ok) are geometric -- above the
+            table, not on an edge -- and a seed can pass both while sitting
+            where the arm simply cannot bring a fingertip. That is the measured
+            failure mode: planned contacts land sub-millimetre from the true
+            surface (|SDF| 0.00-0.65mm) while the fingertip GEOM still stops
+            3-9mm away, because the residual is in the kinematics, not the
+            surface model.
+
+            Mirrors the chart-pair path's scoring exactly (same SpatialIKSolver,
+            same r_thumb/r_index target offsets along the inward normal, same
+            q_bias/null_gain), so the two rankings are comparable. Finger
+            assignment must already have been applied -- the targets depend on
+            which contact is the thumb.
+            """
+            _d = self._planner._dls_data
+            _d.qpos[:] = self._planner.data.qpos[:]
+            _d.qpos[act_idx] = np.asarray(q_ref, float)[:len(act_idx)]
+            _t1 = s['p1s'] + cfg.r_thumb * (-s['n1_in'])
+            _t2 = s['p2s'] + cfg.r_index * (-s['n2_in'])
+            self._planner._dls_ik.solve(
+                model, _d, [self._planner._thumb_sid, self._planner._index_sid],
+                [_t1, _t2], q_bias=q_ref, null_gain=0.3)
+            mj.mj_kinematics(model, _d)
+            return float(max(
+                np.linalg.norm(_d.site_xpos[self._planner._thumb_sid] - _t1),
+                np.linalg.norm(_d.site_xpos[self._planner._index_sid] - _t2)))
+
         seeds, attempts, rejected = [], 0, 0
         _axis_local = _minor_axis_local(geom_type, geom_size, mesh_entry=self._mesh_entry)
         _fs = _fixed_antipodal_seed(geom_type, geom_size, c, obj_R_np, _axis_local,
@@ -4661,8 +4705,22 @@ class MultiStartGraspPlanner3D:
                     if _scored_cands else
                     "[seed_gen] 0 chart-pair candidates reachable/scored")
 
-        # sample seeds for solver
-        while len(seeds) < n_seeds and attempts < max_attempts:
+        # ── Random seeds ──────────────────────────────────────────────────
+        # When seed_dls_rank_pool > 1, OVER-GENERATE and rank by DLS-IK
+        # residual instead of taking the first n_seeds that pass the geometric
+        # gates. The gates say a seed is on a sane piece of surface; they say
+        # nothing about whether the ARM can reach it, and that is where the
+        # measured error actually lives (see _dls_residual's docstring:
+        # sub-mm surrogate error, 3-9mm fingertip gaps). Ranking costs one DLS
+        # solve per candidate -- milliseconds against a multi-second NLP -- and
+        # is the same screen the chart-pair path already applies, which was
+        # previously unavailable here because it was gated behind
+        # use_uv_atlas_contact.
+        _pool_mult = max(int(cfg.seed_dls_rank_pool), 1)
+        _rank_random = _pool_mult > 1
+        _target = n_seeds * _pool_mult if _rank_random else n_seeds
+        _pool = []
+        while len(seeds) + len(_pool) < _target and attempts < max_attempts:
             attempts += 1
             s = _seed_pair(geom_type, geom_size, c, obj_R_np, bbox_r, self._rng,
                            delta_max=np.deg2rad(cfg.seed_march_jitter_deg),
@@ -4691,7 +4749,27 @@ class MultiStartGraspPlanner3D:
                 rejected += 1
                 continue
             _assign_seed_by_finger(s, _live_th, _live_if)
-            seeds.append(s)
+            _pool.append(s)
+
+        if _rank_random and _pool:
+            # Best-reachable first. Seeds already accepted above (minor-axis,
+            # chart-pair) keep their priority -- they have their own rationale
+            # for going first and the chart-pair ones are already DLS-ranked.
+            _scored = sorted(((_dls_residual(_s), _i, _s)
+                              for _i, _s in enumerate(_pool)), key=lambda t: t[:2])
+            log.info(f"[seed_gen] DLS-ranked {len(_pool)} random candidates; "
+                     f"residuals {_scored[0][0]*1e3:.1f}..{_scored[-1][0]*1e3:.1f}mm, "
+                     f"keeping best {max(n_seeds - len(seeds), 0)}")
+            self.last_seed_rank_table = [
+                dict(dls_res_mm=_r * 1e3, accepted=(_k < max(n_seeds - len(seeds), 0)))
+                for _k, (_r, _i, _s) in enumerate(_scored)
+            ]
+            for _r, _i, _s in _scored:
+                if len(seeds) >= n_seeds:
+                    break
+                seeds.append(_s)
+        else:
+            seeds.extend(_pool[:max(n_seeds - len(seeds), 0)])
 
         if len(seeds) < n_seeds:
             log.warning(
