@@ -5,8 +5,12 @@ grasp_planner_3d.py
 
 Seeding (MultiStartGraspPlanner3D)
 -----------------------------------
+    Both seed sources ray from the SAME origin, _ray_origin_local (the mesh's
+    volumetric centroid) -- see that function for why the geom frame origin is
+    the wrong point on a YCB scan (it sits at the object's base).
+
     _seed_pair generates one candidate per call:
-      1. Sphere-trace a random direction to surface point p1s.
+      1. Sphere-trace a random direction FROM THAT ORIGIN to surface point p1s.
       2. Perturb the inward normal by up to delta_max and sphere-march
          through the object to find the antipodal footprint p2s.
       3. Use p1s/p2s directly as the NLP warm-start (p1, p2) — no
@@ -370,10 +374,27 @@ def _mesh_sdf_entry(model, body_id: int) -> dict:
     # in the same body frame as the SDF table.
     _vis_verts = None
     _vis_normals = None
+    _vol_centroid = None
     try:
         from grasp_control import object_uv_atlas as _oua
         _vv, _vf = _oua.body_visual_mesh(model, body_id)
         _vis_verts = np.asarray(_vv, float)
+        # TRUE volumetric centroid of the closed visual mesh, by signed-tetra
+        # decomposition about the origin. This is the shared SEED RAY ORIGIN
+        # (see _ray_origin_local) -- deliberately NOT a vertex mean, which is a
+        # vertex-DENSITY average and lands wherever the scan/decomposition
+        # happened to put more vertices: measured 17.6mm off the true centroid
+        # on 036_wood_block's hull (466 verts unevenly split across faces).
+        # Cross-checked against MuJoCo's own body_ipos (which it computes from
+        # the same geometry): agrees to 0.1mm on the block, 0.0mm on
+        # 017_orange, 0.6mm on 065-a_cups.
+        _vfi = np.asarray(_vf, int)
+        _a, _b, _cc = (_vis_verts[_vfi[:, 0]], _vis_verts[_vfi[:, 1]],
+                       _vis_verts[_vfi[:, 2]])
+        _tv = np.einsum("ij,ij->i", _a, np.cross(_b, _cc)) / 6.0
+        _tot = float(_tv.sum())
+        if abs(_tot) > 1e-12:
+            _vol_centroid = (((_a + _b + _cc) / 4.0) * _tv[:, None]).sum(0) / _tot
         # Area-weighted per-vertex normals, accumulated from the faces. Used by
         # the local surface fit to reject vertices facing the other way -- the
         # inner surface of a thin shell (a cup wall is ~2-3mm) otherwise lands
@@ -393,6 +414,7 @@ def _mesh_sdf_entry(model, body_id: int) -> dict:
         verts=_verts,
         visual_verts=_vis_verts,
         visual_normals=_vis_normals,
+        vol_centroid=_vol_centroid,
         fn=fn,
         grad_fn=_grad_fn,
         normal_fn=_object_sdf.casadi_normal_fn(fn, name=f"{_tag}_normal"),
@@ -574,6 +596,46 @@ def _march_sdf_np(p_start, direction, geom_type, center, mat, size,
     return _project_to_surface_np(p, geom_type, center, mat, size, mesh_entry=mesh_entry)
 
 
+def _ray_origin_local(geom_type, mesh_entry=None) -> np.ndarray:
+    """The point every seed source rays FROM, in the object's LOCAL frame.
+
+    THE SINGLE DEFINITION OF "THE MIDDLE OF THE OBJECT" for seeding. Both seed
+    sources (_fixed_antipodal_seed's fixed-axis ray and _seed_pair's random
+    ray + antipodal march) call this, so they agree on where the object is.
+    They previously did not: _fixed_antipodal_seed rayed through the hull
+    vertex mean while _seed_pair rayed from the geom frame ORIGIN, which on a
+    YCB scan is wherever the capture rig put it -- for 036_wood_block,
+    017_orange and 065-a_cups alike that is the object's BASE (hull z-extent
+    starts at ~0), i.e. a point on the table below the object, 112/44/63mm
+    from the centroid respectively.
+
+    Returns the mesh's TRUE VOLUMETRIC centroid (signed-tetra, cached on
+    mesh_entry by _mesh_sdf_entry), falling back to the hull-vertex mean and
+    then to the geom origin when no mesh is available. The volumetric centroid
+    rather than a vertex mean because a vertex mean is a vertex-DENSITY
+    average: on 036_wood_block's 466-vertex collision hull it sits 17.6mm off
+    the true centroid, biased toward whichever faces the convex decomposition
+    tessellated more finely. MuJoCo's body_ipos agrees with the volumetric
+    value to 0.1mm, which is the independent check that this is the real thing.
+
+    LOCAL frame, and a RAY ORIGIN ONLY. Every SDF / normal / projection call
+    still takes the geom frame's own centre, since that is the frame those
+    functions are defined in -- see _fixed_antipodal_seed's own note. Callers
+    convert with: c_ray_world = center + obj_mat @ _ray_origin_local(...).
+
+    Analytic primitives return the origin: their geom frame is already centred.
+    """
+    if geom_type != _GEOM_TYPE_MESH or mesh_entry is None:
+        return np.zeros(3)
+    vc = mesh_entry.get("vol_centroid")
+    if vc is not None:
+        return np.asarray(vc, float)
+    V = mesh_entry.get("verts")
+    if V is not None and len(V) >= 3:
+        return np.asarray(V, float).mean(0)
+    return np.zeros(3)
+
+
 def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
                delta_max=np.deg2rad(45), mesh_entry=None):
     """
@@ -592,10 +654,17 @@ def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
         delta_deg    — jitter angle applied to march direction
     """
     c = np.asarray(center, float)
+    # Ray from the SHARED seed origin (_ray_origin_local: the mesh's volumetric
+    # centroid), not from the geom frame origin. On every YCB object measured
+    # the geom origin sits at the object's BASE -- a point on the table below
+    # it -- so a random direction cast from there both starts outside the
+    # object and biases every footprint upward. `c` itself stays the SDF frame
+    # centre for all projection/normal calls below.
+    c_ray = c + obj_mat @ _ray_origin_local(geom_type, mesh_entry)
     u = rng.standard_normal(3)
     u[2] *= 0.5                              # bias toward side faces, away from top/bottom
     u /= np.linalg.norm(u) + 1e-12
-    p1s = _project_to_surface_np(c + u * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    p1s = _project_to_surface_np(c_ray + u * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
     n1_in = -_geom_normal_np(p1s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
 
     # Rotate march direction about world z only — prevents downward tilt that
@@ -659,7 +728,15 @@ def _minor_axis_local(geom_type, size, mesh_entry=None):
     if geom_type == _GEOM_TYPE_MESH and mesh_entry is not None:
         V = mesh_entry.get("verts")
         if V is not None and len(V) >= 3:
-            c = V.mean(0)
+            # Centre the SVD on the SHARED ray origin (volumetric centroid),
+            # not on the vertex mean. The vertex mean is a vertex-DENSITY
+            # average (17.6mm off on 036_wood_block's hull), and centring the
+            # SVD there tilts the principal axes toward whichever faces the
+            # convex decomposition tessellated more finely -- the same bias
+            # this change removes from the ray origin, applied to the ray
+            # DIRECTION. The vertex set itself is still what is decomposed;
+            # only the centre it is measured about changes.
+            c = _ray_origin_local(geom_type, mesh_entry)
             _, _, Vt = np.linalg.svd(V - c, full_matrices=False)
             return Vt[2] / (np.linalg.norm(Vt[2]) + 1e-12)
     return np.array([1.0, 0.0, 0.0])
@@ -707,13 +784,12 @@ def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis, mesh_ent
     d_world /= np.linalg.norm(d_world) + 1e-12
     bbox_r = float(np.max(size)) * 2.5
 
-    # Ray origin: hull centroid in WORLD, falling back to the geom centre when
-    # no mesh vertices are available (primitives, where the two coincide).
-    c_ray = c
-    if mesh_entry is not None:
-        _V = mesh_entry.get("verts")
-        if _V is not None and len(_V) >= 3:
-            c_ray = c + obj_mat @ np.asarray(_V, float).mean(0)
+    # Ray origin: the SHARED seed origin in WORLD (_ray_origin_local -- the
+    # mesh's volumetric centroid, or the geom centre for primitives, where the
+    # two coincide). Shared with _seed_pair so both sources agree on where the
+    # object is; this used to be an inline hull-VERTEX mean, 17.6mm off the
+    # true centroid on 036_wood_block.
+    c_ray = c + obj_mat @ _ray_origin_local(geom_type, mesh_entry)
 
     p1s = _project_to_surface_np(c_ray + d_world * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
     n1_in = -_geom_normal_np(p1s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
