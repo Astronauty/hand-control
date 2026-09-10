@@ -65,15 +65,12 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "benchmarks"))
 
 from grasp_control import GraspController                                       # noqa: E402
-from grasp_control import object_uv_atlas as oua                                # noqa: E402
 from kinova_common.constants import FINGER_CODE, FINGER_SET, FINGER_TIP_SITES   # noqa: E402
+from kinova_common.grasp_plots import write_grasp_plots                         # noqa: E402
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
 from simulation.grasp_config_builder import for_ablation_default                # noqa: E402
-from simulation.grasp_planner_3d import _mesh_sdf_entry                         # noqa: E402
-from ycb_grasp import plot_grasp_contacts as PGC                                # noqa: E402
 from simulation.grasp_planner_3d import MultiStartGraspPlanner3D                # noqa: E402
 from ycb_grasp import out_paths as OP                                           # noqa: E402
-from ycb_grasp import plot_quadratic_path as QP                                 # noqa: E402
 from ycb_grasp import table_scene as TS                                         # noqa: E402
 from ycb_grasp.ik_demo import clearance_by_geom, render, robot_geom_names       # noqa: E402
 from ycb_grasp.pick_from_floor import (CONTACT_GAP_TOL_M, JOG_LAM_MAX,          # noqa: E402
@@ -537,47 +534,14 @@ def _solve_gamma(model, data, obj_bid, R_WO, rec_local, obj_gid, tip_geom_ids,
 def _write_plots(model, data, res, verify_info, log_dir, object_id, seed,
                  body_name, obj_bid, pos, out_dir, quadratic_path=False,
                  n_relin=None):
-    """Per-contact grasp figure for this solve (and optionally the older
-    Picard-trajectory view).
+    """Thin shim onto kinova_common.grasp_plots.write_grasp_plots.
 
-    Default is the CONTACT view (plot_grasp_contacts): one zoomed panel per
-    solved contact, drawn in plot_seed_quadratic.py's grammar, which answers
-    "what does this grasp look like on the object". --quadratic-path asks for
-    the trajectory view instead, which answers "how did the contact move
-    across Picard stages" -- the right question while tuning the
-    relinearization loop, and near-empty at n_relin=0 where there is only one
-    stage to plot."""
-    try:
-        stages = QP._iter_trace_quadratic_stages(log_dir, res=res)
-        if not (stages and any(s["contact"] for s in stages)):
-            return
-        V, F = oua.body_visual_mesh(model, obj_bid)
-        if quadratic_path:
-            hand_rgb = QP._render_hand_rgb(model, data, lookat=pos, dist=0.45, elev=-35)
-            QP.plot_quadratic_path(V, F, stages, object_id,
-                                   Path(out_dir) / f"seed{seed}_quadratic_path.png",
-                                   hand_rgb=hand_rgb, verify_info=verify_info)
-            print(f"[plan] quadratic path -> seed{seed}_quadratic_path.png")
-            return
-        # LAST stage carrying contact frames = the returned solve's contacts
-        # (_iter_trace_quadratic_stages already narrowed to the winning attempt).
-        last = next(s for s in reversed(stages) if s["contact"])
-        # True-SDF probe for the per-patch error bar, in the same object-local
-        # frame the saved quad_* frames use.
-        sdf_fn = None
-        try:
-            _me = _mesh_sdf_entry(model, obj_bid)
-            sdf_fn = lambda p: float(_me["fn"](np.asarray(p, float)))   # noqa: E731
-        except Exception:
-            pass
-        out = PGC.plot_grasp_contacts(
-            V, F, last, object_id,
-            Path(out_dir) / f"seed{seed}_grasp_contacts.png",
-            sdf_fn=sdf_fn, verify_info=verify_info, n_relin=n_relin)
-        if out is not None:
-            print(f"[plan] grasp contacts -> seed{seed}_grasp_contacts.png")
-    except Exception as e:
-        print(f"[plan] contact plot failed: {e}")
+    The implementation moved there so the live teleop recommender can emit the
+    SAME figures; this signature is preserved for the call site below.
+    """
+    return write_grasp_plots(model, data, res, verify_info, log_dir, object_id,
+                             seed, body_name, obj_bid, pos, out_dir,
+                             quadratic_path=quadratic_path, n_relin=n_relin)
 
 
 def main():
