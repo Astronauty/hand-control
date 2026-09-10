@@ -3025,6 +3025,23 @@ class GraspPlanner3D:
                 _p1 = _opti.variable(3)
                 _p2 = _opti.variable(3)
 
+            # SYMBOLIC inward normals for the geometry cost terms, when the
+            # quadratic surrogate can supply them. The paraboloid gives n(t) in
+            # closed form (_quadratic_inward_normal_ca), so a cost that means
+            # "align something with the contact normal" should track the normal
+            # AT THE CONTACT THE SOLVER IS CHOOSING, not the seed's. Using the
+            # frozen seed normal makes the cost pull toward a direction the
+            # solve has already moved away from -- the same inconsistency the
+            # wrench frame had before quadratic_symbolic_normals. Falls back to
+            # the frozen -d*_lp whenever the surrogate isn't active.
+            _n1_in_sym_cost = _n2_in_sym_cost = None
+            if (cfg.quadratic_symbolic_normals and _is_mesh
+                    and cfg.use_quadratic_contact
+                    and _t1_frame is not None and _t2_frame is not None
+                    and _t1_var is not None and _t2_var is not None):
+                _n1_in_sym_cost = _quadratic_inward_normal_ca(_t1_var, _t1_frame, obj_R_np)
+                _n2_in_sym_cost = _quadratic_inward_normal_ca(_t2_var, _t2_frame, obj_R_np)
+
             _tp1   = thumb_cb(_q)
             _tp2   = index_cb(_q)
             # IK cost: fingertip center should be at contact point + r_tip * outward_normal.
@@ -3040,8 +3057,28 @@ class GraspPlanner3D:
             # direction, not just along the contact normal).
             _r1_ik = float(cfg.r_thumb if r1_override is None else r1_override)
             _r2_ik = float(cfg.r_index if r2_override is None else r2_override)
-            _tp1_tgt = _p1 + ca.DM(_r1_ik * d1_lp)
-            _tp2_tgt = _p2 + ca.DM(_r2_ik * d2_lp)
+            # Offset direction: the paraboloid's OWN outward normal n(t) when the
+            # surrogate supplies it symbolically, else the frozen seed direction.
+            #
+            # This is the term the frozen normal costs most. The trust region
+            # bounds the patch's POSITION error (|SDF| <= sdf_err_tol, measured
+            # 0.4-0.7mm), but says nothing about how far the NORMAL has rotated
+            # getting there -- and on a curved patch those decouple sharply:
+            # 017_orange holds 0.41mm of surface error across a 13mm patch while
+            # its normal turns 15.7deg. The IK target is p + r*n, so that
+            # rotation is multiplied by the pad radius (~19mm) before it reaches
+            # the target: 5.3mm of target displacement from a patch that is
+            # itself accurate to 0.4mm, a ~13x amplification of an error the
+            # trust region correctly reports as negligible. Using n(t) removes
+            # the term rather than bounding it. Identically zero on a planar
+            # patch (kappa=0, measured 0.00mm on 036_wood_block), so this only
+            # bites on curved objects -- which is where the tip gaps are.
+            _n1_out_ik = (-_n1_in_sym_cost if _n1_in_sym_cost is not None
+                          else ca.DM(np.asarray(d1_lp, float)))
+            _n2_out_ik = (-_n2_in_sym_cost if _n2_in_sym_cost is not None
+                          else ca.DM(np.asarray(d2_lp, float)))
+            _tp1_tgt = _p1 + _r1_ik * _n1_out_ik
+            _tp2_tgt = _p2 + _r2_ik * _n2_out_ik
             _d1_sq = ca.sumsqr(_tp1 - _tp1_tgt)   # m²
             _d2_sq = ca.sumsqr(_tp2 - _tp2_tgt)   # m²
 
@@ -3087,8 +3124,9 @@ class GraspPlanner3D:
             # Uses the frozen inward normal from the seed face direction d1_lp (box) — a
             # constant per face, so this is a smooth quadratic in p1/p2 only.
             if cfg.w_align > 0.0 and d1_lp is not None:
-                _n1_in_al = ca.DM(-np.asarray(d1_lp, float)
-                                  / (np.linalg.norm(d1_lp) + 1e-12))
+                _n1_in_al = (_n1_in_sym_cost if _n1_in_sym_cost is not None
+                             else ca.DM(-np.asarray(d1_lp, float)
+                                        / (np.linalg.norm(d1_lp) + 1e-12)))
                 _dp = _p2 - _p1
                 _g_hat = _dp / (ca.norm_2(_dp) + 1e-9)
                 _cost_align = ca.sumsqr(_g_hat - _n1_in_al)
@@ -3098,17 +3136,22 @@ class GraspPlanner3D:
             # Penalize each tip's pad axis (R_tip(q) @ pad_axis, world) deviating from that
             # contact's INWARD surface normal, so the pad meets the face flush. Same term as
             # ConstrainedIKSolver's orient_weight (‖R_tip@pad_axis − n_in‖² per contact). The
-            # inward normals are the frozen seed directions (-d1_lp thumb, -d2_lp index),
-            # constant per stage like the wrench frame, so the only q-dependence is the tip
-            # rotation (via the axis callbacks). Sentinel-zero when off so the log helper can
+            # inward normals are the paraboloid's SYMBOLIC n(t) under
+            # quadratic_symbolic_normals, else the frozen seed directions (-d1_lp thumb,
+            # -d2_lp index). In the symbolic case the cost couples the tip rotation to the
+            # contact the solver is choosing, which is also what pins the directional pad
+            # radius r_par: r_par is a support function of the pad-vs-normal angle, so a
+            # cost that holds that angle steady holds r_par steady. Sentinel-zero when off so the log helper can
             # always evaluate it.
             _cost_orient = ca.DM(0.0)
             if (cfg.orient_weight > 0.0 and thumb_axis_cb is not None
                     and d1_lp is not None and d2_lp is not None):
-                _n1_in_or = ca.DM(-np.asarray(d1_lp, float)
-                                  / (np.linalg.norm(d1_lp) + 1e-12))
-                _n2_in_or = ca.DM(-np.asarray(d2_lp, float)
-                                  / (np.linalg.norm(d2_lp) + 1e-12))
+                _n1_in_or = (_n1_in_sym_cost if _n1_in_sym_cost is not None
+                             else ca.DM(-np.asarray(d1_lp, float)
+                                        / (np.linalg.norm(d1_lp) + 1e-12)))
+                _n2_in_or = (_n2_in_sym_cost if _n2_in_sym_cost is not None
+                             else ca.DM(-np.asarray(d2_lp, float)
+                                        / (np.linalg.norm(d2_lp) + 1e-12)))
                 _e_th = thumb_axis_cb(_q) - _n1_in_or
                 _e_if = index_axis_cb(_q) - _n2_in_or
                 _cost_orient = ca.dot(_e_th, _e_th) + ca.dot(_e_if, _e_if)
