@@ -572,11 +572,48 @@ alongside that stage's `status_tag` and only for the WINNING attempt. `write_gra
 already narrows to the winning attempt when passed `res=` — the mistake was reading a
 raw npz by hand instead. Worth surfacing `status_tag` on the figure itself.
 
-**Still open:** which knob actually separates the two runs. The failing harness used
-`max_seeds=3, n_normal_relinearize=2`; the passing A/B used `5` and `3`. Isolating that
-(2x2) was blocked by an unrelated merge conflict in `environments/scene_objects.py` and
-is NOT yet answered. If it is `max_seeds`, note the live recommender already uses
-`_REC_NC = 5`.
+**RESOLVED — it is the RNG `seed`, not any solver knob.** Full 2x2s on the same
+object and pose, post-merge:
+
+```
+n_relin  max_seeds   status     WF    gamma_min      seed  log_dir   status     WF   gamma_min
+      2          3  converged  True       37.90         0    False  converged  True      37.90
+      2          5  converged  True       30.68         0     True  converged  True      37.90
+      3          3  converged  True       37.90      None    False  converged  False      None
+      3          5  converged  True       30.68      None     True  converged  False      None
+```
+
+`max_seeds` and `n_normal_relinearize` change the cost but never the verdict.
+`log_dir` is irrelevant (identical rows), which also confirms the trace logging does
+not perturb the solve. The whole difference is `seed`: `seed=0` gives
+WF=True/gamma_min=37.90/cost 2.90, `seed=None` gives WF=False/cost 1.51.
+
+Note `seed=None` is NOT "random" — `MultiStartGraspPlanner3D.__init__` maps it to
+`_SEED_RNG_CONST` (42). So these are two deterministic streams, and stream 42 happens
+to find a CHEAPER (1.51 vs 2.90) but wrench-INFEASIBLE grasp on this object, which the
+ranking then returns. That is the real issue: cost and feasibility disagree, and the
+rank is not gating hard on feasibility.
+
+### A2. The live recommender runs the losing stream
+
+| call site | seed |
+|---|---|
+| `kinova_leap_pick_place.py` `_get_cat_planner` | **none passed** -> 42 |
+| `benchmarks/ycb_grasp/pick_and_place.py:278` | `seed=seed` (CLI, default 0) |
+| `benchmarks/ycb_grasp/pick_from_floor.py:576` | none passed -> 42 |
+
+So live teleop is on exactly the stream that returns wrench-infeasible on
+`036_wood_block`. In practice the WF gate then hides the candidate and the operator
+sees no markers for that object — which is the behaviour to expect today, not a crash.
+
+**Do not "fix" this by hardcoding `seed=0`.** That would be tuning to one object; a
+different object will invert it. SOLVER_STATE.md §1 already notes the deterministic
+`_fixed_antipodal_seed` goes in first and usually wins, so per-seed variation is
+mostly the random `_seed_pair` march directions. The real questions are (a) why a
+lower-cost solution is wrench-infeasible at all, and (b) whether
+`MultiStartGraspPlanner3D.solve`'s ranking should prefer `wrench_ok=True` over raw
+cost. Both are solver questions, out of scope for the teleop integration, but they
+now have a crisp reproduction.
 
 ### B. Startup cost is ~21 s per mesh object, in `object_sdf.casadi_fn`
 
