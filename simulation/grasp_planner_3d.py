@@ -1208,7 +1208,8 @@ def _mesh_local_surface_fit_np(mesh_entry: dict, seed_l: np.ndarray,
                                band_inward: float | None = None,
                                normal_agree_min: float = 0.5,
                                min_pts: int = 12,
-                               quad_gain_min: float = 0.5):
+                               quad_gain_min: float = 0.5,
+                               grad_norm: float = 1.0):
     """Local surface curvature at seed_l fitted DIRECTLY to nearby mesh
     vertices, with a plane-vs-quadratic model-selection test.
 
@@ -1243,6 +1244,13 @@ def _mesh_local_surface_fit_np(mesh_entry: dict, seed_l: np.ndarray,
     face it manages only 15-34% (fitting relief). Below the gate, kappa is
     returned as exactly 0 -- a planar patch, whose validity bound is then set
     by _sdf_axis_bound_np's direct SDF search rather than by a fake curvature.
+
+    grad_norm : ||grad f|| at the seed. Needed ONLY for the height-Hessian ->
+        SDF-Hessian conversion at the end (H_tt = -||grad f|| * W): n_l arrives
+        unit-length, so the gradient's magnitude cannot be recovered from it and
+        must be passed in. Defaults to 1.0, which is very nearly right for a
+        well-conditioned SDF (measured 0.994-1.001 on the benchmark objects) but
+        is not assumed.
 
     radius : tangent-plane sampling radius (m). Sized to span a useful fraction
         of a face rather than a few mm, since the whole point is a patch that
@@ -1314,11 +1322,32 @@ def _mesh_local_surface_fit_np(mesh_entry: dict, seed_l: np.ndarray,
         # order matches _principal_curvature_axes_np: (axis0, axis1, k0, k1).
         return (np.asarray(t1_l, float), np.asarray(t2_l, float), 0.0, 0.0, info)
 
-    # w = a u^2 + b uv + c v^2 + ... -> the surface Hessian in (t1,t2) is
-    # [[2a, b], [b, 2c]]; eigen-decompose for principal axes/curvatures, same
-    # convention _principal_curvature_axes_np returns.
-    H_tt = np.array([[2.0 * c_q[0], c_q[1]],
+    # w = a u^2 + b uv + c v^2 + ... -> the HEIGHT Hessian in (t1,t2) is
+    # W = [[2a, b], [b, 2c]], i.e. the second derivative of the surface's height
+    # ABOVE ITS OWN TANGENT PLANE, measured along +n_l (outward).
+    #
+    # That is the OPPOSITE SIGN CONVENTION to the SDF Hessian this function must
+    # return, and it must be converted, not returned raw. The caller
+    # (_mesh_quadratic_contact_ca) consumes kappa only through
+    #     h(t) = -(kappa0*t0^2 + kappa1*t1^2) / (2*grad_norm)
+    # which is the second-order implicit-function solution of f(seed + t.axis +
+    # h*n) = 0, so its kappa must be the SDF's tangential Hessian H_tt. Equating
+    # the two expressions for the same height gives
+    #     W = -H_tt / ||grad f||        =>      H_tt = -||grad f|| * W
+    # Verified numerically on all three benchmark objects (SDF H_tt eigenvalues
+    # vs -||grad f||*W eigenvalues agree in sign and magnitude to a few percent;
+    # the residual difference is the SDF-vs-mesh disagreement this fit exists to
+    # correct, not a convention mismatch).
+    #
+    # Returning W RAW was a sign bug: on 017_orange it gave kappa=(-30.3,-31.2)
+    # where the true SDF convention needs +31, so h came out POSITIVE and the
+    # paraboloid bulged OUTWARD on a convex sphere -- the surrogate curving away
+    # from the object instead of hugging it, sitting ~0.93mm outside the true
+    # surface at the trust-region edge. Visible directly in the seed-quadratic
+    # visualizer as a patch bowing the wrong way.
+    W_tt = np.array([[2.0 * c_q[0], c_q[1]],
                      [c_q[1], 2.0 * c_q[2]]], float)
+    H_tt = -float(grad_norm) * W_tt
     return _principal_curvature_axes_np(H_tt, t1_l, t2_l) + (info,)
 
 
@@ -1404,7 +1433,11 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     if mesh_fit:
         _fit = _mesh_local_surface_fit_np(
             mesh_entry, seed_l, t1_l, t2_l, n_l_unit,
-            radius=mesh_fit_radius, quad_gain_min=mesh_fit_quad_gain_min)
+            radius=mesh_fit_radius, quad_gain_min=mesh_fit_quad_gain_min,
+            # TRUE (unfloored) magnitude -- this scales a curvature conversion,
+            # not a denominator, so the grad_norm floor used for h() would
+            # distort it near a crease rather than protect it.
+            grad_norm=float(np.linalg.norm(grad_l)))
         if _fit is not None:
             axis0_l, axis1_l, kappa0, kappa1, _fit_info = _fit
 
