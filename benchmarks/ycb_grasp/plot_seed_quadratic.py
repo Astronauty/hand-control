@@ -69,6 +69,7 @@ import mujoco as mj                                               # noqa: E402
 import casadi as ca                                               # noqa: E402
 
 from ycb_grasp import pick_from_floor as P, scene as S, workspace as W   # noqa: E402
+from ycb_grasp import out_paths as OP                                    # noqa: E402
 from ycb_grasp.ik_demo import clearance_by_geom, robot_geom_names        # noqa: E402
 from grasp_control import object_uv_atlas as oua                         # noqa: E402
 from simulation.grasp_config_builder import for_ablation_default         # noqa: E402
@@ -525,8 +526,11 @@ def main():
     ap.add_argument("--rng-seed", type=int, default=0)
     ap.add_argument("--elev", type=float, default=18.0)
     ap.add_argument("--azim", type=float, default=-60.0)
+    # out/analysis/seed_quadratic/ -- environment-independent diagnostic, so it
+    # belongs under analysis/ rather than beside a floor/tabletop run, same as
+    # plot_quadratic_path.py and plot_uv_path.py. See out_paths.py's docstring.
     ap.add_argument("--out-dir", type=Path,
-                    default=REPO / "benchmarks" / "ycb_grasp" / "out" / "seed_quadratic")
+                    default=OP.analysis_dir("seed_quadratic", create=False))
     a = ap.parse_args()
 
     objs = a.objects if a.objects else DEFAULT_OBJECTS
