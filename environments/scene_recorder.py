@@ -69,6 +69,13 @@ class SceneRecorder:
         if not self.enabled:
             return
         t = sim_time if sim_time is not None else self._wall()
+        # A backspace/BADQACC reset snaps data.time back to 0 (or any earlier value). Without
+        # this guard the throttle below would then see (t - _last_t) < 0 for the whole span
+        # back to the pre-reset time and skip EVERY frame — recording appeared to "stop" after
+        # a reset. On any backward jump, re-anchor and capture this frame so recording
+        # continues seamlessly into the reset run.
+        if self._last_t is not None and t < self._last_t:
+            self._last_t = None
         if self._last_t is not None and (t - self._last_t) < (1.0 / self._fps):
             return
         self._last_t = t

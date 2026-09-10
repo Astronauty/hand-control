@@ -109,12 +109,41 @@ def trial_summary(evs: list[dict]) -> dict | None:
         end = {'outcome': 'success', 'duration_s': round(_dur, 3),
                'n_attempts': arrival.get('attempt', 0), 'n_drops': 0}
     mass_kg = start.get('mass_kg')
+    # Subtask flags, from the phase machine's events:
+    #   pickup    — a 'pick_confirmed' fired (object grasped + lifted past the pick threshold).
+    #   transport — reached 'arrival' (carried to the place target) GIVEN it was picked. Drops
+    #               happen between pick_confirmed and arrival, so a picked-but-dropped trial has
+    #               picked=True, arrival=False -> transport failure.
+    #   dropoff   — 'arrival.set_down' (actually placed into the target, not just hovering over
+    #               it) GIVEN it arrived. In this state machine arrival => outcome success, so
+    #               end-to-end success == pickup AND transport AND dropoff.
+    picked   = any(e.get('event') == 'pick_confirmed' for e in evs)
+    arrival  = next((e for e in evs if e.get('event') == 'arrival'), None)
+    arrived  = arrival is not None
+    # Drop-off = the object ended up in the target. The authoritative signal is the trial's
+    # SUCCESS outcome (the state machine sets outcome=success exactly when the object is placed
+    # in the target). arrival.set_down is a finer "set down vs hovering" flag, but it's absent
+    # in older logs and in the arrival-recovery path — so key drop-off off the outcome, which
+    # keeps it consistent with end-to-end (a successful trial always completed drop-off).
+    succeeded = end.get('outcome') == 'success'
+    # Retarget/solve latencies: log_solve rows carry {component, ms}. The retargeter latency
+    # (dexpilot vs anyteleop) is the headline per-method cost; also expose ik/rrt if present.
+    solve_ms = {}
+    for e in evs:
+        if e.get('event') == 'solve' or ('component' in e and 'ms' in e):
+            comp = e.get('component'); ms = e.get('ms')
+            if comp is not None and ms is not None:
+                solve_ms.setdefault(comp, []).append(float(ms))
     return {
         'method':       start.get('method', 'unknown'),
         'object':       start.get('object', 'unknown'),
         'outcome':      end.get('outcome'),
         'duration_s':   end.get('duration_s'),
-        'pick_confirmed': any(e.get('event') == 'pick_confirmed' for e in evs),
+        'pick_confirmed': picked,
+        # Subtask outcomes (see above). Conditional rates are computed in collect().
+        'pickup':       picked,
+        'transport':    (picked and (arrived or succeeded)),
+        'dropoff':      succeeded,
         # Count attempt_start / drop EVENTS directly, not the trial_end.n_* fields. The
         # events are always logged, whereas n_attempts/n_drops are only on trial_end — an
         # arrival-only success (synthesized end above) would otherwise report 0. This counts
@@ -122,6 +151,8 @@ def trial_summary(evs: list[dict]) -> dict | None:
         # timeout, and arrival-recovered).
         'n_attempts':   sum(1 for e in evs if e.get('event') == 'attempt_start'),
         'n_drops':      sum(1 for e in evs if e.get('event') == 'drop'),
+        # Per-component solve latencies (ms) collected across the trial (list per component).
+        'solve_ms':     solve_ms,
         # Physical properties, stamped onto trial_start by object_props_from_model()
         # (trial_logger.py). Absent (-> None) in older logs written before the props stamp.
         'mass_g':       (mass_kg * 1e3) if mass_kg is not None else None,
@@ -154,11 +185,26 @@ def collect(run_dirs):
                 continue   # trial never reached a terminal state (run killed mid-trial)
             if s['outcome'] == 'abandoned':
                 continue   # excluded: operator reset / target switch (not a real attempt)
+            # Per-trial retarget latency (mean ms) if the 'solve' component=='retarget' event
+            # was logged; and per-trial grasp-hold force from trial_end (peak/mean N).
+            retarget_ms = None
+            comp = s.get('solve_ms', {})
+            if 'retarget' in comp and comp['retarget']:
+                retarget_ms = float(np.mean(comp['retarget']))
+            _end = next((e for e in evs if e.get('event') == 'trial_end'), {})
             records[(s['method'], s['object'])].append({
                 'duration_s': s['duration_s'],
                 'n_attempts': s.get('n_attempts', 0) or 0,
                 'n_drops':   s.get('n_drops', 0) or 0,
                 'success':   (s['outcome'] == 'success'),
+                # Subtask flags (booleans) for the conditional success-rate table.
+                'pickup':    bool(s.get('pickup')),
+                'transport': bool(s.get('transport')),
+                'dropoff':   bool(s.get('dropoff')),
+                # Comparison scalars.
+                'retarget_ms':      retarget_ms,
+                'grip_force_peak_n': _end.get('grip_force_peak_n'),
+                'grip_force_mean_n': _end.get('grip_force_mean_n'),
                 'mass_g':   s['mass_g'],
                 'mu':       s['mu'],
                 'izz_gcm2': s['izz_gcm2'],
@@ -351,6 +397,80 @@ def build_success_table(records, methods, objects, method_labels):
     return '\n'.join(lines)
 
 
+def build_subtask_conditional_table(records, methods, objects, method_labels):
+    """CONDITIONAL subtask success rates + comparison scalars, per method (pooled over
+    objects). Unlike build_success_table (per-object raw counts), this decomposes the task
+    into the pipeline the reviewer asked for:
+      Pickup    = trials with a pick_confirmed / n_valid
+      Transport = trials that reached arrival GIVEN picked  (drops fail here)
+      Drop-off  = trials placed in the target GIVEN arrived
+      End-to-end = Pickup x Transport x Drop-off (== overall success)
+    plus the two comparison scalars: finger-retarget latency (ms) and grasp-hold force (N)."""
+    def pooled(m):
+        recs = [r for o in objects for r in records.get((m, o), [])]
+        n = len(recs)
+        n_pick = sum(1 for r in recs if r.get('pickup'))
+        n_trans = sum(1 for r in recs if r.get('transport'))
+        n_drop = sum(1 for r in recs if r.get('dropoff'))
+        n_e2e = sum(1 for r in recs if r['success'])
+        lat = [r['retarget_ms'] for r in recs if r.get('retarget_ms') is not None]
+        gfp = [r['grip_force_peak_n'] for r in recs if r.get('grip_force_peak_n') is not None]
+        gfm = [r['grip_force_mean_n'] for r in recs if r.get('grip_force_mean_n') is not None]
+        return dict(n=n, n_pick=n_pick, n_trans=n_trans, n_drop=n_drop, n_e2e=n_e2e,
+                    lat=lat, gfp=gfp, gfm=gfm)
+
+    def frac(a, b):
+        return r'$-$' if b == 0 else f'{a}/{b} ({100.0*a/b:.0f}\\%)'
+
+    def stat(vals, unit):
+        if not vals:
+            return r'$-$'
+        return f'${np.mean(vals):.1f} \\pm {np.std(vals):.1f}$ {unit}'
+
+    lines = [
+        r'\begin{table}[t]', r'  \centering', r'  \begin{threeparttable}',
+        r'    \caption{Conditional subtask success (pooled over objects) and comparison '
+        r'scalars per method. Transport is conditioned on a successful pick, drop-off on a '
+        r'successful transport, so end-to-end $=$ pickup $\times$ transport $\times$ drop-off. '
+        r'Retarget latency is the per-frame finger-retargeting solve time; grasp-hold force is '
+        r'the finger$\to$object normal force during transport (the method''s ability to '
+        r'maintain the grasp under load).}',
+        r'    \label{tab:subtask_conditional}',
+        r'    \begin{tabular}{l' + 'c' * len(methods) + '}',
+        r'      \toprule',
+        '      & ' + ' & '.join(method_labels.get(m, m) for m in methods) + r' \\',
+        r'      \midrule',
+    ]
+    P = {m: pooled(m) for m in methods}
+    rows = [
+        ('Valid trials ($n$)', lambda p: str(p['n'])),
+        ('Pickup success',     lambda p: frac(p['n_pick'], p['n'])),
+        ('Transport success (| pick)', lambda p: frac(p['n_trans'], p['n_pick'])),
+        ('Drop-off success (| transport)', lambda p: frac(p['n_drop'], p['n_trans'])),
+        ('End-to-end success', lambda p: frac(p['n_e2e'], p['n'])),
+        (r'Retarget latency\tnote{a}', lambda p: stat(p['lat'], 'ms')),
+        (r'Grasp-hold force (peak)\tnote{b}', lambda p: stat(p['gfp'], 'N')),
+        (r'Grasp-hold force (mean)\tnote{b}', lambda p: stat(p['gfm'], 'N')),
+    ]
+    for label, fn in rows:
+        lines.append('      ' + label + ' & ' + ' & '.join(fn(P[m]) for m in methods) + r' \\')
+    lines += [
+        r'      \bottomrule',
+        r'    \end{tabular}',
+        r'    \begin{tablenotes}[para,flushleft]',
+        r'      \footnotesize',
+        r'      \item[a] Mean per-frame finger-retargeting solve time (\texttt{solve} events, '
+        r'component \texttt{retarget}), over valid trials. Lower is better.',
+        r'      \item[b] Total finger$\to$object normal force during the transport phase '
+        r'(\texttt{trial\_end.grip\_force\_*}). A method that cannot command grip force '
+        r'independent of finger position holds weakly and drops under load.',
+        r'    \end{tablenotes}',
+        r'  \end{threeparttable}',
+        r'\end{table}',
+    ]
+    return '\n'.join(lines)
+
+
 METHOD_LABELS = {
     'dexpilot': r'DexPilot \cite{handaDexPilotVisionBasedTeleoperation2020}',
     'contact_aware_teleop':
@@ -392,6 +512,8 @@ def emit_tables(dirs, args, heading=None):
     print(build_time_table(records, methods, objects, METHOD_LABELS))
     print()
     print(build_success_table(records, methods, objects, METHOD_LABELS))
+    print()
+    print(build_subtask_conditional_table(records, methods, objects, METHOD_LABELS))
     return True
 
 

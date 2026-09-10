@@ -1,12 +1,13 @@
 {
   "_comment": "AnyTeleop (dex-retargeting) finger-retargeting backend. Used only when --mode anyteleop or contact_aware_w_anyteleop is selected. See anyteleop/README.md.",
   "_comment_retargeting_type": "'vector' (real-time video retargeting AnyTeleop uses live) or 'dexpilot' (DexPilot-style pinch-aware optimizer). Both LEAP-supported.",
-  "retargeting_type": "vector",
+  "_comment_type_choice": "Default 'dexpilot' = the FAITHFUL AnyTeleop config for a dexterous (pinch-capable) hand. Clarification: 'vector-based retargeting' is AnyTeleop's PARADIGM (match finger/keypoint VECTORS, not joint angles); within it dex-retargeting ships TWO optimizers — the plain 'vector' one (base->fingertip only, no thumb coupling) and the 'dexpilot' one (adds the 'Projected' high-weight pinch term that enforces fingertip->thumb contact). For pinching hands AnyTeleop uses the DexPilot optimizer (the library even defaults teleop of dexterous hands to *_dexpilot.yml), which is why the videos pinch well; the bare 'vector' optimizer does NOT reliably close a pinch on LEAP (confirmed here: it under-curls, and raising scaling makes it worse). So benchmark AnyTeleop with 'dexpilot' as its representative condition; 'vector' is available via --anyteleop-type for an ablation, not as 'the AnyTeleop method'. See arXiv:2307.04577 and github.com/dexsuite/dex-retargeting.",
+  "retargeting_type": "dexpilot",
   "hand_type": "right",
   "_comment_output_alpha": "Extra EMA smoothing our wrapper applies on top of dex-retargeting's own low_pass_alpha. 1.0 = none.",
   "output_alpha": 1.0,
   "_comment_finger_knobs": "dex-retargeting's OWN finger-retargeting knobs, overriding the vendored LEAP YAML so you can tune them here instead of editing anyteleop/assets/.../leap_hand_right*.yml. null = keep the YAML value (scaling_factor 1.6, low_pass_alpha 0.2). Hot-reloaded (rebuilds the solver).",
-  "_comment_scaling_factor": "Robot-to-human hand-size gain. Higher = more finger curl/reach.",
+  "_comment_scaling_factor": "Robot-to-human hand-size gain. null = each type's YAML-native 1.6, which is correct for VECTOR (higher breaks its curl). If you want extra curl for the dexpilot type specifically, override per-run rather than here, since a single value serves both conditions.",
   "scaling_factor": null,
   "_comment_low_pass_alpha": "dex-retargeting's internal low-pass. Smaller = smoother but laggier (0..1); <0 disables.",
   "low_pass_alpha": null

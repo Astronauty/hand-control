@@ -185,7 +185,7 @@ class DexPilotArmController:
         n_arm: int = 7,
         palm_site: str = 'pinch_site',
         q_bias: np.ndarray | None = None,
-        alpha: float = 0.3,
+        alpha: float = 0.7,
         scale_x: float = 0.3,
         scale_z: float = 0.2,
         scale_depth: float = 0.5,

@@ -535,20 +535,48 @@ empty. Until it is filled, `--contact-profile tuned` is an untested code path an
 
 ## 11. Two findings that need a decision
 
-### A. `036_wood_block` is wrench-INFEASIBLE on the teleop preset
+### A. RETRACTED — `036_wood_block` IS wrench-feasible on the teleop preset
 
-Measured on the mesh, teleop preset: `wrench_feasible=False`, `gamma_min=None`,
-**both with and without** `use_quadratic_contact` (A/B'd). So it is pre-existing,
-not introduced by this work — but it matters, because the recommender's WF gate
-means teleop will simply never display a candidate for that object. The figure also
-shows the likely cause: the index contact fits `kappa=(+0.3, +371.5)/m` on a FLAT
-wood-block face. 371.5/m is a ~2.7 mm radius, which collapses the trust region to
-`t1 in [-2,+2] mm`. That is the degenerate-fit signature SOLVER_STATE.md §9 already
-tracks, now visible in a picture rather than inferred from two numbers.
+An earlier revision of this section claimed the wood block was wrench-INFEASIBLE on
+the teleop preset, and blamed a kappa=+371.5/m curvature fitted on a flat face. **Both
+claims were wrong.** Corrected by direct A/B, same object, same pose, seed=0:
 
-Note the benchmark reaches `wrench_feasible=True` on the same object — it uses
-`for_ablation_default` with the full geom set, not the teleop preset. Worth a
-focused comparison of the two presets on this object.
+```
+TELEOP preset      solve   6.5s  status=converged    WF=True  gamma_min=30.68
+  5/5 attempts converged, 4/5 wrench_ok=True, best cost 1.35, n1.n2=-0.788, span 88.7mm
+BENCHMARK preset   solve 166.2s  status=best-effort  WF=True  gamma_min= 5.65
+  0/5 attempts converged, 0/5 wrench_ok
+```
+
+So the teleop preset is not the weaker of the two here — it converges where the
+benchmark preset only reaches best-effort, and 25x faster.
+
+**Where the bad number came from.** The kappa=+371.5 was read out of a `best-effort`
+stage (S2) of a LOSING attempt, not the returned grasp — visible directly in the
+trace:
+
+```
+S1 converged    quad1=(+0.0,+0.0)   quad2=(+0.0,+0.0)
+S2 best-effort  quad1=(+0.0,+0.0)   quad2=(+0.3,+371.5)   <- the number that was quoted
+S3 converged    quad1=(+0.0,+222.9) quad2=(-0.1,+294.5)
+```
+
+Corroborated independently by the seed chart (`plot_seed_quadratic.py`), where every
+ACCEPTED seed on this object fits planar kappa=(0.0,0.0) with trust regions out to
++/-50mm, and the two high-curvature candidates (kappa 117 and 113) are REJECTED by
+`seed_kappa_max_reject=40`; and by the 156 autonomous solves in the
+`contact_aware_autonomous` run, whose traces are planar kappa=(0,0) almost throughout.
+
+**The lesson for reading these figures:** a per-stage `quad*_kappa` is meaningful only
+alongside that stage's `status_tag` and only for the WINNING attempt. `write_grasp_plots`
+already narrows to the winning attempt when passed `res=` — the mistake was reading a
+raw npz by hand instead. Worth surfacing `status_tag` on the figure itself.
+
+**Still open:** which knob actually separates the two runs. The failing harness used
+`max_seeds=3, n_normal_relinearize=2`; the passing A/B used `5` and `3`. Isolating that
+(2x2) was blocked by an unrelated merge conflict in `environments/scene_objects.py` and
+is NOT yet answered. If it is `max_seeds`, note the live recommender already uses
+`_REC_NC = 5`.
 
 ### B. Startup cost is ~21 s per mesh object, in `object_sdf.casadi_fn`
 

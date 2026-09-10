@@ -33,7 +33,8 @@ class AnyTeleopRetargeter:
 
     def __init__(self, model, n_arm: int = 7, debug: bool = False,
                  eps: float | None = None, load_config: bool = True,
-                 pinch_debounce: bool = True) -> None:
+                 pinch_debounce: bool = True,
+                 type_override: str | None = None) -> None:
         self._model = model
         self._n_arm = n_arm
         self._n_hand = 16
@@ -62,7 +63,14 @@ class AnyTeleopRetargeter:
         # dex-retargeting YAML overrides (None => keep the YAML's own value).
         self._scaling_factor = cfg.get("scaling_factor", None)
         self._low_pass_alpha = cfg.get("low_pass_alpha", None)
-        self._build_solver(cfg.get("retargeting_type", "vector"))
+        # A CLI --anyteleop-type wins over the config file so the two AnyTeleop baseline
+        # conditions (vector vs dexpilot) can be run distinctly without editing the config
+        # between runs. It also pins the type against hot-reload (poll_config keeps it).
+        self._type_override = (str(type_override).lower()
+                               if type_override is not None else None)
+        self._retargeting_type = (self._type_override
+                                  or str(cfg.get("retargeting_type", "vector")))
+        self._build_solver(self._retargeting_type)
 
         # Pinch distances the trial logger reads (mirror DexPilotRetargeter's attrs).
         self.last_d_s1 = [float("inf")] * 3
@@ -200,7 +208,10 @@ class AnyTeleopRetargeter:
             return False
         self._cfg_mtime = mtime
         cfg = _cfg.load_config(path)
-        new_type = str(cfg.get("retargeting_type", "vector"))
+        # A CLI --anyteleop-type pins the type: the config's retargeting_type is ignored so a
+        # live edit can't switch the baseline condition out from under a benchmark run.
+        new_type = (self._type_override
+                    or str(cfg.get("retargeting_type", "vector")))
         new_hand = str(cfg.get("hand_type", "right"))
         new_scale = cfg.get("scaling_factor", None)
         new_lpa = cfg.get("low_pass_alpha", None)

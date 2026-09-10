@@ -55,6 +55,7 @@ class DexPilotController:
         retargeter: str = "dexpilot",
         pinch_debounce: bool = True,
         output_ema: bool = True,
+        anyteleop_type: str | None = None,
         **arm_kwargs,
     ) -> None:
         self._n_arm   = n_arm
@@ -88,7 +89,8 @@ class DexPilotController:
             from anyteleop.factory import make_retargeter
             self._retarg = make_retargeter(retargeter, model, n_arm=n_arm,
                                            debug=debug, eps=eps,
-                                           pinch_debounce=pinch_debounce)
+                                           pinch_debounce=pinch_debounce,
+                                           type_override=anyteleop_type)
         self._arm    = DexPilotArmController(
             model,
             n_arm=n_arm,
@@ -114,6 +116,8 @@ class DexPilotController:
         self._hand_evt     = threading.Event()
         self._hand_pending: np.ndarray | None = None      # world_lm (21,3) to solve
         self._hand_result:  np.ndarray | None = None       # latest raw solved q_hand (16,)
+        self._last_retarget_ms: float | None = None       # most-recent finger-solve latency
+        self._retarget_ms_hist: list[float] = []          # rolling history (app polls to log)
         self._hand_stop    = threading.Event()
         self._hand_thread  = threading.Thread(
             target=self._hand_worker, name="dexpilot-finger-retarget", daemon=True)
@@ -307,18 +311,44 @@ class DexPilotController:
             if world_lm is None:
                 continue
             try:
+                import time as _time
+                _t0 = _time.perf_counter()
                 q = self._retarg.retarget(world_lm)
+                _ms = (_time.perf_counter() - _t0) * 1e3
             except Exception as e:   # noqa: BLE001 — a bad solve must not kill the worker
                 print(f"[hand] finger retarget worker error (skipping): {e!r}")
                 continue
             with self._hand_lock:
                 self._hand_result = q.copy()
+                # Rolling retarget-latency stats (ms) the app polls to log per-trial (the
+                # dexpilot-vs-anyteleop finger-solve cost — the headline per-method latency).
+                self._last_retarget_ms = _ms
+                self._retarget_ms_hist.append(_ms)
+                if len(self._retarget_ms_hist) > 2000:
+                    del self._retarget_ms_hist[:1000]
 
     @property
     def retargeter(self) -> DexPilotRetargeter:
         """The finger-retargeting stage — exposed so a live tuner can mutate its
         tunable constants (BETA/GAMMA/EPS/ETA1/ETA2/S1_GAIN/S2_GAIN) per frame."""
         return self._retarg
+
+    def retarget_latency_stats(self, clear: bool = False):
+        """(last_ms, mean_ms, p95_ms, n) over the retarget-latency history, or None if no
+        solve has run yet. The app polls this to log the per-trial finger-retarget latency
+        (the dexpilot-vs-anyteleop comparison metric). Pass clear=True to reset the history
+        window (e.g. at a trial boundary so each trial's stat is its own)."""
+        with self._hand_lock:
+            hist = list(self._retarget_ms_hist)
+            last = self._last_retarget_ms
+            if clear:
+                self._retarget_ms_hist = []
+        if not hist:
+            return None
+        arr = sorted(hist)
+        mean = sum(arr) / len(arr)
+        p95 = arr[min(len(arr) - 1, int(0.95 * len(arr)))]
+        return {'last_ms': last, 'mean_ms': mean, 'p95_ms': p95, 'n': len(arr)}
 
     def poll_retarget_config(self) -> bool:
         """Hot-reload the retargeting constants from teleop/calibration/retarget_config.json

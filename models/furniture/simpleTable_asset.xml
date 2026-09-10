@@ -29,7 +29,10 @@
         </default>
 
         <default class="body_simpleTable" >
-            <geom contype="1" conaffinity="1" group="4" rgba=".4 .5 .6 1" />
+            <!-- solref 0.004 (= 2x the 2ms timestep, the stability floor): the default 0.02 was
+                 soft enough that resting objects sank ~30mm into the tabletop. Matches the YCB
+                 object geoms' solref so the object<->table contact is stiff on both sides. -->
+            <geom contype="1" conaffinity="1" group="4" rgba=".4 .5 .6 1" solref="0.004 1" />
             <joint limited="true" damping="1" frictionloss="0.5" armature=".01" />
         </default>
 

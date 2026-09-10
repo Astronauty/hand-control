@@ -33,12 +33,13 @@
 
   <worldbody>
     <light pos="0 0 1.5" directional="true"/>
-    <!-- 3rd-person overview camera for recording (see SceneRecorder / --trial-log). Fixed
-         front-elevated view of the table workspace: the arm (base at origin, facing +y) and
-         the objects in front of it, framed from -y looking toward +y. 1280x960 (see <global
-         offwidth/offheight>). -->
-    <camera name="overview" pos="0.0 -0.75 1.35" xyaxes="1 0 0 0 0.6 0.8"
-            resolution="1280 960" fovy="55"/>
+    <!-- 3rd-person overview camera for recording (see SceneRecorder / --trial-log). Faces the
+         FRONT of the robot: the base is yawed to face +y, so this sits out on the +y side
+         (pos y=1.7, elevated) looking back toward -y at the robot's front, its wrist/gripper,
+         and the objects on the table. 1280x960 (see <global offwidth/offheight>). -->
+    <camera name="overview" pos="0.0 1.7 1.25"
+            xyaxes="-1 0 0  0 -0.2203 0.9754"
+            resolution="1280 960" fovy="58"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
     <!-- Table centered under the robot workspace (arm base at ~(0,0), reaches +y forward). -->
     <body name="table" pos="0.0 0.25 0.0">

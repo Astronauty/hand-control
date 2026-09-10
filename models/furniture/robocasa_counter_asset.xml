@@ -18,7 +18,9 @@
 
     <default>
         <default class="counter_col">
-            <geom contype="1" conaffinity="1" group="4"/>
+            <!-- solref 0.004 (stability floor, = 2x timestep): the default 0.02 let resting
+                 objects sink into the counter top. Matches the YCB object geoms' solref. -->
+            <geom contype="1" conaffinity="1" group="4" solref="0.004 1"/>
         </default>
     </default>
 </mujocoinclude>
