@@ -1,0 +1,539 @@
+"""Visualize the SEEDING strategy and its local quadratic surrogates, decoupled
+from the NLP / controller.
+
+The seeding pipeline (MultiStartGraspPlanner3D.solve) and the local-quadratic
+contact patch (_mesh_quadratic_contact_ca) are normally only observable through
+whatever the full solve happens to converge to. This script exercises the SAME
+functions in isolation -- no opti, no IK, no collision model -- and draws:
+
+  1. SEED RAYS AND THEIR PROJECTION. Each seed source casts a ray and lands the
+     result on the surface with _project_to_surface_np:
+       - minor-axis seed (_fixed_antipodal_seed): the deterministic pair tried
+         FIRST by every solve. Its ray runs along the object's minor principal
+         axis through the HULL CENTROID (not the body origin -- see that
+         function's docstring for why that distinction is load-bearing on
+         036_wood_block). Drawn as a dashed line through the object with the two
+         ray endpoints (bbox_r out along +/-axis) marked hollow, and an arrow
+         from each endpoint to where it projects onto the surface.
+       - random seeds (_seed_pair): a random direction from the geom centre
+         projected to p1s, then a z-rotation-jittered march THROUGH the object
+         (_march_sdf_np) to the antipodal footprint p2s. Both legs are drawn,
+         so the "project, then march" structure is visible rather than inferred.
+     Rejected seeds are drawn too (grey/red), since which seeds the curvature
+     gate throws away is as informative as which survive.
+
+  2. THE QUADRATIC APPROXIMATION, two colors per finger. For each accepted seed
+     contact, _mesh_quadratic_contact_ca is called exactly as _run_stage calls
+     it, and its returned `frame` dict is used to reconstruct the paraboloid
+       p_l(t1,t2) = seed_l + t1*axis0_l + t2*axis1_l + h(t1,t2)*n_l
+       h(t1,t2)   = -(kappa0*t1^2 + kappa1*t2^2) / (2*grad_norm)
+     over the ASYMMETRIC per-axis trust region [t_lo_i, t_hi_i]. Each finger gets
+     two colors: a saturated surface inside the trust region (where the surrogate
+     is measured-good, |SDF| <= sdf_err_tol) and a pale wireframe extension
+     beyond it (where the model is extrapolating). That is the whole point of the
+     bound, so both sides of it are drawn.
+
+  3. TRANSPARENT OBJECT MESH. The visual mesh (group 2, the same vertices
+     _mesh_local_surface_fit_np fits to) as a low-alpha Poly3DCollection, so
+     patch-vs-surface agreement is judged against the real geometry.
+
+Usage
+-----
+    python benchmarks/ycb_grasp/plot_seed_quadratic.py                 # all three objects
+    python benchmarks/ycb_grasp/plot_seed_quadratic.py 017_orange
+    python benchmarks/ycb_grasp/plot_seed_quadratic.py 036_wood_block --n-random 3
+    python benchmarks/ycb_grasp/plot_seed_quadratic.py --no-mesh-fit   # SDF-Hessian curvature
+
+--mesh-fit (default on) matches cfg.quadratic_mesh_fit=True: curvature fitted to
+mesh vertices with the plane-vs-quadratic model-selection test, so a flat face
+reports kappa=0 and gets a trust region sized by the direct SDF search instead of
+a curvature contaminated by a corner 50mm away.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "benchmarks"))
+
+import mujoco as mj                                               # noqa: E402
+import casadi as ca                                               # noqa: E402
+
+from ycb_grasp import pick_from_floor as P, scene as S, workspace as W   # noqa: E402
+from ycb_grasp.ik_demo import clearance_by_geom, robot_geom_names        # noqa: E402
+from grasp_control import object_uv_atlas as oua                         # noqa: E402
+from simulation.grasp_config_builder import for_ablation_default         # noqa: E402
+from simulation.grasp_planner_3d import (                                # noqa: E402
+    _GEOM_TYPE_MESH,
+    _fixed_antipodal_seed,
+    _geom_normal_np,
+    _geom_sdf_np,
+    _mesh_quadratic_contact_ca,
+    _mesh_surface_kappa_max_np,
+    _minor_axis_local,
+    _project_to_surface_np,
+    _reachable_contact,
+    _seed_pair,
+    MultiStartGraspPlanner3D,
+)
+
+DEFAULT_OBJECTS = ["036_wood_block", "017_orange", "065-a_cups"]
+
+# Two colors per finger: (inside trust region, outside / extrapolated).
+FINGER_COLORS = {
+    "thumb": ("#d94801", "#fdd0a2"),   # orange: saturated inside, pale outside
+    "index": ("#2171b5", "#c6dbef"),   # blue:   saturated inside, pale outside
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scene setup — same construction path as plot_mesh_fit.py / pick_from_floor
+# ─────────────────────────────────────────────────────────────────────────────
+def build_object(obj: str, seed: int = 4):
+    """Place `obj` on the floor and settle it, returning everything the seeding
+    functions need. Mirrors plot_mesh_fit.py's setup so the geometry seen here is
+    the geometry a benchmark run would see."""
+    rng = np.random.default_rng(seed)
+    base = mj.MjModel.from_xml_path(str(REPO / "models" / "scene_kinova_leap.xml"))
+    ws = W.load_or_build(base, n=200_000, seed=0)
+    pos, quat = P.place_object_on_floor(obj, ws, rng)
+    model, data, info = S.build([(obj, pos, quat)])
+    bn = next(iter(info))
+    bid = info[bn]["bid"]
+    mj.mj_forward(model, data)
+    P.settle_object_on_floor(model, data, bid)
+
+    rg = robot_geom_names(model)
+    cfg = for_ablation_default(
+        obj_geom=S.hull_geoms(model, bn)[0], obj_body=bn, n_seeds=1,
+        arm_geom_names=rg, obj_clearance_by_geom=clearance_by_geom(rg))
+    ms = MultiStartGraspPlanner3D(model, data, cfg)
+    pl = ms._planner
+
+    gid = pl._obj_gid
+    geom_type = int(model.geom_type[gid])
+    geom_size = model.geom_size[gid].copy()
+    mesh_entry = pl._mesh_entry
+
+    # MESH pose comes from the BODY (object_sdf's table is body-frame), matching
+    # MultiStartGraspPlanner3D.solve's own branch.
+    if geom_type == _GEOM_TYPE_MESH:
+        center = data.xpos[pl._obj_bid].copy()
+        R = data.xmat[pl._obj_bid].reshape(3, 3).copy()
+    else:
+        center = data.geom_xpos[gid].copy()
+        R = data.geom_xmat[gid].reshape(3, 3).copy()
+
+    Vvis, Fvis = oua.body_visual_mesh(model, bid)     # body frame
+    return dict(obj=obj, model=model, data=data, body=bn, cfg=cfg, planner=pl,
+                geom_type=geom_type, geom_size=geom_size, mesh_entry=mesh_entry,
+                center=center, R=R, Vvis=Vvis, Fvis=Fvis,
+                r_tip=min(cfg.r_thumb, cfg.r_index), ground_z=cfg.ground_z)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Seed generation — replays solve()'s seeding order, recording the RAYS
+# ─────────────────────────────────────────────────────────────────────────────
+def _kappa_max(sc, p_world):
+    """Seed-gate curvature at a world point (solve()'s _seed_kappa_ok inner test)."""
+    if sc["geom_type"] != _GEOM_TYPE_MESH or sc["mesh_entry"] is None:
+        return 0.0
+    p_l = sc["R"].T @ (p_world - sc["center"])
+    return float(_mesh_surface_kappa_max_np(sc["mesh_entry"], p_l))
+
+
+def _gate(sc, seed):
+    """Apply solve()'s two seed gates and report WHY a seed was rejected, so the
+    plot can show discarded seeds rather than silently dropping them."""
+    reach = (_reachable_contact(seed["p1s"], sc["ground_z"], sc["r_tip"]) and
+             _reachable_contact(seed["p2s"], sc["ground_z"], sc["r_tip"]))
+    k1 = _kappa_max(sc, seed["p1s"])
+    k2 = _kappa_max(sc, seed["p2s"])
+    k_lim = float(sc["cfg"].seed_kappa_max_reject)
+    kappa_ok = (k_lim <= 0) or (max(k1, k2) <= k_lim)
+    if not reach:
+        return False, "unreachable (too near floor)", (k1, k2)
+    if not kappa_ok:
+        return False, f"kappa {max(k1, k2):.0f} > {k_lim:.0f}", (k1, k2)
+    return True, "accepted", (k1, k2)
+
+
+def generate_seeds(sc, n_random: int = 3, rng_seed: int = 0):
+    """Minor-axis seed then random _seed_pair seeds, each annotated with the RAY
+    geometry that produced it (the thing part 1 of this plot is about).
+
+    Deliberately does NOT stop at the first n accepted seeds the way solve() does
+    -- rejected seeds are kept and returned so they can be drawn."""
+    gt, gs, c, R, me = (sc["geom_type"], sc["geom_size"], sc["center"],
+                        sc["R"], sc["mesh_entry"])
+    bbox_r = float(np.max(gs)) * 2.5
+    out = []
+
+    # ── minor-axis (deterministic, tried FIRST by every solve) ──────────────
+    axis_l = _minor_axis_local(gt, gs, mesh_entry=me)
+    fs = _fixed_antipodal_seed(gt, gs, c, R, axis_l, mesh_entry=me)
+    d_world = R @ axis_l
+    d_world /= np.linalg.norm(d_world) + 1e-12
+    # Ray origin: hull centroid in world (the geom centre for primitives) --
+    # reproduces _fixed_antipodal_seed's own c_ray choice.
+    c_ray = c
+    if me is not None and me.get("verts") is not None and len(me["verts"]) >= 3:
+        c_ray = c + R @ np.asarray(me["verts"], float).mean(0)
+    ok, why, kk = _gate(sc, fs)
+    out.append(dict(seed=fs, kind="minor-axis", ok=ok, why=why, kappa=kk,
+                    ray=dict(mode="axis", origin=c_ray, dir=d_world, length=bbox_r)))
+
+    # ── random _seed_pair seeds ────────────────────────────────────────────
+    # solve() resets to a fixed constant every solve (determinism); a plain
+    # default_rng here reproduces the same style of stream.
+    rng = np.random.default_rng(rng_seed)
+    for _ in range(n_random):
+        # Re-derive the ray by drawing from a CLONED stream first, so the ray we
+        # draw is exactly the one _seed_pair consumed (it draws u, then ang).
+        st = rng.bit_generator.state
+        probe = np.random.default_rng(0)
+        probe.bit_generator.state = st
+        u = probe.standard_normal(3)
+        u[2] *= 0.5                       # _seed_pair's bias away from top/bottom
+        u /= np.linalg.norm(u) + 1e-12
+
+        s = _seed_pair(gt, gs, c, R, bbox_r, rng,
+                       delta_max=np.deg2rad(sc["cfg"].seed_march_jitter_deg),
+                       mesh_entry=me)
+        ok, why, kk = _gate(sc, s)
+        out.append(dict(seed=s, kind="random", ok=ok, why=why, kappa=kk,
+                        ray=dict(mode="march", origin=c, dir=u, length=bbox_r)))
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quadratic patch — calls the REAL _mesh_quadratic_contact_ca, uses its `frame`
+# ─────────────────────────────────────────────────────────────────────────────
+def quad_frame(sc, p_world, n_in, cfg):
+    """Run _mesh_quadratic_contact_ca exactly as _run_stage does and return its
+    `frame` dict (the paraboloid's object-local parameters), or None for a
+    non-mesh object. A throwaway ca.Opti absorbs the decision variable -- the
+    frame itself is pure numpy and is what we draw."""
+    if sc["geom_type"] != _GEOM_TYPE_MESH or sc["mesh_entry"] is None:
+        return None
+    opti = ca.Opti()
+    _, _, _, frame = _mesh_quadratic_contact_ca(
+        opti, p_world, -np.asarray(n_in, float), sc["center"], sc["R"], sc["mesh_entry"],
+        t_bound_max=cfg.quadratic_t_bound_max,
+        sdf_err_tol=cfg.quadratic_sdf_err_tol,
+        mesh_fit=cfg.quadratic_mesh_fit,
+        mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
+        mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min)
+    return frame
+
+
+def patch_points(frame, center, R, t0_range, t1_range, n=13):
+    """Evaluate p_world(t1,t2) on a grid, using the frame's own reconstruction
+    formula (documented in _mesh_quadratic_contact_ca's return contract -- valid
+    outside the bounds too, which is exactly what the pale extrapolation band
+    needs)."""
+    t0 = np.linspace(t0_range[0], t0_range[1], n)
+    t1 = np.linspace(t1_range[0], t1_range[1], n)
+    T0, T1 = np.meshgrid(t0, t1)
+    h = -(frame["kappa0"] * T0**2 + frame["kappa1"] * T1**2) / (2.0 * frame["grad_norm"])
+    p_l = (frame["seed_l"][None, None, :]
+           + T0[..., None] * frame["axis0_l"][None, None, :]
+           + T1[..., None] * frame["axis1_l"][None, None, :]
+           + h[..., None] * frame["n_l"][None, None, :])
+    return center[None, None, :] + p_l @ R.T
+
+
+def patch_sdf_err(sc, frame, t0_range, t1_range, n=9):
+    """Max |true SDF| over the drawn patch -- the quantity the trust region is
+    sized against, reported so the picture carries its own error bar."""
+    if sc["mesh_entry"] is None:
+        return float("nan")
+    pts = patch_points(frame, sc["center"], sc["R"], t0_range, t1_range, n=n)
+    errs = [abs(_geom_sdf_np(p, sc["geom_type"], sc["center"], sc["R"], sc["geom_size"],
+                             mesh_entry=sc["mesh_entry"]))
+            for p in pts.reshape(-1, 3)]
+    return float(np.max(errs))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Drawing
+# ─────────────────────────────────────────────────────────────────────────────
+def draw_mesh(ax, sc, alpha=0.10, max_tris=3000):
+    """Transparent object mesh, world frame.
+
+    Drawn as thin-edged translucent triangles rather than filled faces: a YCB
+    scan carries 5-20k triangles, and at that density even alpha=0.05 fills
+    stack into an opaque blob that hides the very patches this plot is about.
+    Edges at low alpha read as a see-through shell instead. Triangles are
+    subsampled (deterministically) above max_tris purely for render time -- the
+    silhouette is unaffected at these counts."""
+    Vw = sc["center"] + sc["Vvis"] @ sc["R"].T
+    F = sc["Fvis"]
+    if len(F) > max_tris:
+        F = F[np.linspace(0, len(F) - 1, max_tris).astype(int)]
+    pc = Poly3DCollection(Vw[F], facecolor="0.6", edgecolor="0.45",
+                          linewidths=0.15, alpha=alpha, zsort="min")
+    ax.add_collection3d(pc)
+    return Vw
+
+
+def draw_seed_rays(ax, sc, rec):
+    """Part 1: the ray, its endpoint, and the projection onto the surface."""
+    s, ray = rec["seed"], rec["ray"]
+    ok = rec["ok"]
+    col = "0.25" if ok else "#cb181d"
+    a = 0.9 if ok else 0.45
+
+    if ray["mode"] == "axis":
+        # Deterministic minor-axis pair: one line through the object, both
+        # endpoints projected inward onto the surface.
+        o, d, L = ray["origin"], ray["dir"], ray["length"]
+        e1, e2 = o + d * L, o - d * L
+        ax.plot(*np.array([e1, e2]).T, color=col, ls="--", lw=1.0, alpha=a, zorder=4)
+        ax.scatter(*o, color=col, marker="+", s=60, alpha=a, zorder=5)
+        for e, p in ((e1, s["p1s"]), (e2, s["p2s"])):
+            ax.scatter(*e, facecolor="none", edgecolor=col, s=28, lw=1.0, alpha=a, zorder=5)
+            _arrow(ax, e, p, col, a)
+    else:
+        # Random seed: (a) centre -> ray endpoint -> project to p1s, then
+        # (b) march from p1s through the object -> p2s.
+        o, d, L = ray["origin"], ray["dir"], ray["length"]
+        e1 = o + d * L
+        ax.plot(*np.array([o, e1]).T, color=col, ls=":", lw=0.9, alpha=a, zorder=4)
+        ax.scatter(*e1, facecolor="none", edgecolor=col, s=28, lw=1.0, alpha=a, zorder=5)
+        _arrow(ax, e1, s["p1s"], col, a)
+        # march leg: p1s -> p2s (the jittered antipodal direction)
+        ax.plot(*np.array([s["p1s"], s["p2s"]]).T, color=col, ls="-.", lw=1.0,
+                alpha=a * 0.8, zorder=4)
+
+    # Landed surface footprints
+    for p, key in ((s["p1s"], "thumb"), (s["p2s"], "index")):
+        c_in, _ = FINGER_COLORS[key]
+        ax.scatter(*p, color=c_in if ok else "#cb181d", s=42,
+                   edgecolor="k", lw=0.4, alpha=1.0 if ok else 0.5, zorder=6)
+
+
+def _arrow(ax, a, b, color, alpha):
+    """Projection arrow: ray endpoint -> its _project_to_surface_np image."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    ax.plot(*np.array([a, b]).T, color=color, lw=1.4, alpha=alpha, zorder=5)
+    ax.scatter(*b, color=color, marker="o", s=10, alpha=alpha, zorder=5)
+
+
+def draw_quadratic(ax, sc, frame, key):
+    """Part 2: the paraboloid in two colors -- saturated inside the measured
+    trust region, pale beyond it (extrapolation)."""
+    c_in, c_out = FINGER_COLORS[key]
+    center, R = sc["center"], sc["R"]
+    lo0, hi0 = frame["t_lo_0"], frame["t_hi_0"]
+    lo1, hi1 = frame["t_lo_1"], frame["t_hi_1"]
+
+    # Pale extrapolation band: 1.8x the trust region, wireframe only, so the
+    # region where the surrogate has NO correction mechanism is visible.
+    f = 1.8
+    P_out = patch_points(frame, center, R, (lo0 * f, hi0 * f), (lo1 * f, hi1 * f), n=15)
+    ax.plot_wireframe(P_out[..., 0], P_out[..., 1], P_out[..., 2],
+                      color=c_out, lw=0.5, alpha=0.75, rstride=1, cstride=1, zorder=7)
+
+    # Saturated valid region.
+    P_in = patch_points(frame, center, R, (lo0, hi0), (lo1, hi1), n=13)
+    ax.plot_surface(P_in[..., 0], P_in[..., 1], P_in[..., 2],
+                    color=c_in, alpha=0.55, linewidth=0, antialiased=True,
+                    shade=True, zorder=8)
+    # Trust-region boundary, drawn solid so the asymmetry (t_lo != t_hi) reads.
+    for edge in (P_in[0], P_in[-1], P_in[:, 0], P_in[:, -1]):
+        ax.plot(edge[:, 0], edge[:, 1], edge[:, 2], color=c_in, lw=1.4, zorder=9)
+
+    # Principal axes at the seed, scaled to their own (asymmetric) bounds.
+    seed_w = center + R @ frame["seed_l"]
+    for ax_l, lo, hi in ((frame["axis0_l"], lo0, hi0), (frame["axis1_l"], lo1, hi1)):
+        d = R @ ax_l
+        ax.plot(*np.array([seed_w + d * lo, seed_w + d * hi]).T,
+                color=c_in, lw=2.0, alpha=0.95, zorder=10)
+
+
+def _equal_axes(ax, pts, pad=0.005, min_r=None):
+    """Equal-aspect cube around `pts`. Aspect must be equal or a paraboloid's
+    curvature is a plotting artifact rather than the fit's.
+
+    min_r floors the half-span so a tightly-bounded patch (017_orange's ~6mm
+    trust region) still shows some surrounding surface for context instead of
+    filling the panel edge to edge."""
+    pts = np.asarray(pts, float).reshape(-1, 3)
+    mid = 0.5 * (pts.max(0) + pts.min(0))
+    r = 0.5 * float(np.max(pts.max(0) - pts.min(0))) + pad
+    if min_r is not None:
+        r = max(r, float(min_r))
+    # autoscale OFF first: an added Poly3DCollection (the object mesh) otherwise
+    # re-expands the limits to the whole object, which un-zooms a patch panel
+    # back to a few pixels of paraboloid.
+    ax.set_autoscale_on(False)
+    ax.set_xlim(mid[0] - r, mid[0] + r)
+    ax.set_ylim(mid[1] - r, mid[1] + r)
+    ax.set_zlim(mid[2] - r, mid[2] + r)
+    ax.set_box_aspect((1, 1, 1))
+
+
+def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
+                out_dir: Path, elev: float, azim: float,
+                show_rejected: bool = False):
+    sc = build_object(obj)
+    cfg = sc["cfg"]
+    cfg.quadratic_mesh_fit = mesh_fit
+    recs = generate_seeds(sc, n_random=n_random, rng_seed=rng_seed)
+
+    accepted = [r for r in recs if r["ok"]]
+    # Which seeds get a patch column. Normally the accepted ones -- but on an
+    # object where the curvature gate rejects EVERYTHING (065-a_cups: a thin
+    # shell whose rim/wall reports kappa 91-323 against a limit of 40), the
+    # accepted list is empty and the figure would carry no patches at all. The
+    # rejected seeds are then the whole story, so --show-rejected draws their
+    # patches too, marked as such: it shows exactly what the gate is refusing.
+    panel_recs = accepted if (accepted and not show_rejected) else recs
+    # Layout: column 0 is the whole-object seed-ray overview (spanning both
+    # rows); then one COLUMN per accepted seed with the THUMB patch on the top
+    # row and the INDEX patch below it. Separate axes per contact because the
+    # two contacts of a pair sit on opposite sides of the object -- framing both
+    # in one panel forces an object-scale zoom, which is exactly what makes a
+    # 6mm trust region (017_orange) unreadable.
+    n_cols = 1 + len(panel_recs)
+    fig = plt.figure(figsize=(6.0 * n_cols, 10.2))
+    gs = fig.add_gridspec(2, n_cols)
+    fit_tag = "mesh-fit curvature" if mesh_fit else "SDF-Hessian curvature"
+    fig.suptitle(
+        f"{obj}  —  seeding strategy and local quadratic surrogate  ({fit_tag})\n"
+        "left: all seed rays → surface projections   |   "
+        "right: per-seed paraboloid (thumb above, index below), "
+        "saturated = measured trust region, pale wireframe = extrapolation",
+        fontsize=11)
+
+    # ── Panel 0: every seed ray + projection, over the transparent mesh ─────
+    ax = fig.add_subplot(gs[:, 0], projection="3d")
+    Vw = draw_mesh(ax, sc)
+    for rec in recs:
+        draw_seed_rays(ax, sc, rec)
+    _equal_axes(ax, np.vstack([Vw] + [np.array([r["ray"]["origin"] + r["ray"]["dir"] * r["ray"]["length"],
+                                                r["ray"]["origin"] - r["ray"]["dir"] * r["ray"]["length"]])
+                                      for r in recs]))
+    n_rej = len(recs) - len(accepted)
+    ax.set_title(f"1. seed rays → projection\n"
+                 f"{len(accepted)}/{len(recs)} accepted, {n_rej} rejected "
+                 f"(kappa gate {cfg.seed_kappa_max_reject:.0f})", fontsize=9)
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_xlabel("x (m)", fontsize=7); ax.set_ylabel("y (m)", fontsize=7)
+    ax.set_zlabel("z (m)", fontsize=7); ax.tick_params(labelsize=6)
+
+    # ── Panels 1..n: one accepted seed each, both contacts' paraboloids ─────
+    # Framed on the PATCHES, not the object: a trust region is ~5-30mm on a
+    # 60-200mm object, so an object-framed view renders it as a few pixels.
+    # The mesh is still drawn (clipped by the zoom) so the patch is read
+    # against the real surface it is approximating.
+    lines = []
+    for i, rec in enumerate(panel_recs):
+        s = rec["seed"]
+        for row, (p, n_in, key) in enumerate(((s["p1s"], s["n1_in"], "thumb"),
+                                              (s["p2s"], s["n2_in"], "index"))):
+            axq = fig.add_subplot(gs[row, 1 + i], projection="3d")
+            draw_mesh(axq, sc, alpha=0.12)
+            fr = quad_frame(sc, p, n_in, cfg)
+            axq.scatter(*p, color=FINGER_COLORS[key][0], s=48, edgecolor="k",
+                        lw=0.5, zorder=11)
+            if fr is None:
+                _equal_axes(axq, p.reshape(1, 3), min_r=0.03)
+                axq.set_title(f"seed {i} ({rec['kind']}) — {key}\n"
+                              "analytic geom (no mesh patch)", fontsize=8)
+            else:
+                draw_quadratic(axq, sc, fr, key)
+                err = patch_sdf_err(sc, fr, (fr["t_lo_0"], fr["t_hi_0"]),
+                                    (fr["t_lo_1"], fr["t_hi_1"]))
+                planar = (abs(fr["kappa0"]) < 1e-9 and abs(fr["kappa1"]) < 1e-9)
+                txt = (f"κ=({fr['kappa0']:+.1f},{fr['kappa1']:+.1f})"
+                       f"{' [planar]' if planar else ''}\n"
+                       f"t0∈[{fr['t_lo_0']*1e3:+.0f},{fr['t_hi_0']*1e3:+.0f}]mm  "
+                       f"t1∈[{fr['t_lo_1']*1e3:+.0f},{fr['t_hi_1']*1e3:+.0f}]mm\n"
+                       f"max|SDF| over patch = {err*1e3:.2f}mm "
+                       f"(tol {cfg.quadratic_sdf_err_tol*1e3:.1f}mm)")
+                pts = patch_points(fr, sc["center"], sc["R"],
+                                   (fr["t_lo_0"] * 1.8, fr["t_hi_0"] * 1.8),
+                                   (fr["t_lo_1"] * 1.8, fr["t_hi_1"] * 1.8),
+                                   n=5).reshape(-1, 3)
+                _equal_axes(axq, np.vstack([pts, p.reshape(1, 3)]), min_r=0.012)
+                _rej = "" if rec["ok"] else f"  [REJECTED: {rec['why']}]"
+                axq.set_title(f"seed {i} ({rec['kind']}){_rej} — {key}\n" + txt,
+                              fontsize=8,
+                              color="k" if rec["ok"] else "#cb181d")
+                lines.append(f"  [{obj}] seed{i} {rec['kind']:>10s} {key:>5s}  "
+                             + txt.replace("\n", "  "))
+            axq.view_init(elev=elev, azim=azim)
+            axq.set_xlabel("x (m)", fontsize=7); axq.set_ylabel("y (m)", fontsize=7)
+            axq.set_zlabel("z (m)", fontsize=7); axq.tick_params(labelsize=6)
+
+    # Legend describing the two-color-per-finger encoding.
+    handles = [
+        plt.Line2D([], [], color=FINGER_COLORS["thumb"][0], lw=6,
+                   label="thumb patch — inside trust region"),
+        plt.Line2D([], [], color=FINGER_COLORS["thumb"][1], lw=6,
+                   label="thumb patch — extrapolated"),
+        plt.Line2D([], [], color=FINGER_COLORS["index"][0], lw=6,
+                   label="index patch — inside trust region"),
+        plt.Line2D([], [], color=FINGER_COLORS["index"][1], lw=6,
+                   label="index patch — extrapolated"),
+        plt.Line2D([], [], color="0.25", ls="--", label="minor-axis seed ray"),
+        plt.Line2D([], [], color="0.25", ls=":", label="random seed ray"),
+        plt.Line2D([], [], color="0.25", ls="-.", label="antipodal march (p1s→p2s)"),
+        plt.Line2D([], [], color="#cb181d", lw=2, label="rejected seed"),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=8, frameon=False)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"seedquad_{obj}{'' if mesh_fit else '_sdfhess'}.png"
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.87, bottom=0.09,
+                        wspace=0.18, hspace=0.30)
+    fig.savefig(out, dpi=115)
+    plt.close(fig)
+
+    print(f"-> {out}")
+    for r in recs:
+        if not r["ok"]:
+            print(f"  [{obj}] {r['kind']:>10s} REJECTED: {r['why']}")
+    for ln in lines:
+        print(ln)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("objects", nargs="*", default=None,
+                    help=f"YCB object ids (default: {' '.join(DEFAULT_OBJECTS)})")
+    ap.add_argument("--n-random", type=int, default=2,
+                    help="random _seed_pair seeds to draw alongside the minor-axis seed")
+    ap.add_argument("--no-mesh-fit", action="store_true",
+                    help="use the SDF Hessian for curvature instead of the mesh-vertex fit")
+    ap.add_argument("--show-rejected", action="store_true",
+                    help="also draw patch panels for seeds the gates rejected "
+                         "(automatic when NO seed is accepted, e.g. 065-a_cups)")
+    ap.add_argument("--rng-seed", type=int, default=0)
+    ap.add_argument("--elev", type=float, default=18.0)
+    ap.add_argument("--azim", type=float, default=-60.0)
+    ap.add_argument("--out-dir", type=Path,
+                    default=REPO / "benchmarks" / "ycb_grasp" / "out" / "seed_quadratic")
+    a = ap.parse_args()
+
+    objs = a.objects if a.objects else DEFAULT_OBJECTS
+    for obj in objs:
+        plot_object(obj, a.n_random, not a.no_mesh_fit, a.rng_seed,
+                    a.out_dir, a.elev, a.azim, a.show_rejected)
+
+
+if __name__ == "__main__":
+    main()
