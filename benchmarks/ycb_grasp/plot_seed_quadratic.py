@@ -8,17 +8,28 @@ functions in isolation -- no opti, no IK, no collision model -- and draws:
 
   1. SEED RAYS AND THEIR PROJECTION. Each seed source casts a ray and lands the
      result on the surface with _project_to_surface_np:
+     THE TWO SOURCES RAY FROM DIFFERENT ORIGINS, and on a YCB mesh they are far
+     apart -- measured |hull centroid - body origin|: 036_wood_block 112mm,
+     065-a_cups 63mm, 017_orange 44mm. Both points are drawn in every ray panel
+     ("P" = hull centroid, "X" = geom centre), with the one that seed actually
+     used drawn filled and tagged "<- ray origin", so no panel is ambiguous
+     about where its ray started. On an analytic primitive the two coincide.
        - minor-axis seed (_fixed_antipodal_seed): the deterministic pair tried
-         FIRST by every solve. Its ray runs along the object's minor principal
-         axis through the HULL CENTROID (not the body origin -- see that
-         function's docstring for why that distinction is load-bearing on
-         036_wood_block). Drawn as a dashed line through the object with the two
-         ray endpoints (bbox_r out along +/-axis) marked hollow, and an arrow
-         from each endpoint to where it projects onto the surface.
-       - random seeds (_seed_pair): a random direction from the geom centre
-         projected to p1s, then a z-rotation-jittered march THROUGH the object
-         (_march_sdf_np) to the antipodal footprint p2s. Both legs are drawn,
-         so the "project, then march" structure is visible rather than inferred.
+         FIRST by every solve. Rays from the HULL CENTROID (mean of the mesh
+         hull vertices), along the object's minor principal axis. Deliberately
+         NOT the body origin: YCB scans put the origin wherever the capture rig
+         had it, commonly the object's base -- 036_wood_block's sits 103mm below
+         its centre of mass on a 207mm block, so raying through it exits at the
+         bottom RIM and both contacts land on an edge. See that function's
+         docstring for the full failure chain. Drawn as a dashed line through
+         the object with the two ray endpoints (bbox_r out along +/-axis) marked
+         hollow, and an arrow from each endpoint to its surface projection.
+       - random seeds (_seed_pair): a random direction from the GEOM CENTRE
+         (the body/geom frame origin, i.e. `c` -- the frame every SDF and normal
+         call is defined in, for both sources) projected to p1s, then a
+         z-rotation-jittered march THROUGH the object (_march_sdf_np) to the
+         antipodal footprint p2s. Both legs are drawn, so the "project, then
+         march" structure is visible rather than inferred.
      Rejected seeds are drawn too (grey/red), since which seeds the curvature
      gate throws away is as informative as which survive.
 
@@ -191,7 +202,9 @@ def generate_seeds(sc, n_random: int = 3, rng_seed: int = 0):
         c_ray = c + R @ np.asarray(me["verts"], float).mean(0)
     ok, why, kk = _gate(sc, fs)
     out.append(dict(seed=fs, kind="minor-axis", ok=ok, why=why, kappa=kk,
-                    ray=dict(mode="axis", origin=c_ray, dir=d_world, length=bbox_r)))
+                    ray=dict(mode="axis", origin=c_ray, dir=d_world, length=bbox_r,
+                             origin_kind="hull centroid", geom_center=c,
+                             hull_centroid=c_ray)))
 
     # ── random _seed_pair seeds ────────────────────────────────────────────
     # solve() resets to a fixed constant every solve (determinism); a plain
@@ -212,7 +225,9 @@ def generate_seeds(sc, n_random: int = 3, rng_seed: int = 0):
                        mesh_entry=me)
         ok, why, kk = _gate(sc, s)
         out.append(dict(seed=s, kind="random", ok=ok, why=why, kappa=kk,
-                        ray=dict(mode="march", origin=c, dir=u, length=bbox_r)))
+                        ray=dict(mode="march", origin=c, dir=u, length=bbox_r,
+                                 origin_kind="geom centre", geom_center=c,
+                                 hull_centroid=c_ray)))
     return out
 
 
@@ -300,7 +315,6 @@ def draw_seed_rays(ax, sc, rec):
         o, d, L = ray["origin"], ray["dir"], ray["length"]
         e1, e2 = o + d * L, o - d * L
         ax.plot(*np.array([e1, e2]).T, color=col, ls="--", lw=1.0, alpha=a, zorder=4)
-        ax.scatter(*o, color=col, marker="+", s=60, alpha=a, zorder=5)
         for e, p in ((e1, s["p1s"]), (e2, s["p2s"])):
             ax.scatter(*e, facecolor="none", edgecolor=col, s=28, lw=1.0, alpha=a, zorder=5)
             _arrow(ax, e, p, col, a)
@@ -310,9 +324,36 @@ def draw_seed_rays(ax, sc, rec):
         o, d, L = ray["origin"], ray["dir"], ray["length"]
         e1 = o + d * L
         ax.plot(*np.array([o, e1]).T, color=col, ls=":", lw=0.9, alpha=a, zorder=4)
-        ax.scatter(*o, color=col, marker="+", s=60, alpha=a, zorder=5)
         ax.scatter(*e1, facecolor="none", edgecolor=col, s=28, lw=1.0, alpha=a, zorder=5)
         _arrow(ax, e1, s["p1s"], col, a)
+
+    # RAY ORIGIN. The two seed sources ray from DIFFERENT points, and the
+    # difference is large and object-specific (measured |centroid - origin|:
+    # 112mm on 036_wood_block, 63mm on 065-a_cups, 44mm on 017_orange), so both
+    # are always drawn and the one THIS seed actually used is filled:
+    #   * hull centroid  -- _fixed_antipodal_seed's c_ray, the mean of the
+    #     mesh hull vertices. Deliberately NOT the body origin: YCB scans put
+    #     the origin wherever the capture rig had it (commonly the object's
+    #     base), so raying through it exits at the bottom rim. See that
+    #     function's docstring for the failure chain this avoids.
+    #   * geom centre    -- _seed_pair's `c`, the body/geom frame origin, which
+    #     is what the random search rays from (and what every SDF/normal call
+    #     is defined against, for both sources).
+    # On a YCB mesh these are far apart; on an analytic primitive they coincide.
+    gc, hc = ray.get("geom_center"), ray.get("hull_centroid")
+    used = ray.get("origin_kind")
+    for pt, name in ((gc, "geom centre"), (hc, "hull centroid")):
+        if pt is None:
+            continue
+        active = (name == used)
+        ax.scatter(*pt, marker="P" if name == "hull centroid" else "X",
+                   s=95 if active else 45,
+                   color=col if active else "none",
+                   edgecolor=col, lw=1.1,
+                   alpha=a if active else a * 0.55, zorder=6)
+        ax.text(*pt, f"  {name}{' ← ray origin' if active else ''}",
+                fontsize=6.5, color=col,
+                alpha=1.0 if active else 0.6, zorder=7)
 
     # PAIRING: the chord joining this seed's two footprints. Drawn for BOTH
     # seed kinds -- for a random seed it is also the physical march leg
@@ -466,7 +507,11 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
         # is the last stretch where the ray meets the surface.
         _equal_axes(axr, np.vstack([Vw, s_pts(rec)]), pad=0.03)
         _rej = "" if rec["ok"] else f"\nREJECTED: {rec['why']}"
-        axr.set_title(f"seed {i} ({rec['kind']}) — ray → projection"
+        _org = rec["ray"].get("origin_kind", "?")
+        _d = np.linalg.norm(np.asarray(rec["ray"]["hull_centroid"], float)
+                            - np.asarray(rec["ray"]["geom_center"], float))
+        axr.set_title(f"seed {i} ({rec['kind']}) — ray → projection\n"
+                      f"rays from {_org}  (centroid–origin gap {_d*1e3:.0f}mm)"
                       f"{_rej}", fontsize=8.5,
                       color="k" if rec["ok"] else "#cb181d")
         axr.view_init(elev=elev, azim=azim)
@@ -528,6 +573,10 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
                    label="index patch — inside trust region"),
         plt.Line2D([], [], color=FINGER_COLORS["index"][1], lw=6,
                    label="index patch — extrapolated"),
+        plt.Line2D([], [], color="0.25", marker="P", ls="none", ms=9,
+                   label="hull centroid (minor-axis ray origin)"),
+        plt.Line2D([], [], color="0.25", marker="X", ls="none", ms=8,
+                   label="geom centre (random ray origin)"),
         plt.Line2D([], [], color="0.25", ls="--", label="minor-axis seed ray"),
         plt.Line2D([], [], color="0.25", ls=":", label="random seed ray"),
         plt.Line2D([], [], color="0.25", ls="-.", label="antipodal march (p1s→p2s)"),
