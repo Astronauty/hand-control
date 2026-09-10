@@ -9,12 +9,12 @@ functions in isolation -- no opti, no IK, no collision model -- and draws:
   1. SEED RAYS AND THEIR PROJECTION. Each seed source casts a ray and lands the
      result on the surface with _project_to_surface_np:
      BOTH SOURCES RAY FROM THE SAME ORIGIN: _ray_origin_local, the mesh's
-     volumetric centroid, drawn filled ("P") in every ray panel. The geom frame
-     origin is drawn hollow ("X") for reference -- it is where the SDF/normal
-     functions are centred, and on a YCB scan it sits at the object's BASE
-     (measured |centroid - geom origin|: 036_wood_block 112mm, 065-a_cups 63mm,
-     017_orange 44mm), which is why raying from it was wrong. They coincide on
-     an analytic primitive.
+     volumetric centroid, drawn "P" in every ray panel. The geom frame origin
+     (the SDF frame centre) is NOT drawn by default -- it is not part of the
+     seeding geometry, and on a YCB scan it sits far outside the object where
+     it only adds a distracting marker. --ray-origins brings it back for the
+     one question it answers: why raying from it was wrong (measured |centroid
+     - geom origin|: 036_wood_block 112mm, 065-a_cups 63mm, 017_orange 44mm).
        - minor-axis seed (_fixed_antipodal_seed): the deterministic pair tried
          FIRST by every solve. Rays from the SHARED CENTROID along the object's
          minor principal axis. Deliberately
@@ -301,7 +301,7 @@ def draw_mesh(ax, sc, alpha=0.10, max_tris=3000):
     return Vw
 
 
-def draw_seed_rays(ax, sc, rec):
+def draw_seed_rays(ax, sc, rec, show_geom_origin=False):
     """Part 1: the ray, its endpoint, and the projection onto the surface."""
     s, ray = rec["seed"], rec["ray"]
     ok = rec["ok"]
@@ -326,26 +326,25 @@ def draw_seed_rays(ax, sc, rec):
         ax.scatter(*e1, facecolor="none", edgecolor=col, s=28, lw=1.0, alpha=a, zorder=5)
         _arrow(ax, e1, s["p1s"], col, a)
 
-    # RAY ORIGIN. BOTH seed sources now ray from the same point --
-    # _ray_origin_local, the mesh's volumetric centroid -- drawn filled ("P")
-    # and tagged. The geom frame origin is drawn too, hollow ("X"), purely as a
-    # reference: it is where the SDF/normal functions are centred, and on a YCB
-    # scan it sits at the object's BASE, far from the object's middle (measured
-    # |centroid - geom origin|: 112mm on 036_wood_block, 63mm on 065-a_cups,
-    # 44mm on 017_orange). Seeing the two together is what makes it obvious why
-    # raying from the geom origin was wrong. They coincide on a primitive.
-    gc, hc = ray.get("geom_center"), ray.get("hull_centroid")
-    for pt, name, mk, active in ((hc, "centroid ← ray origin (both sources)", "P", True),
-                                 (gc, "geom origin (SDF frame centre)", "X", False)):
-        if pt is None:
-            continue
-        ax.scatter(*pt, marker=mk,
-                   s=95 if active else 45,
-                   color=col if active else "none",
-                   edgecolor=col, lw=1.1,
-                   alpha=a if active else a * 0.5, zorder=6)
-        ax.text(*pt, f"  {name}", fontsize=6.5, color=col,
-                alpha=1.0 if active else 0.55, zorder=7)
+    # RAY ORIGIN. Both seed sources ray from the same point --
+    # _ray_origin_local, the mesh's volumetric centroid. The SDF frame centre
+    # (geom origin) is deliberately NOT drawn here: it is not part of the
+    # seeding geometry, it is only the frame the SDF/normal functions are
+    # defined in, and on a YCB scan it sits far outside the object where it
+    # just adds a distracting marker. The --ray-origins flag brings it back
+    # for the one question it answers (why the geom origin was the wrong
+    # thing to ray from).
+    hc = ray.get("hull_centroid")
+    if hc is not None:
+        ax.scatter(*hc, marker="P", s=95, color=col, edgecolor="k", lw=0.6,
+                   alpha=a, zorder=6)
+        ax.text(*hc, "  centroid (ray origin)", fontsize=6.5, color=col, zorder=7)
+    if show_geom_origin and ray.get("geom_center") is not None:
+        gc = ray["geom_center"]
+        ax.scatter(*gc, marker="X", s=45, facecolor="none", edgecolor=col,
+                   lw=1.1, alpha=a * 0.5, zorder=6)
+        ax.text(*gc, "  geom origin (SDF frame centre)", fontsize=6.5,
+                color=col, alpha=0.55, zorder=7)
 
     # PAIRING: the chord joining this seed's two footprints. Drawn for BOTH
     # seed kinds -- for a random seed it is also the physical march leg
@@ -443,7 +442,7 @@ def _equal_axes(ax, pts, pad=0.005, min_r=None):
 
 def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
                 out_dir: Path, elev: float, azim: float,
-                show_rejected: bool = False):
+                show_rejected: bool = False, show_geom_origin: bool = False):
     sc = build_object(obj)
     cfg = sc["cfg"]
     cfg.quadratic_mesh_fit = mesh_fit
@@ -490,7 +489,7 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
     for i, rec in enumerate(panel_recs):
         axr = fig.add_subplot(gs[0, i], projection="3d")
         Vw = draw_mesh(axr, sc)
-        draw_seed_rays(axr, sc, rec)
+        draw_seed_rays(axr, sc, rec, show_geom_origin=show_geom_origin)
         # Frame on the OBJECT (plus a small margin), not on the ray extent.
         # A seed ray starts 2.5*max(geom_size) out, so including its far tail
         # in an equal-aspect cube shrinks the object to a blob in the middle
@@ -499,11 +498,11 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
         # is the last stretch where the ray meets the surface.
         _equal_axes(axr, np.vstack([Vw, s_pts(rec)]), pad=0.03)
         _rej = "" if rec["ok"] else f"\nREJECTED: {rec['why']}"
-        _org = rec["ray"].get("origin_kind", "?")
         _d = np.linalg.norm(np.asarray(rec["ray"]["hull_centroid"], float)
                             - np.asarray(rec["ray"]["geom_center"], float))
-        axr.set_title(f"seed {i} ({rec['kind']}) — ray → projection\n"
-                      f"rays from {_org}  (centroid–geom-origin gap {_d*1e3:.0f}mm)"
+        _gap = (f"  (centroid–geom-origin gap {_d*1e3:.0f}mm)"
+                if show_geom_origin else "")
+        axr.set_title(f"seed {i} ({rec['kind']}) — ray → projection{_gap}"
                       f"{_rej}", fontsize=8.5,
                       color="k" if rec["ok"] else "#cb181d")
         axr.view_init(elev=elev, azim=azim)
@@ -567,14 +566,15 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
                    label="index patch — extrapolated"),
         plt.Line2D([], [], color="0.25", marker="P", ls="none", ms=9,
                    label="volumetric centroid — shared ray origin"),
-        plt.Line2D([], [], markerfacecolor="none", markeredgecolor="0.25",
-                   marker="X", ls="none", ms=8,
-                   label="geom origin (SDF frame centre, reference only)"),
         plt.Line2D([], [], color="0.25", ls="--", label="minor-axis seed ray"),
         plt.Line2D([], [], color="0.25", ls=":", label="random seed ray"),
         plt.Line2D([], [], color="0.25", ls="-.", label="antipodal march (p1s→p2s)"),
         plt.Line2D([], [], color="#cb181d", lw=2, label="rejected seed"),
     ]
+    if show_geom_origin:
+        handles.append(plt.Line2D([], [], markerfacecolor="none",
+                                  markeredgecolor="0.25", marker="X", ls="none",
+                                  ms=8, label="geom origin (SDF frame centre)"))
     fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=8, frameon=False)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -735,6 +735,10 @@ def main():
     ap.add_argument("--show-rejected", action="store_true",
                     help="also draw patch panels for seeds the gates rejected "
                          "(automatic when NO seed is accepted, e.g. 065-a_cups)")
+    ap.add_argument("--ray-origins", action="store_true",
+                    help="also mark the geom origin (SDF frame centre) in the ray "
+                         "panels; off by default since it is not part of the "
+                         "seeding geometry")
     ap.add_argument("--ray-distribution", action="store_true",
                     help="instead of the per-seed panels, draw ONE figure showing "
                          "the distribution of sampled seed rays for every object")
@@ -757,7 +761,7 @@ def main():
         return
     for obj in objs:
         plot_object(obj, a.n_random, not a.no_mesh_fit, a.rng_seed,
-                    a.out_dir, a.elev, a.azim, a.show_rejected)
+                    a.out_dir, a.elev, a.azim, a.show_rejected, a.ray_origins)
 
 
 if __name__ == "__main__":
