@@ -70,7 +70,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -593,6 +593,136 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
     return out
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Distribution view — many rays at once, all objects in one figure
+# ─────────────────────────────────────────────────────────────────────────────
+def sample_ray_distribution(sc, n: int, rng_seed: int = 0):
+    """`n` random seed directions drawn EXACTLY as _seed_pair draws them, with
+    the surface footprint each one lands on.
+
+    Reproduces _seed_pair's own two lines (standard_normal, then u[2] *= 0.5)
+    rather than calling it, because we want only the ray and its first
+    projection -- not the antipodal march, the gates, or the finger assignment.
+    Anything that changes _seed_pair's direction sampling must be mirrored here;
+    the shared ray ORIGIN comes from _ray_origin_local so at least that cannot
+    drift."""
+    gt, gs, c, R, me = (sc["geom_type"], sc["geom_size"], sc["center"],
+                        sc["R"], sc["mesh_entry"])
+    bbox_r = float(np.max(gs)) * 2.5
+    c_ray = c + R @ _ray_origin_local(gt, me)
+    rng = np.random.default_rng(rng_seed)
+    dirs, hits = [], []
+    for _ in range(n):
+        u = rng.standard_normal(3)
+        u[2] *= 0.5              # _seed_pair's bias away from top/bottom faces
+        u /= np.linalg.norm(u) + 1e-12
+        dirs.append(u)
+        hits.append(_project_to_surface_np(c_ray + u * bbox_r, gt, c, R, gs,
+                                           mesh_entry=me))
+    return c_ray, np.array(dirs), np.array(hits)
+
+
+def plot_ray_distribution(objects, n_rays, rng_seed, out_dir, elev, azim):
+    """ONE figure, one column per object: where the seed rays actually go.
+
+    Answers a different question from the per-seed panels -- not "what did this
+    pair do" but "is the sampling covering the object at all". Two rows:
+      top    -- the rays themselves, drawn from the shared centroid outward to
+                the surface, over the transparent mesh.
+      bottom -- the landed footprints alone, colored by height, plus the
+                elevation histogram of the sampled directions. _seed_pair
+                applies u[2] *= 0.5 to bias AWAY from the top and bottom faces;
+                the histogram is where that bias is actually visible, and the
+                footprint cloud is where its effect on coverage shows up.
+    """
+    n_cols = len(objects)
+    fig = plt.figure(figsize=(max(5.2 * n_cols, 11.0), 9.4))
+    gs_ = fig.add_gridspec(2, n_cols, height_ratios=[1.35, 1.0])
+    fig.suptitle(
+        f"seed ray distribution — {n_rays} random directions per object "
+        f"(_seed_pair sampling, from the shared volumetric centroid)\n"
+        "top: rays to their surface footprint   |   "
+        "bottom: where those rays LAND, vs this shape's own surface-area "
+        "profile (_seed_pair's u[2] *= 0.5 biases away from top/bottom faces)",
+        fontsize=11)
+
+    for i, obj in enumerate(objects):
+        sc = build_object(obj)
+        c_ray, dirs, hits = sample_ray_distribution(sc, n_rays, rng_seed)
+
+        ax = fig.add_subplot(gs_[0, i], projection="3d")
+        Vw = draw_mesh(ax, sc, alpha=0.10)
+        # One line per ray, centroid -> footprint. Thin and translucent so the
+        # DENSITY reads (a few hundred opaque lines would just be a solid ball).
+        segs = np.stack([np.repeat(c_ray[None, :], len(hits), 0), hits], axis=1)
+        ax.add_collection3d(Line3DCollection(segs, colors="#2171b5",
+                                             linewidths=0.35, alpha=0.28))
+        ax.scatter(hits[:, 0], hits[:, 1], hits[:, 2], s=5,
+                   c=hits[:, 2], cmap="viridis", depthshade=False, zorder=6)
+        ax.scatter(*c_ray, marker="P", s=90, color="#d94801",
+                   edgecolor="k", lw=0.6, zorder=8)
+        _equal_axes(ax, np.vstack([Vw, hits]), pad=0.01)
+        ax.set_title(f"{obj}\n{len(hits)} rays from the shared centroid", fontsize=9)
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_xlabel("x (m)", fontsize=7); ax.set_ylabel("y (m)", fontsize=7)
+        ax.set_zlabel("z (m)", fontsize=7); ax.tick_params(labelsize=6)
+
+        # WHERE THE RAYS LAND, as a height histogram over the object's own
+        # z-extent. Deliberately NOT a histogram of the sampled directions:
+        # _seed_pair's direction sampling is object-INDEPENDENT, so that plot is
+        # identical in every column and says nothing per object. Coverage is
+        # what differs, and it is what a seeding strategy is judged on -- a face
+        # that never gets sampled cannot be grasped no matter how good the
+        # downstream solve is.
+        #
+        # The reference line is the object's own surface-area distribution over
+        # height, estimated from the visual mesh's triangle areas: that is what
+        # "uniform coverage of THIS shape" would look like. Deviation from it is
+        # the sampling bias, separated from the shape's own geometry (a cup is
+        # mostly wall, so even perfect sampling is not flat in z).
+        axh = fig.add_subplot(gs_[1, i])
+        zlo, zhi = float(hits[:, 2].min()), float(hits[:, 2].max())
+        _rng_z = max(zhi - zlo, 1e-6)
+        axh.hist(hits[:, 2], bins=30, range=(zlo, zhi), color="#2171b5",
+                 alpha=0.85, density=True, label="ray footprints")
+        # area-weighted reference from the mesh triangles, in WORLD z
+        Vw_l = sc["center"] + sc["Vvis"] @ sc["R"].T
+        F = np.asarray(sc["Fvis"], int)
+        _a, _b, _c3 = Vw_l[F[:, 0]], Vw_l[F[:, 1]], Vw_l[F[:, 2]]
+        _ar = 0.5 * np.linalg.norm(np.cross(_b - _a, _c3 - _a), axis=1)
+        _zc = (_a[:, 2] + _b[:, 2] + _c3[:, 2]) / 3.0
+        _h, _e = np.histogram(_zc, bins=30, range=(zlo, zhi), weights=_ar)
+        _w = (_e[1] - _e[0])
+        _h = _h / max(_h.sum() * _w, 1e-12)
+        axh.plot(0.5 * (_e[:-1] + _e[1:]), _h, color="#cb181d", lw=1.4, ls="--",
+                 label="surface area of this shape")
+        # Coverage: fraction of height bands that got at least one footprint.
+        _cov = float(np.mean(np.histogram(hits[:, 2], bins=20,
+                                          range=(zlo, zhi))[0] > 0)) * 100
+        axh.set_title(f"footprint height — spans {_rng_z*1e3:.0f}mm, "
+                      f"{_cov:.0f}% of bands hit", fontsize=8)
+        axh.set_xlabel("footprint z (m)", fontsize=7)
+        axh.set_ylabel("density", fontsize=7)
+        axh.tick_params(labelsize=6); axh.grid(alpha=0.3)
+        axh.legend(fontsize=6.5, frameon=False)
+
+        el = np.degrees(np.arcsin(np.clip(dirs[:, 2], -1, 1)))
+        _frac = float(np.mean(np.abs(el) > 60.0)) * 100
+        print(f"  [{obj}] {len(hits)} rays  "
+              f"footprint z [{zlo:.3f}, {zhi:.3f}]m  "
+              f"{_cov:.0f}% of height bands hit  "
+              f"({_frac:.0f}% of directions steeper than +/-60deg, isotropic 13%)")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "seedray_distribution.png"
+    fig.subplots_adjust(left=0.05, right=0.97, top=0.88, bottom=0.07,
+                        wspace=0.22, hspace=0.28)
+    fig.savefig(out, dpi=115)
+    plt.close(fig)
+    print(f"-> {out}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -605,6 +735,11 @@ def main():
     ap.add_argument("--show-rejected", action="store_true",
                     help="also draw patch panels for seeds the gates rejected "
                          "(automatic when NO seed is accepted, e.g. 065-a_cups)")
+    ap.add_argument("--ray-distribution", action="store_true",
+                    help="instead of the per-seed panels, draw ONE figure showing "
+                         "the distribution of sampled seed rays for every object")
+    ap.add_argument("--n-rays", type=int, default=300,
+                    help="rays per object for --ray-distribution")
     ap.add_argument("--rng-seed", type=int, default=0)
     ap.add_argument("--elev", type=float, default=18.0)
     ap.add_argument("--azim", type=float, default=-60.0)
@@ -616,6 +751,10 @@ def main():
     a = ap.parse_args()
 
     objs = a.objects if a.objects else DEFAULT_OBJECTS
+    if a.ray_distribution:
+        plot_ray_distribution(objs, a.n_rays, a.rng_seed, a.out_dir,
+                              a.elev, a.azim)
+        return
     for obj in objs:
         plot_object(obj, a.n_random, not a.no_mesh_fit, a.rng_seed,
                     a.out_dir, a.elev, a.azim, a.show_rejected)
