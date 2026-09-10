@@ -53,6 +53,7 @@ import simulation.grasp_config_builder as _grasp_config_builder  # noqa: E402
 
 from kinova_common.constants import (FINGER_TIP_SITES, FINGER_CODE, FINGER_SET,
                                      GEN3_XML, FINGERTIP_POINTING_AXIS)
+from kinova_common.grasp_plots import write_grasp_plots
 from kinova_common.wrench import solve_gamma_live, composite_wrench_cone, hull3d
 from kinova_common.geometry import _approach_orientation, _finger_collision_geoms
 from kinova_common.keyboard import make_key_callback
@@ -2948,6 +2949,47 @@ if __name__ == "__main__":
             data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
         return _cand
 
+    def _emit_lockin_figure(obj_idx, cand):
+        """Render the grasp analysis figure for the candidate just locked in.
+
+        No-op unless --rec-log-dir is set. Runs on a DAEMON THREAD: the figure is
+        matplotlib-Agg and takes ~1-2 s, which would visibly stall the viewer if it ran
+        inline on the render thread at lock-in.
+
+        Two things this deliberately does NOT do:
+          - it does not render the hand overlay (render_hand=False). That needs the GL
+            context the viewer thread owns; grabbing it from here deadlocks.
+          - it does not delete the trace afterwards (unlike the benchmark, which rmtree's
+            its log_dir). Another solve may be writing into the shared log_dir
+            concurrently, and the per-solve snapshot is cheap to keep.
+        """
+        if _REC_LOG_ROOT is None or cand is None:
+            return
+        _tdir = cand.get('trace_dir')
+        _res  = cand.get('res')
+        if _tdir is None or _res is None:
+            print("[rec] lock-in figure skipped: no NLP trace for this candidate "
+                  "(was --rec-log-dir set before the solve?)")
+            return
+        _o    = objects[obj_idx]
+        _n    = _rec_lockin_n[0] = _rec_lockin_n[0] + 1
+        _outd = os.path.join(_REC_LOG_ROOT, _o['name'], f"lockin_{_n:03d}")
+        _pos  = data.xpos[_o['id_body']].copy()
+
+        def _work():
+            try:
+                os.makedirs(_outd, exist_ok=True)
+                for _qp in (False, True):     # contact view, then the Picard-path view
+                    write_grasp_plots(
+                        model, data, _res, cand.get('verify'), _tdir,
+                        _o['name'], _n, _o['name'], _o['id_body'], _pos, _outd,
+                        quadratic_path=_qp, render_hand=False)
+                print(f"[rec] lock-in {_n} analysis figures -> {_outd}/")
+            except Exception:
+                traceback.print_exc()
+
+        threading.Thread(target=_work, daemon=True).start()
+
     def _recommended_inward_normals(obj_idx, p1, p2):
         """Outward->inward surface normals at p1/p2 for the object's live geom pose,
         using the planner's shape-aware _geom_normal_np. Returns (n1_in, n2_in).
@@ -4097,6 +4139,7 @@ if __name__ == "__main__":
                         plan_thread.start()
                         print(f"[teleop] LOCK-IN {objects[active_idx]['name']} — "
                               f"solving IK + RRT to recommended contacts ...")
+                        _emit_lockin_figure(active_idx, _cand)
 
                 if TELEOP_PROFILE:
                     _t = time.perf_counter(); _tp_acc['recommender'] += _t - _tp_s; _tp_s = _t
@@ -4686,6 +4729,7 @@ if __name__ == "__main__":
                         print(f"\r\n[auto-rec] LOCK-IN {objects[active_idx]['name']} "
                               f"(wf, cost={_cand.get('cost')}) — solving IK + RRT to "
                               f"recommended contacts ...")
+                        _emit_lockin_figure(active_idx, _cand)
                 # Consume the L latch whether or not it committed (idle-only): a press
                 # while busy (planning/grasping) is ignored, not queued for later.
                 _auto_lock_in = False

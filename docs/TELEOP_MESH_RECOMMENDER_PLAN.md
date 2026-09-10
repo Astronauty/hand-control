@@ -397,9 +397,37 @@ figures across the object set without a human at the viewer.
 
 ## 5. Risks / things that will bite
 
-- **First mesh SDF bake is slow.** `_mesh_sdf_entry` bakes+caches a CasADi SDF. Doing
-  it lazily inside the 2 s recommender thread will stall the first solve badly. Bake
-  all spawned objects at startup.
+- **First mesh SDF bake is slow — MEASURED at ~21 s PER OBJECT.** Confirmed on this
+  machine: the five-object `pick_place` scene spends ~130 s in `_mesh_sdf_entry`
+  before the viewer opens (gelatin 21.6 s, wood_block 21.2 s, orange 21.2 s, lemon
+  20.2 s, tennis_ball 45.9 s). This is why the eager bake is a hard requirement, not
+  an optimization — lazily inside the 2 s recommender thread it would have been
+  catastrophic, and would have looked like a planner hang.
+
+  **It is NOT amortized by the disk cache, and the cost is in ONE place.** Profiled
+  per stage on `017_orange` with the npz already on disk:
+
+  ```
+  load_or_bake           19 ms     <- the disk cache works; the grid is NOT the cost
+  casadi_fn           23634 ms     <- the B-spline interpolant over the SDF lattice
+  casadi_grad_fn         41 ms
+  hessian construct     114 ms
+  ```
+
+  So it is `object_sdf.casadi_fn` — constructing the CasADi B-spline over the full
+  SDF grid — and it is paid on EVERY run regardless of the cache. A contact-aware
+  teleop session on the default 5-object scene therefore starts ~2 minutes slower
+  than a dexpilot one.
+
+  (An earlier guess that `hessian_fn` was the culprit was wrong — it is 114 ms.
+  Whatever is done about this has to target `casadi_fn`.)
+
+  Worth fixing if it becomes a workflow irritant, but NOT in scope here and NOT to be
+  guessed at: the fix is either a coarser lattice for the live recommender, caching
+  the serialized CasADi function (`fn.save()`/`ca.Function.load`) next to the npz, or
+  baking the objects in parallel across processes. Until then, iterate with a trimmed
+  object set — `--objects` for primitives, or a shortened `models/scene_objects.json`
+  list for meshes.
 - **Solve time.** The teleop preset uses `max_iter=120` and 5 seeds against a
   primitive. Mesh SDF constraints are heavier; expect the 2 s cadence to be missed.
   `_recommender_tick` already guards with `_rec_idle`, so it degrades to "solve as
