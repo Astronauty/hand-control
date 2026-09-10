@@ -1508,6 +1508,69 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     return t_var, p_world, (t_bound_0, t_bound_1), frame
 
 
+def _quadratic_inward_normal_ca(t_var, frame: dict, mat_np):
+    """INWARD unit normal of the local paraboloid at (t0,t1), as a CasADi MX
+    expression in WORLD coordinates -- the closed-form counterpart of
+    _sym_inward_normal_ca for a mesh contact under use_quadratic_contact.
+
+    The patch _mesh_quadratic_contact_ca builds is
+
+        p(t) = seed + t0*a0 + t1*a1 + h(t)*n,
+        h(t) = -(kappa0*t0^2 + kappa1*t1^2) / (2*grad_norm)
+
+    so its tangents and hence its normal are available in CLOSED FORM:
+
+        dp/dt0 = a0 - (kappa0*t0/grad_norm) * n
+        dp/dt1 = a1 - (kappa1*t1/grad_norm) * n
+        n(t)   = normalize(dp/dt0 x dp/dt1)
+
+    Every coefficient (a0, a1, n, kappa0/1, grad_norm) is a numpy constant
+    frozen at seed time, so this is a low-degree polynomial in t_var --
+    exactly differentiable, no SDF call, no mesh lookup.
+
+    WHY THIS MATTERS. The wrench-cone LP and GWS both build their friction
+    cones on a contact frame [n_in | t1 | t2]. For a mesh that frame was
+    always a FROZEN parameter, i.e. the normal at the seed, held constant
+    while the optimizer moved the contact across the patch -- which is
+    inconsistent with the very surrogate being used for POSITION: kappa is
+    precisely the statement that the normal tilts as the contact moves, and
+    freezing the frame discards it. Measured normal error against the true
+    SDF over a patch: 017_orange 9.22deg median (frozen) vs 2.02deg
+    (analytic); 065-a_cups 8.77 vs 5.02. On a PLANAR patch (kappa=0) the two
+    coincide exactly, which is the correct degenerate case.
+
+    Sign: returns the INWARD normal, matching _sym_inward_normal_ca and
+    _build_contact_frame_3d's convention (R[:,0] = inward). frame['n_l'] is
+    the OUTWARD SDF gradient direction, so the cross product is oriented
+    against it and then negated.
+
+    mat_np : object world rotation; the frame's vectors are object-local, and
+        the wrench machinery works in world, so the result is rotated out.
+    """
+    a0 = ca.DM(np.asarray(frame["axis0_l"], float))
+    a1 = ca.DM(np.asarray(frame["axis1_l"], float))
+    n_l = np.asarray(frame["n_l"], float)
+    n_dm = ca.DM(n_l)
+    k0 = float(frame["kappa0"]); k1 = float(frame["kappa1"])
+    gn = float(frame["grad_norm"])
+
+    dp0 = a0 - (k0 * t_var[0] / gn) * n_dm
+    dp1 = a1 - (k1 * t_var[1] / gn) * n_dm
+    nc = ca.cross(dp0, dp1)
+    # Orient against the seed's OUTWARD normal. a0,a1,n_l are right-handed up
+    # to the eigen-decomposition's arbitrary axis signs, so the raw cross
+    # product's orientation is not guaranteed -- fix it with the numpy-side
+    # sign, which is a constant (not a function of t_var) and so keeps the
+    # expression smooth.
+    _sgn = float(np.sign(np.dot(np.cross(np.asarray(frame["axis0_l"], float),
+                                         np.asarray(frame["axis1_l"], float)), n_l)))
+    if _sgn == 0.0:
+        _sgn = 1.0
+    n_out_sym = (_sgn * nc) / (ca.norm_2(nc) + 1e-12)
+    n_in_local = -n_out_sym
+    return ca.DM(np.asarray(mat_np, float)) @ n_in_local
+
+
 def _friction_cone_verts(mu: float) -> np.ndarray:
     """5-vertex linearized Coulomb cone in the LOCAL contact frame [n_in|t1|t2]
     (origin + 4 unit-normal-force edges at ±mu tangential). Shared by the
@@ -2125,6 +2188,14 @@ class SolverBackendConfig:
     # inconsistent across iterations because ∇f changes not just due to x movement
     # but also due to the frame rotating with x — demonstrably harder to solve.
     symbolic_normals: bool = True
+    # Same idea for a MESH contact under use_quadratic_contact: build the
+    # wrench/GWS contact frame from the paraboloid's OWN analytic normal
+    # (_quadratic_inward_normal_ca) instead of freezing the seed's. The
+    # surrogate already carries the curvature that says how the normal tilts
+    # across the patch, so freezing the frame contradicts the model used for
+    # position. Separate flag from symbolic_normals because it applies to a
+    # different geometry class and changes NLP conditioning independently.
+    quadratic_symbolic_normals: bool = False
     smooth_sdf: bool  = True
     slsqp_alpha: float = 400.0  # smooth SDF alpha (collision avoidance SDF only)
 
@@ -3178,9 +3249,28 @@ class GraspPlanner3D:
             # both default to 0.0" docstring) but structurally wasn't.
             _need_contact_frame = cfg.wrench_constraint or cfg.w_gws > 0.0 or cfg.w_span > 0.0
             if _need_contact_frame:
+                # MESH under use_quadratic_contact: the paraboloid surrogate
+                # supplies the normal in CLOSED FORM (see
+                # _quadratic_inward_normal_ca), so the frame can track the
+                # contact the same way it does for an analytic sphere/cylinder
+                # -- no SDF call, no mesh lookup, exactly differentiable.
+                # Gated on its own flag because it makes the frame a function
+                # of the decision variables, which changes the NLP's
+                # conditioning (see cfg.symbolic_normals' own note about
+                # L-BFGS seeing curvature pairs from both movement AND frame
+                # rotation).
+                use_quad_sym = (cfg.quadratic_symbolic_normals
+                                and _is_mesh and cfg.use_quadratic_contact
+                                and _t1_frame is not None and _t2_frame is not None
+                                and _t1_var is not None and _t2_var is not None)
                 use_sym_normals = (cfg.symbolic_normals and
                                    geom_type in (2, 5))  # sphere / cylinder only
-                if use_sym_normals:
+                if use_quad_sym:
+                    _n1_in_sym = _quadratic_inward_normal_ca(_t1_var, _t1_frame, obj_R_np)
+                    _n2_in_sym = _quadratic_inward_normal_ca(_t2_var, _t2_frame, obj_R_np)
+                    _R1_expr = _symbolic_contact_frame_ca(_n1_in_sym)
+                    _R2_expr = _symbolic_contact_frame_ca(_n2_in_sym)
+                elif use_sym_normals:
                     # Contact frame built as a CasADi MX expression of _p1/_p2.
                     # CasADi re-evaluates this at every eval_f / eval_grad_f call,
                     # so the frame tracks the current contact position throughout

@@ -202,6 +202,7 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                    w_span=1.0, view=False, out_dir=None, do_transport=True,
                    max_iter=200, w_edge_margin=0.0, directional_r_tip=True,
                    mesh_fit=True, sdf_err_tol=None, quadratic_path=False,
+                   quad_sym_normals=False,
                    impratio=None, gamma_override=None,
                    squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05,
                    lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS):
@@ -241,6 +242,11 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                   ground_clearance_m=0.006)
     if n_relin is not None:
         cfg_kw["n_normal_relinearize"] = n_relin
+    if quad_sym_normals:
+        # Build the wrench/GWS contact frame from the paraboloid's own
+        # analytic normal instead of freezing the seed's -- see
+        # GraspConfig3D.quadratic_symbolic_normals.
+        cfg_kw["quadratic_symbolic_normals"] = True
     if sdf_err_tol is not None:
         # Trust-region tolerance for the local-quadratic surrogate: how far the
         # paraboloid may depart from the true SDF along each axis before that
@@ -591,6 +597,10 @@ def main():
     ap.add_argument("--no-mesh-fit", dest="mesh_fit", action="store_false",
                     help="use the SDF-Hessian curvature instead of the mesh fit")
     ap.add_argument("--w-edge-margin", type=float, default=0.0)
+    ap.add_argument("--quad-sym-normals", action="store_true",
+                    help="build the contact frame from the paraboloid's analytic "
+                         "normal instead of freezing the seed's "
+                         "(GraspConfig3D.quadratic_symbolic_normals)")
     ap.add_argument("--quadratic-path", action="store_true",
                     help="write the Picard-trajectory figure instead of the "
                          "per-contact grasp figure (useful when tuning "
@@ -652,6 +662,7 @@ def main():
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
         sdf_err_tol=args.sdf_err_tol, quadratic_path=args.quadratic_path,
+        quad_sym_normals=args.quad_sym_normals,
         impratio=args.impratio, gamma_override=args.gamma,
         squeeze_pd_scale=args.squeeze_pd_scale,
         finger_kp=args.finger_kp, finger_kd=args.finger_kd,
