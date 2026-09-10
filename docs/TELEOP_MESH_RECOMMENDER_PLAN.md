@@ -504,3 +504,52 @@ default and treat `tuned` as a measurement profile only, or (b) re-derive the no
 compensation as a floor ON the certified gamma (`gamma = max(gamma_live, gamma_floor)`)
 and re-measure. **Recommend (a) until Phase 3c's table exists** — there is no basis
 for changing teleop's force contract before the pick/drop numbers are in hand.
+
+
+---
+
+## 10. Status as built (2026-09-10)
+
+Commits: `d366440` (shared plot writer), `4ee74ec` (teleop mesh recommender).
+
+**Done and verified:**
+- Phase 1 — `kinova_common/grasp_plots.py`. Benchmark output byte-identical
+  (md5 86c96e88), both figure branches re-checked.
+- Phase 2 — capability gate + eager SDF bake + mesh-aware normals. 5/5 objects
+  supported in the default `pick_place` scene (previously a hard `sys.exit`).
+- Phase 3 — `use_quadratic_contact`/`quadratic_mesh_fit`/`ground_z` on the teleop
+  preset; `--rec-log-dir`.
+- Phase 3b — `--contact-profile {stock,tuned}`, default stock, rejected on
+  dexpilot/anyteleop (verified: the guard fires).
+- Phase 4 — lock-in figures on a daemon thread, per-solve trace snapshot, `res`
+  carried for winning-attempt matching.
+
+Verified headlessly on `056_tennis_ball` (teleop preset, mesh): converged,
+`wrench_feasible=True`, `gamma_min=2.59`, all 13 `quad1_*` keys recorded, both
+figures rendered, fitted kappa ~(+31,+34)/m => ~31 mm radius vs the ball's true
+~33 mm. The quadratic fit is recovering real geometry.
+
+**NOT done — Phase 3c (pick/drop validation) is still owed.** The table in §3c is
+empty. Until it is filled, `--contact-profile tuned` is an untested code path and
+`stock` remains the default for that reason.
+
+## 11. Two findings that need a decision
+
+### A. `036_wood_block` is wrench-INFEASIBLE on the teleop preset
+
+Measured on the mesh, teleop preset: `wrench_feasible=False`, `gamma_min=None`,
+**both with and without** `use_quadratic_contact` (A/B'd). So it is pre-existing,
+not introduced by this work — but it matters, because the recommender's WF gate
+means teleop will simply never display a candidate for that object. The figure also
+shows the likely cause: the index contact fits `kappa=(+0.3, +371.5)/m` on a FLAT
+wood-block face. 371.5/m is a ~2.7 mm radius, which collapses the trust region to
+`t1 in [-2,+2] mm`. That is the degenerate-fit signature SOLVER_STATE.md §9 already
+tracks, now visible in a picture rather than inferred from two numbers.
+
+Note the benchmark reaches `wrench_feasible=True` on the same object — it uses
+`for_ablation_default` with the full geom set, not the teleop preset. Worth a
+focused comparison of the two presets on this object.
+
+### B. Startup cost is ~21 s per mesh object, in `object_sdf.casadi_fn`
+
+See §5. Not addressed here; the plan lists the options rather than guessing at one.
