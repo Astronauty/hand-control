@@ -97,6 +97,17 @@ ego)
 	exec python3 teleop/hand_ego_view.py
 	;;
 
+tune)
+	# Live pinch/retarget tuner: subscribes to /hand/joint_angles and shows the hand +
+	# per-finger pinch detection with sliders (EPS, enter/exit, median) that save to
+	# teleop/calibration/retarget_config.json. NEEDS the hand publisher running in another
+	# terminal (./start_teleop.sh hands) or it just shows "waiting for hand data...".
+	# ros_env sources ROS + unsets CYCLONEDDS_URI so the subscription actually receives.
+	ros_env
+	shift   # drop 'tune'; forward any remaining args (e.g. --topic, --span) to the tuner
+	exec python3 teleop/hand_tune.py "$@"
+	;;
+
 mock)
 	cd "$HERE" || exit 1
 	exec python3 teleop/mock_headset.py --motion "${2:-open_close}"

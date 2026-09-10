@@ -154,6 +154,16 @@ if __name__ == "__main__":
              "Passing this opts OUT of the default multicam fusion. Omit it to use "
              "the default: auto-discovered multi-camera fusion (see --multicam-auto).")
     _arg_parser.add_argument(
+        '--anyteleop-type', dest='anyteleop_type', choices=['vector', 'dexpilot'],
+        default=None,
+        help="AnyTeleop retargeting optimizer for --mode anyteleop / "
+             "contact_aware_w_anyteleop (ignored otherwise). 'vector' is the retargeter "
+             "AnyTeleop presents as its method (its live video demos); 'dexpilot' is "
+             "dex-retargeting's DexPilot-style pinch-aware optimizer. Overrides "
+             "anyteleop_config.json's retargeting_type for THIS run and appends to the "
+             "trial-log dir name, so the two AnyTeleop baseline conditions log distinctly. "
+             "Default: whatever the config file says.")
+    _arg_parser.add_argument(
         '--position-mode', choices=['relative', 'absolute'], default=None,
         help="dexpilot position mapping. relative: press-8 re-zeroable, robot tracks "
              "abs_scale × (board displacement from press-8). absolute: true absolute, "
@@ -318,6 +328,11 @@ if __name__ == "__main__":
         args.mode = 'contact_aware_teleop'
     elif args.mode == 'contact_aware_w_anyteleop':
         args.mode, _RETARGETER = 'contact_aware_teleop', 'anyteleop'
+    # For the AnyTeleop baseline, --anyteleop-type distinguishes the two optimizer conditions
+    # (vector vs dexpilot). Append it to the run label so logs/<...>_<type>/ stays distinct;
+    # ignored for non-anyteleop runs.
+    if _RETARGETER == 'anyteleop' and args.anyteleop_type is not None:
+        _run_label = f'{_run_label}_{args.anyteleop_type}'
     if args.multicam and args.multicam_auto:
         _arg_parser.error("--multicam and --multicam-auto are mutually exclusive")
     # Multicam fusion is the DEFAULT hand source in teleop modes: a bare run
@@ -435,7 +450,8 @@ if __name__ == "__main__":
                     _spec, _oid, _entry.get('xy', [0.5, 0.3]),
                     mass=_entry.get('mass'),
                     friction=tuple(_entry['friction']) if 'friction' in _entry else (2.0, 0.05, 0.005),
-                    quat=tuple(_entry['quat']) if 'quat' in _entry else (1.0, 0.0, 0.0, 0.0))
+                    quat=tuple(_entry['quat']) if 'quat' in _entry else (1.0, 0.0, 0.0, 0.0),
+                    solref=tuple(_entry['solref']) if 'solref' in _entry else (0.004, 1.0))
             except FileNotFoundError as _e:
                 sys.exit(f"[scene] {_e}")
             _ycb_placed.append((_bn, _entry.get('xy', [0.5, 0.3])))
@@ -1034,6 +1050,25 @@ if __name__ == "__main__":
             'ipopt_ms':     ipopt_ms,
         })
 
+    def _log_retarget_latency(trial_id):
+        """Log the finger-retarget latency for this trial as a 'solve' event with
+        component='retarget' (mean/p95/last ms over the trial's solves). This is the
+        dexpilot-vs-anyteleop headline latency; parse_trials_tables.py surfaces it per method.
+        Clears the controller's rolling window so each trial's stat is its own. No-op without
+        a trial logger or an active dexpilot controller."""
+        if _dexpilot_ctrl is None or 'args' not in dir() or not getattr(args, 'trial_log', None):
+            return
+        try:
+            st = _dexpilot_ctrl.retarget_latency_stats(clear=True)
+        except Exception:
+            return
+        if st is None:
+            return
+        _trial_events.log_solve(trial_id, 'retarget', st['mean_ms'],
+                                p95_ms=round(st['p95_ms'], 3),
+                                last_ms=round(st['last_ms'], 3) if st['last_ms'] else None,
+                                n=st['n'])
+
     def _push_squeeze(on, gamma):
         """Forward the GRASP internal-force state to the dashboard header. gamma is the
         per-object value solved at the REACH->GRASP transition; ~gamma/sqrt(2) N per
@@ -1191,10 +1226,21 @@ if __name__ == "__main__":
     # Arm gains sized for Gen3's forcerange (±105/±52 Nm); finger gains mirror the small
     # values used for the planar model's tiny finger actuators. Finger gains bumped 1.5x
     # (Kp 0.8->1.2, Kd 0.05->0.075) so the LEAP fingers close harder/faster toward the
-    # retargeted/grasp angles. Shared by the dexpilot torque drive and contact_aware
-    # REACH/GRASP controller (the dexpilot drive is Kp-only, so Kd[7:] applies to REACH).
+    # retargeted/grasp angles. This Kp is used by OUR contact-aware pipeline (the _CAT_MODE
+    # teleop drive + the GRASP/REACH GraspController); leave it as tuned.
     Kp = np.concatenate([np.full(7, 40.0), np.full(16, 1.2)])
     Kd = np.concatenate([np.full(7, 4.0),  np.full(16, 0.075)])
+
+    # BASELINE finger position gain (plain dexpilot / anyteleop teleop drive ONLY — the
+    # args.mode == 'dexpilot' block). Kept SEPARATE from the contact-aware Kp above so the
+    # baselines can use a controller gain faithful to the published methods (which drive the
+    # retargeted finger angles with a standard position/impedance controller, NOT the tiny
+    # planar-model value) WITHOUT perturbing our pipeline's tuned gains. 3.0 matches the
+    # MuJoCo Menagerie LEAP hand's own position-actuator kp; the earlier shared 1.2 was ~2.5x
+    # below that, an unintentionally weak baseline. The baselines stay position-only (no
+    # internal-force squeeze — that is our contribution), so this is a faithful, not inflated,
+    # baseline controller.
+    KP_TELEOP_FINGER = 3.0
 
     # Internal squeeze force scale (GRASP, toggled with Enter): f_c = null(G) @ gamma.
     # gamma is now SOLVED per object at the REACH->GRASP transition (solve_gamma_live)
@@ -2126,7 +2172,13 @@ if __name__ == "__main__":
         _cam_kwargs = {
             "R_cam_robot": np.diag([1.0, -1.0, -1.0]),
             "position_mode": "relative",   # press-8 rezeroable; see note below
-            "abs_scale": 1.5,              # 1:1, no amplification
+            # abs_scale amplifies hand travel -> robot travel. Raised 1.5 -> 2.0 so a SMALLER
+            # physical hand movement covers the sim workspace: the operator's hand stays in a
+            # tighter volume close to the headset, less likely to leave the OpenXR hand-tracking
+            # FOV (the tracked=0 dropouts that froze the robot when reaching far). Higher = less
+            # reach needed but coarser precision; 2.0 is a moderate step. This is the VR path's
+            # value (the config's abs_scale is for the MediaPipe path).
+            "abs_scale": 2.0,
             "scale_x": 1.0,                # already metres
             "scale_z": 1.0,
             "identity_orientation": True,  # direct hand->wrist, no press-8 offset
@@ -2246,13 +2298,22 @@ if __name__ == "__main__":
         # the arm/fingers feel sluggish — use a much CRISPER alpha there (near-raw IK
         # output) and let the physics do the smoothing. hand_alpha likewise.
         _dp_arm_alpha  = 0.9 if args.physics else 0.3
-        _dp_hand_alpha = 0.9 if args.physics else 0.3
+        # Finger EMA lowered 0.9 -> 0.4 in physics mode. The pinch is a SNAP: when it latches,
+        # the retargeted finger target jumps from BETA*d to ETA1 (near-closed) in one frame, and
+        # the stiff finger servo slamming to that step is what SHOVES objects. 0.4 ramps the
+        # snapped target in over ~4 frames, softening the transient shove — WITHOUT weakening
+        # the steady grip (S1_GAIN still holds the object once closed). Pure control-signal
+        # smoothing: it never touches the physics, so it can't cause the singularity reset.
+        # (Lower to 0.3 for an even softer close if the shove persists; raise toward 0.6 if the
+        # fingers feel laggy to close.)
+        _dp_hand_alpha = 0.4 if args.physics else 0.3
         _cam_kwargs.setdefault("alpha", _dp_arm_alpha)
         _dexpilot_ctrl = DexPilotController(model, q_bias=_Q_BIAS_DP,
             debug=_retarg_debug, eps=0.03, hand_tracking=_hand_tracking,
             hand_alpha=_dp_hand_alpha, retargeter=_RETARGETER,
             pinch_debounce=(args.pinch_debounce == 'on'),
-            output_ema=(args.output_ema == 'on'), **_cam_kwargs)
+            output_ema=(args.output_ema == 'on'),
+            anyteleop_type=args.anyteleop_type, **_cam_kwargs)
         if args.pinch_debounce == 'off' or args.output_ema == 'off':
             print(f"[retarget] filters: pinch-debounce={args.pinch_debounce}, "
                   f"output-ema={args.output_ema}.")
@@ -3412,9 +3473,11 @@ if __name__ == "__main__":
                 # Arrival sets outcome=SUCCESS but does NOT write trial_end / save the trace —
                 # the caller must call end_trial. Do so on arrival, or on a timeout.
                 if _arrived_tr:
+                    _log_retarget_latency(_trial_state.trial_id)
                     _trial_runner.end_trial(_trial_state, _tnow_tr)
                 elif (_trial_state.outcome is None
                         and _trial_runner.check_timeout(_trial_state, _tnow_tr)):
+                    _log_retarget_latency(_trial_state.trial_id)
                     _trial_runner.end_trial(_trial_state, _tnow_tr)
 
             # Always-on pose recorder: one throttled row per iteration, ALL phases (the
@@ -4208,7 +4271,9 @@ if __name__ == "__main__":
                             tau_ctrl[:] = 0.0
                             _err = _dp_target - data.qpos[:N_ROBOT]
                             tau_ctrl[:7]        = _dp_Kp_arm * _err[:7]
-                            tau_ctrl[7:N_ROBOT] = Kp[7:] * _err[7:]
+                            # Baseline finger gain (see KP_TELEOP_FINGER): faithful position
+                            # control for the plain-dexpilot baseline, independent of our Kp.
+                            tau_ctrl[7:N_ROBOT] = KP_TELEOP_FINGER * _err[7:]
                             data.qfrc_applied[:] = tau_ctrl
                             data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
                             mj.mj_step(model, data)
@@ -4246,7 +4311,10 @@ if __name__ == "__main__":
                                 # normal tracking and only bites once qvel has already blown up.
                                 np.clip(data.qvel[:7], -QVEL_ARM_MAX, QVEL_ARM_MAX,
                                         out=data.qvel[:7])
-                                tau_ctrl[7:N_ROBOT] = Kp[7:] * _err[7:]
+                                # Baseline finger gain (KP_TELEOP_FINGER) — faithful position
+                                # control for the plain-dexpilot baseline; our contact-aware
+                                # pipeline's Kp[7:] is untouched.
+                                tau_ctrl[7:N_ROBOT] = KP_TELEOP_FINGER * _err[7:]
                                 data.qfrc_applied[:] = tau_ctrl
                                 data.qfrc_applied[:N_ROBOT] += data.qfrc_bias[:N_ROBOT]
                                 mj.mj_step(model, data)
@@ -4321,6 +4389,13 @@ if __name__ == "__main__":
                         inside_container=_object_in_bowl(0))
                     _dp_thumb_sid = id_C[FINGER_SET.index('thumb')]
                     _dp_index_sid = id_C[FINGER_SET.index('index')]
+                    # Grasp-hold force summary: total finger->object normal force this step,
+                    # accumulated by the runner only while phase==TRANSPORT (see
+                    # note_grasp_force). Reuses the same per-finger normals the metrics helper
+                    # computes; cheap (throttled to the trace rate).
+                    _, _, _dp_normals, _ = _hand_object_contact_metrics(active_idx)
+                    _trial_runner.note_grasp_force(
+                        _trial_state, float(sum(_dp_normals.values())))
                     _trial_runner.trace.sample(
                         t=_tnow_dp,
                         p_thumb=data.site_xpos[_dp_thumb_sid].copy(),
@@ -4332,6 +4407,7 @@ if __name__ == "__main__":
                         phase=1 if _trial_state.phase == TrialPhase.TRANSPORT else 0)
                     if (_arrived_dp
                             or _trial_runner.check_timeout(_trial_state, _tnow_dp)):
+                        _log_retarget_latency(_trial_state.trial_id)
                         _trial_runner.end_trial(_trial_state, _tnow_dp)
                 if DP_PROFILE:
                     _dpp_acc['trial_log'] += time.perf_counter() - _dpp_t0
@@ -5570,6 +5646,7 @@ if __name__ == "__main__":
                         _trial_state, _tnow, data.contact[:data.ncon],
                         _HAND_GIDS, obj['id_geom'])
                     if _trial_runner.check_timeout(_trial_state, _tnow):
+                        _log_retarget_latency(_trial_state.trial_id)
                         _trial_runner.end_trial(_trial_state, _tnow)
                 elif control_phase == 'GRASP':
                     _hh = _trial_rest_hh[active_idx]
@@ -5615,6 +5692,7 @@ if __name__ == "__main__":
                         q_robot=data.qpos[:N_ROBOT].copy(),
                         obj_qpos=data.qpos[N_ROBOT:].copy())
                     if _arrived or _trial_runner.check_timeout(_trial_state, _tnow):
+                        _log_retarget_latency(_trial_state.trial_id)
                         _trial_runner.end_trial(_trial_state, _tnow)
 
             # Teleop: keep the achieved-contact markers pinned to the object as it

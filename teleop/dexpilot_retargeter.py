@@ -47,6 +47,30 @@ class DexPilotRetargeter:
     S1_GAIN = 200.0   # S1 (pinch) cost weight when a primary tip is near the thumb
     S2_GAIN = 400.0   # S2 cost weight when both involved primaries are pinching
 
+    # PINCH_SNAP: when 1 (default), a detected pinch OVERRIDES the finger target to the
+    # near-closed ETA1 with weight S1_GAIN — a snap-to-closed that grips firmly but lunges
+    # (shoving objects on curl/uncurl). Set to 0 for PURE PROPORTIONAL tracking: every finger
+    # simply tracks the human fingertip-to-thumb distance scaled by BETA (target = BETA*d), no
+    # snap and no closing override. The sim fingers then just mirror your hand, and grip force
+    # comes from how far YOU curl (physics turns curl-past-the-object-surface into contact
+    # force). Firmer grip in this mode -> curl harder, or raise BETA. This is the natural,
+    # shove-free teleop feel. Hot-reloadable via retarget_config.json.
+    PINCH_SNAP = 1.0
+
+    # PINCH_SMOOTH: pinch activation model. 0 (default) = the DexPilot-PAPER hard step switch
+    # (Handa et al. 2020, Fig 7): s(d) and f(d) jump discretely at the threshold — this IS the
+    # paper's cost (S1_GAIN=200 etc. are its constants). The paper tames the resulting step
+    # with an output low-pass filter + a compliant impedance controller; the object-fling here
+    # comes from this sim's STIFF position PD, not from the cost. 1 = the smooth pinch from
+    # arXiv:2506.09384 (continuous sigmoid weight + continuous distance rescaling), a later
+    # modification OF DexPilot that removes the discrete step so the pinch closes smoothly.
+    # When PINCH_SMOOTH=1 the sigmoid replaces the binary gate (PINCH_SNAP/debounce no longer
+    # gate the pinch cost).
+    PINCH_SMOOTH = 0.0
+    PINCH_EPS1 = 0.1     # sigmoid center + rescale upper bound [m] (paper: 1e-1)
+    PINCH_EPS2 = 0.01    # rescale lower bound (target hits 0 below this) [m] (paper: 1e-2)
+    PINCH_K    = 10.0    # sigmoid steepness (paper: 10). Higher -> sharper (toward hard switch)
+
     # --- Pinch-STATE debounce (multi-view fusion robustness) ------------------
     # The pinch decision (d_s1 <= EPS -> close the fingers) is driven by the FUSED
     # triangulated fingertip, which can jump for a single frame when one camera view
@@ -71,7 +95,8 @@ class DexPilotRetargeter:
     # and any config file agree on exactly which fields are tunable.
     TUNABLE = ('BETA', 'GAMMA', 'EPS', 'ETA1', 'ETA2', 'S1_GAIN', 'S2_GAIN',
                'PINCH_MEDIAN_N', 'PINCH_ENTER_FRAC', 'PINCH_EXIT_FRAC',
-               'PINCH_ENTER_N', 'PINCH_EXIT_N')
+               'PINCH_ENTER_N', 'PINCH_EXIT_N', 'PINCH_SNAP',
+               'PINCH_SMOOTH', 'PINCH_EPS1', 'PINCH_EPS2', 'PINCH_K')
 
     # MediaPipe landmark indices
     _LM_WRIST   = 0
@@ -404,7 +429,42 @@ class DexPilotRetargeter:
     def _switching(
         self, hv: dict, d_s1: list[float], pinch: list[bool]
     ) -> tuple[float, float]:
-        """Return (s, f) for one human vector entry.
+        """Return (s, f) for one human vector entry — the cost weight `s` and the target
+        distance `f` for that vector (the cost matches robot vector rv to f * r_hat with
+        weight s; see _cost).
+
+        Two pinch models, selected by PINCH_SMOOTH (0=hard/legacy default, 1=smooth):
+          * "hard" (legacy, default): FAITHFUL TO THE DexPilot PAPER (Handa et al. 2020,
+            arXiv:1910.03135, Sec VII-A / Fig 7). The paper's switching weight s(d) and
+            distancing f(d) ARE discrete step functions of the fingertip distance d vs a
+            threshold eps: s = 1 (d>eps) -> 200 (S1) / 400 (S2); f = beta*d (d>eps) -> eta1
+            (S1) / eta2 (S2). So while pinching the target jumps to ETA1 at S1_GAIN — the
+            S1_GAIN=200, S2_GAIN=400, ETA1=1e-4, ETA2=3e-2, BETA=1.6, GAMMA=2.5e-3 defaults
+            come straight from the paper. This repo adds a debounce on the DECISION (bad-view
+            robustness), which the paper does not, but the cost is the paper's.
+            IMPORTANT: the paper does NOT let this step reach the robot raw. It applies "a
+            first-order low-pass filter ... to smooth discrete events like the projection
+            algorithm inducing step-response changes in retargeted angles" (Sec VII-A) and
+            sends the result to a torque-level IMPEDANCE (compliant) controller at 30 Hz. The
+            object-FLINGING here is NOT from the paper's algorithm — it is this sim driving the
+            smoothed target with a STIFF POSITION PD (models/kinova_leap.xml gainprm), which
+            DexPilot's compliant impedance controller would not do. So the faithful fixes for
+            the shove are (a) keep the output low-pass filter (the hand_alpha EMA) and (b)
+            soften the finger servo toward impedance-like compliance — NOT changing the cost.
+          * "smooth": a DIFFERENT paper's modification — the sigmoid-weight + continuous-
+            rescaling pinch from arXiv:2506.09384 ("Analyzing Key Objectives in Human-to-Robot
+            Retargeting"), which replaces DexPilot's discrete s(d)/threshold-clamp with
+            continuous transitions. Not DexPilot itself; an improvement OF it. The switching
+            weight is a CONTINUOUS sigmoid of the fingertip distance and the target is a
+            continuously RESCALED distance:
+                s(d)  = sigmoid(d, eps1, k) = 1 / (1 + exp(k*(d - eps1)))
+                l(d)  = 0                         if d < eps2
+                        eps1/(eps1-eps2)*(d-eps2) if eps2 <= d <= eps1
+                        d                         if d > eps1
+            The vector cost weight blends the base tracking (weight 1, target BETA*d) with
+            the pinch pull (weight S1_GAIN, target l(d)) by s(d): as the fingers approach,
+            s->1 and the target eases toward closed; far apart, s->0 and it's pure tracking.
+            eps1/eps2 default to the paper's 0.1/0.01 m; PINCH_K is the sigmoid steepness.
 
         Args:
             hv:    One element from _human_vectors().
@@ -417,19 +477,59 @@ class DexPilotRetargeter:
         if vtype == 'palm':
             return 1.0, self.BETA * d
 
+        smooth = float(getattr(self, "PINCH_SMOOTH", 0.0)) >= 0.5
+
         if vtype == 's1':
-            # Pinch cost keyed off the DEBOUNCED per-finger state, not the raw d <= EPS —
-            # so a bad-view fingertip spike can't flip it off mid-grasp. hv['primary'] is
-            # the S1 finger index (0=index,1=middle,2=ring).
+            if smooth:
+                return self._smooth_pinch(d, self.S1_GAIN)
+            # hard/legacy: binary latch -> snap to ETA1.
             if pinch[hv['primary']]:
                 return self.S1_GAIN, self.ETA1
             return 1.0, self.BETA * d
 
-        # s2: active only when BOTH involved primary fingers are in the (debounced) pinch
+        # s2: minimum inter-primary separation.
+        if smooth:
+            # Weight s2 by how much BOTH involved fingers are pinching (product of sigmoids
+            # on their fingertip distances), targeting the separation ETA2 continuously.
+            si, sj = hv['s1_dep']
+            w = (self._pinch_sigmoid(d_s1[si]) * self._pinch_sigmoid(d_s1[sj])
+                 if si < len(d_s1) and sj < len(d_s1) else 0.0)
+            return 1.0 + (self.S2_GAIN - 1.0) * w, self.ETA2
         si, sj = hv['s1_dep']
         if pinch[si] and pinch[sj]:
             return self.S2_GAIN, self.ETA2
         return 1.0, self.BETA * d
+
+    # ------------------------------------------------------------------
+    # Smooth (paper-faithful) pinch primitives
+    # ------------------------------------------------------------------
+    def _pinch_sigmoid(self, d: float) -> float:
+        """Continuous switching weight s(d) = 1/(1+exp(k*(d-eps1))): ->1 when the fingertip
+        is close (d<<eps1, pinching), ->0 when far apart. k = PINCH_K steepness."""
+        eps1 = float(getattr(self, "PINCH_EPS1", 0.1))
+        k = float(getattr(self, "PINCH_K", 10.0))
+        # clamp the exponent for numerical safety
+        z = float(np.clip(k * (d - eps1), -60.0, 60.0))
+        return 1.0 / (1.0 + np.exp(z))
+
+    def _pinch_rescale(self, d: float) -> float:
+        """Distance rescaling l(d): 0 below eps2, linear ramp on [eps2,eps1], identity above
+        eps1 — a continuous close-toward-contact target (no clamp discontinuity)."""
+        eps1 = float(getattr(self, "PINCH_EPS1", 0.1))
+        eps2 = float(getattr(self, "PINCH_EPS2", 0.01))
+        if d < eps2:
+            return 0.0
+        if d <= eps1:
+            return (eps1 / (eps1 - eps2)) * (d - eps2)
+        return d
+
+    def _smooth_pinch(self, d: float, gain: float) -> tuple[float, float]:
+        """(s, f) for an s1 vector in smooth mode: blend base tracking (weight 1, target
+        BETA*d) with the pinch pull (weight `gain`, target l(d)) by the sigmoid s(d)."""
+        w = self._pinch_sigmoid(d)               # 0..1, 1 = fully pinching
+        s = 1.0 + (gain - 1.0) * w               # eases from 1 (open) to gain (pinched)
+        f = (1.0 - w) * (self.BETA * d) + w * self._pinch_rescale(d)
+        return s, f
 
     # ------------------------------------------------------------------
     # Cost function
@@ -484,6 +584,12 @@ class DexPilotRetargeter:
         # single-frame fused-fingertip jump can't drop a held pinch. last_d_s1_filt is
         # the median-filtered distance for downstream detection (trial_logger).
         pinch = self._update_pinch_state(d_s1)
+        # PINCH_SNAP off -> pure proportional tracking: force the pinch state all-False so the
+        # s1/s2 branches in _switching() never apply the snap-to-closed override and every
+        # finger just tracks BETA*d. The debounce still runs above (so last_d_s1_filt / trial
+        # logging stay valid); only the OPTIMISER's pinch cost is disabled.
+        if float(getattr(self, "PINCH_SNAP", 1.0)) < 0.5:
+            pinch = [False, False, False]
 
         x0 = (q_prev if q_prev is not None
                else (self._q_prev if self._q_prev is not None

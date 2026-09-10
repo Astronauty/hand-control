@@ -388,6 +388,13 @@ class TrialState:
     n_inadvertent_contacts: int = 0
     n_drops: int = 0
     max_slip_mm: float = 0.0       # diagnostic only, does not gate drop counting
+    # Grasp-force summary during TRANSPORT (finger->object total normal force, N): the
+    # comparable scalar for "can the method HOLD the grasp under load". Accumulated by
+    # note_grasp_force() only while phase == TRANSPORT (the carry), so it measures the
+    # sustained hold, not the transient squeeze on contact.
+    grip_force_peak_n: float = 0.0
+    grip_force_sum_n: float = 0.0
+    grip_force_samples: int = 0
     outcome: str | None = TrialOutcome.RUNNING
     t_end: float | None = None
 
@@ -471,11 +478,16 @@ class TrialRunner:
         # Wall clock is monotonic across sim resets, so no clamp is needed here.
         t_end_wall = time.time()
         duration_wall_s = max(0.0, t_end_wall - state.t_start_wall)
+        grip_mean = (state.grip_force_sum_n / state.grip_force_samples
+                     if state.grip_force_samples else 0.0)
         self.events.log(state.trial_id, t_now, 'trial_end', t_wall=t_end_wall,
                          outcome=state.outcome,
                          n_inadvertent_contacts=state.n_inadvertent_contacts,
                          n_drops=state.n_drops, n_attempts=state.attempt_id,
                          max_slip_mm=state.max_slip_mm,
+                         # Grasp-hold force during TRANSPORT (finger->object normal force, N).
+                         grip_force_peak_n=round(state.grip_force_peak_n, 3),
+                         grip_force_mean_n=round(grip_mean, 3),
                          duration_s=round(duration_wall_s, 3),
                          duration_sim_s=round(t_now - state.t_start, 3))
         trace_path = self.trace_dir / f'{self._trace_filename(state)}.npz'
@@ -660,3 +672,16 @@ class TrialRunner:
         translational deviation of object-in-palm-frame vs. its pose at pick_confirmed."""
         if slip_mm > state.max_slip_mm:
             state.max_slip_mm = slip_mm
+
+    def note_grasp_force(self, state: TrialState, normal_force_n: float):
+        """Accumulate the finger->object total normal force (N) for the grasp-force summary.
+        Only counts while phase == TRANSPORT (the sustained carry), so trial_end reports the
+        HOLD force — the scalar for comparing whether a method maintains the grasp under load.
+        Call once per logged step with the summed per-finger normal force."""
+        if state.phase != TrialPhase.TRANSPORT:
+            return
+        f = float(normal_force_n)
+        if f > state.grip_force_peak_n:
+            state.grip_force_peak_n = f
+        state.grip_force_sum_n += f
+        state.grip_force_samples += 1

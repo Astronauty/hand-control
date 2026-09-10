@@ -96,7 +96,8 @@ def rest_half_height_from_geom(model, gid) -> float:
 
 def attach_ycb_object(spec, obj_id: str, xy, *, mass: float | None = None,
                       friction=(2.0, 0.05, 0.005), condim: int = 6,
-                      quat=(1.0, 0.0, 0.0, 0.0)) -> str:
+                      quat=(1.0, 0.0, 0.0, 0.0),
+                      solref=(0.004, 1.0)) -> str:
     """Attach a built YCB object into `spec` as an obj_<slug> body. Returns the body name.
 
     The built YCB mjcf (assets/ycb_mjcf/<id>/<id>.xml) already carries a <freejoint/>,
@@ -106,6 +107,15 @@ def attach_ycb_object(spec, obj_id: str, xy, *, mass: float | None = None,
     place the body at `xy` (z is set by the caller after compile, via the freejoint qpos,
     since the AABB half-height needs the compiled model). Raises FileNotFoundError with the
     build instructions if the object isn't built.
+
+    solref: contact solver reference (time_constant, damping_ratio) for the collision geoms.
+      This is the object's CONTACT COMPLIANCE, and it is object-specific — not every YCB item
+      is rigid. solref[0] must be >= ~2*timestep (0.004 s at dt=2ms), the stability floor:
+        * RIGID objects (boxes, blocks, hard fruit) -> ~0.004 (as stiff as stable; no give,
+          rests flush on the table).
+        * COMPLIANT objects (orange, apple, tennis ball, soft toys) -> LARGER, ~0.008-0.02,
+          so the contact yields a little (deforms) under load — physically realistic. Larger
+          is always stable (it's above the floor). Set per object via the config's `solref`.
     """
     path = _mjcf_path(obj_id)
     if not os.path.exists(path):
@@ -126,20 +136,33 @@ def attach_ycb_object(spec, obj_id: str, xy, *, mass: float | None = None,
         except Exception:
             pass
 
-    # Name geoms to the contract + set grasp contact params on the collision geoms.
+    # Name geoms to the contract + set grasp contact params on the collision geoms. Use stable
+    # incrementing counters for the extra geom names: an object with MULTIPLE collision geoms
+    # (e.g. 025_mug) previously suffixed with `id(g) & 0xffff`, which could COLLIDE (two geoms
+    # hashing to the same low 16 bits -> "repeated name" on compile). Same for multiple visual
+    # geoms sharing one `_vis` name.
     first_col = True
+    col_i = 0
+    vis_i = 0
     for g in body.geoms:
         is_col = (g.contype != 0 or g.conaffinity != 0) and g.group == 3
         if is_col:
             g.condim = condim
             g.friction = list(friction)
+            # Per-object contact compliance (see the solref arg). Default 0.004 (rigid, the
+            # stability floor); the config can soften it for compliant items so they deform a
+            # little instead of resting perfectly rigid. MuJoCo's own default (0.02) was too
+            # soft for EVERY object and let them sink ~30 mm into the table.
+            g.solref = list(solref)
             if first_col:
                 g.name = f"{name}_geom"   # <body>_geom, the pipeline's derived name
                 first_col = False
             else:
-                g.name = f"{name}_col_{id(g) & 0xffff}"
+                g.name = f"{name}_col_{col_i}"
+                col_i += 1
         else:
-            g.name = f"{name}_vis"
+            g.name = f"{name}_vis_{vis_i}"
+            vis_i += 1
 
     # attach_body renames children in place; a frame lets us prefix cleanly.
     spec.worldbody.add_frame().attach_body(body, "", "")

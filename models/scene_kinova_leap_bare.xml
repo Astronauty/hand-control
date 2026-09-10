@@ -28,11 +28,12 @@
        share one robot base. -->
   <worldbody>
     <light pos="0 0 1.5" directional="true"/>
-    <!-- 3rd-person overview camera for recording (see SceneRecorder / --trial-log). Fixed
-         front-elevated view; the robocasa counter top is higher (z~0.86), so this sits a bit
-         higher than the pick_place overview. Arm faces +y, objects in front. 1280x960. -->
-    <camera name="overview" pos="0.0 -0.85 1.65" xyaxes="1 0 0 0 0.6 0.8"
-            resolution="1280 960" fovy="55"/>
+    <!-- 3rd-person overview camera for recording (see SceneRecorder / --trial-log). Faces the
+         FRONT of the robot from the +y side looking back toward -y (arm is yawed to face +y);
+         raised ~0.2 m vs pick_place since the robocasa counter top is higher (z~0.86). 1280x960. -->
+    <camera name="overview" pos="0.0 1.7 1.45"
+            xyaxes="-1 0 0  0 -0.2203 0.9754"
+            resolution="1280 960" fovy="58"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
   </worldbody>
 </mujoco>
