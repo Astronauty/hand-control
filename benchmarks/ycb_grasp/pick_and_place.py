@@ -69,6 +69,8 @@ from grasp_control import object_uv_atlas as oua                                
 from kinova_common.constants import FINGER_CODE, FINGER_SET, FINGER_TIP_SITES   # noqa: E402
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
 from simulation.grasp_config_builder import for_ablation_default                # noqa: E402
+from simulation.grasp_planner_3d import _mesh_sdf_entry                         # noqa: E402
+from ycb_grasp import plot_grasp_contacts as PGC                                # noqa: E402
 from simulation.grasp_planner_3d import MultiStartGraspPlanner3D                # noqa: E402
 from ycb_grasp import out_paths as OP                                           # noqa: E402
 from ycb_grasp import plot_quadratic_path as QP                                 # noqa: E402
@@ -199,7 +201,8 @@ def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
 def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                    w_span=1.0, view=False, out_dir=None, do_transport=True,
                    max_iter=200, w_edge_margin=0.0, directional_r_tip=True,
-                   mesh_fit=True, impratio=None, gamma_override=None,
+                   mesh_fit=True, sdf_err_tol=None, quadratic_path=False,
+                   impratio=None, gamma_override=None,
                    squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05,
                    lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS):
     """Plan + execute one grasp on one object, then carry it to the bin."""
@@ -238,6 +241,12 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                   ground_clearance_m=0.006)
     if n_relin is not None:
         cfg_kw["n_normal_relinearize"] = n_relin
+    if sdf_err_tol is not None:
+        # Trust-region tolerance for the local-quadratic surrogate: how far the
+        # paraboloid may depart from the true SDF along each axis before that
+        # axis's bound stops. Larger = more surface per patch, at more model
+        # error. See GraspConfig3D.quadratic_sdf_err_tol.
+        cfg_kw["quadratic_sdf_err_tol"] = sdf_err_tol
     if gws:
         cfg_kw["wrench_constraint"] = False
         cfg_kw["w_gws"] = w_gws
@@ -290,7 +299,8 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
 
     if out_dir is not None:
         _write_plots(model, data, res, verify_info, log_dir, object_id, seed,
-                     body_name, obj_bid, pos, out_dir)
+                     body_name, obj_bid, pos, out_dir,
+                     quadratic_path=quadratic_path, n_relin=n_relin)
     shutil.rmtree(log_dir, ignore_errors=True)
 
     p_WoO = data.xpos[obj_bid].copy()
@@ -515,19 +525,49 @@ def _solve_gamma(model, data, obj_bid, R_WO, rec_local, obj_gid, tip_geom_ids,
 
 
 def _write_plots(model, data, res, verify_info, log_dir, object_id, seed,
-                 body_name, obj_bid, pos, out_dir):
-    """Quadratic-path iso views + the mesh-fit panel for this solve."""
+                 body_name, obj_bid, pos, out_dir, quadratic_path=False,
+                 n_relin=None):
+    """Per-contact grasp figure for this solve (and optionally the older
+    Picard-trajectory view).
+
+    Default is the CONTACT view (plot_grasp_contacts): one zoomed panel per
+    solved contact, drawn in plot_seed_quadratic.py's grammar, which answers
+    "what does this grasp look like on the object". --quadratic-path asks for
+    the trajectory view instead, which answers "how did the contact move
+    across Picard stages" -- the right question while tuning the
+    relinearization loop, and near-empty at n_relin=0 where there is only one
+    stage to plot."""
     try:
         stages = QP._iter_trace_quadratic_stages(log_dir, res=res)
-        if stages and any(s["contact"] for s in stages):
-            V, F = oua.body_visual_mesh(model, obj_bid)
+        if not (stages and any(s["contact"] for s in stages)):
+            return
+        V, F = oua.body_visual_mesh(model, obj_bid)
+        if quadratic_path:
             hand_rgb = QP._render_hand_rgb(model, data, lookat=pos, dist=0.45, elev=-35)
             QP.plot_quadratic_path(V, F, stages, object_id,
                                    Path(out_dir) / f"seed{seed}_quadratic_path.png",
                                    hand_rgb=hand_rgb, verify_info=verify_info)
             print(f"[plan] quadratic path -> seed{seed}_quadratic_path.png")
+            return
+        # LAST stage carrying contact frames = the returned solve's contacts
+        # (_iter_trace_quadratic_stages already narrowed to the winning attempt).
+        last = next(s for s in reversed(stages) if s["contact"])
+        # True-SDF probe for the per-patch error bar, in the same object-local
+        # frame the saved quad_* frames use.
+        sdf_fn = None
+        try:
+            _me = _mesh_sdf_entry(model, obj_bid)
+            sdf_fn = lambda p: float(_me["fn"](np.asarray(p, float)))   # noqa: E731
+        except Exception:
+            pass
+        out = PGC.plot_grasp_contacts(
+            V, F, last, object_id,
+            Path(out_dir) / f"seed{seed}_grasp_contacts.png",
+            sdf_fn=sdf_fn, verify_info=verify_info, n_relin=n_relin)
+        if out is not None:
+            print(f"[plan] grasp contacts -> seed{seed}_grasp_contacts.png")
     except Exception as e:
-        print(f"[plan] quadratic-path plot failed: {e}")
+        print(f"[plan] contact plot failed: {e}")
 
 
 def main():
@@ -551,6 +591,13 @@ def main():
     ap.add_argument("--no-mesh-fit", dest="mesh_fit", action="store_false",
                     help="use the SDF-Hessian curvature instead of the mesh fit")
     ap.add_argument("--w-edge-margin", type=float, default=0.0)
+    ap.add_argument("--quadratic-path", action="store_true",
+                    help="write the Picard-trajectory figure instead of the "
+                         "per-contact grasp figure (useful when tuning "
+                         "--n-relin; near-empty at --n-relin 0)")
+    ap.add_argument("--sdf-err-tol", type=float, default=None,
+                    help="metres; max surrogate-vs-true-SDF gap that sizes each "
+                         "trust-region axis (default: GraspConfig3D's 5e-4)")
     ap.add_argument("--impratio", type=float, default=None,
                     help="override the scene's contact impratio (scene XML sets 100; "
                          "the floor-pick benchmark measured 20 as best)")
@@ -604,6 +651,7 @@ def main():
         args.object, args.seed, n_seeds=args.n_seeds, n_relin=args.n_relin,
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
+        sdf_err_tol=args.sdf_err_tol, quadratic_path=args.quadratic_path,
         impratio=args.impratio, gamma_override=args.gamma,
         squeeze_pd_scale=args.squeeze_pd_scale,
         finger_kp=args.finger_kp, finger_kd=args.finger_kd,
