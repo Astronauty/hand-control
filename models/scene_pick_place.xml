@@ -72,27 +72,29 @@
 
     <!-- Bin/tray (fixed place target) at (0.40, 0.30) on the table top (z=0.625). A clean
          rectangular open box: a flat base + 4 upright walls flush with the base edges (no
-         gaps). ENLARGED to inner ~0.34 x 0.34 (was 0.24 x 0.24) so it can hold ALL 5 cleared
-         objects with clearance — including the HORIZONTAL wood block (~21 x 14 cm) plus the
-         4 smaller items (9-12 cm each) in the remaining space. Center at (0.48, 0.26): clear
-         of the table objects (out to x~0.28) and on the enlarged 1.4x1.0 table. The
-         3D-containment arrival test reads these geom sizes from the model (_bowl_geometry), so
-         it auto-adapts — no Python change. Base top z=0.635; wall top z=0.690.
-         Wall segments overlap at the corners (half-extents include the wall thickness) so the
-         box is fully closed — no open corners. -->
-    <geom name="bowl_base" type="box" pos="0.48 0.26 0.630" size="0.17 0.17 0.005"
+         gaps). ENLARGED to inner ~0.36 x 0.68 (doubled floor area; recentered to (0.50, 0.26)
+         to stay on the table and clear of the objects) so it comfortably holds ALL 5 cleared
+         objects — including the HORIZONTAL wood block (~21 x 14 cm) plus the 4 smaller items
+         (9-12 cm each). A literal 2x in place would overhang the +x table edge (0.70) and put
+         the west wall in the object drop zone, so growth is mostly along the table WIDTH (y);
+         the x span is pinned by the table edge (east wall 0.68) and the objects (west wall
+         0.32, rightmost object edge ~0.25). The 3D-containment arrival test reads these geom
+         sizes from the model (_bowl_geometry), so it auto-adapts — no Python change.
+         Base top z=0.635; wall top z=0.690. Wall segments overlap at the corners (x half-extent
+         0.18 includes the wall thickness) so the box is fully closed — no open corners. -->
+    <geom name="bowl_base" type="box" pos="0.50 0.26 0.630" size="0.18 0.34 0.005"
       rgba="0.25 0.35 0.85 1" contype="1" conaffinity="1"/>
-    <geom name="bowl_wall_n" type="box" pos="0.48 0.43 0.660" size="0.17 0.008 0.030"
+    <geom name="bowl_wall_n" type="box" pos="0.50 0.60 0.660" size="0.18 0.008 0.030"
       rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
-    <geom name="bowl_wall_s" type="box" pos="0.48 0.09 0.660" size="0.17 0.008 0.030"
+    <geom name="bowl_wall_s" type="box" pos="0.50 -0.08 0.660" size="0.18 0.008 0.030"
       rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
-    <geom name="bowl_wall_e" type="box" pos="0.65 0.26 0.660" size="0.008 0.17 0.030"
+    <geom name="bowl_wall_e" type="box" pos="0.68 0.26 0.660" size="0.008 0.34 0.030"
       rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
-    <geom name="bowl_wall_w" type="box" pos="0.31 0.26 0.660" size="0.008 0.17 0.030"
+    <geom name="bowl_wall_w" type="box" pos="0.32 0.26 0.660" size="0.008 0.34 0.030"
       rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
     <!-- Kept named place_red_site so the trial-logger place-site lookup resolves via its
          existing _DEFAULT_PLACE_SITE fallback with no Python change. -->
-    <site name="place_red_site" pos="0.48 0.26 0.660" size="0.001"/>
+    <site name="place_red_site" pos="0.50 0.26 0.660" size="0.001"/>
 
     <!-- Contact-point marker spheres for GraspPlanner3D visualisation. -->
     <body name="cp1_body" mocap="true">

@@ -233,19 +233,23 @@ class DexPilotArmController:
         # Load a saved orientation correction if present (from a prior multi-pose
         # calibration), else identity — or an explicit R_align override.
         #
-        # identity_orientation: force R_correct = I and disable ALL calibration
-        # (press-8 auto-calib AND the saved orientation_correction.json). This is
-        # the DIRECT mapping R_des = R_mp_to_robot @ palm_R — the world->wrist
-        # rotation shown in the MediaPipe overlay becomes the exact target in
-        # MuJoCo, with no offset. Meaningful now that the arm palm frame is built
-        # from the STABLE image landmarks (the saved correction was fit against the
-        # old flip-prone world-landmark frame and is no longer valid).
+        # identity_orientation: use the DIRECT mapping R_des = R_mp_to_robot @ palm_R
+        # (no saved orientation_correction.json — that file was fit against the old
+        # flip-prone world-landmark frame and is no longer valid). R_correct = I is only
+        # the PRE-CALIBRATION default: _has_full_correction stays False so the press-8
+        # auto-calib (armed by DexPilotController.start -> request_orientation_calib) still
+        # fires, capturing R_correct = R_site_home @ raw.T on the first tracked frame. That
+        # maps the operator's CURRENT hand orientation to the robot's CURRENT home wrist —
+        # which ABSORBS any change to HOME_ARM (e.g. a base re-yaw). The old code forced
+        # _has_full_correction=True here to keep R_correct==I, which assumed palm-down ==
+        # home wrist; that assumption broke whenever the base moved and produced a ~0.5 rad
+        # arm jerk at press-8 (arm commanded outside the reachable workspace at home).
         self._identity_orientation = identity_orientation
         if identity_orientation:
             self._R_correct = np.eye(3)
-            self._has_full_correction = True   # block press-8 from overwriting I
-            print("[arm] identity orientation: direct hand->wrist mapping, "
-                  "no calibration offset.")
+            self._has_full_correction = False   # let press-8 calibrate to the home wrist
+            print("[arm] identity orientation: hand->wrist calibrated to the home "
+                  "wrist at press-8.")
         elif R_align is not None:
             self._R_correct = np.asarray(R_align, float)
             self._has_full_correction = True

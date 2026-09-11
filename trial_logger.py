@@ -53,7 +53,7 @@ CONTACT_EPISODE_COOLDOWN_S = 0.5  # min sim-time gap between counted episodes �
                                    # episode, exploding one real touch into hundreds
                                    # (observed in a live dexpilot log).
 ARRIVAL_SPEED_M_S  = 0.05   # object linear speed below which it's considered "settled"
-TRIAL_TIMEOUT_S     = 60.0   # trial force-ends (outcome='timeout') past this sim-time
+TRIAL_TIMEOUT_S     = 120.0  # trial force-ends (outcome='timeout') past this WALL-clock time
 PINCH_EPS_M         = 0.03   # DexPilot: min(d_s1) below this = operator fingers pinched
                               # (matches DexPilotRetargeter.EPS; kept here as the
                               # trial-logger's own copy so this module has no import-time
@@ -228,6 +228,31 @@ class DexPilotAttemptTrigger:
 
     def reset(self):
         self._was_pinched = False
+
+
+class PhysicalPickTrigger:
+    """Rising edge: the hand is in contact with the target object AND the object is CLEAR of
+    the support surface (no object↔table/floor contact). Retargeter-agnostic — unlike
+    DexPilotAttemptTrigger it does NOT depend on the operator's pinch distance (d_s1), so it
+    works for any grasp style (pinch, power grasp, scoop). This is the physical definition of
+    a pickup: fingers holding the object AND the object no longer resting on the surface.
+
+    The caller supplies the two booleans each step (both are pure contact/kinematic facts):
+      hand_touching_target: any hand geom contacts any of the object's collision hulls.
+      object_on_support:    any of the object's hulls contacts the table/floor/counter.
+    """
+
+    def __init__(self):
+        self._was_picked = False
+
+    def update(self, hand_touching_target: bool, object_on_support: bool) -> bool:
+        is_picked = bool(hand_touching_target) and not bool(object_on_support)
+        fired = is_picked and not self._was_picked
+        self._was_picked = is_picked
+        return fired
+
+    def reset(self):
+        self._was_picked = False
 
 
 class ContactAwareAttemptTrigger:

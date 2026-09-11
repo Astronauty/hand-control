@@ -42,6 +42,11 @@ def make_key_callback(key_queue):
                         # the viewer already mj_resetData'd the shared data from its own
                         # thread; this event lets the control loop re-home its state
                         # machine instead of PD-exploding against the qpos0 arm pose.
+        59:  'skip_object',   # ; (semicolon) — (--sequential-spawn) SKIP the current object:
+                              #     end its trial and advance to the next. For quick testing so
+                              #     you don't have to place every object. NOTE: NOT Tab — the
+                              #     MuJoCo viewer hard-binds Tab to its UI-panel toggle and would
+                              #     swallow it; ';' is not a viewer shortcut.
         46:  'next_keyframe',  # . (>) — cycle to the NEXT scene <keyframe> (pose_00, ...)
         44:  'prev_keyframe',  # , (<) — cycle to the PREVIOUS scene <keyframe>
                                #     ...and re-home the state machine onto it. NOTE: do NOT use

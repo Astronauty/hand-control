@@ -346,7 +346,12 @@ def _mesh_sdf_entry(model, body_id: int) -> dict:
     # body_id-based name can collide across separate MjModel instances the
     # same way the old cache key did.
     _tag = f"gp3_sdf_{id(model)}_{body_id}"
-    fn = _object_sdf.casadi_fn(table, name=_tag, conservative=False)
+    # DISK-CACHED base fn: building the B-spline casadi_fn from the grid is a ~20s
+    # symbolic-graph construction; load_or_build_casadi_fn serializes it (keyed on the
+    # shape hash + grid params), so a re-launch on the same object loads it in ~40ms
+    # instead of rebuilding. The grad/Hessian below re-derive from it in ~0.2s.
+    fn = _object_sdf.load_or_build_casadi_fn(model, body_id, name=_tag,
+                                             conservative=False)
     # load_or_bake discards the raw hull vertices after baking (only keeps the
     # half-space (A,b) form) — re-extract them the same way
     # object_sdf.body_hull_halfspaces does, for _minor_axis_local's SVD (the

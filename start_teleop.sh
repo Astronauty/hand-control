@@ -84,7 +84,12 @@ sim)
 	# anyteleop / contact_aware_w_anyteleop need:  uv sync --extra anyteleop
 	MODE="${2:-dexpilot}"
 	if [ "$#" -ge 2 ]; then shift 2; else shift "$#"; fi   # drop 'sim' + mode; rest = extra flags
-	exec python3 kinova_leap_pick_place.py --mode "$MODE" --no-mediapipe "$@"
+	# DP_PROFILE=1 prints the per-iteration wall-time breakdown (retarget / step / draw /
+	# record) so a "sim gets stuck" stall shows which bucket spiked. An env assignment must
+	# precede the command (or the shell tries to exec a program literally named DP_PROFILE=1);
+	# `exec env VAR=val cmd` is the exec-safe form. Set to 0 (or drop it) to silence profiling.
+	exec env DP_PROFILE="${DP_PROFILE:-1}" python3 kinova_leap_pick_place.py \
+		--mode "$MODE" --no-mediapipe "$@"
 	;;
 
 viz)
