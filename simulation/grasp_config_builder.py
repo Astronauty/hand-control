@@ -120,7 +120,7 @@ def for_teleop_recommender(obj_name: str, arm_geom_names: list,
 def for_gws_recommender(obj_name: str, arm_geom_names: list,
                         obj_clearance_by_geom: dict,
                         accel_budget_xyz: tuple, ang_accel_budget_xyz: tuple,
-                        max_iter: int = 120,
+                        max_iter: int = 80,
                         w_gws: float = 5.0, w_span: float = 1.0,
                         obj_id: str | None = None,
                         **overrides) -> GraspConfig3D:
@@ -190,6 +190,20 @@ def for_gws_recommender(obj_name: str, arm_geom_names: list,
     # keeps the n_seeds with the smallest DLS fingertip residual; also populates
     # planner.last_seed_rank_table for the seed diagnostics.
     cfg_kw.setdefault('seed_dls_rank_pool', 3)
+    # n_seeds=3 (was 5) and max_iter=80 (was 120/200), MEASURED on the five tabletop
+    # objects, seed 0, execution through pick_and_place.py -- not a speed compromise:
+    #   200/5 -> 3/5 objects squeeze+lift, solve 5.4s
+    #    80/3 -> 4/5 objects squeeze+lift, solve ~2.3s
+    # 036_wood_block FAILED at 200/5 (index gap 10.96mm vs the 8mm squeeze gate) and
+    # LIFTS at 80/3 with the tightest contacts measured (0.32/0.60mm). Cutting the
+    # budget IMPROVED the grasp, which fits the IPOPT iterate log: the objective
+    # oscillates (60 -> 256 -> 110 -> 79 across consecutive iterations) because the
+    # duals are indeterminate under the antipodal minimax symmetry, so grinding
+    # further lands on a worse iterate as often as a better one.
+    # The DLS rank pool is what makes n_seeds=3 safe -- seeds are ordered by arm
+    # reachability first, so seeds 4-5 were the worst of the pool (dropping them was
+    # bit-identical on 014_lemon and 056_tennis_ball).
+    cfg_kw.setdefault('n_seeds', 3)
     # NO PICARD RELINEARIZATION. n_normal_relinearize=0 means the solve is a SINGLE
     # stage: the contact frame is never re-frozen from a re-read normal. This is only
     # coherent together with quadratic_symbolic_normals -- the paraboloid supplies the
