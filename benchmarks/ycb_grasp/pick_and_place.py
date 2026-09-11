@@ -203,13 +203,28 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                    quad_sym_normals=False, seed_rank_pool=1,
                    impratio=None, gamma_override=None,
                    squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05,
-                   lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS):
+                   lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS,
+                   contact_profile="stock"):
     """Plan + execute one grasp on one object, then carry it to the bin."""
     rng = np.random.default_rng(seed)
     t_build = time.time()
     model, data, info = TS.build([object_id], impratio=impratio)
     body_name = next(iter(info))
     obj_bid = info[body_name]["bid"]
+    # Contact profile BEFORE the settle, so the object settles under the same
+    # contact model the grasp is then measured with. contact_tuning's numbers are
+    # fingertip-scoped on purpose: MuJoCo combines an unpaired contact's solref by
+    # taking the MIN of the two geoms, so softening the OBJECT does nothing while
+    # the fingertip sits at the stock 0.004 (= 2 timesteps at dt=2ms), which is the
+    # release-fling mechanism that module documents.
+    if contact_profile == "tuned":
+        from ycb_grasp import contact_tuning as _ct
+        _applied = _ct.apply_to_model(model, object_id=object_id)
+        print(f"[contact] tuned profile: {_applied}")
+    else:
+        print(f"[contact] stock profile: impratio={model.opt.impratio:g} "
+              f"noslip_iterations={model.opt.noslip_iterations} "
+              f"timestep={model.opt.timestep:g}")
     TS.settle(model, data)
     pos, quat = TS.object_pose(model, data, body_name, info)
     # The compiled qpos0 must match the settled pose, or mj_resetData would put
@@ -232,8 +247,7 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                   quadratic_mesh_fit=mesh_fit,
                   w_edge_margin=w_edge_margin,
                   directional_r_tip=directional_r_tip,
-                  w_align=float(os.environ.get("PFF_ALIGN_W", 10.0)),
-                  orient_weight=float(os.environ.get("PFF_ORIENT_W", 2.0)),
+                  w_align=10.0, orient_weight=2.0,
                   # Fingertips must clear the TABLE, not the floor: the object
                   # rests on the table top, so a floor-relative clearance would
                   # permit contacts driven straight through the table surface.
@@ -480,11 +494,25 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
             # RELEASE: stop squeezing and let the object settle into the bin.
             ctrl.set_squeeze(False)
             ctrl.set_transporting(False)
+            # PEAK RELEASE VELOCITY — the fling metric. contact_tuning.py scores
+            # every contact setting on BOTH grasp force AND this number, because
+            # the two trade off along the same axis and optimizing either alone
+            # picks a setting that fails the other. Sampled over the whole settle
+            # (not just the final state) since the fling is a transient: the object
+            # is pumped over ~50ms and may well have hit something by step 400.
+            _peak_v = 0.0
+            _peak_w = 0.0
             for _ in range(RELEASE_SETTLE_STEPS):
                 data.qvel[:N_ROBOT] = 0.0
                 data.qfrc_applied[:] = ctrl.compute(data)
                 mj.mj_step(model, data)
+                _vw = data.cvel[obj_bid]          # spatial velocity, [ang(3); lin(3)]
+                _peak_w = max(_peak_w, float(np.linalg.norm(_vw[:3])))
+                _peak_v = max(_peak_v, float(np.linalg.norm(_vw[3:])))
                 _sync()
+            result["release_peak_speed_mps"] = round(_peak_v, 3)
+            result["release_peak_spin_radps"] = round(_peak_w, 2)
+            print(f"[release] peak |v|={_peak_v:.3f} m/s  |w|={_peak_w:.1f} rad/s")
             result["in_bin"] = TS.in_bin(model, data, obj_bid)
             result["object_final_xyz"] = np.round(data.xpos[obj_bid], 4).tolist()
             result["phase_log"].append("release_done")
@@ -590,6 +618,15 @@ def main():
                     help="finger PD multiplier DURING the squeeze ramp. Lower lets the "
                          "internal-force term win against the finger PD; too low and the "
                          "measured force falls short of the commanded gamma.")
+    ap.add_argument("--contact-profile", choices=["stock", "tuned"], default="stock",
+                    help="stock (default): whatever the scene XML compiles to "
+                         "(impratio=100, noslip_iterations=0, fingertip "
+                         "solref=[0.004,1.0]). tuned: apply contact_tuning.py's "
+                         "measured settings (fingertip solref=[0.02,2.0], "
+                         "noslip_iterations=5). NOTE contact_tuning pairs noslip=5 "
+                         "with gamma=10.0 and squeeze_pd_scale=1.0 -- pass those "
+                         "via --gamma/--squeeze-pd-scale; noslip alone removes the "
+                         "tangential compliance a heavy object leans on.")
     ap.add_argument("--finger-kp", type=float, default=0.8)
     ap.add_argument("--finger-kd", type=float, default=0.05)
     ap.add_argument("--lift-speed", type=float, default=LIFT_SPEED_MPS,
@@ -640,7 +677,8 @@ def main():
         impratio=args.impratio, gamma_override=args.gamma,
         squeeze_pd_scale=args.squeeze_pd_scale,
         finger_kp=args.finger_kp, finger_kd=args.finger_kd,
-        lift_speed=args.lift_speed, transport_speed=args.transport_speed)
+        lift_speed=args.lift_speed, transport_speed=args.transport_speed,
+        contact_profile=args.contact_profile)
     print("\n=== RESULT ===")
     for k, v in result.items():
         print(f"  {k}: {v}")
