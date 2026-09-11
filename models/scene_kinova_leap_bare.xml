@@ -34,6 +34,11 @@
     <camera name="overview" pos="0.0 1.7 1.45"
             xyaxes="-1 0 0  0 -0.2203 0.9754"
             resolution="1280 960" fovy="58"/>
+    <!-- Saved viewer angle (same 3/4 elevated side view as scene_kinova_leap.xml, from the
+         interactive viewer's free camera). The passive viewer starts through this camera so
+         robocasa opens at the same repeatable angle as pick_place. -->
+    <camera name="viewer" pos="-1.559 -0.400 1.652"
+            xyaxes="0.424 -0.905 -0.000  0.367 0.172 0.914"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
   </worldbody>
 </mujoco>

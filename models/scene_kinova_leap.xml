@@ -40,6 +40,11 @@
     <camera name="overview" pos="0.0 1.7 1.25"
             xyaxes="-1 0 0  0 -0.2203 0.9754"
             resolution="1280 960" fovy="58"/>
+    <!-- Saved viewer angle (a 3/4 elevated side view captured from the interactive MuJoCo
+         viewer's free camera). The passive viewer starts looking through this camera so every
+         launch opens at the same repeatable angle. -->
+    <camera name="viewer" pos="-1.559 -0.400 1.652"
+            xyaxes="0.424 -0.905 -0.000  0.367 0.172 0.914"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
     <!-- Table centered under the robot workspace (arm base at ~(0,0), reaches +y forward). -->
     <body name="table" pos="0.0 0.25 0.0">

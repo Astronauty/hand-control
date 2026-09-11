@@ -1323,7 +1323,7 @@ if __name__ == "__main__":
     # below that, an unintentionally weak baseline. The baselines stay position-only (no
     # internal-force squeeze — that is our contribution), so this is a faithful, not inflated,
     # baseline controller.
-    KP_TELEOP_FINGER = 3.0
+    KP_TELEOP_FINGER = 2.0
 
     # Internal squeeze force scale (GRASP, toggled with Enter): f_c = null(G) @ gamma.
     # gamma is now SOLVED per object at the REACH->GRASP transition (solve_gamma_live)
@@ -3499,6 +3499,14 @@ if __name__ == "__main__":
 
     with mj.viewer.launch_passive(model, data, key_callback=make_key_callback(keys)) as viewer:
         viewer.opt.frame = mj.mjtFrame.mjFRAME_WORLD
+        # Start the viewer looking through the saved 'viewer' camera (a fixed 3/4 side angle
+        # baked into the base scene XMLs), so every launch opens at the same repeatable view.
+        # Guarded: scenes without that camera fall back to the default free camera. The user can
+        # still orbit freely (this only sets the INITIAL camera) or press Tab->Camera to switch.
+        _viewcam = mj.mj_name2id(model, mj.mjtObj.mjOBJ_CAMERA, 'viewer')
+        if _viewcam >= 0:
+            viewer.cam.type = mj.mjtCamera.mjCAMERA_FIXED
+            viewer.cam.fixedcamid = _viewcam
         if args.collision_view:
             # Show only the collision geoms (group 3); hide the LEAP-hand (group 1) and arm
             # (group 2) visual meshes. Lets you see the exact boxes the recommender's

@@ -1,6 +1,6 @@
 {
   "_comment": "Per-scene object list for the clear-the-table task. Keyed by --scene. Each entry names a YCB object (built into assets/ycb_mjcf/ by scripts/build_ycb.py) and its table-top XY. z is auto-derived from the object's rest height + the scene's table-top (TABLE_TOP_Z). Optional per-entry: quat (4), mass (kg), friction (3), solref (2). ~5 objects per scene is typical. The CLI --objects flag OVERRIDES this list; if this file (or a scene's entry) is missing, the loader falls back to the primitive obj_* bodies authored in the scene XML.",
-  "_comment_solref": "Per-object contact COMPLIANCE = solref [time_constant, damping_ratio], set from the object's REAL material. Default (omitted) = [0.004, 1] = rigid (0.004s is the stability floor at dt=2ms; can't go stiffer, rests flush on the table). Larger time-constant = softer/more give (always stable, it's above the floor). Assignments here: RIGID (0.004, omitted) = 036_wood_block (solid wood), 058_golf_ball (hard resin), 025_mug (ceramic). DEFORMABLE: 009_gelatin_box is a thin CARDBOARD Jell-O carton (soft, ~0.012), 056_tennis_ball rubber+felt (springy, ~0.013), 017_orange soft fruit (~0.010), 013_apple semi-firm fruit (~0.008), 014_lemon firm fruit (~0.007).",
+  "_comment_solref": "Per-object contact COMPLIANCE = solref [time_constant, damping_ratio], set from the object's REAL material. Default (omitted) = [0.004, 1] = rigid (0.004s is the stability floor at dt=2ms; can't go stiffer, rests flush on the table). Larger time-constant = softer/more give (always stable, it's above the floor). Assignments here: RIGID (0.004, omitted) = 036_wood_block (solid wood), 058_golf_ball (hard resin), 025_mug (ceramic). DEFORMABLE: 009_gelatin_box is a thin CARDBOARD Jell-O carton (soft, ~0.012), 056_tennis_ball rubber+felt (springy, ~0.013), 017_orange soft fruit (~0.010), 014_lemon firm fruit (~0.007).",
   "_comment_scope": "Mesh objects are for the plain-teleop dexpilot / anyteleop modes (grasp by hand physics, no recommender). Contact-aware modes need per-object grasp-contact handling for meshes (in progress) and stay on the primitive stand-ins.",
 
   "_comment_layout": "Base yawed +90 deg, arm reaching +y (across the table WIDTH). Objects are spread along the table LENGTH (world x, from -0.30 to +0.30) in FRONT of the arm (+y ~0.30-0.34), so the operator picks them left-to-right along the length. All 0.30-0.42 m from the base (reachable, none under the robot) and >=0.05 m inside the table edges (x in [-0.55,0.55], y in [-0.075,0.575]).",
@@ -12,13 +12,14 @@
     {"id": "036_wood_block",   "xy": [ 0.00, 0.42], "quat": [0.70710678, 0.0, -0.70710678, 0.0]},
     {"id": "017_orange",       "xy": [ 0.00, 0.30], "solref": [0.010, 1.0]},
     {"id": "014_lemon",        "xy": [ 0.15, 0.34], "solref": [0.007, 1.0]},
-    {"id": "056_tennis_ball",  "xy": [ 0.30, 0.30], "solref": [0.013, 1.0]}
+    {"id": "056_tennis_ball",  "xy": [ 0.22, 0.30], "solref": [0.013, 1.0]}
   ],
 
   "robocasa": [
-    {"id": "009_gelatin_box",  "xy": [-0.50, 0.20], "solref": [0.012, 1.0]},
-    {"id": "013_apple",        "xy": [ -0.30, 0.50], "solref": [0.008, 1.0]},
-    {"id": "058_golf_ball",    "xy": [ -0.35, 0.30]},
-    {"id": "025_mug",          "xy": [ -0.40, 0.10]}
+    {"id": "009_gelatin_box",  "xy": [-0.50, 0.55], "solref": [0.012, 1.0]},
+    {"id": "017_orange",       "xy": [ -0.15, 0.50], "solref": [0.010, 1.0]},
+    {"id": "058_golf_ball",    "xy": [ -0.35, 0.40]},
+    {"id": "025_mug",          "xy": [ -0.30, 0.55]},
+    {"id": "036_wood_block",   "xy": [ -0.25, 0.25], "quat": [0.70710678, 0.0, -0.70710678, 0.0]}
   ]
 }
