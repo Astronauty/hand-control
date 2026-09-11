@@ -247,7 +247,8 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                   quadratic_mesh_fit=mesh_fit,
                   w_edge_margin=w_edge_margin,
                   directional_r_tip=directional_r_tip,
-                  w_align=10.0, orient_weight=2.0,
+                  w_align=float(os.environ.get("PFF_ALIGN_W", 10.0)),
+                  orient_weight=float(os.environ.get("PFF_ORIENT_W", 2.0)),
                   # Fingertips must clear the TABLE, not the floor: the object
                   # rests on the table top, so a floor-relative clearance would
                   # permit contacts driven straight through the table surface.
@@ -264,6 +265,17 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
         # analytic normal instead of freezing the seed's -- see
         # GraspConfig3D.quadratic_symbolic_normals.
         cfg_kw["quadratic_symbolic_normals"] = True
+        # Per-consumer ablation. PFF_SYM_<CONSUMER>=0 turns the symbolic normal
+        # back off for exactly one of the four consumers while the master flag
+        # keeps it on for the rest, so the 6/8 -> 3/8 regression can be
+        # attributed. Unset = follow the master flag.
+        for _env, _key in (("PFF_SYM_FRAME",  "quad_sym_normals_frame"),
+                           ("PFF_SYM_IKTGT",  "quad_sym_normals_iktgt"),
+                           ("PFF_SYM_ALIGN",  "quad_sym_normals_align"),
+                           ("PFF_SYM_ORIENT", "quad_sym_normals_orient")):
+            _v = os.environ.get(_env)
+            if _v is not None:
+                cfg_kw[_key] = (_v not in ("0", "false", "False", ""))
     if sdf_err_tol is not None:
         # Trust-region tolerance for the local-quadratic surrogate: how far the
         # paraboloid may depart from the true SDF along each axis before that

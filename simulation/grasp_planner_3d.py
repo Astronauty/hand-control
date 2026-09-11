@@ -2206,6 +2206,17 @@ class SolverBackendConfig:
     # position. Separate flag from symbolic_normals because it applies to a
     # different geometry class and changes NLP conditioning independently.
     quadratic_symbolic_normals: bool = False
+    # Per-consumer ablation switches for quadratic_symbolic_normals. The master
+    # flag turns the symbolic normal ON; each of these can turn it back OFF for
+    # ONE consumer, so the four consumers (wrench frame, IK target, w_align,
+    # orient_weight) can be attributed independently. None = follow the master
+    # flag. These exist because all four went in together and regressed the
+    # tabletop benchmark 6/8 -> 3/8 full cycles; the master flag alone cannot
+    # say which one is responsible.
+    quad_sym_normals_frame:  bool | None = None   # wrench/GWS contact frame
+    quad_sym_normals_iktgt:  bool | None = None   # IK target p + r*n(t)
+    quad_sym_normals_align:  bool | None = None   # w_align grasp-axis cost
+    quad_sym_normals_orient: bool | None = None   # orient_weight pad-axis cost
     smooth_sdf: bool  = True
     slsqp_alpha: float = 400.0  # smooth SDF alpha (collision avoidance SDF only)
 
@@ -3042,6 +3053,19 @@ class GraspPlanner3D:
                 _n1_in_sym_cost = _quadratic_inward_normal_ca(_t1_var, _t1_frame, obj_R_np)
                 _n2_in_sym_cost = _quadratic_inward_normal_ca(_t2_var, _t2_frame, obj_R_np)
 
+            # Per-consumer ablation: each sub-flag can veto the symbolic normal
+            # for ONE consumer while the others keep it (None = follow master).
+            def _sym_pair(sub):
+                if _n1_in_sym_cost is None:
+                    return None, None
+                if sub is False:
+                    return None, None
+                return _n1_in_sym_cost, _n2_in_sym_cost
+
+            _n1_ik_s, _n2_ik_s = _sym_pair(cfg.quad_sym_normals_iktgt)
+            _n1_al_s, _n2_al_s = _sym_pair(cfg.quad_sym_normals_align)
+            _n1_or_s, _n2_or_s = _sym_pair(cfg.quad_sym_normals_orient)
+
             _tp1   = thumb_cb(_q)
             _tp2   = index_cb(_q)
             # IK cost: fingertip center should be at contact point + r_tip * outward_normal.
@@ -3073,9 +3097,9 @@ class GraspPlanner3D:
             # the term rather than bounding it. Identically zero on a planar
             # patch (kappa=0, measured 0.00mm on 036_wood_block), so this only
             # bites on curved objects -- which is where the tip gaps are.
-            _n1_out_ik = (-_n1_in_sym_cost if _n1_in_sym_cost is not None
+            _n1_out_ik = (-_n1_ik_s if _n1_ik_s is not None
                           else ca.DM(np.asarray(d1_lp, float)))
-            _n2_out_ik = (-_n2_in_sym_cost if _n2_in_sym_cost is not None
+            _n2_out_ik = (-_n2_ik_s if _n2_ik_s is not None
                           else ca.DM(np.asarray(d2_lp, float)))
             _tp1_tgt = _p1 + _r1_ik * _n1_out_ik
             _tp2_tgt = _p2 + _r2_ik * _n2_out_ik
@@ -3124,7 +3148,7 @@ class GraspPlanner3D:
             # Uses the frozen inward normal from the seed face direction d1_lp (box) — a
             # constant per face, so this is a smooth quadratic in p1/p2 only.
             if cfg.w_align > 0.0 and d1_lp is not None:
-                _n1_in_al = (_n1_in_sym_cost if _n1_in_sym_cost is not None
+                _n1_in_al = (_n1_al_s if _n1_al_s is not None
                              else ca.DM(-np.asarray(d1_lp, float)
                                         / (np.linalg.norm(d1_lp) + 1e-12)))
                 _dp = _p2 - _p1
@@ -3146,10 +3170,10 @@ class GraspPlanner3D:
             _cost_orient = ca.DM(0.0)
             if (cfg.orient_weight > 0.0 and thumb_axis_cb is not None
                     and d1_lp is not None and d2_lp is not None):
-                _n1_in_or = (_n1_in_sym_cost if _n1_in_sym_cost is not None
+                _n1_in_or = (_n1_or_s if _n1_or_s is not None
                              else ca.DM(-np.asarray(d1_lp, float)
                                         / (np.linalg.norm(d1_lp) + 1e-12)))
-                _n2_in_or = (_n2_in_sym_cost if _n2_in_sym_cost is not None
+                _n2_in_or = (_n2_or_s if _n2_or_s is not None
                              else ca.DM(-np.asarray(d2_lp, float)
                                         / (np.linalg.norm(d2_lp) + 1e-12)))
                 _e_th = thumb_axis_cb(_q) - _n1_in_or
@@ -3313,6 +3337,7 @@ class GraspPlanner3D:
                 # L-BFGS seeing curvature pairs from both movement AND frame
                 # rotation).
                 use_quad_sym = (cfg.quadratic_symbolic_normals
+                                and cfg.quad_sym_normals_frame is not False
                                 and _is_mesh and cfg.use_quadratic_contact
                                 and _t1_frame is not None and _t2_frame is not None
                                 and _t1_var is not None and _t2_var is not None)
