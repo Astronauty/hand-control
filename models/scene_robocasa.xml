@@ -52,18 +52,20 @@
 
     <!-- Bin place target (rectangular open tray) at (0.40, 0.30) on the counter top (z=0.86).
          Same bowl_* geom names + place_red_site so the collision list and 3D-containment
-         arrival work unchanged. Base top z=0.870; wall top z=0.920. -->
-    <geom name="bowl_base" type="box" pos="0.40 0.30 0.865" size="0.12 0.12 0.005"
+         arrival work unchanged. ENLARGED to inner ~0.34 x 0.34 + center (0.48,0.26) to match
+         scene_pick_place (holds all 5 cleared objects incl the horizontal wood block, clears
+         the objects). Base top z=0.870; wall top z=0.925. -->
+    <geom name="bowl_base" type="box" pos="0.48 0.26 0.865" size="0.17 0.17 0.005"
       rgba="0.25 0.35 0.85 1" contype="1" conaffinity="1"/>
-    <geom name="bowl_wall_n" type="box" pos="0.40 0.415 0.895" size="0.12 0.008 0.030"
+    <geom name="bowl_wall_n" type="box" pos="0.48 0.43 0.895" size="0.17 0.008 0.030"
       rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
-    <geom name="bowl_wall_s" type="box" pos="0.40 0.185 0.895" size="0.12 0.008 0.030"
+    <geom name="bowl_wall_s" type="box" pos="0.48 0.09 0.895" size="0.17 0.008 0.030"
       rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
-    <geom name="bowl_wall_e" type="box" pos="0.515 0.30 0.895" size="0.008 0.12 0.030"
+    <geom name="bowl_wall_e" type="box" pos="0.65 0.26 0.895" size="0.008 0.17 0.030"
       rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
-    <geom name="bowl_wall_w" type="box" pos="0.285 0.30 0.895" size="0.008 0.12 0.030"
+    <geom name="bowl_wall_w" type="box" pos="0.31 0.26 0.895" size="0.008 0.17 0.030"
       rgba="0.30 0.45 0.90 0.85" contype="1" conaffinity="1"/>
-    <site name="place_red_site" pos="0.40 0.30 0.895" size="0.001"/>
+    <site name="place_red_site" pos="0.48 0.26 0.895" size="0.001"/>
 
     <!-- Grasp-planner visualization markers (same as scene_pick_place.xml; required by the
          control loop). cp1/cp2 = GraspPlanner3D verify points; rec1/rec2 = NLP recommendation

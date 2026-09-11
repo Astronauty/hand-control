@@ -1240,7 +1240,7 @@ if __name__ == "__main__":
     # below that, an unintentionally weak baseline. The baselines stay position-only (no
     # internal-force squeeze — that is our contribution), so this is a faithful, not inflated,
     # baseline controller.
-    KP_TELEOP_FINGER = 3.0
+    KP_TELEOP_FINGER = 2.0
 
     # Internal squeeze force scale (GRASP, toggled with Enter): f_c = null(G) @ gamma.
     # gamma is now SOLVED per object at the REACH->GRASP transition (solve_gamma_live)
