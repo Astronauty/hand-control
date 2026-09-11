@@ -314,7 +314,9 @@ metric (commit `445cedf`), seed 0, `--n-seeds 3 --n-relin 2`, transport on.
 | 036_wood_block | stock | 2.04 / 2.17 | **-0.4 mm FAIL** | 0.016 | 0.1 | both |
 | 036_wood_block | tuned | 5.43 / 4.88 | **+37.8 mm** | 0.017 | 0.4 | both |
 | 056_tennis_ball | stock | 1.31 / 1.05 | **+0.1 mm FAIL** | 0.001 | 0.0 | both |
-| 056_tennis_ball | tuned | — | *aborted at gap gate* | — | — | — |
+| 056_tennis_ball | tuned (s0) | — | *aborted at gap gate* | — | — | — |
+| 056_tennis_ball | tuned (s1) | 6.77 / 6.53 | **+121.2 mm, in_bin=True** | **1.742** | 7.7 | none |
+| 056_tennis_ball | tuned (s2) | — | *aborted at gap gate* | — | — | — |
 | 014_lemon | stock | 0.30 / 0.26 | +119.3 mm | **1.447** | 16.5 | thumb |
 | 014_lemon | tuned | 6.63 / 6.64 | +119.5 mm | **1.403** | 29.0 | none |
 | 017_orange | stock | 1.07 / 1.06 | +118.4 mm | **1.667** | 21.6 | none |
@@ -352,8 +354,18 @@ tuned do not plan against a bit-identical object pose. `056_tennis_ball|tuned`
 aborted at the 8 mm gap gate with gaps `thumb +10.0 / index -2.1 mm` — the asymmetric
 straddle that marks a SEATING outcome, exactly the artifact contact_tuning.py warns
 about ("a 0.0 N failure that is a PLANNER outcome, not a contact one"). Scored as
-`squeeze_aborted_no_contact`, NOT as a tuned-profile failure. Worth a re-run at other
-seeds before treating that cell as evidence either way.
+`squeeze_aborted_no_contact`, NOT as a tuned-profile failure.
+
+**Re-run at seeds 1 and 2 confirms that, and adds a caveat.** Seed 1 succeeds
+outright — 6.77/6.53 N, +121.2 mm, and the ONLY cell in this whole matrix to score
+`in_bin=True`. Seed 2 aborts again (gaps +10.5/+6.4 mm). So the abort is seating, not
+the profile — but at 2 of 3 seeds it is FREQUENT, not a fluke, and the tennis ball
+should be treated as having a seating problem on this scene worth its own look. The
+gap gate is doing its job: it is refusing to squeeze on a grasp that never seated.
+
+Seed 1 also puts the tennis ball in the ROLL-OUT class: 1.742 m/s, the highest release
+in the matrix, on a sphere — consistent with the lemon/orange mechanism and with its
+geometry.
 
 **Not yet decided: teleop's default.** This validates `tuned` for the BENCHMARK, whose
 gamma is a fixed override. Teleop certifies gamma per grasp via `solve_gamma_live`, so
