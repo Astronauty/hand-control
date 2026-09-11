@@ -4990,6 +4990,12 @@ class MultiStartGraspPlanner3D:
                 np.linalg.norm(_d.site_xpos[self._planner._index_sid] - _t2)))
 
         seeds, attempts, rejected = [], 0, 0
+        # Per-seed REJECT record, so a paired diagnostic can draw the seeds the
+        # gates threw away rather than only the survivors (the rejects are the
+        # whole story on objects where the gate refuses everything -- see
+        # plot_seed_quadratic's --show-rejected). solve() stops at the first
+        # n_seeds ACCEPTED, so these are the only rejects that ever materialise.
+        self.last_seed_reject_table = []
         _axis_local = _minor_axis_local(geom_type, geom_size, mesh_entry=self._mesh_entry)
         _fs = _fixed_antipodal_seed(geom_type, geom_size, c, obj_R_np, _axis_local,
                                     prefer_outer=cfg.seed_prefer_outer_surface,
@@ -5000,6 +5006,12 @@ class MultiStartGraspPlanner3D:
             _assign_seed_by_finger(_fs, _live_th, _live_if)
             seeds.append(_fs)
         else:
+            self.last_seed_reject_table.append(
+                dict(kind='minor-axis', why='unreachable or too-curved',
+                     p1s=np.asarray(_fs['p1s'], float).copy(),
+                     p2s=np.asarray(_fs['p2s'], float).copy(),
+                     n1_in=np.asarray(_fs['n1_in'], float).copy(),
+                     n2_in=np.asarray(_fs['n2_in'], float).copy()))
             log.debug(f"[seed_gen] minor-axis seed (local axis {_axis_local.tolist()}) "
                       f"unreachable or too-curved — skipped")
 
@@ -5128,6 +5140,12 @@ class MultiStartGraspPlanner3D:
             if (not _reachable_contact(s['p1s'], _ground_z, _r_tip_min) or
                     not _reachable_contact(s['p2s'], _ground_z, _r_tip_min)):
                 rejected += 1
+                self.last_seed_reject_table.append(
+                    dict(kind='random', why='unreachable (too near floor)',
+                         p1s=np.asarray(s['p1s'], float).copy(),
+                         p2s=np.asarray(s['p2s'], float).copy(),
+                         n1_in=np.asarray(s['n1_in'], float).copy(),
+                         n2_in=np.asarray(s['n2_in'], float).copy()))
                 continue
             # Curvature check (mesh only) — reject seeds landing at/near an
             # edge or corner of the SDF's zero level set, where the surface
@@ -5141,6 +5159,13 @@ class MultiStartGraspPlanner3D:
             # seed avoids by construction rather than needing a larger box.
             if not _seed_kappa_ok(s):
                 rejected += 1
+                self.last_seed_reject_table.append(
+                    dict(kind='random',
+                         why=f'kappa > {cfg.seed_kappa_max_reject:.0f}',
+                         p1s=np.asarray(s['p1s'], float).copy(),
+                         p2s=np.asarray(s['p2s'], float).copy(),
+                         n1_in=np.asarray(s['n1_in'], float).copy(),
+                         n2_in=np.asarray(s['n2_in'], float).copy()))
                 continue
             _assign_seed_by_finger(s, _live_th, _live_if)
             _pool.append(s)
@@ -5169,9 +5194,20 @@ class MultiStartGraspPlanner3D:
             log.warning(
                 f"[seed_gen] only {len(seeds)}/{n_seeds} valid seeds after "
                 f"{attempts} attempts ({rejected} rejected)")
+        # Accepted seeds, same schema as the reject table -- the paired seed figure
+        # draws both from ONE solve instead of re-deriving them in a second process
+        # with its own RNG (which could not be guaranteed to match).
+        self.last_seed_accept_table = [
+            dict(kind=_s.get('kind', 'random'), why='accepted',
+                 p1s=np.asarray(_s['p1s'], float).copy(),
+                 p2s=np.asarray(_s['p2s'], float).copy(),
+                 n1_in=np.asarray(_s['n1_in'], float).copy(),
+                 n2_in=np.asarray(_s['n2_in'], float).copy())
+            for _s in seeds]
         log.info(
             f"[seed_gen] {len(seeds)} seeds in {(time.perf_counter()-_t0)*1e3:.1f}ms "
-            f"({attempts} attempts, {rejected} rejected)")
+            f"({attempts} attempts, {rejected} rejected, "
+            f"{len(self.last_seed_reject_table)} recorded)")
 
         # DEPRECATED — the live caller no longer passes warm_contacts (kept only for API
         # compatibility). Warm-starting from a prior CONVERGED grasp is counterproductive: the

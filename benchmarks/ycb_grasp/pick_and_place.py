@@ -42,7 +42,6 @@ artifacts are grouped by ENVIRONMENT, and a tagged sweep nests under it rather
 than creating a sibling top-level folder):
   seed<N>.png                  final-pose render
   seed<N>.mp4                  the whole run
-  seed<N>_quadratic_path.png   per-contact local-quadratic fit + wrench summary
   seed<N>_mesh_fit.png         plane-vs-quadratic mesh fit at the solved contact
 
     python benchmarks/ycb_grasp/pick_and_place.py --object 036_wood_block
@@ -68,7 +67,8 @@ from grasp_control import GraspController                                       
 from kinova_common.constants import FINGER_CODE, FINGER_SET, FINGER_TIP_SITES   # noqa: E402
 from kinova_common.grasp_plots import write_grasp_plots                         # noqa: E402
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
-from simulation.grasp_config_builder import (for_ablation_default,              # noqa: E402
+from simulation.grasp_config_builder import (for_gws_recommender,               # noqa: E402
+                                             for_ablation_default,
                                              load_seed_config)                  # noqa: E402
 from simulation.grasp_planner_3d import MultiStartGraspPlanner3D                # noqa: E402
 from ycb_grasp import out_paths as OP                                           # noqa: E402
@@ -109,6 +109,17 @@ RELEASE_SETTLE_STEPS = 400
 # speeds safe: peak speed sets how long the carry takes, the slew limit sets
 # what the grasp has to survive.
 JOG_ACCEL_BUDGET_MPS2 = 20.0    # teleop's NCF_ACCEL_BUDGET_XYZ (m/s^2)
+
+# Disturbance budget for the grasp NLP's gamma certificate, shared with the teleop
+# recommender (kinova_leap_pick_place.NCF_ACCEL_BUDGET_XYZ / NCF_ANG_ACCEL_BUDGET)
+# now that both use the same solver preset. This REPLACES the former per-script
+# (0.25, 0.25, 0.25) / (0.5, 0.5, 0.5) budget: gamma is solved per object either
+# way, but a ~80x larger budget yields much larger gamma, so gamma_min values are
+# not comparable across this change. It matches JOG_ACCEL_BUDGET_MPS2 above, which
+# is what the jog's slew limiter actually enforces -- so the certificate is now
+# sized for the motion this script really executes.
+NCF_ACCEL_BUDGET_XYZ = (JOG_ACCEL_BUDGET_MPS2,) * 3
+NCF_ANG_ACCEL_BUDGET = (1.0, 1.0, 1.0)
 JOG_VEL_MAX_MPS = 0.3           # teleop's JOG_VEL peak-speed cap (m/s)
 
 
@@ -200,8 +211,8 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                    w_span=1.0, view=False, out_dir=None, do_transport=True,
                    max_iter=int(os.environ.get("PFF_MAXITER", 200)),
                    w_edge_margin=0.0, directional_r_tip=True,
-                   mesh_fit=True, sdf_err_tol=None, quadratic_path=False,
-                   quad_sym_normals=False, seed_rank_pool=1,
+                   mesh_fit=True, sdf_err_tol=None,
+                   quad_sym_normals=False, seed_rank_pool=1, backend=None,
                    impratio=None, gamma_override=None,
                    squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05,
                    lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS,
@@ -277,14 +288,24 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
             _v = os.environ.get(_env)
             if _v is not None:
                 cfg_kw[_key] = (_v not in ("0", "false", "False", ""))
+    if backend is not None:
+        # Solver BACKEND only -- the NLP is identical either way. use_slsqp appears
+        # in exactly two places in grasp_planner_3d.py: which plugin Opti gets
+        # (:3929) and a log label (:4098). Every cost term, constraint, bound and
+        # seed gate -- and the smooth-SDF alpha, despite its slsqp_alpha name, which
+        # is gated on cfg.smooth_sdf not on the backend -- is built BEFORE that
+        # branch. So this flag swaps the solver on one fixed problem.
+        cfg_kw["use_slsqp"] = (backend == "sqp")
     if sdf_err_tol is not None:
         # Trust-region tolerance for the local-quadratic surrogate: how far the
         # paraboloid may depart from the true SDF along each axis before that
         # axis's bound stops. Larger = more surface per patch, at more model
         # error. See GraspConfig3D.quadratic_sdf_err_tol.
         cfg_kw["quadratic_sdf_err_tol"] = sdf_err_tol
+    # --gws is now the DEFAULT architecture (see for_gws_recommender below), so
+    # the flag only overrides the term WEIGHTS; wrench_constraint=False comes
+    # from the shared preset either way.
     if gws:
-        cfg_kw["wrench_constraint"] = False
         cfg_kw["w_gws"] = w_gws
         cfg_kw["w_span"] = w_span
     # Seed/surrogate settings from models/grasp_seed_config.json, applied as
@@ -292,7 +313,29 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
     # override set above still wins. Precedence: file -> per-object -> CLI/env.
     for _k, _v in load_seed_config(object_id).items():
         cfg_kw.setdefault(_k, _v)
-    cfg = for_ablation_default(obj_geom=obj_geom0, obj_body=body_name, **cfg_kw)
+    # STANDARDIZED CONFIG: the same preset the teleop recommender uses
+    # (kinova_leap_pick_place.py _get_cat_planner) -- IK-only NLP
+    # (wrench_constraint=False) + datum-gamma certificate + the FRoGGeR
+    # min-weight objective + soft-finger W + quadratic contacts.
+    #
+    # Everything in cfg_kw is passed through as an OVERRIDE, so this benchmark
+    # KEEPS its own tuned seeding//solver knobs that the preset would otherwise
+    # dictate: max_iter (200, not the live loop's 120), directional_r_tip,
+    # seed_ground_clearance_m and the rest of grasp_seed_config.json, plus every
+    # PFF_* env and CLI override. Only the architecture is shared.
+    #
+    # NOTE the disturbance budget now comes from the preset: 20 m/s^2 / 1 rad/s^2
+    # (the teleop carry budget) instead of this script's former 0.25 / 0.5. gamma
+    # is solved per object either way, but against a budget ~80x larger, so
+    # reported gamma_min values are NOT comparable to runs from before this change.
+    cfg_kw.pop("obj_geom", None)
+    cfg_kw.setdefault("obj_geom", obj_geom0)
+    cfg = for_gws_recommender(body_name,
+                              cfg_kw.pop("arm_geom_names"),
+                              cfg_kw.pop("obj_clearance_by_geom"),
+                              accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
+                              ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
+                              **cfg_kw)
 
     log_dir = None
     if out_dir is not None:
@@ -339,9 +382,11 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
     mj.mj_forward(model, data)
 
     if out_dir is not None:
+        # planner= also writes the PAIRED seed figure from the tables this very
+        # solve recorded as it gated (last_seed_accept_table/last_seed_reject_table).
         _write_plots(model, data, res, verify_info, log_dir, object_id, seed,
-                     body_name, obj_bid, pos, out_dir,
-                     quadratic_path=quadratic_path, n_relin=n_relin)
+                     body_name, obj_bid, pos, out_dir, n_relin=n_relin,
+                     planner=planner)
     shutil.rmtree(log_dir, ignore_errors=True)
 
     p_WoO = data.xpos[obj_bid].copy()
@@ -361,8 +406,9 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
         # The disturbance LP's feasibility is decided by the contact GEOMETRY,
         # not by the object's mass -- two near-parallel inward normals cannot
         # resist a transverse wrench at any gamma, and the LP then returns None
-        # and the caller silently substitutes GAMMA_FALLBACK. Dump the geometry
-        # that actually went in, so an "infeasible" is diagnosable.
+        # and the run then ABORTS (the GAMMA_FALLBACK substitution was removed --
+        # see _solve_gamma). Dump the geometry that actually went in, so an
+        # "infeasible" is diagnosable.
         _n1, _n2 = np.asarray(n1_in, float), np.asarray(n2_in, float)
         print(f"[contact] p1={np.round(res['p1'], 4).tolist()} "
               f"p2={np.round(res['p2'], 4).tolist()}")
@@ -375,6 +421,14 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                               planner._planner._obj_gid, tip_geom_ids,
                               gamma_override)
     result["gamma"] = gamma_live
+    if gamma_live is None:
+        # Wrench-infeasible contact geometry: there is no grasp to execute. Report
+        # it as a planning outcome rather than squeezing at a fabricated gamma.
+        result["phase_log"] = ["gamma_infeasible_no_grasp"]
+        result["wrench_infeasible"] = True
+        print("[exec] ABORT before SQUEEZE -- wrench-infeasible contacts "
+              "(see [contact] trace: PFF_CONTACT_TRACE=1)")
+        return res, result
 
     Kp = np.concatenate([np.full(7, 40.0), np.full(16, finger_kp)])
     Kd = np.concatenate([np.full(7, 4.0), np.full(16, finger_kd)])
@@ -559,17 +613,32 @@ def _solve_gamma(model, data, obj_bid, R_WO, rec_local, obj_gid, tip_geom_ids,
     see its comment for why Task-B (datum) and not Task-A (CoM)."""
     if override is not None:
         return float(override)
-    ACCEL = (0.5, 0.5, 0.5)
-    ANG = (0.1, 0.1, 0.1)
-    FALLBACK = 2.0
+    # SHARED BUDGET: the same disturbance box the NLP's gamma certificate is solved
+    # against (NCF_ACCEL_BUDGET_XYZ / NCF_ANG_ACCEL_BUDGET, == the teleop stack's),
+    # not a second hardcoded copy. These were (0.5,0.5,0.5)/(0.1,0.1,0.1) while the
+    # certificate used the cfg budget, so planning and execution sized gamma for
+    # DIFFERENT tasks -- measured on 014_lemon: certificate gamma_min=1.07 at
+    # 20 m/s^2 vs commanded gamma=0.13 at 0.5 m/s^2, an 8x disagreement on the same
+    # contacts via the same LP. The jog's slew limiter clamps executed acceleration
+    # to JOG_ACCEL_BUDGET_MPS2, which NCF_ACCEL_BUDGET_XYZ is derived from, so this
+    # budget is the one actually ENFORCED during the carry.
+    ACCEL = NCF_ACCEL_BUDGET_XYZ
+    ANG = NCF_ANG_ACCEL_BUDGET
     g_O = R_WO.T @ model.opt.gravity
     mu = [float(model.geom_friction[obj_gid, 0])] * len(FINGER_SET)
     gamma = solve_gamma_live([p for p, _ in rec_local], [R for _, R in rec_local],
                              mu, float(model.body_mass[obj_bid]), ACCEL, ANG,
                              model.body_inertia[obj_bid], grav_O=g_O)
     if gamma is None or not np.isfinite(gamma) or gamma <= 0.0:
-        print(f"[plan] solve_gamma_live infeasible -> gamma={FALLBACK}")
-        gamma = FALLBACK
+        # NO FALLBACK. An infeasible LP means the contact geometry cannot resist
+        # the disturbance box at ANY squeeze force -- substituting a constant here
+        # (formerly FALLBACK=2.0) converted "no feasible grasp" into "squeeze
+        # anyway at a made-up force", which is how an 80-degree-splay grasp on
+        # 014_lemon (n1.n2=+0.166) still reached the squeeze phase. Return None and
+        # let the caller abort.
+        print("[plan] solve_gamma_live INFEASIBLE for this contact geometry "
+              "-- no gamma can resist the disturbance box; aborting the grasp.")
+        return None
     ceiling = _gamma_stability_ceiling(model, obj_bid, tip_geom_ids)
     if gamma > ceiling:
         print(f"[plan] clamping gamma {gamma:.2f} -> {ceiling:.2f} (stability ceiling)")
@@ -580,8 +649,7 @@ def _solve_gamma(model, data, obj_bid, R_WO, rec_local, obj_gid, tip_geom_ids,
 
 
 def _write_plots(model, data, res, verify_info, log_dir, object_id, seed,
-                 body_name, obj_bid, pos, out_dir, quadratic_path=False,
-                 n_relin=None):
+                 body_name, obj_bid, pos, out_dir, n_relin=None, planner=None):
     """Thin shim onto kinova_common.grasp_plots.write_grasp_plots.
 
     The implementation moved there so the live teleop recommender can emit the
@@ -589,7 +657,7 @@ def _write_plots(model, data, res, verify_info, log_dir, object_id, seed,
     """
     return write_grasp_plots(model, data, res, verify_info, log_dir, object_id,
                              seed, body_name, obj_bid, pos, out_dir,
-                             quadratic_path=quadratic_path, n_relin=n_relin)
+                             n_relin=n_relin, planner=planner)
 
 
 def main():
@@ -598,6 +666,10 @@ def main():
     ap.add_argument("--object", default="036_wood_block")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--n-seeds", type=int, default=3)
+    ap.add_argument("--backend", choices=["ipopt", "sqp"], default=None,
+                    help="NLP solver backend (GraspConfig3D.use_slsqp). Same cost "
+                         "function and constraints either way -- only the solver "
+                         "plugin changes. Default: the preset's own choice (ipopt).")
     ap.add_argument("--n-relin", type=int, default=3)
     ap.add_argument("--mode", choices=["autonomous", "scene-only"],
                     default="autonomous")
@@ -620,10 +692,6 @@ def main():
                     help="build the contact frame from the paraboloid's analytic "
                          "normal instead of freezing the seed's "
                          "(GraspConfig3D.quadratic_symbolic_normals)")
-    ap.add_argument("--quadratic-path", action="store_true",
-                    help="write the Picard-trajectory figure instead of the "
-                         "per-contact grasp figure (useful when tuning "
-                         "--n-relin; near-empty at --n-relin 0)")
     ap.add_argument("--sdf-err-tol", type=float, default=None,
                     help="metres; max surrogate-vs-true-SDF gap that sizes each "
                          "trust-region axis (default: GraspConfig3D's 5e-4)")
@@ -689,7 +757,7 @@ def main():
         args.object, args.seed, n_seeds=args.n_seeds, n_relin=args.n_relin,
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
-        sdf_err_tol=args.sdf_err_tol, quadratic_path=args.quadratic_path,
+        sdf_err_tol=args.sdf_err_tol, backend=args.backend,
         quad_sym_normals=args.quad_sym_normals,
         seed_rank_pool=args.seed_rank_pool,
         impratio=args.impratio, gamma_override=args.gamma,

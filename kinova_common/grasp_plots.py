@@ -44,20 +44,28 @@ from ycb_grasp import plot_quadratic_path as QP                     # noqa: E402
 
 
 def write_grasp_plots(model, data, res, verify_info, log_dir, object_id, seed,
-                      body_name, obj_bid, pos, out_dir, quadratic_path=False,
-                      n_relin=None, render_hand=True):
-    """Per-contact grasp figure for this solve (and optionally the older
-    Picard-trajectory view).
+                      body_name, obj_bid, pos, out_dir,
+                      n_relin=None, render_hand=True, planner=None):
+    """Per-contact grasp figure for this solve.
 
-    Default is the CONTACT view (plot_grasp_contacts): one zoomed panel per
-    solved contact, drawn in plot_seed_quadratic.py's grammar, which answers
-    "what does this grasp look like on the object". quadratic_path asks for
-    the trajectory view instead, which answers "how did the contact move
-    across Picard stages" -- the right question while tuning the
-    relinearization loop, and near-empty at n_relin=0 where there is only one
-    stage to plot.
+    The CONTACT view (plot_grasp_contacts): one zoomed panel per solved contact,
+    drawn in plot_seed_quadratic.py's grammar, which answers "what does this grasp
+    look like on the object".
 
-    render_hand=False skips the offscreen hand render for the trajectory view.
+    The Picard-TRAJECTORY view ("how did the contact move across Picard stages")
+    was REMOVED along with its quadratic_path argument: the solver now runs a
+    single stage (n_normal_relinearize=0 paired with quadratic_symbolic_normals --
+    see grasp_config_builder.for_gws_recommender), so there is no inter-stage
+    trajectory left to draw. plot_quadratic_path is still imported for
+    _iter_trace_quadratic_stages, its shared trace reader.
+
+    planner: when given, ALSO writes the paired seed figure (seed<N>_seeds.pdf)
+    from that planner's last_seed_accept_table / last_seed_reject_table -- every
+    contact seed THIS solve considered, accepted and rejected, in the same grammar
+    as plot_seed_quadratic. Paired by construction: same seeds, same gates, same
+    RNG draw as the grasp being drawn beside it. Omit it to skip that figure.
+
+    render_hand=False skips the offscreen hand render.
     Teleop calls it that way: the render needs the GL context that the viewer
     thread owns, and grabbing it from a background plot worker deadlocks.
 
@@ -69,16 +77,12 @@ def write_grasp_plots(model, data, res, verify_info, log_dir, object_id, seed,
         if not (stages and any(s["contact"] for s in stages)):
             return None
         V, F = oua.body_visual_mesh(model, obj_bid)
-        if quadratic_path:
-            hand_rgb = None
-            if render_hand:
-                hand_rgb = QP._render_hand_rgb(model, data, lookat=pos,
-                                               dist=0.45, elev=-35)
-            out = OP.fig_path(Path(out_dir) / f"seed{seed}_quadratic_path.png")
-            QP.plot_quadratic_path(V, F, stages, object_id, out,
-                                   hand_rgb=hand_rgb, verify_info=verify_info)
-            print(f"[plan] quadratic path -> {out.name}")
-            return out
+        # NOTE: the Picard-TRAJECTORY figure (seed<N>_quadratic_path) was removed --
+        # it answered "how did the contact MOVE across Picard stages", which no longer
+        # applies now that the solver runs a SINGLE stage (n_normal_relinearize=0 with
+        # quadratic_symbolic_normals; see grasp_config_builder.for_gws_recommender).
+        # plot_quadratic_path is still imported for _iter_trace_quadratic_stages, the
+        # shared trace reader that narrows a log_dir to the WINNING attempt.
         # LAST stage carrying contact frames = the returned solve's contacts
         # (_iter_trace_quadratic_stages already narrowed to the winning attempt).
         last = next(s for s in reversed(stages) if s["contact"])
@@ -96,8 +100,25 @@ def write_grasp_plots(model, data, res, verify_info, log_dir, object_id, seed,
             sdf_fn=sdf_fn, verify_info=verify_info, n_relin=n_relin)
         if got is not None:
             print(f"[plan] grasp contacts -> {out.name}")
-            return out
-        return None
+        _write_seed_fig(planner, model, data, out_dir, seed)
+        return out if got is not None else None
     except Exception as e:
         print(f"[plan] contact plot failed: {e}")
+        return None
+
+
+def _write_seed_fig(planner, model, data, out_dir, seed):
+    """Paired seed figure, best-effort: a failure here must never lose the grasp
+    figure that was already written."""
+    if planner is None:
+        return None
+    try:
+        from kinova_common.seed_figure import write_seed_figure
+        got = write_seed_figure(planner, model, data,
+                                Path(out_dir) / f"seed{seed}_seeds.png")
+        if got is not None:
+            print(f"[plan] contact seeds -> {got.name}")
+        return got
+    except Exception as e:
+        print(f"[plan] seed figure failed: {e}")
         return None

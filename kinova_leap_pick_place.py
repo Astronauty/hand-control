@@ -2747,7 +2747,15 @@ if __name__ == "__main__":
                   f"{len(_rec_nonactive_geoms)} non-active (mf/rf, "
                   f"obj-clearance +{_REC_NONACTIVE_OBJ_CLR*1e3:.0f}mm) "
                   f"(active tiers: adjacent -10mm, proximal +2mm)")
-            cfg = _grasp_config_builder.for_teleop_recommender(
+            # STANDARDIZED CONFIG: for_gws_recommender == for_teleop_recommender
+            # plus the FRoGGeR min-weight objective (w_gws/w_span) and the
+            # soft-finger W (gws_soft_finger=True, mu_t from the live model's
+            # geom_friction via _contact_friction). It also forces the quadratic
+            # contact parameterization on, so the two explicit flags below are
+            # now redundant but kept for readability of intent.
+            # The SAME preset is used by the autonomous tabletop benchmark
+            # (benchmarks/ycb_grasp/pick_and_place.py) -- one solver config.
+            cfg = _grasp_config_builder.for_gws_recommender(
                 o['name'], _rec_arm_geoms, _rec_obj_clearance,
                 accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
                 ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
@@ -3040,12 +3048,21 @@ if __name__ == "__main__":
         def _work():
             try:
                 os.makedirs(_outd, exist_ok=True)
-                for _qp in (False, True):     # contact view, then the Picard-path view
-                    write_grasp_plots(
-                        model, data, _res, cand.get('verify'), _tdir,
-                        _o['name'], _n, _o['name'], _o['id_body'], _pos, _outd,
-                        quadratic_path=_qp, render_hand=False)
-                print(f"[rec] lock-in {_n} analysis figures -> {_outd}/")
+                # ONE figure: the per-contact view. The Picard-trajectory view was
+                # removed (write_grasp_plots lost its quadratic_path argument) because
+                # the solver now runs a SINGLE stage -- n_normal_relinearize=0 paired
+                # with quadratic_symbolic_normals -- so there are no inter-stage
+                # contact movements left to draw.
+                # planner= adds the PAIRED seed figure: every contact seed this
+                # object's solve considered, accepted and rejected, from the tables
+                # MultiStartGraspPlanner3D.solve() recorded as it gated. The cached
+                # per-object planner is the one that ran this solve, so the seeds
+                # drawn are the seeds the committed grasp actually came from.
+                write_grasp_plots(
+                    model, data, _res, cand.get('verify'), _tdir,
+                    _o['name'], _n, _o['name'], _o['id_body'], _pos, _outd,
+                    render_hand=False, planner=_get_cat_planner(obj_idx))
+                print(f"[rec] lock-in {_n} analysis figure -> {_outd}/")
             except Exception:
                 traceback.print_exc()
 
@@ -3062,10 +3079,19 @@ if __name__ == "__main__":
         o = objects[obj_idx]
         gid = o['id_geom']
         gtype = int(model.geom_type[gid])
-        c   = data.geom_xpos[gid].copy()
-        R   = data.geom_xmat[gid].reshape(3, 3).copy()
-        size = model.geom_size[gid]
         _me = _cat_mesh_entry.get(obj_idx)
+        # MESH pose comes from the BODY, not the collision hull -- object_sdf's table
+        # is BODY-frame, and a CoACD hull origin is offset from the body origin
+        # (measured [-10.8, +21.0, +26.2] mm on 014_lemon), so the hull frame
+        # evaluates the SDF well off the true point. Same convention as
+        # grasp_planner_3d.verify() / solve() / plot_seed_quadratic / ablate_grasp.
+        if _me is not None:
+            c = data.xpos[o['id_body']].copy()
+            R = data.xmat[o['id_body']].reshape(3, 3).copy()
+        else:
+            c = data.geom_xpos[gid].copy()
+            R = data.geom_xmat[gid].reshape(3, 3).copy()
+        size = model.geom_size[gid]
         n1_out = _geom_normal_np(p1, gtype, c, R, size, mesh_entry=_me)
         n2_out = _geom_normal_np(p2, gtype, c, R, size, mesh_entry=_me)
         return -n1_out, -n2_out
