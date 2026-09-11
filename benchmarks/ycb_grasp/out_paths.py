@@ -54,13 +54,24 @@ def fig_path(path) -> Path:
     return Path(path).with_suffix("." + FIG_FORMAT)
 
 
-def savefig(fig, path, dpi=150, **kw):
-    """fig.savefig() honouring FIG_FORMAT. dpi is ignored for vector formats
-    (it only affects any rasterized sub-artist), kept so raster previews via
-    PFF_FIG_FORMAT=png retain their intended resolution."""
+def savefig(fig, path, dpi=200, **kw):
+    """fig.savefig() honouring FIG_FORMAT.
+
+    dpi is passed through for EVERY format, vector included. An earlier version
+    dropped it for pdf/svg on the theory that a vector file has no resolution --
+    that is wrong whenever the figure contains a RASTERIZED sub-artist, which
+    these do: draw_mesh rasterizes the object shell on purpose (see its
+    docstring). Measured on one orange panel, pdf size by dpi: 39KB at the
+    matplotlib default, 108KB at 200, 296KB at 400 -- i.e. dpi fully controls
+    that layer, and omitting it silently pinned the shell at 100 dpi.
+
+    200 is the default: enough that the translucent shell stays smooth when the
+    reader zooms, without the 3x size of 400 for detail nobody inspects on a
+    see-through backdrop.
+    """
     out = fig_path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out, **({"dpi": dpi} if FIG_FORMAT in ("png", "jpg", "jpeg") else {}), **kw)
+    fig.savefig(out, dpi=dpi, **kw)
     return out
 OUT_ROOT = REPO / "benchmarks" / "ycb_grasp" / "out"
 

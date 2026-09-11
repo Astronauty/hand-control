@@ -43,6 +43,12 @@ Plots:
 import argparse
 import logging
 import os
+
+# Figure format (vector by default) lives with the output-path convention.
+try:
+    from benchmarks.ycb_grasp import out_paths as OP
+except ImportError:  # running with benchmarks/ycb_grasp on sys.path
+    import out_paths as OP
 import sys
 from datetime import datetime
 
@@ -346,8 +352,8 @@ def _plot(records, sweep_meta, is_obj_sweep, out_dir, logger):
                  + ("arm joint angles (j1, j2)" if not is_obj_sweep else "object position"))
     ax.set_aspect('auto')
     fig.tight_layout()
-    p1_path = os.path.join(out_dir, "grid_success.png")
-    fig.savefig(p1_path, dpi=130)
+    p1_path = str(OP.fig_path(os.path.join(out_dir, "grid_success.png")))
+    OP.savefig(fig, p1_path, dpi=130)
     plt.close(fig)
     logger.info(f"Saved -> {p1_path}")
 
@@ -368,8 +374,8 @@ def _plot(records, sweep_meta, is_obj_sweep, out_dir, logger):
     ax3.set_xlabel("X (m)"); ax3.set_ylabel("Y (m)"); ax3.set_zlabel("Z (m)")
     ax3.set_title("Contact points 3D  ○=thumb  △=index")
     fig.tight_layout()
-    p2_path = os.path.join(out_dir, "contacts_3d.png")
-    fig.savefig(p2_path, dpi=130)
+    p2_path = str(OP.fig_path(os.path.join(out_dir, "contacts_3d.png")))
+    OP.savefig(fig, p2_path, dpi=130)
     plt.close(fig)
     logger.info(f"Saved -> {p2_path}")
 
@@ -382,8 +388,8 @@ def _plot(records, sweep_meta, is_obj_sweep, out_dir, logger):
         ax.set_ylabel("Count")
         ax.set_title("Cost distribution (converged + best-effort)")
         fig.tight_layout()
-        p3_path = os.path.join(out_dir, "cost_hist.png")
-        fig.savefig(p3_path, dpi=130)
+        p3_path = str(OP.fig_path(os.path.join(out_dir, "cost_hist.png")))
+        OP.savefig(fig, p3_path, dpi=130)
         plt.close(fig)
         logger.info(f"Saved -> {p3_path}")
 
@@ -400,8 +406,8 @@ def _plot(records, sweep_meta, is_obj_sweep, out_dir, logger):
         ax.set_ylabel("Objective cost")
         ax.set_title("Iterations vs cost")
         fig.tight_layout()
-        p4_path = os.path.join(out_dir, "iter_vs_cost.png")
-        fig.savefig(p4_path, dpi=130)
+        p4_path = str(OP.fig_path(os.path.join(out_dir, "iter_vs_cost.png")))
+        OP.savefig(fig, p4_path, dpi=130)
         plt.close(fig)
         logger.info(f"Saved -> {p4_path}")
 

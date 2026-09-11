@@ -6,8 +6,9 @@ contact patch (_mesh_quadratic_contact_ca) are normally only observable through
 whatever the full solve happens to converge to. This script exercises the SAME
 functions in isolation -- no opti, no IK, no collision model -- and draws:
 
-  1. SEED RAYS AND THEIR PROJECTION. Each seed source casts a ray and lands the
-     result on the surface with _project_to_surface_np:
+  1. SEED RAYS AND WHERE THEY LAND. Each seed source casts a ray and takes the
+     OUTER surface crossings along it (_outer_pair_t on
+     _ray_surface_crossings_np), polishing each hit onto the zero level set:
      BOTH SOURCES RAY FROM THE SAME ORIGIN: _ray_origin_local, the mesh's
      volumetric centroid, drawn "P" in every ray panel. The geom frame origin
      (the SDF frame centre) is NOT drawn by default -- it is not part of the
@@ -22,14 +23,17 @@ functions in isolation -- no opti, no IK, no collision model -- and draws:
          had it, commonly the object's base -- 036_wood_block's sits 103mm below
          its centre of mass on a 207mm block, so raying through it exits at the
          bottom RIM and both contacts land on an edge. See that function's
-         docstring for the full failure chain. Drawn as a dashed line through
-         the object with the two ray endpoints (bbox_r out along +/-axis) marked
-         hollow, and an arrow from each endpoint to its surface projection.
+         docstring for the full failure chain. Drawn as two dashed segments
+         from the centroid to the two landing points, one in each finger's
+         colour -- nothing is drawn outside the object, because the landing
+         point now comes from the ray's own SDF zero crossings
+         (_ray_surface_crossings_np) rather than from projecting a far-away
+         endpoint onto the nearest surface.
        - random seeds (_seed_pair): a random direction from the SHARED CENTROID
-         projected to p1s, then a
-         z-rotation-jittered march THROUGH the object (_march_sdf_np) to the
-         antipodal footprint p2s. Both legs are drawn, so the "project, then
-         march" structure is visible rather than inferred.
+         whose outermost crossing gives p1s, then a
+         z-rotation-jittered direction whose furthest crossing gives the
+         antipodal footprint p2s. Both legs are drawn, so the pairing is
+         visible rather than inferred.
      Rejected seeds are drawn too (grey/red), since which seeds the curvature
      gate throws away is as informative as which survive.
 
@@ -93,6 +97,7 @@ from simulation.grasp_planner_3d import (                                # noqa:
     _mesh_quadratic_contact_ca,
     _mesh_surface_kappa_max_np,
     _minor_axis_local,
+    _outer_pair_t,
     _ray_origin_local,
     _project_to_surface_np,
     _reachable_contact,
@@ -104,9 +109,9 @@ DEFAULT_OBJECTS = ["036_wood_block", "017_orange", "065-a_cups"]
 
 # Two colors per finger: (inside trust region, outside / extrapolated).
 # One colour per finger, used for EVERY mark that belongs to that contact: its
-# ray endpoint and projection arrow in the ray panel, its surface footprint, and
-# its patch. There is no second (pale) colour: the patch panel draws the trust
-# region only, so there is no extrapolation band for a pale colour to mean.
+# half of the seed ray, its surface footprint, and its patch. There is no
+# second (pale) colour: the patch panel draws the trust region only, so there
+# is no extrapolation band for a pale colour to mean.
 FINGER_COLORS = {
     "thumb": "#d94801",   # orange
     "index": "#2171b5",   # blue
@@ -312,44 +317,66 @@ def draw_mesh(ax, sc, alpha=0.10, max_tris=3000):
         F = F[np.linspace(0, len(F) - 1, max_tris).astype(int)]
     pc = Poly3DCollection(Vw[F], facecolor="0.6", edgecolor="0.45",
                           linewidths=0.15, alpha=alpha, zsort="min")
+    # RASTERIZE the shell, even in a vector figure. The 0.15pt edge strokes are
+    # what make this read as see-through, and they only work because they are
+    # SUB-PIXEL: 0.15pt is 0.24 device px at 115 dpi, so AGG renders them as a
+    # faint wash. A vector viewer strokes them at 0.15pt no matter the zoom, so
+    # in pdf/svg all ~3000 of them draw at full weight and the wireframe
+    # competes with the patch instead of backing it -- worse the further you
+    # zoom. Measured at 300 dpi, edges add ~80% to the rendered ink (701KB vs
+    # 394KB faces-only).
+    #
+    # Rasterizing pins the shell to savefig's dpi, restoring exactly the
+    # appearance this alpha/linewidth pair was tuned for, while the patches,
+    # contact markers, text and axes all stay vector.
+    #
+    # Size effect depends on panel count, and the two regimes are worth knowing:
+    # on a SINGLE panel the embedded image costs more than the paths it
+    # replaces (185KB vs 91KB at dpi=200). On the real multi-panel figures the
+    # path collapse dominates and every object got smaller -- 009_gelatin_box
+    # 732->328KB, 017_orange 272->172KB, 036_wood_block 744->292KB,
+    # 065-a_cups 260->112KB.
+    pc.set_rasterized(True)
     ax.add_collection3d(pc)
     return Vw
 
 
 def draw_seed_rays(ax, sc, rec, show_geom_origin=False):
-    """Part 1: the ray, its endpoint, and the projection onto the surface."""
+    """Part 1: the seed ray, drawn centroid -> landing point for each finger."""
     s, ray = rec["seed"], rec["ray"]
     ok = rec["ok"]
     col = "0.25" if ok else "#cb181d"
     a = 0.9 if ok else 0.45
 
-    # Per-contact marks (ray endpoint, projection arrow, footprint) take THAT
-    # contact's finger colour, so the ray panel and the patch panels below it
-    # use one consistent encoding. The ray LINE and the centroid stay neutral:
-    # they are shared by both contacts, so colouring them for one finger would
-    # be a lie. A rejected seed overrides everything to red.
+    # Everything belonging to ONE contact -- its half of the seed ray and its
+    # surface footprint -- takes that finger's colour, so the ray panel and the
+    # patch panels below it share one encoding. Only the centroid stays neutral:
+    # it is the single point both contacts ray from, so colouring it for one
+    # finger would be a lie. A rejected seed overrides everything to red.
     def _fcol(key):
         return FINGER_COLORS[key] if ok else "#cb181d"
 
-    if ray["mode"] == "axis":
-        # Deterministic minor-axis pair: one line through the object, both
-        # endpoints projected inward onto the surface.
-        o, d, L = ray["origin"], ray["dir"], ray["length"]
-        e1, e2 = o + d * L, o - d * L
-        ax.plot(*np.array([e1, e2]).T, color=col, ls="--", lw=1.0, alpha=a, zorder=4)
-        for e, p, key in ((e1, s["p1s"], "thumb"), (e2, s["p2s"], "index")):
-            fc = _fcol(key)
-            ax.scatter(*e, facecolor="none", edgecolor=fc, s=28, lw=1.2, alpha=a, zorder=5)
-            _arrow(ax, e, p, fc, a)
-    else:
-        # Random seed: (a) centre -> ray endpoint -> project to p1s, then
-        # (b) march from p1s through the object -> p2s.
-        o, d, L = ray["origin"], ray["dir"], ray["length"]
-        e1 = o + d * L
-        fc = _fcol("thumb")
-        ax.plot(*np.array([o, e1]).T, color=col, ls=":", lw=0.9, alpha=a, zorder=4)
-        ax.scatter(*e1, facecolor="none", edgecolor=fc, s=28, lw=1.2, alpha=a, zorder=5)
-        _arrow(ax, e1, s["p1s"], fc, a)
+    # CENTROID -> LANDING POINT, one coloured segment per finger, stopping at
+    # the surface. Nothing is drawn outside the object.
+    #
+    # This used to draw the ray overshooting to a point ~2.5 bbox radii away,
+    # a hollow marker there, and an arrow projecting back onto the surface --
+    # a faithful picture of the OLD mechanism, where the ray only chose a
+    # far-away point and _project_to_surface_np picked the nearest surface to
+    # it. That is no longer how seeding works: _ray_surface_crossings_np scans
+    # the ray and _outer_pair_t takes its first and last zero crossings, so the
+    # landing point IS on the ray and the overshoot never existed except as an
+    # artefact of the old construction. Drawing it now would depict a step the
+    # code does not take.
+    #
+    # The ray line is still shown between the two contacts (dashed for the
+    # deterministic minor-axis seed, dotted for a random one) because that
+    # segment is real -- it is the chord the scan ran along.
+    o = ray["origin"]
+    _ls = "--" if ray["mode"] == "axis" else ":"
+    for p, key in ((s["p1s"], "thumb"), (s["p2s"], "index")):
+        ax.plot(*np.array([o, p]).T, color=_fcol(key), ls=_ls, lw=1.6,
+                alpha=a, zorder=4, solid_capstyle="round")
 
     # RAY ORIGIN. Both seed sources ray from the same point --
     # _ray_origin_local, the mesh's volumetric centroid. The SDF frame centre
@@ -368,14 +395,6 @@ def draw_seed_rays(ax, sc, rec, show_geom_origin=False):
         ax.scatter(*gc, marker="X", s=45, facecolor="none", edgecolor=col,
                    lw=1.1, alpha=a * 0.5, zorder=6)
 
-    # PAIRING: the chord joining this seed's two footprints. Drawn for BOTH
-    # seed kinds -- for a random seed it is also the physical march leg
-    # (_march_sdf_np's path from p1s through the object to p2s), for the
-    # minor-axis seed it coincides with the ray. Its job in either case is to
-    # make "these two contacts are one pair" unambiguous within the panel.
-    ax.plot(*np.array([s["p1s"], s["p2s"]]).T, color=col, ls="-.", lw=1.2,
-            alpha=a * 0.85, zorder=4)
-
     # Landed surface footprints. Which is thumb and which is index
     # (_assign_seed_by_finger's output) is carried by COLOR alone -- the same
     # color that fills that finger's patch in the rows below -- so the figure
@@ -389,13 +408,6 @@ def s_pts(rec):
     """This seed's two surface footprints, as a (2,3) array -- the points a ray
     panel must keep in frame regardless of how far out the ray itself starts."""
     return np.array([rec["seed"]["p1s"], rec["seed"]["p2s"]], float)
-
-
-def _arrow(ax, a, b, color, alpha):
-    """Projection arrow: ray endpoint -> its _project_to_surface_np image."""
-    a, b = np.asarray(a, float), np.asarray(b, float)
-    ax.plot(*np.array([a, b]).T, color=color, lw=1.4, alpha=alpha, zorder=5)
-    ax.scatter(*b, color=color, marker="o", s=10, alpha=alpha, zorder=5)
 
 
 def draw_quadratic(ax, sc, frame, key):
@@ -472,7 +484,7 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
     # patches too, marked as such: it shows exactly what the gate is refusing.
     panel_recs = accepted if (accepted and not show_rejected) else recs
     # Layout: ONE COLUMN PER SEED, read top to bottom --
-    #   row 0: that seed's OWN ray + projection panel, whole-object framing
+    #   row 0: that seed's OWN ray -> surface panel, whole-object framing
     #   row 1: its thumb paraboloid   row 2: its index paraboloid
     # Every seed gets its own ray panel rather than sharing one overview,
     # because an overview draws every pair in the same style and gives no way
@@ -496,11 +508,11 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
         f"{obj}  —  seeding strategy and local quadratic surrogate  ({fit_tag})\n"
         f"{len(accepted)}/{len(recs)} seeds accepted, {n_rej} rejected "
         f"(kappa gate {cfg.seed_kappa_max_reject:.0f})\n"
-        "one column per seed: ray → projection, then its thumb and index paraboloid"
+        "one column per seed: seed ray → surface, then its thumb and index paraboloid"
         "  —  patch = the measured trust region (t_lo/t_hi per axis)",
         fontsize=10.5)
 
-    # ── Row 0: each seed's own ray + projection, over the transparent mesh ──
+    # ── Row 0: each seed's own ray -> surface, over the transparent mesh ──
     for i, rec in enumerate(panel_recs):
         axr = fig.add_subplot(gs[0, i], projection="3d")
         Vw = draw_mesh(axr, sc)
@@ -517,7 +529,7 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
                             - np.asarray(rec["ray"]["geom_center"], float))
         _gap = (f"  (centroid–geom-origin gap {_d*1e3:.0f}mm)"
                 if show_geom_origin else "")
-        axr.set_title(f"seed {i} ({rec['kind']}) — ray → projection{_gap}"
+        axr.set_title(f"seed {i} ({rec['kind']}) — seed ray → surface{_gap}"
                       f"{_rej}", fontsize=8.5,
                       color="k" if rec["ok"] else "#cb181d")
         axr.view_init(elev=elev, azim=azim)
@@ -578,14 +590,14 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
     handles = [
         plt.Line2D([], [], color=FINGER_COLORS["thumb"], lw=6, marker="o",
                    markeredgecolor="k", markeredgewidth=0.5, ms=9,
-                   label="thumb — contact point & patch"),
+                   label="thumb — seed ray, contact point & patch"),
         plt.Line2D([], [], color=FINGER_COLORS["index"], lw=6, marker="o",
                    markeredgecolor="k", markeredgewidth=0.5, ms=9,
-                   label="index — contact point & patch"),
+                   label="index — seed ray, contact point & patch"),
         plt.Line2D([], [], color="0.25", marker="P", ls="none", ms=9,
                    label="volumetric centroid — shared ray origin"),
-        plt.Line2D([], [], color="0.25", ls="--", label="minor-axis seed ray"),
-        plt.Line2D([], [], color="0.25", ls=":", label="random seed ray"),
+        plt.Line2D([], [], color="0.35", ls="--", label="dashed = minor-axis seed"),
+        plt.Line2D([], [], color="0.35", ls=":", label="dotted = random seed"),
     ]
     # --ray-origins draws the geom origin as well; it is off by default, so this
     # entry does not count against the compact five-entry legend.
@@ -630,11 +642,17 @@ def sample_ray_distribution(sc, n: int, rng_seed: int = 0):
     the surface footprint each one lands on.
 
     Reproduces _seed_pair's own two lines (standard_normal, then u[2] *= 0.5)
-    rather than calling it, because we want only the ray and its first
-    projection -- not the antipodal march, the gates, or the finger assignment.
+    rather than calling it, because we want only the ray and where it FIRST
+    lands -- not the antipodal march, the gates, or the finger assignment.
     Anything that changes _seed_pair's direction sampling must be mirrored here;
     the shared ray ORIGIN comes from _ray_origin_local so at least that cannot
-    drift."""
+    drift.
+
+    Landing uses the same outer-surface rule the solver uses (_outer_pair_t on
+    the ray's SDF zero crossings), NOT the nearest-surface projection this used
+    to call. Those disagree on any hollow object -- on 065-a_cups the old rule
+    put footprints on the INNER wall, so this diagnostic would have drawn a
+    sampling distribution the planner never actually produces."""
     gt, gs, c, R, me = (sc["geom_type"], sc["geom_size"], sc["center"],
                         sc["R"], sc["mesh_entry"])
     bbox_r = float(np.max(gs)) * 2.5
@@ -646,8 +664,16 @@ def sample_ray_distribution(sc, n: int, rng_seed: int = 0):
         u[2] *= 0.5              # _seed_pair's bias away from top/bottom faces
         u /= np.linalg.norm(u) + 1e-12
         dirs.append(u)
-        hits.append(_project_to_surface_np(c_ray + u * bbox_r, gt, c, R, gs,
-                                           mesh_entry=me))
+        _o = None
+        if gt == _GEOM_TYPE_MESH and me is not None:
+            _u_l = R.T @ u
+            _o = _outer_pair_t(me, _ray_origin_local(gt, me), _u_l)
+        if _o is not None:
+            _p = c + R @ (_ray_origin_local(gt, me) + _o[1] * (R.T @ u))
+            hits.append(_project_to_surface_np(_p, gt, c, R, gs, mesh_entry=me))
+        else:
+            hits.append(_project_to_surface_np(c_ray + u * bbox_r, gt, c, R, gs,
+                                               mesh_entry=me))
     return c_ray, np.array(dirs), np.array(hits)
 
 

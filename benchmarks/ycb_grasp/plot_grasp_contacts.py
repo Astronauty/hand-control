@@ -84,8 +84,14 @@ def _draw_mesh(ax, Vw, F, alpha=0.12, max_tris=3000):
     faces at YCB triangle counts stack into an opaque blob)."""
     if len(F) > max_tris:
         F = F[np.linspace(0, len(F) - 1, max_tris).astype(int)]
-    ax.add_collection3d(Poly3DCollection(Vw[F], facecolor="0.6", edgecolor="0.45",
-                                         linewidths=0.15, alpha=alpha, zsort="min"))
+    pc = Poly3DCollection(Vw[F], facecolor="0.6", edgecolor="0.45",
+                          linewidths=0.15, alpha=alpha, zsort="min")
+    # Rasterize the shell even in a vector figure -- same reason as
+    # plot_seed_quadratic.draw_mesh: the 0.15pt edges only read as see-through
+    # because they are sub-pixel in a raster render, and a vector viewer strokes
+    # all ~3000 of them at full weight, burying the patch this plot is about.
+    pc.set_rasterized(True)
+    ax.add_collection3d(pc)
 
 
 def _equal_axes(ax, pts, pad=0.005, min_r=None):

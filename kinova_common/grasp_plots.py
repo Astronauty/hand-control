@@ -38,6 +38,7 @@ if str(_REPO / "benchmarks") not in sys.path:
 
 from grasp_control import object_uv_atlas as oua                    # noqa: E402
 from simulation.grasp_planner_3d import _mesh_sdf_entry             # noqa: E402
+from ycb_grasp import out_paths as OP                             # noqa: E402
 from ycb_grasp import plot_grasp_contacts as PGC                    # noqa: E402
 from ycb_grasp import plot_quadratic_path as QP                     # noqa: E402
 
@@ -73,7 +74,7 @@ def write_grasp_plots(model, data, res, verify_info, log_dir, object_id, seed,
             if render_hand:
                 hand_rgb = QP._render_hand_rgb(model, data, lookat=pos,
                                                dist=0.45, elev=-35)
-            out = Path(out_dir) / f"seed{seed}_quadratic_path.png"
+            out = OP.fig_path(Path(out_dir) / f"seed{seed}_quadratic_path.png")
             QP.plot_quadratic_path(V, F, stages, object_id, out,
                                    hand_rgb=hand_rgb, verify_info=verify_info)
             print(f"[plan] quadratic path -> {out.name}")
@@ -89,7 +90,7 @@ def write_grasp_plots(model, data, res, verify_info, log_dir, object_id, seed,
             sdf_fn = lambda p: float(_me["fn"](np.asarray(p, float)))   # noqa: E731
         except Exception:
             pass
-        out = Path(out_dir) / f"seed{seed}_grasp_contacts.png"
+        out = OP.fig_path(Path(out_dir) / f"seed{seed}_grasp_contacts.png")
         got = PGC.plot_grasp_contacts(
             V, F, last, object_id, out,
             sdf_fn=sdf_fn, verify_info=verify_info, n_relin=n_relin)
