@@ -29,6 +29,11 @@ USAGE
   python plot_event_traces.py logs/*/ --out traces.png     # headless save (else shows window)
 """
 import argparse
+
+try:
+    from benchmarks.ycb_grasp import out_paths as OP
+except ImportError:
+    OP = None
 import glob
 import json
 import os
@@ -217,7 +222,10 @@ def plot(all_lanes, clock: str, event_filter, out_path, width, height):
 
     fig.tight_layout()
     if out_path is not None:
-        fig.savefig(out_path, dpi=140, bbox_inches='tight')
+        if OP is not None:
+            out_path = OP.savefig(fig, out_path, dpi=140, bbox_inches='tight')
+        else:
+            fig.savefig(out_path, dpi=140, bbox_inches='tight')
         print(f"wrote {out_path}")
     else:
         plt.show()

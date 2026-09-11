@@ -361,7 +361,7 @@ def _plot(rows, out_path):
     ax2.set_title("Grasp NLP solve time by object")
 
     fig.tight_layout()
-    fig.savefig(out_path, dpi=140)
+    OP.savefig(fig, out_path, dpi=140)
     print(f"\n-> {out_path}")
 
 

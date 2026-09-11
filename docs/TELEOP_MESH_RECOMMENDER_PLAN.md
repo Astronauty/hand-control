@@ -302,33 +302,75 @@ Two gaps in `apply_to_model` to close while wiring it:
   caller to read). Given constraint (1) above, teleop should NOT blindly adopt
   `GAMMA=10.0` — see the validation gate below.
 
-### Phase 3c — VALIDATE pick-and-drop before trusting either profile
+### Phase 3c — pick/drop validation: DONE (2026-09-10)
 
-Per the user's ask: if we start on global/stock settings, prove the basic behavior
-first. This is a gate, not a nice-to-have — the release-fling failure mode is
-invisible until you actually drop something.
+Run with `--contact-profile {stock,tuned}` + the new `release_peak_speed_mps`
+metric (commit `445cedf`), seed 0, `--n-seeds 3 --n-relin 2`, transport on.
+`tuned` additionally passes `--gamma 10.0 --squeeze-pd-scale 1.0`, the pairing
+`contact_tuning.py` requires alongside `noslip=5`.
 
-Run each profile over the four single-hull objects and record, per object:
-grasp force (N), lift height (mm), and **peak |v| at release** (m/s).
+| object | profile | grip N (idx/thumb) | lift | peak \|v\| | peak \|w\| | contact lost |
+|---|---|---|---|---|---|---|
+| 036_wood_block | stock | 2.04 / 2.17 | **-0.4 mm FAIL** | 0.016 | 0.1 | both |
+| 036_wood_block | tuned | 5.43 / 4.88 | **+37.8 mm** | 0.017 | 0.4 | both |
+| 056_tennis_ball | stock | 1.31 / 1.05 | **+0.1 mm FAIL** | 0.001 | 0.0 | both |
+| 056_tennis_ball | tuned (s0) | — | *aborted at gap gate* | — | — | — |
+| 056_tennis_ball | tuned (s1) | 6.77 / 6.53 | **+121.2 mm, in_bin=True** | **1.742** | 7.7 | none |
+| 056_tennis_ball | tuned (s2) | — | *aborted at gap gate* | — | — | — |
+| 014_lemon | stock | 0.30 / 0.26 | +119.3 mm | **1.447** | 16.5 | thumb |
+| 014_lemon | tuned | 6.63 / 6.64 | +119.5 mm | **1.403** | 29.0 | none |
+| 017_orange | stock | 1.07 / 1.06 | +118.4 mm | **1.667** | 21.6 | none |
+| 017_orange | tuned | 6.33 / 6.63 | +117.1 mm | **1.494** | 16.8 | none |
 
-```
-                     stock (today)        tuned (contact_tuning)
-036_wood_block       ? / ? / ?            5.7 N / 96 mm / 0.04 m/s
-056_tennis_ball      ? / ? / ?            ?
-014_lemon            ? / ? / ?            ?
-017_orange           ? / ? / ?            6.2 N / 115 mm / 2.92 m/s  KNOWN-BAD
-```
+**Verdict: adopt `tuned` for grip and lift; it does NOT fix release on round objects.**
 
-Reference numbers in the right column are contact_tuning.py's tabletop measurements;
-`056_tennis_ball` and `014_lemon` were not in that sweep, so they need measuring.
-`017_orange` is a documented genuine exception — a smooth sphere rolls out of a
-two-finger pinch, it CONVERGES under timestep refinement (1.68/1.60/1.58 m/s at
-dt=2/1/0.5 ms), so it is what the model says happens and no contact setting fixes it.
-**Do not tune against the orange**; record it and move on.
+1. **Grip/lift is a clear win.** Stock FAILED to lift both prismatic objects
+   (-0.4 mm, +0.1 mm) at 1-2 N. Tuned lifts the wood block +37.8 mm at 5.4/4.9 N,
+   and raises grip ~6x on every object that squeezed. Tuned also retains contact
+   where stock loses it (lemon: thumb lost -> none lost).
 
-Only adopt `tuned` as teleop's default if it holds grasp force AND lift AND improves
-release across the non-orange objects — and only once the gamma question in
-constraint (1) is settled.
+2. **Release splits into TWO mechanisms that look identical in the symptom.**
+   This distinction is not currently drawn in `contact_tuning.py`, which lists the
+   orange as a lone exception rather than as a category:
+   - *Chatter-driven* (wood block; the cups in contact_tuning's own sweep) — stiff
+     fingertip contact re-energizing each step. Already near zero here (0.016 m/s),
+     and this is what `noslip=5` + the softer fingertip solref fixes.
+   - *Roll-out* (lemon, orange) — a smooth convex body rotating out from between two
+     pads as they open. **Contact parameters barely move it.** The lemon went from
+     1.447 -> 1.403 m/s (3%) for a 22x grip increase, and its SPIN nearly doubled
+     (16.5 -> 29.0 rad/s). The orange improved only 1.667 -> 1.494 m/s.
+
+3. **Independent corroboration of a prior finding.** `017_orange` stock measured
+   1.667 m/s here; contact_tuning.py records 1.68 m/s for the orange at condim=4 and
+   notes it CONVERGES under timestep refinement (1.68/1.60/1.58 at dt=2/1/0.5 ms).
+   Within 1%, re-measured on the tabletop through a metric added this session. That
+   also shows the tabletop scene already runs the orange at the softer rolling
+   friction, not the 2.92 m/s stock-condim case.
+
+**Caveat on the comparison (my choice, stated so it can be overridden).** The profile
+is applied BEFORE `TS.settle` so the object settles under the contact model being
+measured. That is the right call for measurement validity, but it means stock and
+tuned do not plan against a bit-identical object pose. `056_tennis_ball|tuned`
+aborted at the 8 mm gap gate with gaps `thumb +10.0 / index -2.1 mm` — the asymmetric
+straddle that marks a SEATING outcome, exactly the artifact contact_tuning.py warns
+about ("a 0.0 N failure that is a PLANNER outcome, not a contact one"). Scored as
+`squeeze_aborted_no_contact`, NOT as a tuned-profile failure.
+
+**Re-run at seeds 1 and 2 confirms that, and adds a caveat.** Seed 1 succeeds
+outright — 6.77/6.53 N, +121.2 mm, and the ONLY cell in this whole matrix to score
+`in_bin=True`. Seed 2 aborts again (gaps +10.5/+6.4 mm). So the abort is seating, not
+the profile — but at 2 of 3 seeds it is FREQUENT, not a fluke, and the tennis ball
+should be treated as having a seating problem on this scene worth its own look. The
+gap gate is doing its job: it is refusing to squeeze on a grasp that never seated.
+
+Seed 1 also puts the tennis ball in the ROLL-OUT class: 1.742 m/s, the highest release
+in the matrix, on a sphere — consistent with the lemon/orange mechanism and with its
+geometry.
+
+**Not yet decided: teleop's default.** This validates `tuned` for the BENCHMARK, whose
+gamma is a fixed override. Teleop certifies gamma per grasp via `solve_gamma_live`, so
+the `gamma=10.0` half of the pairing does not transfer — see the open question in
+section 9. Teleop's `--contact-profile` default stays `stock` until that is settled.
 
 ### Phase 4 — emit plots at lock-in, off the render thread
 
@@ -438,10 +480,14 @@ figures across the object set without a human at the viewer.
 - **Trust-region pinning.** SOLVER_STATE.md §2 records `pinned=True` 9/9 stages — the
   Picard loop takes maximum-length steps. The contact-movement plot will therefore
   show seed + N x bound marches, not interior optima. That is a known, documented
-  solver property, not a bug introduced here.
-- **`009_gelatin_box` cannot be planned lying flat** (SOLVER_STATE.md §9): fingertip
-  r = 19.4 mm vs a 28 mm box. It is in the default `pick_place` list — expect it to
-  report unsupported/unreachable. Not a regression.
+  solver property, not a bug introduced here. Note the bounds themselves are now
+  patch-wide (`_shrink_patch_to_tol`), so "N x bound" is a smaller step than it was
+  before that change.
+- **`009_gelatin_box` lying flat is seed-starved** (SOLVER_STATE.md §9). It used to be
+  impossible (fingertip bounding-sphere r = 19.4 mm vs a ~30 mm box, 120/120 seeds
+  rejected); with `seed_ground_clearance_m = 0.005` it now yields ~1 seed in 3. It is in
+  the default `pick_place` list — expect sparse seeds, not a hard failure. Not a
+  regression either way.
 - **Don't touch dexpilot / anyteleop.** They are the paper's baselines.
 - **`log_dir` is deleted by the benchmark after plotting** (pick_and_place.py:315
   `shutil.rmtree`). Teleop must NOT copy that: the plot worker runs async on a

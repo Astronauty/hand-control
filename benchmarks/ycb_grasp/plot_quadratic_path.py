@@ -207,6 +207,12 @@ def _draw_mesh_3d(ax, V, F, color="#dcdcdc", alpha=None, edge_color="#333333", e
         pc = Poly3DCollection(tv, facecolors=color, edgecolors=edge_color, linewidths=edge_lw)
     else:
         pc = Poly3DCollection(tv, facecolors=color, edgecolors=edge_color, linewidths=edge_lw, alpha=alpha)
+    # Rasterize the OBJECT SHELL in vector output: its thin (0.25pt) wireframe
+    # is sub-pixel in a raster render but full-weight in pdf/svg, where ~3000
+    # strokes bury the contact patch. The patch's own boundary (linewidths=1.4,
+    # drawn elsewhere in this module) is a deliberate feature line and stays
+    # vector.
+    pc.set_rasterized(True)
     # mplot3d sorts each Poly3DCollection as ONE unit by its average depth, not
     # per-triangle -- a many-triangle mesh collection's average can end up
     # "in front of" a small patch collection added later even where the real
@@ -594,7 +600,7 @@ def plot_quadratic_path(V: np.ndarray, F: np.ndarray, stages: list[dict],
         "blue=thumb/orange=index, x=seed, circle=path start, star=path end",
         fontsize=9, y=0.985)
     fig.subplots_adjust(left=0.01, right=0.99, top=0.92, bottom=0.02, hspace=0.25, wspace=0.05)
-    fig.savefig(out_path, dpi=150)
+    OP.savefig(fig, out_path, dpi=150)
     plt.close(fig)
 
 
@@ -727,7 +733,7 @@ def main():
 
             obj_out_dir = out_root / oid
             obj_out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = obj_out_dir / f"seed{seed_val}.png"
+            out_path = OP.fig_path(obj_out_dir / f"seed{seed_val}.png")
             render_path = (obj_out_dir / f"seed{seed_val}_arm_pose.png") if args.render else None
             try:
                 _solve_and_plot(model, data, body_name, q_bias_full, pos, cfg,

@@ -6,8 +6,9 @@ contact patch (_mesh_quadratic_contact_ca) are normally only observable through
 whatever the full solve happens to converge to. This script exercises the SAME
 functions in isolation -- no opti, no IK, no collision model -- and draws:
 
-  1. SEED RAYS AND THEIR PROJECTION. Each seed source casts a ray and lands the
-     result on the surface with _project_to_surface_np:
+  1. SEED RAYS AND WHERE THEY LAND. Each seed source casts a ray and takes the
+     OUTER surface crossings along it (_outer_pair_t on
+     _ray_surface_crossings_np), polishing each hit onto the zero level set:
      BOTH SOURCES RAY FROM THE SAME ORIGIN: _ray_origin_local, the mesh's
      volumetric centroid, drawn "P" in every ray panel. The geom frame origin
      (the SDF frame centre) is NOT drawn by default -- it is not part of the
@@ -22,14 +23,17 @@ functions in isolation -- no opti, no IK, no collision model -- and draws:
          had it, commonly the object's base -- 036_wood_block's sits 103mm below
          its centre of mass on a 207mm block, so raying through it exits at the
          bottom RIM and both contacts land on an edge. See that function's
-         docstring for the full failure chain. Drawn as a dashed line through
-         the object with the two ray endpoints (bbox_r out along +/-axis) marked
-         hollow, and an arrow from each endpoint to its surface projection.
+         docstring for the full failure chain. Drawn as two dashed segments
+         from the centroid to the two landing points, one in each finger's
+         colour -- nothing is drawn outside the object, because the landing
+         point now comes from the ray's own SDF zero crossings
+         (_ray_surface_crossings_np) rather than from projecting a far-away
+         endpoint onto the nearest surface.
        - random seeds (_seed_pair): a random direction from the SHARED CENTROID
-         projected to p1s, then a
-         z-rotation-jittered march THROUGH the object (_march_sdf_np) to the
-         antipodal footprint p2s. Both legs are drawn, so the "project, then
-         march" structure is visible rather than inferred.
+         whose outermost crossing gives p1s, then a
+         z-rotation-jittered direction whose furthest crossing gives the
+         antipodal footprint p2s. Both legs are drawn, so the pairing is
+         visible rather than inferred.
      Rejected seeds are drawn too (grey/red), since which seeds the curvature
      gate throws away is as informative as which survive.
 
@@ -84,6 +88,7 @@ from ycb_grasp import out_paths as OP                                    # noqa:
 from ycb_grasp.ik_demo import clearance_by_geom, robot_geom_names        # noqa: E402
 from grasp_control import object_uv_atlas as oua                         # noqa: E402
 from simulation.grasp_config_builder import for_ablation_default         # noqa: E402
+from simulation.grasp_config_builder import load_seed_config
 from simulation.grasp_planner_3d import (                                # noqa: E402
     _GEOM_TYPE_MESH,
     _fixed_antipodal_seed,
@@ -92,6 +97,7 @@ from simulation.grasp_planner_3d import (                                # noqa:
     _mesh_quadratic_contact_ca,
     _mesh_surface_kappa_max_np,
     _minor_axis_local,
+    _outer_pair_t,
     _ray_origin_local,
     _project_to_surface_np,
     _reachable_contact,
@@ -102,9 +108,13 @@ from simulation.grasp_planner_3d import (                                # noqa:
 DEFAULT_OBJECTS = ["036_wood_block", "017_orange", "065-a_cups"]
 
 # Two colors per finger: (inside trust region, outside / extrapolated).
+# One colour per finger, used for EVERY mark that belongs to that contact: its
+# half of the seed ray, its surface footprint, and its patch. There is no
+# second (pale) colour: the patch panel draws the trust region only, so there
+# is no extrapolation band for a pale colour to mean.
 FINGER_COLORS = {
-    "thumb": ("#d94801", "#fdd0a2"),   # orange: saturated inside, pale outside
-    "index": ("#2171b5", "#c6dbef"),   # blue:   saturated inside, pale outside
+    "thumb": "#d94801",   # orange
+    "index": "#2171b5",   # blue
 }
 
 
@@ -126,9 +136,13 @@ def build_object(obj: str, seed: int = 4):
     P.settle_object_on_floor(model, data, bid)
 
     rg = robot_geom_names(model)
+    # Same seed/surrogate settings the solver gets (models/grasp_seed_config.json),
+    # so this diagnostic cannot drift from the gate it is drawing. plot_object's
+    # --sdf-err-tol / --t-bound-max flags are applied AFTER this and still win.
     cfg = for_ablation_default(
         obj_geom=S.hull_geoms(model, bn)[0], obj_body=bn, n_seeds=1,
-        arm_geom_names=rg, obj_clearance_by_geom=clearance_by_geom(rg))
+        arm_geom_names=rg, obj_clearance_by_geom=clearance_by_geom(rg),
+        **load_seed_config(obj))
     ms = MultiStartGraspPlanner3D(model, data, cfg)
     pl = ms._planner
 
@@ -150,7 +164,13 @@ def build_object(obj: str, seed: int = 4):
     return dict(obj=obj, model=model, data=data, body=bn, cfg=cfg, planner=pl,
                 geom_type=geom_type, geom_size=geom_size, mesh_entry=mesh_entry,
                 center=center, R=R, Vvis=Vvis, Fvis=Fvis,
-                r_tip=min(cfg.r_thumb, cfg.r_index), ground_z=cfg.ground_z)
+                # Mirrors solve()'s own _r_tip_min rule (flat
+                # seed_ground_clearance_m override, else the bounding-sphere
+                # radius) so this plot cannot drift from the real seed gate.
+                r_tip=(float(cfg.seed_ground_clearance_m)
+                       if cfg.seed_ground_clearance_m is not None
+                       else min(cfg.r_thumb, cfg.r_index)),
+                ground_z=cfg.ground_z)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,34 +317,66 @@ def draw_mesh(ax, sc, alpha=0.10, max_tris=3000):
         F = F[np.linspace(0, len(F) - 1, max_tris).astype(int)]
     pc = Poly3DCollection(Vw[F], facecolor="0.6", edgecolor="0.45",
                           linewidths=0.15, alpha=alpha, zsort="min")
+    # RASTERIZE the shell, even in a vector figure. The 0.15pt edge strokes are
+    # what make this read as see-through, and they only work because they are
+    # SUB-PIXEL: 0.15pt is 0.24 device px at 115 dpi, so AGG renders them as a
+    # faint wash. A vector viewer strokes them at 0.15pt no matter the zoom, so
+    # in pdf/svg all ~3000 of them draw at full weight and the wireframe
+    # competes with the patch instead of backing it -- worse the further you
+    # zoom. Measured at 300 dpi, edges add ~80% to the rendered ink (701KB vs
+    # 394KB faces-only).
+    #
+    # Rasterizing pins the shell to savefig's dpi, restoring exactly the
+    # appearance this alpha/linewidth pair was tuned for, while the patches,
+    # contact markers, text and axes all stay vector.
+    #
+    # Size effect depends on panel count, and the two regimes are worth knowing:
+    # on a SINGLE panel the embedded image costs more than the paths it
+    # replaces (185KB vs 91KB at dpi=200). On the real multi-panel figures the
+    # path collapse dominates and every object got smaller -- 009_gelatin_box
+    # 732->328KB, 017_orange 272->172KB, 036_wood_block 744->292KB,
+    # 065-a_cups 260->112KB.
+    pc.set_rasterized(True)
     ax.add_collection3d(pc)
     return Vw
 
 
 def draw_seed_rays(ax, sc, rec, show_geom_origin=False):
-    """Part 1: the ray, its endpoint, and the projection onto the surface."""
+    """Part 1: the seed ray, drawn centroid -> landing point for each finger."""
     s, ray = rec["seed"], rec["ray"]
     ok = rec["ok"]
     col = "0.25" if ok else "#cb181d"
     a = 0.9 if ok else 0.45
 
-    if ray["mode"] == "axis":
-        # Deterministic minor-axis pair: one line through the object, both
-        # endpoints projected inward onto the surface.
-        o, d, L = ray["origin"], ray["dir"], ray["length"]
-        e1, e2 = o + d * L, o - d * L
-        ax.plot(*np.array([e1, e2]).T, color=col, ls="--", lw=1.0, alpha=a, zorder=4)
-        for e, p in ((e1, s["p1s"]), (e2, s["p2s"])):
-            ax.scatter(*e, facecolor="none", edgecolor=col, s=28, lw=1.0, alpha=a, zorder=5)
-            _arrow(ax, e, p, col, a)
-    else:
-        # Random seed: (a) centre -> ray endpoint -> project to p1s, then
-        # (b) march from p1s through the object -> p2s.
-        o, d, L = ray["origin"], ray["dir"], ray["length"]
-        e1 = o + d * L
-        ax.plot(*np.array([o, e1]).T, color=col, ls=":", lw=0.9, alpha=a, zorder=4)
-        ax.scatter(*e1, facecolor="none", edgecolor=col, s=28, lw=1.0, alpha=a, zorder=5)
-        _arrow(ax, e1, s["p1s"], col, a)
+    # Everything belonging to ONE contact -- its half of the seed ray and its
+    # surface footprint -- takes that finger's colour, so the ray panel and the
+    # patch panels below it share one encoding. Only the centroid stays neutral:
+    # it is the single point both contacts ray from, so colouring it for one
+    # finger would be a lie. A rejected seed overrides everything to red.
+    def _fcol(key):
+        return FINGER_COLORS[key] if ok else "#cb181d"
+
+    # CENTROID -> LANDING POINT, one coloured segment per finger, stopping at
+    # the surface. Nothing is drawn outside the object.
+    #
+    # This used to draw the ray overshooting to a point ~2.5 bbox radii away,
+    # a hollow marker there, and an arrow projecting back onto the surface --
+    # a faithful picture of the OLD mechanism, where the ray only chose a
+    # far-away point and _project_to_surface_np picked the nearest surface to
+    # it. That is no longer how seeding works: _ray_surface_crossings_np scans
+    # the ray and _outer_pair_t takes its first and last zero crossings, so the
+    # landing point IS on the ray and the overshoot never existed except as an
+    # artefact of the old construction. Drawing it now would depict a step the
+    # code does not take.
+    #
+    # The ray line is still shown between the two contacts (dashed for the
+    # deterministic minor-axis seed, dotted for a random one) because that
+    # segment is real -- it is the chord the scan ran along.
+    o = ray["origin"]
+    _ls = "--" if ray["mode"] == "axis" else ":"
+    for p, key in ((s["p1s"], "thumb"), (s["p2s"], "index")):
+        ax.plot(*np.array([o, p]).T, color=_fcol(key), ls=_ls, lw=1.6,
+                alpha=a, zorder=4, solid_capstyle="round")
 
     # RAY ORIGIN. Both seed sources ray from the same point --
     # _ray_origin_local, the mesh's volumetric centroid. The SDF frame centre
@@ -338,39 +390,18 @@ def draw_seed_rays(ax, sc, rec, show_geom_origin=False):
     if hc is not None:
         ax.scatter(*hc, marker="P", s=95, color=col, edgecolor="k", lw=0.6,
                    alpha=a, zorder=6)
-        ax.text(*hc, "  centroid (ray origin)", fontsize=6.5, color=col, zorder=7)
     if show_geom_origin and ray.get("geom_center") is not None:
         gc = ray["geom_center"]
         ax.scatter(*gc, marker="X", s=45, facecolor="none", edgecolor=col,
                    lw=1.1, alpha=a * 0.5, zorder=6)
-        ax.text(*gc, "  geom origin (SDF frame centre)", fontsize=6.5,
-                color=col, alpha=0.55, zorder=7)
 
-    # PAIRING: the chord joining this seed's two footprints. Drawn for BOTH
-    # seed kinds -- for a random seed it is also the physical march leg
-    # (_march_sdf_np's path from p1s through the object to p2s), for the
-    # minor-axis seed it coincides with the ray. Its job in either case is to
-    # make "these two contacts are one pair" unambiguous within the panel.
-    ax.plot(*np.array([s["p1s"], s["p2s"]]).T, color=col, ls="-.", lw=1.2,
-            alpha=a * 0.85, zorder=4)
-
-    # Landed surface footprints, labelled p1s/p2s so the thumb/index assignment
-    # (_assign_seed_by_finger's output) can be read off directly.
-    # Offset each label OUTWARD along the pair's own chord, so the two tags
-    # separate even when the footprints project close together on a small panel.
-    chord = np.asarray(s["p2s"], float) - np.asarray(s["p1s"], float)
-    chord = chord / (np.linalg.norm(chord) + 1e-12)
-    # Outward offset along the chord: scaled to the pair's separation, and large
-    # enough that the tag clears its own marker rather than sitting on top of it.
-    off = 0.22 * float(np.linalg.norm(np.asarray(s["p2s"]) - np.asarray(s["p1s"]))) + 0.010
-    for p, key, tag, sgn in ((s["p1s"], "thumb", "p1s", -1.0),
-                             (s["p2s"], "index", "p2s", +1.0)):
-        c_in, _ = FINGER_COLORS[key]
-        ax.scatter(*p, color=c_in if ok else "#cb181d", s=52,
+    # Landed surface footprints. Which is thumb and which is index
+    # (_assign_seed_by_finger's output) is carried by COLOR alone -- the same
+    # color that fills that finger's patch in the rows below -- so the figure
+    # needs one shared legend instead of a per-point text tag in every panel.
+    for p, key in ((s["p1s"], "thumb"), (s["p2s"], "index")):
+        ax.scatter(*p, color=_fcol(key), s=52,
                    edgecolor="k", lw=0.5, alpha=1.0 if ok else 0.55, zorder=6)
-        lp = np.asarray(p, float) + sgn * off * chord
-        ax.text(*lp, f"{tag} ({key})", fontsize=7.5, zorder=7, fontweight="bold",
-                ha="center", color=c_in if ok else "#cb181d")
 
 
 def s_pts(rec):
@@ -379,29 +410,20 @@ def s_pts(rec):
     return np.array([rec["seed"]["p1s"], rec["seed"]["p2s"]], float)
 
 
-def _arrow(ax, a, b, color, alpha):
-    """Projection arrow: ray endpoint -> its _project_to_surface_np image."""
-    a, b = np.asarray(a, float), np.asarray(b, float)
-    ax.plot(*np.array([a, b]).T, color=color, lw=1.4, alpha=alpha, zorder=5)
-    ax.scatter(*b, color=color, marker="o", s=10, alpha=alpha, zorder=5)
-
-
 def draw_quadratic(ax, sc, frame, key):
-    """Part 2: the paraboloid in two colors -- saturated inside the measured
-    trust region, pale beyond it (extrapolation)."""
-    c_in, c_out = FINGER_COLORS[key]
+    """Part 2: the paraboloid over its measured trust region.
+
+    Only the trust region is drawn. An earlier version added a pale wireframe
+    at 1.8x the bounds to show where the surrogate is extrapolating, but the
+    panel's whole subject IS the trust region -- the bounds are what
+    _sdf_axis_bound_np measured -- and a second, larger surface around it reads
+    as part of the patch and works against that.
+    """
+    c_in = FINGER_COLORS[key]
     center, R = sc["center"], sc["R"]
     lo0, hi0 = frame["t_lo_0"], frame["t_hi_0"]
     lo1, hi1 = frame["t_lo_1"], frame["t_hi_1"]
 
-    # Pale extrapolation band: 1.8x the trust region, wireframe only, so the
-    # region where the surrogate has NO correction mechanism is visible.
-    f = 1.8
-    P_out = patch_points(frame, center, R, (lo0 * f, hi0 * f), (lo1 * f, hi1 * f), n=15)
-    ax.plot_wireframe(P_out[..., 0], P_out[..., 1], P_out[..., 2],
-                      color=c_out, lw=0.5, alpha=0.75, rstride=1, cstride=1, zorder=7)
-
-    # Saturated valid region.
     P_in = patch_points(frame, center, R, (lo0, hi0), (lo1, hi1), n=13)
     ax.plot_surface(P_in[..., 0], P_in[..., 1], P_in[..., 2],
                     color=c_in, alpha=0.55, linewidth=0, antialiased=True,
@@ -409,13 +431,6 @@ def draw_quadratic(ax, sc, frame, key):
     # Trust-region boundary, drawn solid so the asymmetry (t_lo != t_hi) reads.
     for edge in (P_in[0], P_in[-1], P_in[:, 0], P_in[:, -1]):
         ax.plot(edge[:, 0], edge[:, 1], edge[:, 2], color=c_in, lw=1.4, zorder=9)
-
-    # Principal axes at the seed, scaled to their own (asymmetric) bounds.
-    seed_w = center + R @ frame["seed_l"]
-    for ax_l, lo, hi in ((frame["axis0_l"], lo0, hi0), (frame["axis1_l"], lo1, hi1)):
-        d = R @ ax_l
-        ax.plot(*np.array([seed_w + d * lo, seed_w + d * hi]).T,
-                color=c_in, lw=2.0, alpha=0.95, zorder=10)
 
 
 def _equal_axes(ax, pts, pad=0.005, min_r=None):
@@ -442,10 +457,22 @@ def _equal_axes(ax, pts, pad=0.005, min_r=None):
 
 def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
                 out_dir: Path, elev: float, azim: float,
-                show_rejected: bool = False, show_geom_origin: bool = False):
+                show_rejected: bool = False, show_geom_origin: bool = False,
+                sdf_err_tol: float | None = None,
+                t_bound_max: float | None = None):
     sc = build_object(obj)
     cfg = sc["cfg"]
     cfg.quadratic_mesh_fit = mesh_fit
+    # The two knobs that size a patch. sdf_err_tol is the model-validity
+    # tolerance _sdf_axis_bound_np binary-searches against (how far the
+    # paraboloid may depart from the true SDF before that axis's bound stops);
+    # t_bound_max caps the half-width even where the surface stays flat enough
+    # to never trip the tolerance. Overriding either here is the whole point of
+    # a tuning sweep -- the solver reads the same two cfg fields.
+    if sdf_err_tol is not None:
+        cfg.quadratic_sdf_err_tol = float(sdf_err_tol)
+    if t_bound_max is not None:
+        cfg.quadratic_t_bound_max = float(t_bound_max)
     recs = generate_seeds(sc, n_random=n_random, rng_seed=rng_seed)
 
     accepted = [r for r in recs if r["ok"]]
@@ -457,7 +484,7 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
     # patches too, marked as such: it shows exactly what the gate is refusing.
     panel_recs = accepted if (accepted and not show_rejected) else recs
     # Layout: ONE COLUMN PER SEED, read top to bottom --
-    #   row 0: that seed's OWN ray + projection panel, whole-object framing
+    #   row 0: that seed's OWN ray -> surface panel, whole-object framing
     #   row 1: its thumb paraboloid   row 2: its index paraboloid
     # Every seed gets its own ray panel rather than sharing one overview,
     # because an overview draws every pair in the same style and gives no way
@@ -481,11 +508,11 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
         f"{obj}  —  seeding strategy and local quadratic surrogate  ({fit_tag})\n"
         f"{len(accepted)}/{len(recs)} seeds accepted, {n_rej} rejected "
         f"(kappa gate {cfg.seed_kappa_max_reject:.0f})\n"
-        "one column per seed: ray → projection, then its thumb and index paraboloid"
-        "  —  saturated = measured trust region, pale = extrapolation",
+        "one column per seed: seed ray → surface, then its thumb and index paraboloid"
+        "  —  patch = the measured trust region (t_lo/t_hi per axis)",
         fontsize=10.5)
 
-    # ── Row 0: each seed's own ray + projection, over the transparent mesh ──
+    # ── Row 0: each seed's own ray -> surface, over the transparent mesh ──
     for i, rec in enumerate(panel_recs):
         axr = fig.add_subplot(gs[0, i], projection="3d")
         Vw = draw_mesh(axr, sc)
@@ -502,7 +529,7 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
                             - np.asarray(rec["ray"]["geom_center"], float))
         _gap = (f"  (centroid–geom-origin gap {_d*1e3:.0f}mm)"
                 if show_geom_origin else "")
-        axr.set_title(f"seed {i} ({rec['kind']}) — ray → projection{_gap}"
+        axr.set_title(f"seed {i} ({rec['kind']}) — seed ray → surface{_gap}"
                       f"{_rej}", fontsize=8.5,
                       color="k" if rec["ok"] else "#cb181d")
         axr.view_init(elev=elev, azim=azim)
@@ -522,7 +549,7 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
             axq = fig.add_subplot(gs[1 + row, i], projection="3d")
             draw_mesh(axq, sc, alpha=0.12)
             fr = quad_frame(sc, p, n_in, cfg)
-            axq.scatter(*p, color=FINGER_COLORS[key][0], s=48, edgecolor="k",
+            axq.scatter(*p, color=FINGER_COLORS[key], s=48, edgecolor="k",
                         lw=0.5, zorder=11)
             if fr is None:
                 _equal_axes(axq, p.reshape(1, 3), min_r=0.03)
@@ -539,9 +566,12 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
                        f"t1∈[{fr['t_lo_1']*1e3:+.0f},{fr['t_hi_1']*1e3:+.0f}]mm\n"
                        f"max|SDF| over patch = {err*1e3:.2f}mm "
                        f"(tol {cfg.quadratic_sdf_err_tol*1e3:.1f}mm)")
+                # Framed just outside the trust region (not the old 1.8x that
+                # matched the removed extrapolation band, which now leaves the
+                # patch floating in empty space).
                 pts = patch_points(fr, sc["center"], sc["R"],
-                                   (fr["t_lo_0"] * 1.8, fr["t_hi_0"] * 1.8),
-                                   (fr["t_lo_1"] * 1.8, fr["t_hi_1"] * 1.8),
+                                   (fr["t_lo_0"] * 1.25, fr["t_hi_0"] * 1.25),
+                                   (fr["t_lo_1"] * 1.25, fr["t_hi_1"] * 1.25),
                                    n=5).reshape(-1, 3)
                 _equal_axes(axq, np.vstack([pts, p.reshape(1, 3)]), min_r=0.012)
                 _rej = "" if rec["ok"] else f"  [REJECTED: {rec['why']}]"
@@ -554,34 +584,45 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
             axq.set_xlabel("x (m)", fontsize=7); axq.set_ylabel("y (m)", fontsize=7)
             axq.set_zlabel("z (m)", fontsize=7); axq.tick_params(labelsize=6)
 
-    # Legend describing the two-color-per-finger encoding.
+    # Legend describing the two-color-per-finger encoding. Colour is the ONLY
+    # thumb/index cue in the panels (the per-point p1s/p2s tags were removed),
+    # so each finger's entry names its contact POINT and its patch together.
     handles = [
-        plt.Line2D([], [], color=FINGER_COLORS["thumb"][0], lw=6,
-                   label="thumb patch — inside trust region"),
-        plt.Line2D([], [], color=FINGER_COLORS["thumb"][1], lw=6,
-                   label="thumb patch — extrapolated"),
-        plt.Line2D([], [], color=FINGER_COLORS["index"][0], lw=6,
-                   label="index patch — inside trust region"),
-        plt.Line2D([], [], color=FINGER_COLORS["index"][1], lw=6,
-                   label="index patch — extrapolated"),
+        plt.Line2D([], [], color=FINGER_COLORS["thumb"], lw=6, marker="o",
+                   markeredgecolor="k", markeredgewidth=0.5, ms=9,
+                   label="thumb — seed ray, contact point & patch"),
+        plt.Line2D([], [], color=FINGER_COLORS["index"], lw=6, marker="o",
+                   markeredgecolor="k", markeredgewidth=0.5, ms=9,
+                   label="index — seed ray, contact point & patch"),
         plt.Line2D([], [], color="0.25", marker="P", ls="none", ms=9,
                    label="volumetric centroid — shared ray origin"),
-        plt.Line2D([], [], color="0.25", ls="--", label="minor-axis seed ray"),
-        plt.Line2D([], [], color="0.25", ls=":", label="random seed ray"),
-        plt.Line2D([], [], color="0.25", ls="-.", label="antipodal march (p1s→p2s)"),
-        plt.Line2D([], [], color="#cb181d", lw=2, label="rejected seed"),
+        plt.Line2D([], [], color="0.35", ls="--", label="dashed = minor-axis seed"),
+        plt.Line2D([], [], color="0.35", ls=":", label="dotted = random seed"),
     ]
+    # --ray-origins draws the geom origin as well; it is off by default, so this
+    # entry does not count against the compact five-entry legend.
     if show_geom_origin:
         handles.append(plt.Line2D([], [], markerfacecolor="none",
                                   markeredgecolor="0.25", marker="X", ls="none",
                                   ms=8, label="geom origin (SDF frame centre)"))
-    fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=8, frameon=False)
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.0),
+               ncol=4, fontsize=8, frameon=False, borderaxespad=0.0)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"seedquad_{obj}{'' if mesh_fit else '_sdfhess'}.png"
-    fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.06,
+    # One SUBFOLDER per object. A tolerance/cap sweep emits a figure per
+    # setting, so a flat directory turns into a pile the moment more than one
+    # object is swept. The filename keeps the object token too, so a figure
+    # pulled out of its folder is still self-identifying.
+    obj_dir = out_dir / obj
+    obj_dir.mkdir(parents=True, exist_ok=True)
+    # Tag the filename with the tolerance whenever it is overridden, so a sweep
+    # writes one figure per setting instead of clobbering a single file.
+    _tag = "" if sdf_err_tol is None else f"_tol{cfg.quadratic_sdf_err_tol*1e3:g}mm"
+    if t_bound_max is not None:
+        _tag += f"_cap{cfg.quadratic_t_bound_max*1e3:g}mm"
+    out = obj_dir / f"seedquad_{obj}{'' if mesh_fit else '_sdfhess'}{_tag}.png"
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.07,
                         wspace=0.14, hspace=0.24)
-    fig.savefig(out, dpi=115)
+    out = OP.savefig(fig, out, dpi=115)
     plt.close(fig)
 
     print(f"-> {out}")
@@ -601,11 +642,17 @@ def sample_ray_distribution(sc, n: int, rng_seed: int = 0):
     the surface footprint each one lands on.
 
     Reproduces _seed_pair's own two lines (standard_normal, then u[2] *= 0.5)
-    rather than calling it, because we want only the ray and its first
-    projection -- not the antipodal march, the gates, or the finger assignment.
+    rather than calling it, because we want only the ray and where it FIRST
+    lands -- not the antipodal march, the gates, or the finger assignment.
     Anything that changes _seed_pair's direction sampling must be mirrored here;
     the shared ray ORIGIN comes from _ray_origin_local so at least that cannot
-    drift."""
+    drift.
+
+    Landing uses the same outer-surface rule the solver uses (_outer_pair_t on
+    the ray's SDF zero crossings), NOT the nearest-surface projection this used
+    to call. Those disagree on any hollow object -- on 065-a_cups the old rule
+    put footprints on the INNER wall, so this diagnostic would have drawn a
+    sampling distribution the planner never actually produces."""
     gt, gs, c, R, me = (sc["geom_type"], sc["geom_size"], sc["center"],
                         sc["R"], sc["mesh_entry"])
     bbox_r = float(np.max(gs)) * 2.5
@@ -617,8 +664,16 @@ def sample_ray_distribution(sc, n: int, rng_seed: int = 0):
         u[2] *= 0.5              # _seed_pair's bias away from top/bottom faces
         u /= np.linalg.norm(u) + 1e-12
         dirs.append(u)
-        hits.append(_project_to_surface_np(c_ray + u * bbox_r, gt, c, R, gs,
-                                           mesh_entry=me))
+        _o = None
+        if gt == _GEOM_TYPE_MESH and me is not None:
+            _u_l = R.T @ u
+            _o = _outer_pair_t(me, _ray_origin_local(gt, me), _u_l)
+        if _o is not None:
+            _p = c + R @ (_ray_origin_local(gt, me) + _o[1] * (R.T @ u))
+            hits.append(_project_to_surface_np(_p, gt, c, R, gs, mesh_entry=me))
+        else:
+            hits.append(_project_to_surface_np(c_ray + u * bbox_r, gt, c, R, gs,
+                                               mesh_entry=me))
     return c_ray, np.array(dirs), np.array(hits)
 
 
@@ -717,7 +772,7 @@ def plot_ray_distribution(objects, n_rays, rng_seed, out_dir, elev, azim):
     out = out_dir / "seedray_distribution.png"
     fig.subplots_adjust(left=0.05, right=0.97, top=0.88, bottom=0.07,
                         wspace=0.22, hspace=0.28)
-    fig.savefig(out, dpi=115)
+    out = OP.savefig(fig, out, dpi=115)
     plt.close(fig)
     print(f"-> {out}")
     return out
@@ -744,6 +799,14 @@ def main():
                          "the distribution of sampled seed rays for every object")
     ap.add_argument("--n-rays", type=int, default=300,
                     help="rays per object for --ray-distribution")
+    ap.add_argument("--sdf-err-tol", type=float, default=None,
+                    help="metres; max surrogate-vs-true-SDF gap that sizes each "
+                         "trust-region axis (default: GraspConfig3D's 5e-4). "
+                         "Pass several times via a shell loop to sweep; the "
+                         "figure filename carries the value.")
+    ap.add_argument("--t-bound-max", type=float, default=None,
+                    help="metres; hard cap on each patch half-width even where "
+                         "the surface never trips --sdf-err-tol (default 0.05)")
     ap.add_argument("--rng-seed", type=int, default=0)
     ap.add_argument("--elev", type=float, default=18.0)
     ap.add_argument("--azim", type=float, default=-60.0)
@@ -761,7 +824,8 @@ def main():
         return
     for obj in objs:
         plot_object(obj, a.n_random, not a.no_mesh_fit, a.rng_seed,
-                    a.out_dir, a.elev, a.azim, a.show_rejected, a.ray_origins)
+                    a.out_dir, a.elev, a.azim, a.show_rejected, a.ray_origins,
+                    a.sdf_err_tol, a.t_bound_max)
 
 
 if __name__ == "__main__":

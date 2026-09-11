@@ -447,7 +447,7 @@ def plot_uv_path(paths: dict, object_id: str, out_path: Path, rank_table: list |
     # bounding boxes to tight_layout, which left a large blank band under
     # the suptitle; explicit margins avoid that.
     fig.subplots_adjust(left=0.02, right=0.80, top=0.92, bottom=0.05, wspace=0.15)
-    fig.savefig(out_path, dpi=150)
+    OP.savefig(fig, out_path, dpi=150)
     plt.close(fig)
 
 
@@ -558,7 +558,7 @@ def main():
             obj_geom0 = S.hull_geoms(model, body_name)[0]
             cfg = GraspConfig3D(obj_geom=obj_geom0, obj_body=body_name, **cfg_kw)
 
-            out_path = out_dir / f"uv_iteration_path_{oid}_seed{seed_val}.png"
+            out_path = OP.fig_path(out_dir / f"uv_iteration_path_{oid}_seed{seed_val}.png")
             render_path = (out_dir / f"arm_pose_{oid}_seed{seed_val}.png") if args.render else None
             try:
                 _solve_and_plot(model, data, body_name, q_bias_full, pos, cfg,

@@ -8,7 +8,15 @@ same commit.
 
 Last verified against: `simulation/grasp_planner_3d.py`, `kinova_common/wrench.py`,
 `grasp_control/grasp_controller.py`, `benchmarks/ycb_grasp/{pick_from_floor,pick_and_place}.py`,
-`kinova_leap_pick_place.py` — 2026-09-10.
+`kinova_leap_pick_place.py` — 2026-09-11.
+
+**Seed/surrogate settings live in `models/grasp_seed_config.json`**, not only in
+`GraspConfig3D`'s dataclass defaults — `grasp_config_builder.load_seed_config()` reads it
+and both `pick_and_place.py` and `plot_seed_quadratic.py` apply it as DEFAULTS, so an
+explicit CLI flag or `PFF_*` env var still wins (file -> per-object -> CLI/env). Current
+values: `seed_kappa_max_reject` 150, `quadratic_sdf_err_tol` 4 mm,
+`quadratic_t_bound_max` 100 mm, `seed_ground_clearance_m` 5 mm,
+`seed_prefer_outer_surface` true.
 
 ---
 
@@ -33,8 +41,31 @@ Candidates are generated and inserted in priority order:
    antipodality.
 3. `_seed_pair` — random march directions, drawn from `self._rng`, up to `max_attempts`.
 
-Each candidate is filtered by `_reachable_contact` (both contacts must sit at least
-`ground_z + r_tip + 2mm`) and `_seed_kappa_ok` (`seed_kappa_max_reject`).
+All three place their contacts on the object's **outer** surface: the seed ray's zero
+crossings are enumerated (`_ray_surface_crossings_np`) and the FIRST and LAST are taken
+(`_outer_pair_t`). The scan sizes its own span from the mesh's vertex extent about the
+ray origin (`_ray_scan_span_np`) — do NOT pass the seed helpers' `bbox_r`, which is
+`max(geom_size)*2.5` and for a MESH is not the half-extent: on `065-a_cups` it evaluates
+to 26.4 mm against a far wall already 27 mm from the volumetric centroid, so tilted rays
+found 0-1 crossings, fell back to nearest-surface projection, and landed inside the cup
+anyway. An ODD crossing count means a clipped or degenerate ray and is rejected rather
+than paired. The older rules — project the far ray endpoint to the nearest surface,
+and sphere-march until the SDF turns positive — are correct only for a SOLID object. A
+cup is two thin shells around a void, and the void reads as OUTSIDE (measured on
+`065-a_cups`: +12.20 mm at the volumetric centroid, −2.48 mm inside the wall), so both
+rules landed on the INNER wall — 6 of 14 seed contacts. Measured after the change:
+`065-a_cups` 12 outer / 0 inner, with `017_orange` and `036_wood_block` unchanged at
+14/14 outer. A solid object has exactly two crossings, so first/last reproduce the old
+behaviour exactly. Controlled by
+`seed_prefer_outer_surface` (default True); inner-surface seeds are NOT supported
+downstream, because the squeeze phase drives fingers in the closing direction and would
+unload an inner-wall contact rather than press it.
+
+Each candidate is then filtered by `_reachable_contact` (both contacts must sit at least
+`ground_z + floor + 2mm`, where `floor` is `seed_ground_clearance_m` when set and the
+fingertip's isotropic bounding-sphere radius otherwise) and `_seed_kappa_ok`
+(`seed_kappa_max_reject`, evaluated on the MESH-FIT curvature when
+`quadratic_mesh_fit` is on, so the gate and the surrogate judge the same surface).
 
 **Consequence worth knowing:** because the deterministic seed goes in first and usually
 wins the ranking, varying the planner's `seed` produces NO variation on rigid symmetric
@@ -80,6 +111,17 @@ opti.subject_to(opti.bounded(t_lo_0, t_var[0], t_hi_0))
 An axis that reaches `t_bound_max` is flat/uncapped; one that stops short is
 divergence-limited (an edge is near). `w_edge_margin`'s hinge fires only on
 divergence-limited axes, so a genuinely flat face is not penalized.
+
+Those four searches bound the rectangle's **centre-lines** only, and say nothing about
+its corners — which is where a paraboloid departs worst. `_shrink_patch_to_tol` therefore
+treats them as an upper bracket and scales all four down uniformly (bisection on a 5x5
+grid over the real patch surface) until the WHOLE patch honours `sdf_err_tol`. Uniform,
+so the measured four-way asymmetry keeps its shape. Without it, measured patch error ran
+to **8.78 mm against a 4 mm tolerance** on `036_wood_block` and the patch visibly hung off
+the face it was fitted to; after, every contact on orange/gelatin/block lands at or under
+4.0 mm. Costs 1-3 ms per contact. Note the shrink is NOT a rare path: because the axis
+searches walk out until the centre-lines reach the tolerance, the corners start over it,
+so most contacts on every object measured enter the bisection.
 
 **Measured caveat:** the solution sits AT a trust-region bound (`pinned=True`) 9/9 stages.
 The Picard loop takes maximum-length steps, so the final contact is largely
@@ -314,9 +356,16 @@ works alone.
   timestep refinement (1.68 / 1.60 / 1.58 m/s at dt = 2/1/0.5 ms), so it is what the model
   says happens when a rigid sphere pinched between two pads is released. Needs a grasp or
   release-strategy change, not a parameter.
-- **`009_gelatin_box` cannot be planned lying flat.** Fingertip r = 19.4 mm forces contacts
-  >= 21.4 mm above the table; the box is 28 mm tall, leaving a 6.6 mm band. 120/120 seeds
-  rejected in 43 ms. Plans fine standing upright. Geometric, not tunable.
+- **`009_gelatin_box` lying flat is seed-starved, but no longer impossible.** The seed
+  floor used to be the fingertip's isotropic bounding-sphere radius (19.4 mm), forcing
+  contacts >= 21.4 mm above the table on a ~30 mm box — 120/120 seeds rejected. That
+  radius is set by the tip's LONG axis, pointing away from the contact; the pad's honest
+  extent along the contact direction is 10.8 mm (`_tip_support_along`), and the NLP's own
+  `ground_clearance_m` constraint governs the FINAL pose regardless. With
+  `seed_ground_clearance_m = 0.005` the box now yields seeds (measured 1/3 accepted, and
+  1/8 over a larger draw). Still marginal: its volumetric centroid sits at 13.7 mm, so
+  antipodal rays through the centroid put one contact near the table almost regardless of
+  the floor. A side-approach seeding mode is the real fix.
 - **`in_bin` origin-height bug** (§7).
 - **Verify/execute gamma inconsistency** (§5).
 

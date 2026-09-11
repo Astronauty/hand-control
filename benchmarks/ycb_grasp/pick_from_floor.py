@@ -216,8 +216,20 @@ def recommended_inward_normals(model, data, obj_gid, mesh_entry, p1, p2):
     same call verify() makes internally (see grasp_planner_3d.py's verify()),
     exposed here for the controller's contact-frame provider."""
     gtype = int(model.geom_type[obj_gid])
-    c = data.geom_xpos[obj_gid].copy()
-    R = data.geom_xmat[obj_gid].reshape(3, 3).copy()
+    # MESH pose comes from the BODY, not the collision hull: object_sdf's table is
+    # BODY-frame, and a CoACD hull's origin is offset from the body origin (measured
+    # [-10.8, +21.0, +26.2] mm on 014_lemon). Feeding the hull frame evaluates the SDF
+    # ~35mm from the true point and returns normals off the wrong part of the surface:
+    # the same committed contacts read n1.n2 = +0.368 (splayed, LP-infeasible) in the
+    # hull frame vs -0.801 (a true pinch, gamma_min 1.07) in the body frame.
+    # Matches the convention already used by grasp_planner_3d.verify(),
+    # MultiStartGraspPlanner3D.solve, plot_seed_quadratic and ablate_grasp.
+    if mesh_entry is not None:
+        c = data.xpos[model.geom_bodyid[obj_gid]].copy()
+        R = data.xmat[model.geom_bodyid[obj_gid]].reshape(3, 3).copy()
+    else:
+        c = data.geom_xpos[obj_gid].copy()
+        R = data.geom_xmat[obj_gid].reshape(3, 3).copy()
     size = model.geom_size[obj_gid]
     n1_out = _geom_normal_np(p1, gtype, c, R, size, mesh_entry=mesh_entry)
     n2_out = _geom_normal_np(p2, gtype, c, R, size, mesh_entry=mesh_entry)

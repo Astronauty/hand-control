@@ -38,6 +38,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
+try:
+    import out_paths as OP
+except ImportError:
+    from ycb_grasp import out_paths as OP
+
 # Same finger palette as plot_seed_quadratic.py: (inside trust region, outside).
 FINGER_COLORS = {
     1: ("#d94801", "#fdd0a2"),   # thumb  — orange
@@ -79,8 +84,14 @@ def _draw_mesh(ax, Vw, F, alpha=0.12, max_tris=3000):
     faces at YCB triangle counts stack into an opaque blob)."""
     if len(F) > max_tris:
         F = F[np.linspace(0, len(F) - 1, max_tris).astype(int)]
-    ax.add_collection3d(Poly3DCollection(Vw[F], facecolor="0.6", edgecolor="0.45",
-                                         linewidths=0.15, alpha=alpha, zsort="min"))
+    pc = Poly3DCollection(Vw[F], facecolor="0.6", edgecolor="0.45",
+                          linewidths=0.15, alpha=alpha, zsort="min")
+    # Rasterize the shell even in a vector figure -- same reason as
+    # plot_seed_quadratic.draw_mesh: the 0.15pt edges only read as see-through
+    # because they are sub-pixel in a raster render, and a vector viewer strokes
+    # all ~3000 of them at full weight, burying the patch this plot is about.
+    pc.set_rasterized(True)
+    ax.add_collection3d(pc)
 
 
 def _equal_axes(ax, pts, pad=0.005, min_r=None):
@@ -214,6 +225,6 @@ def plot_grasp_contacts(V, F, stage, object_id, out_path, sdf_fn=None,
         axq.set_zlabel("z (m)", fontsize=7); axq.tick_params(labelsize=6)
 
     fig.subplots_adjust(left=0.03, right=0.97, top=0.86, bottom=0.05, wspace=0.16)
-    fig.savefig(out_path, dpi=115)
+    out_path = OP.savefig(fig, out_path, dpi=115)
     plt.close(fig)
     return out_path
