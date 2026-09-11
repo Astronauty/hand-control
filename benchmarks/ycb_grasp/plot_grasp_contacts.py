@@ -38,6 +38,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
+try:
+    import out_paths as OP
+except ImportError:
+    from ycb_grasp import out_paths as OP
+
 # Same finger palette as plot_seed_quadratic.py: (inside trust region, outside).
 FINGER_COLORS = {
     1: ("#d94801", "#fdd0a2"),   # thumb  — orange
@@ -214,6 +219,6 @@ def plot_grasp_contacts(V, F, stage, object_id, out_path, sdf_fn=None,
         axq.set_zlabel("z (m)", fontsize=7); axq.tick_params(labelsize=6)
 
     fig.subplots_adjust(left=0.03, right=0.97, top=0.86, bottom=0.05, wspace=0.16)
-    fig.savefig(out_path, dpi=115)
+    out_path = OP.savefig(fig, out_path, dpi=115)
     plt.close(fig)
     return out_path

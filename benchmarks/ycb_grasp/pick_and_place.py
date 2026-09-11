@@ -68,7 +68,8 @@ from grasp_control import GraspController                                       
 from kinova_common.constants import FINGER_CODE, FINGER_SET, FINGER_TIP_SITES   # noqa: E402
 from kinova_common.grasp_plots import write_grasp_plots                         # noqa: E402
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
-from simulation.grasp_config_builder import for_ablation_default                # noqa: E402
+from simulation.grasp_config_builder import (for_ablation_default,              # noqa: E402
+                                             load_seed_config)                  # noqa: E402
 from simulation.grasp_planner_3d import MultiStartGraspPlanner3D                # noqa: E402
 from ycb_grasp import out_paths as OP                                           # noqa: E402
 from ycb_grasp import table_scene as TS                                         # noqa: E402
@@ -286,6 +287,11 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
         cfg_kw["wrench_constraint"] = False
         cfg_kw["w_gws"] = w_gws
         cfg_kw["w_span"] = w_span
+    # Seed/surrogate settings from models/grasp_seed_config.json, applied as
+    # DEFAULTS (setdefault, not update) so every explicit CLI flag and PFF_* env
+    # override set above still wins. Precedence: file -> per-object -> CLI/env.
+    for _k, _v in load_seed_config(object_id).items():
+        cfg_kw.setdefault(_k, _v)
     cfg = for_ablation_default(obj_geom=obj_geom0, obj_body=body_name, **cfg_kw)
 
     log_dir = None

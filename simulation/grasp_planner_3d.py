@@ -581,6 +581,89 @@ def _project_to_surface_np(point, geom_type, center, mat, size, iters=12, mesh_e
     return p
 
 
+def _ray_scan_span_np(mesh_entry: dict, origin_l) -> float:
+    """How far a crossing scan must reach from origin_l to leave the mesh behind.
+
+    The farthest vertex from the scan origin, with margin. Callers must NOT pass
+    their own bbox_r here: _fixed_antipodal_seed/_seed_pair's bbox_r is
+    max(geom_size)*2.5, and for a MESH geom_size is not the half-extent -- on
+    065-a_cups it evaluates to 26.4mm against an object whose far wall already
+    sits at 27mm from the volumetric centroid. A scan that short simply misses
+    the far wall: measured 0 crossings on a 45-degree ray and 1 on another,
+    which silently fell back to nearest-surface projection and landed INSIDE the
+    cup, i.e. exactly the bug the crossing scan exists to fix.
+    """
+    V = mesh_entry.get("verts")
+    if V is None or len(V) == 0:
+        return 0.25
+    return float(np.max(np.linalg.norm(np.asarray(V, float) - np.asarray(origin_l, float),
+                                       axis=1))) * 1.5
+
+
+def _ray_surface_crossings_np(mesh_entry: dict, origin_l, dir_l,
+                              span: float | None = None,
+                              step: float = 2e-3, n_refine: int = 20):
+    """Every point where a ray crosses the mesh SDF's zero level set, as sorted
+    signed distances along dir_l from origin_l (all object-LOCAL).
+
+    WHY THIS EXISTS. The seed sources used to pick surface points by projecting
+    a far-away ray endpoint to the NEAREST surface, and by sphere-marching until
+    the SDF turned positive. Both are correct only for a SOLID object. A cup is
+    two thin shells with a void between them, and the void is POSITIVE (measured
+    on 065-a_cups: +12.20mm at the volumetric centroid, -2.48mm inside the wall,
+    +170mm far outside). So "march until sdf > 0" stops at the INNER wall, and
+    "project to nearest surface" from a point near the rim lands on the inner
+    wall too -- measured 6 of 14 seed contacts inside the cup.
+
+    Enumerating sign changes instead makes the topology explicit: a solid object
+    yields exactly 2 crossings, a cup 4 (outer, inner, inner, outer). The caller
+    then picks by POSITION rather than hoping a first-hit rule lands right --
+    see _outer_pair_t, which takes the first and last.
+
+    Fixed step, not a sphere-march: the march's adaptive step is |sdf|-scaled,
+    and inside a thin wall |sdf| is small but the wall is not, so it can stride
+    past one. 065-a_cups' wall is 6.0mm thick with a minimum |SDF| of only
+    2.75mm; a 2mm fixed step resolves it with margin. Each bracketed crossing is
+    then bisected to n_refine digits, so the step size sets which walls are
+    FOUND, not how precisely they are located.
+    """
+    if span is None:
+        span = _ray_scan_span_np(mesh_entry, origin_l)
+    ts = np.arange(-span, span + 0.5 * step, step)
+    vals = np.array([float(mesh_entry["fn"](origin_l + t * dir_l)) for t in ts])
+    out = []
+    for i in range(len(ts) - 1):
+        if np.sign(vals[i]) == np.sign(vals[i + 1]):
+            continue
+        lo, hi, s_lo = ts[i], ts[i + 1], np.sign(vals[i])
+        for _ in range(n_refine):
+            mid = 0.5 * (lo + hi)
+            if np.sign(float(mesh_entry["fn"](origin_l + mid * dir_l))) == s_lo:
+                lo = mid
+            else:
+                hi = mid
+        out.append(0.5 * (lo + hi))
+    return np.asarray(out, float)
+
+
+def _outer_pair_t(mesh_entry: dict, origin_l, dir_l, span: float | None = None):
+    """(t_first, t_last) of the OUTER surface crossings along dir_l, or None when
+    the ray finds fewer than two (a miss, or a numerically degenerate graze).
+
+    First and last are the outer walls for any ray that fully traverses the
+    object, whatever its interior topology -- that is the whole point of picking
+    by position instead of by first hit. Returns None rather than guessing so
+    the caller can fall back to the projection path unchanged.
+    """
+    xs = _ray_surface_crossings_np(mesh_entry, origin_l, dir_l, span)
+    # An ODD count means the scan started or ended inside material -- a clipped
+    # or degenerate ray, not a real traversal. Bail rather than pair a genuine
+    # outer wall with a mid-object crossing.
+    if len(xs) < 2 or len(xs) % 2 == 1:
+        return None
+    return float(xs[0]), float(xs[-1])
+
+
 def _march_sdf_np(p_start, direction, geom_type, center, mat, size,
                   max_steps=80, mesh_entry=None):
     """Sphere-march from p_start along direction until exiting the object, then project to surface."""
@@ -637,7 +720,8 @@ def _ray_origin_local(geom_type, mesh_entry=None) -> np.ndarray:
 
 
 def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
-               delta_max=np.deg2rad(45), mesh_entry=None):
+               delta_max=np.deg2rad(45), mesh_entry=None,
+               prefer_outer: bool = True):
     """
     One antipodal seed pair, sampled exactly on the object surface.
 
@@ -664,7 +748,21 @@ def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
     u = rng.standard_normal(3)
     u[2] *= 0.5                              # bias toward side faces, away from top/bottom
     u /= np.linalg.norm(u) + 1e-12
-    p1s = _project_to_surface_np(c_ray + u * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    # OUTER-surface selection for the first contact -- the ray's crossing
+    # NEAREST its far endpoint, i.e. the outer wall on the side the ray points
+    # toward, rather than whatever surface happens to be nearest that endpoint.
+    _o_l = (_ray_origin_local(geom_type, mesh_entry)
+            if (geom_type == _GEOM_TYPE_MESH and mesh_entry is not None) else None)
+    _outer = None
+    if prefer_outer and _o_l is not None:
+        _u_l = np.asarray(obj_mat, float).T @ u
+        _outer = _outer_pair_t(mesh_entry, _o_l, _u_l)
+    if _outer is not None:
+        _u_l = np.asarray(obj_mat, float).T @ u
+        p1s = _project_to_surface_np(c + obj_mat @ (_o_l + _outer[1] * _u_l),
+                                     geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    else:
+        p1s = _project_to_surface_np(c_ray + u * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
     n1_in = -_geom_normal_np(p1s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
 
     # Rotate march direction about world z only — prevents downward tilt that
@@ -675,7 +773,22 @@ def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
     d  = Rz @ n1_in
     delta = abs(ang)
 
-    p2s = _march_sdf_np(p1s + 1e-3 * d, d, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    # Second contact: the FURTHEST crossing along the march direction, not the
+    # first. _march_sdf_np stops the moment the SDF turns positive, which inside
+    # a cup is the cavity -- so it returns the INNER wall. Scanning the whole ray
+    # and taking the last crossing returns the far OUTER wall instead.
+    _outer2 = None
+    if prefer_outer and _o_l is not None:
+        _d_l = np.asarray(obj_mat, float).T @ d
+        _p1_l = np.asarray(obj_mat, float).T @ (p1s - c)
+        _outer2 = _outer_pair_t(mesh_entry, _p1_l, _d_l)
+    if _outer2 is not None:
+        _d_l = np.asarray(obj_mat, float).T @ d
+        _p1_l = np.asarray(obj_mat, float).T @ (p1s - c)
+        p2s = _project_to_surface_np(c + obj_mat @ (_p1_l + _outer2[1] * _d_l),
+                                     geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    else:
+        p2s = _march_sdf_np(p1s + 1e-3 * d, d, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
     n2_in = -_geom_normal_np(p2s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
 
     return {
@@ -742,7 +855,8 @@ def _minor_axis_local(geom_type, size, mesh_entry=None):
     return np.array([1.0, 0.0, 0.0])
 
 
-def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis, mesh_entry=None):
+def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis, mesh_entry=None,
+                          prefer_outer: bool = True):
     """
     One deterministic, perfectly antipodal seed pair along a fixed axis
     (given in the OBJECT's local frame) through the object's hull CENTROID
@@ -791,9 +905,30 @@ def _fixed_antipodal_seed(geom_type, size, center, obj_mat, local_axis, mesh_ent
     # true centroid on 036_wood_block.
     c_ray = c + obj_mat @ _ray_origin_local(geom_type, mesh_entry)
 
-    p1s = _project_to_surface_np(c_ray + d_world * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    # OUTER-surface selection. Projecting the two far endpoints to the nearest
+    # surface lands on an INNER wall for a hollow object (see
+    # _ray_surface_crossings_np). Taking the ray's first and last zero crossings
+    # gives the two outer walls directly. Falls back to projection for analytic
+    # primitives (no SDF callable), and whenever the ray finds fewer than two
+    # crossings.
+    _outer = None
+    if prefer_outer and geom_type == _GEOM_TYPE_MESH and mesh_entry is not None:
+        _o_l = _ray_origin_local(geom_type, mesh_entry)
+        _d_l = np.asarray(obj_mat, float).T @ d_world
+        _outer = _outer_pair_t(mesh_entry, _o_l, _d_l)
+    if _outer is not None:
+        _o_l = _ray_origin_local(geom_type, mesh_entry)
+        _d_l = np.asarray(obj_mat, float).T @ d_world
+        # Polished onto the zero level set so the contact is exactly where the
+        # surrogate will be fitted, as the projection path already guaranteed.
+        p1s = _project_to_surface_np(c + obj_mat @ (_o_l + _outer[1] * _d_l),
+                                     geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+        p2s = _project_to_surface_np(c + obj_mat @ (_o_l + _outer[0] * _d_l),
+                                     geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+    else:
+        p1s = _project_to_surface_np(c_ray + d_world * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
+        p2s = _project_to_surface_np(c_ray - d_world * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
     n1_in = -_geom_normal_np(p1s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
-    p2s = _project_to_surface_np(c_ray - d_world * bbox_r, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
     n2_in = -_geom_normal_np(p2s, geom_type, c, obj_mat, size, mesh_entry=mesh_entry)
 
     return {
@@ -879,7 +1014,18 @@ def _chart_pair_seeds(uv_atlas: dict, center, obj_mat, geom_type, size, mesh_ent
 
 
 def _reachable_contact(p, ground_z, r_tip, z_margin=0.002):
-    """Returns False if the contact is too close to the support surface for the fingertip sphere."""
+    """Returns False if the contact is too close to the support surface for the
+    fingertip to reach.
+
+    `r_tip` is whatever the caller decides the tip needs underneath it. Passing
+    cfg.r_thumb/r_index (the ISOTROPIC bounding-sphere radius, 19.4mm on the
+    LEAP tip) is the conservative reading and bans the bottom 21.4mm of every
+    object -- 71% of a 30mm 009_gelatin_box. The pad's honest extent along the
+    contact direction is 10.8mm (see _tip_support_along), and the NLP's own
+    ground-collision constraint (ground_clearance_m) enforces real clearance on
+    the final pose anyway, so the SEED gate does not have to be the binding
+    one. cfg.seed_ground_clearance_m replaces r_tip here when set.
+    """
     if p[2] < ground_z + r_tip + z_margin:
         return False
     return True
@@ -1351,6 +1497,80 @@ def _mesh_local_surface_fit_np(mesh_entry: dict, seed_l: np.ndarray,
     return _principal_curvature_axes_np(H_tt, t1_l, t2_l) + (info,)
 
 
+def _patch_max_sdf_err_np(mesh_entry: dict, seed_l, axis0_l, axis1_l, n_l,
+                          kappa0, kappa1, grad_norm,
+                          t_lo_0, t_hi_0, t_lo_1, t_hi_1, n=5) -> float:
+    """Max |SDF - SDF(seed)| over the whole paraboloid patch, not just its axes.
+
+    Reconstructs the same surface the surrogate hands the NLP --
+    p_l(t) = seed_l + t0*axis0_l + t1*axis1_l + h(t)*n_l, h as in
+    _mesh_quadratic_contact_ca -- on an n x n grid over the bound rectangle and
+    returns the worst departure from the seed's own SDF value. Anchored to
+    fn(seed_l) for the same reason _sdf_axis_bound_np is: the seed may itself
+    carry a small residual from the previous Picard stage, and an absolute-zero
+    baseline would charge that residual to the patch.
+
+    n=5 (25 evaluations) rather than a fine grid: this runs inside a bisection,
+    per contact, per Picard stage. The grid includes all four corners and both
+    centre-lines, which is where the error actually concentrates -- the axis
+    searches already cover the centre-lines exactly, so the corners are what
+    this adds.
+    """
+    f0 = float(mesh_entry["fn"](seed_l))
+    T0 = np.linspace(t_lo_0, t_hi_0, n)
+    T1 = np.linspace(t_lo_1, t_hi_1, n)
+    worst = 0.0
+    for a in T0:
+        for b in T1:
+            h = -(kappa0 * a * a + kappa1 * b * b) / (2.0 * grad_norm)
+            p = seed_l + a * axis0_l + b * axis1_l + h * n_l
+            e = abs(float(mesh_entry["fn"](p)) - f0)
+            if e > worst:
+                worst = e
+    return worst
+
+
+def _shrink_patch_to_tol(mesh_entry: dict, seed_l, axis0_l, axis1_l, n_l,
+                         kappa0, kappa1, grad_norm, bounds,
+                         tol: float, n_refine: int = 6, n_grid: int = 5):
+    """Scale the four axis bounds down uniformly until the WHOLE patch is within
+    `tol`, and return the scaled (t_lo_0, t_hi_0, t_lo_1, t_hi_1).
+
+    The axis searches bound the centre-lines; this bounds the area they span.
+    Returns the input unchanged (scale 1.0) when the patch already honours the
+    tolerance -- but that is not the typical case. Because the axis searches
+    deliberately walk out until the CENTRE-LINES hit the tolerance, the corners
+    start over it, so the shrink engages on curved and planar patches alike
+    (measured: 4 of 6 017_orange contacts enter the bisection, not just the
+    large 036_wood_block faces where t_bound_max is what stopped the search).
+
+    Bisection on the scale factor is sound here in a way a bisection along a
+    single axis would not be: error grows monotonically with the patch's SIZE
+    (a smaller rectangle is a subset of a larger one, so its max cannot exceed
+    the larger one's), even though error along any one axis is not monotonic in
+    t. Shrinking can only ever remove sample points.
+    """
+    t_lo_0, t_hi_0, t_lo_1, t_hi_1 = bounds
+
+    def _err(scale: float) -> float:
+        return _patch_max_sdf_err_np(
+            mesh_entry, seed_l, axis0_l, axis1_l, n_l, kappa0, kappa1, grad_norm,
+            t_lo_0 * scale, t_hi_0 * scale, t_lo_1 * scale, t_hi_1 * scale,
+            n=n_grid)
+
+    if _err(1.0) <= tol:
+        return t_lo_0, t_hi_0, t_lo_1, t_hi_1
+
+    lo, hi = 0.0, 1.0          # _err(0) == 0 <= tol by construction; _err(1) > tol
+    for _ in range(n_refine):
+        mid = 0.5 * (lo + hi)
+        if _err(mid) <= tol:
+            lo = mid
+        else:
+            hi = mid
+    return t_lo_0 * lo, t_hi_0 * lo, t_lo_1 * lo, t_hi_1 * lo
+
+
 def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np.ndarray,
                                center_np, mat_np, mesh_entry: dict,
                                t_bound_max: float = 0.05, sdf_err_tol: float = 5e-4,
@@ -1470,6 +1690,34 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     t_hi_0 = _sdf_axis_bound_np(mesh_entry, seed_l, axis0_l, t_bound_max, tol=sdf_err_tol)
     t_lo_1 = -_sdf_axis_bound_np(mesh_entry, seed_l, -axis1_l, t_bound_max, tol=sdf_err_tol)
     t_hi_1 = _sdf_axis_bound_np(mesh_entry, seed_l, axis1_l, t_bound_max, tol=sdf_err_tol)
+
+    # PATCH-WIDE shrink. The four searches above each walk ONE axis, so they
+    # bound the error along the rectangle's two centre-lines and say nothing
+    # about its interior or corners -- and the corner is where a paraboloid
+    # departs worst from the real surface. At a 0.5mm tolerance with a 50mm cap
+    # the gap was invisible (measured 0.63mm patch error against a 0.5mm
+    # bound). At 4mm with a 100mm cap it is not: 036_wood_block measured
+    # 8.78mm of true patch error against a 4mm tolerance, and the patch visibly
+    # hung off the side of the block it was fitted to.
+    #
+    # So the axis bounds are treated as an upper bracket and scaled DOWN
+    # uniformly until the whole patch honours sdf_err_tol. Uniform, rather than
+    # shrinking whichever axis looks guilty: the asymmetry between the four
+    # sides is a real measurement (see the note above) and scaling preserves
+    # its shape, while singling out one side would distort it by an amount no
+    # measurement justifies.
+    #
+    # Costs one 25-point grid evaluation when the patch already honours the
+    # tolerance and n_refine+1 of them when it does not -- measured at 1-3ms per
+    # contact either way, against a multi-second NLP per seed. Note the shrink
+    # is NOT a rare path at a 4mm tolerance: most contacts on every object
+    # measured (017_orange included) do enter the bisection, because the axis
+    # searches walk out until the CENTRE-LINES reach the tolerance, which
+    # leaves the corners over it by construction.
+    t_lo_0, t_hi_0, t_lo_1, t_hi_1 = _shrink_patch_to_tol(
+        mesh_entry, seed_l, axis0_l, axis1_l, n_l_unit,
+        kappa0, kappa1, grad_norm, (t_lo_0, t_hi_0, t_lo_1, t_hi_1),
+        tol=sdf_err_tol)
 
     # Reported bound stays the SYMMETRIC half-width (the smaller side), since
     # that is what the Picard loop's pinned-at-trust-region test and the
@@ -1977,8 +2225,8 @@ class UVAtlasConfig:
     # so this does NOT interact with the chart-pair antipodal seeding gated on
     # use_uv_atlas_contact elsewhere (_seed_pair, last_chart_rank_table).
     use_quadratic_contact: bool = False
-    quadratic_t_bound_max:  float = 0.05    # metres, cap even where the surface stays flat
-    quadratic_sdf_err_tol:  float = 5e-4    # metres, max surrogate-vs-true-SDF gap per axis
+    quadratic_t_bound_max:  float = 0.10    # metres, cap even where the surface stays flat
+    quadratic_sdf_err_tol:  float = 4e-3    # metres, max surrogate-vs-true-SDF gap per axis
     # Fit the local patch's curvature to the VISUAL MESH vertices around the
     # seed instead of to the SDF Hessian. The SDF's second derivative is a
     # global quantity and reports curvature belonging to nearby features rather
@@ -2166,7 +2414,33 @@ class MultiStartConfig:
     # the surface while fingertip geoms stop 3-9mm short. Costs one DLS solve
     # per candidate (milliseconds) against a multi-second NLP per seed.
     seed_dls_rank_pool: int = 1
-    seed_kappa_max_reject: float = 40.0
+    seed_kappa_max_reject: float = 150.0
+
+    # Vertical room the SEED gate requires under a contact, in metres. None
+    # (default) = cfg.r_thumb/r_index, the fingertip's isotropic bounding-sphere
+    # radius. A float overrides it with a flat floor, which is the less
+    # conservative reading: the bounding sphere is set by the tip's LONG axis
+    # (16.7mm, pointing away from the contact), while the pad only extends
+    # 10.8mm along the direction that actually touches the object. The seed gate
+    # only has to pick a plausible STARTING point -- the NLP's ground-collision
+    # constraint (ground_clearance_m) is what keeps the final pose off the
+    # table -- so an over-tight seed floor rejects reachable grasps on thin
+    # objects for no safety gain (009_gelatin_box: 120/120 seeds rejected at the
+    # bounding-sphere floor).
+    seed_ground_clearance_m: float | None = None
+
+    # True (default) -- seed contacts are placed on the object's OUTER surface by
+    # taking the first and last zero crossings of the seed ray, instead of the
+    # nearest-surface projection / first-positive-SDF march that preceded it.
+    # Those older rules are correct only for a solid object: a cup's cavity reads
+    # as OUTSIDE (positive SDF), so both land on the INNER wall -- measured 6 of
+    # 14 seed contacts inside 065-a_cups. No effect on solid objects, where the
+    # ray has exactly two crossings and first/last are what the old rules already
+    # returned. Set False to allow inner-surface seeds; note the rest of the
+    # pipeline does not yet support internal (expanding) grasps -- the squeeze
+    # phase drives fingers in the closing direction, which unloads an inner-wall
+    # contact rather than pressing it.
+    seed_prefer_outer_surface: bool = True
 
     # q_ref (arm-pose) restart perturbation — matches ablate_ik.py's RESTART_SIGMA
     # pattern: seed 0 uses q_ref exactly as given (the operator's actual retargeted
@@ -4604,7 +4878,11 @@ class MultiStartGraspPlanner3D:
                                 mesh_entry=self._mesh_entry)
 
         _ground_z  = cfg.ground_z
-        _r_tip_min = min(cfg.r_thumb, cfg.r_index)  # conservative: unknown which tip goes where
+        # Seed-gate floor: flat override when set, else the conservative
+        # bounding-sphere radius (unknown which tip goes where).
+        _r_tip_min = (float(cfg.seed_ground_clearance_m)
+                      if cfg.seed_ground_clearance_m is not None
+                      else min(cfg.r_thumb, cfg.r_index))
 
         _t0 = time.perf_counter()
 
@@ -4617,6 +4895,52 @@ class MultiStartGraspPlanner3D:
         # geometry (measured 2-6x worse DLS residual than the minor-axis
         # choice on several YCB objects) — this gives every solve one
         # well-conditioned attempt before falling back to random exploration.
+        def _gate_kappa_max(p_l) -> float:
+            """Largest-magnitude principal curvature at p_l (object-local) using
+            the SAME surface model the solve's surrogate will fit.
+
+            With cfg.quadratic_mesh_fit on, _mesh_quadratic_contact_ca takes its
+            curvature from _mesh_local_surface_fit_np (a fit to nearby mesh
+            VERTICES), not from the SDF Hessian. Gating on the SDF Hessian while
+            fitting the mesh judges seeds by a quantity the solve never uses, and
+            the two disagree badly on smooth objects: an SDF encodes distance to
+            the WHOLE shape, so scan relief and far-away features bleed into its
+            second derivative. Measured on 017_orange (true curvature 1/36.6mm =
+            27.6 everywhere, no edges anywhere), 60 random surface points:
+
+                SDF Hessian   median kappa 49.3, 73% above the gate of 40
+                mesh fit      median kappa 32.8,  3% above
+
+            i.e. the SDF-Hessian gate rejected 73% of a smooth sphere as
+            "too curved to seed on". Gating on the fit admits 97% of it while
+            still rejecting 036_wood_block's genuine edges (measured 190-536,
+            far above any plausible threshold under either model).
+
+            Falls back to the SDF Hessian exactly where the surrogate does --
+            when the fit returns None (mesh too sparse to support one) -- so the
+            gate and the patch never disagree about which model is in force.
+            Costs ~1.0ms vs ~0.13ms per contact; paid per candidate seed, against
+            a multi-second NLP per accepted seed.
+            """
+            me = self._planner._mesh_entry
+            if cfg.quadratic_mesh_fit:
+                grad_l = np.asarray(me["grad_fn"](p_l), float).reshape(3)
+                gnorm = float(np.linalg.norm(grad_l))
+                n_l = grad_l / (gnorm + 1e-9)
+                t1_l, t2_l = _tangent_basis_np(n_l)
+                _fit = _mesh_local_surface_fit_np(
+                    me, p_l, t1_l, t2_l, n_l,
+                    radius=cfg.quadratic_mesh_fit_radius,
+                    quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
+                    grad_norm=gnorm)
+                if _fit is not None:
+                    # (axis0, axis1, kappa0, kappa1, info) -- the order
+                    # _principal_curvature_axes_np returns, matching
+                    # _mesh_quadratic_contact_ca's own unpacking.
+                    _, _, _k0, _k1, _ = _fit
+                    return max(abs(_k0), abs(_k1))
+            return _mesh_surface_kappa_max_np(me, p_l)
+
         def _seed_kappa_ok(s) -> bool:
             """True unless this seed pair fails the mesh curvature gate (see
             seed_kappa_max_reject docstring) — shared by every seed source
@@ -4628,8 +4952,8 @@ class MultiStartGraspPlanner3D:
                 return True
             p1s_l = obj_R_np.T @ (s['p1s'] - obj_center_np)
             p2s_l = obj_R_np.T @ (s['p2s'] - obj_center_np)
-            k1 = _mesh_surface_kappa_max_np(self._planner._mesh_entry, p1s_l)
-            k2 = _mesh_surface_kappa_max_np(self._planner._mesh_entry, p2s_l)
+            k1 = _gate_kappa_max(p1s_l)
+            k2 = _gate_kappa_max(p2s_l)
             return max(k1, k2) <= cfg.seed_kappa_max_reject
 
         def _dls_residual(s) -> float:
@@ -4668,6 +4992,7 @@ class MultiStartGraspPlanner3D:
         seeds, attempts, rejected = [], 0, 0
         _axis_local = _minor_axis_local(geom_type, geom_size, mesh_entry=self._mesh_entry)
         _fs = _fixed_antipodal_seed(geom_type, geom_size, c, obj_R_np, _axis_local,
+                                    prefer_outer=cfg.seed_prefer_outer_surface,
                                     mesh_entry=self._mesh_entry)
         if (_reachable_contact(_fs['p1s'], _ground_z, _r_tip_min) and
                 _reachable_contact(_fs['p2s'], _ground_z, _r_tip_min) and
@@ -4791,6 +5116,7 @@ class MultiStartGraspPlanner3D:
         while len(seeds) + len(_pool) < _target and attempts < max_attempts:
             attempts += 1
             s = _seed_pair(geom_type, geom_size, c, obj_R_np, bbox_r, self._rng,
+                           prefer_outer=cfg.seed_prefer_outer_surface,
                            delta_max=np.deg2rad(cfg.seed_march_jitter_deg),
                            mesh_entry=self._mesh_entry)
             # # Hemisphere check — n1 and n2 must point into opposing hemispheres

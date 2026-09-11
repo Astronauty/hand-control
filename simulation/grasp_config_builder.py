@@ -15,7 +15,45 @@ construction patterns — not a new design, just a shared home for an existing o
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from simulation.grasp_planner_3d import GraspConfig3D
+
+# Seed/surrogate settings that live in a tunable file rather than in
+# GraspConfig3D's dataclass defaults. See load_seed_config().
+SEED_CONFIG_PATH = Path(__file__).resolve().parent.parent / "models" / "grasp_seed_config.json"
+
+
+def load_seed_config(obj_id: str | None = None,
+                     path: str | Path | None = None) -> dict:
+    """GraspConfig3D kwargs from models/grasp_seed_config.json.
+
+    Returns a flat dict suitable for **-splatting into for_ablation_default (or
+    for assigning onto an already-built cfg). Keys beginning with '_' are
+    comments and are dropped. When obj_id is given, that id's block under
+    'per_object' is merged OVER the top-level block.
+
+    These are DEFAULTS. Callers must apply them so that an explicit CLI flag or
+    environment override still wins -- dict.setdefault, not dict.update -- which
+    gives the intended precedence: file -> per-object -> CLI/env.
+
+    A missing or unreadable file returns {} rather than raising: the file is a
+    tuning convenience, and the dataclass defaults must remain sufficient on
+    their own for anyone running from a fresh checkout.
+    """
+    p = Path(path) if path is not None else SEED_CONFIG_PATH
+    try:
+        raw = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+    out = {k: v for k, v in raw.items()
+           if not k.startswith("_") and k != "per_object"}
+    if obj_id is not None:
+        per = raw.get("per_object") or {}
+        out.update({k: v for k, v in (per.get(obj_id) or {}).items()
+                    if not k.startswith("_")})
+    return out
 
 
 def for_ablation_default(obj_geom: str, obj_body: str,

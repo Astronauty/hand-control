@@ -234,6 +234,25 @@ Each entry is a YCB `id` (built in `assets/ycb_mjcf/`) + a table-top `xy` (z is 
 
 **Scope:** YCB mesh objects are for the **plain-teleop `dexpilot` / `anyteleop`** modes (they grasp by hand physics and carry no `_c1`/`_c2` grasp sites). The **contact-aware** methods need per-object grasp-contact sites, which is being updated separately, so a contact-aware run with mesh objects exits with a message directing you to a primitive object or a plain-teleop mode.
 
+#### Grasp seed config (`models/grasp_seed_config.json`)
+
+The grasp planner's seed-generation and local-quadratic-surrogate settings live in `models/grasp_seed_config.json` rather than only in `GraspConfig3D`'s dataclass defaults, so they can be tuned without editing source. `simulation/grasp_config_builder.load_seed_config()` reads it; both `benchmarks/ycb_grasp/pick_and_place.py` and `benchmarks/ycb_grasp/plot_seed_quadratic.py` apply it.
+
+```json
+{
+  "seed_kappa_max_reject":     150.0,   // reject a seed whose larger principal curvature (1/m) exceeds this
+  "quadratic_sdf_err_tol":     0.004,   // m — max surrogate-vs-true-SDF gap over the patch
+  "quadratic_t_bound_max":     0.10,    // m — hard cap on patch half-width on a flat face
+  "seed_ground_clearance_m":   0.005,   // m — vertical room the SEED gate needs under a contact (null = fingertip bounding-sphere radius)
+  "seed_prefer_outer_surface": true,    // place seeds on the OUTER surface (matters for hollow objects: cups, mugs)
+  "per_object": { }                     // same keys, overriding the above for one YCB id
+}
+```
+
+**Precedence:** file → `per_object` → explicit CLI flag / `PFF_*` env var. The file supplies *defaults*, so `--sdf-err-tol 0.002` still wins. A missing or unreadable file falls back to the dataclass defaults, so a fresh checkout runs without it.
+
+The curvature gate is evaluated on the **mesh-fit** curvature whenever `quadratic_mesh_fit` is on, i.e. the same surface model the surrogate fits — gating on the SDF Hessian instead rejected 73% of a smooth sphere. See `simulation/SOLVER_STATE.md` §1-2 for the measurements behind each default.
+
 The committed/vendored surface assets: the counter's marble texture (`models/furniture/textures/robocasa_marble.png`, from RoboCasa, CC-BY-4.0) and the wood-table assets (`models/furniture/`, from reachy2_mujoco_assets / Vikash Kumar's furniture_sim, Apache-2.0).
 
 ---

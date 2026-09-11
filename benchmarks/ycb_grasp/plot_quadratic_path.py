@@ -594,7 +594,7 @@ def plot_quadratic_path(V: np.ndarray, F: np.ndarray, stages: list[dict],
         "blue=thumb/orange=index, x=seed, circle=path start, star=path end",
         fontsize=9, y=0.985)
     fig.subplots_adjust(left=0.01, right=0.99, top=0.92, bottom=0.02, hspace=0.25, wspace=0.05)
-    fig.savefig(out_path, dpi=150)
+    OP.savefig(fig, out_path, dpi=150)
     plt.close(fig)
 
 

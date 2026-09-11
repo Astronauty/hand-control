@@ -12,6 +12,11 @@ curvature, so a radius sweep shows whether kappa is converging to a stable value
 """
 import sys
 from pathlib import Path
+
+try:
+    import out_paths as OP
+except ImportError:
+    from ycb_grasp import out_paths as OP
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -134,7 +139,7 @@ def main():
 
     out = Path(f"meshfit_{obj}_{frac:.2f}.png")
     fig.tight_layout(rect=[0, 0, 1, 0.93])
-    fig.savefig(out, dpi=110)
+    OP.savefig(fig, out, dpi=110)
     print(f"-> {out.resolve()}")
     for radius in radii:
         f = fit_at(Vv, seed_l, t1_l, t2_l, n_l, radius)

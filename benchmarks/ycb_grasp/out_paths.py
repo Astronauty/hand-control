@@ -25,9 +25,43 @@ environment rather than beside it.
 Scripts should call env_dir()/analysis_dir() rather than building paths from
 REPO themselves, so the convention stays in one place.
 """
+import os
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+
+# Figure format for MATPLOTLIB figures (not MuJoCo camera renders, which are
+# inherently raster and stay .png). Vector by default: these are diagnostic
+# figures that get zoomed hard and land in a LaTeX paper, where a rasterized
+# 3D panel goes soft and its text does not match the document font.
+#
+# Measured on the seed-quadratic figures: 017_orange 268KB pdf vs 396KB png,
+# 036_wood_block 742KB pdf vs 741KB png (1.7s vs 1.2s to write). So the win is
+# scalability and text quality, NOT file size -- a mesh-heavy panel emits one
+# vector path per triangle and roughly breaks even.
+#
+# PFF_FIG_FORMAT=png restores raster output for quick previewing.
+FIG_FORMAT = os.environ.get("PFF_FIG_FORMAT", "pdf").lstrip(".").lower()
+
+
+def fig_path(path) -> Path:
+    """Re-extension a figure path to the configured FIG_FORMAT.
+
+    Call sites keep writing `.../name.png` literals -- readable, greppable, and
+    matching the docstrings that name the artifact -- and this decides the
+    actual container in one place.
+    """
+    return Path(path).with_suffix("." + FIG_FORMAT)
+
+
+def savefig(fig, path, dpi=150, **kw):
+    """fig.savefig() honouring FIG_FORMAT. dpi is ignored for vector formats
+    (it only affects any rasterized sub-artist), kept so raster previews via
+    PFF_FIG_FORMAT=png retain their intended resolution."""
+    out = fig_path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, **({"dpi": dpi} if FIG_FORMAT in ("png", "jpg", "jpeg") else {}), **kw)
+    return out
 OUT_ROOT = REPO / "benchmarks" / "ycb_grasp" / "out"
 
 FLOOR = "floor"

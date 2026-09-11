@@ -447,7 +447,7 @@ def plot_uv_path(paths: dict, object_id: str, out_path: Path, rank_table: list |
     # bounding boxes to tight_layout, which left a large blank band under
     # the suptitle; explicit margins avoid that.
     fig.subplots_adjust(left=0.02, right=0.80, top=0.92, bottom=0.05, wspace=0.15)
-    fig.savefig(out_path, dpi=150)
+    OP.savefig(fig, out_path, dpi=150)
     plt.close(fig)
 
 

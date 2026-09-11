@@ -480,10 +480,14 @@ figures across the object set without a human at the viewer.
 - **Trust-region pinning.** SOLVER_STATE.md §2 records `pinned=True` 9/9 stages — the
   Picard loop takes maximum-length steps. The contact-movement plot will therefore
   show seed + N x bound marches, not interior optima. That is a known, documented
-  solver property, not a bug introduced here.
-- **`009_gelatin_box` cannot be planned lying flat** (SOLVER_STATE.md §9): fingertip
-  r = 19.4 mm vs a 28 mm box. It is in the default `pick_place` list — expect it to
-  report unsupported/unreachable. Not a regression.
+  solver property, not a bug introduced here. Note the bounds themselves are now
+  patch-wide (`_shrink_patch_to_tol`), so "N x bound" is a smaller step than it was
+  before that change.
+- **`009_gelatin_box` lying flat is seed-starved** (SOLVER_STATE.md §9). It used to be
+  impossible (fingertip bounding-sphere r = 19.4 mm vs a ~30 mm box, 120/120 seeds
+  rejected); with `seed_ground_clearance_m = 0.005` it now yields ~1 seed in 3. It is in
+  the default `pick_place` list — expect sparse seeds, not a hard failure. Not a
+  regression either way.
 - **Don't touch dexpilot / anyteleop.** They are the paper's baselines.
 - **`log_dir` is deleted by the benchmark after plotting** (pick_and_place.py:315
   `shutil.rmtree`). Teleop must NOT copy that: the plot worker runs async on a

@@ -1,0 +1,22 @@
+{
+  "_comment": "Seed-generation and local-quadratic-surrogate settings, split out of GraspConfig3D's dataclass defaults so they can be tuned without editing source. Loaded by simulation/grasp_config_builder.load_seed_config(). PRECEDENCE: these values are DEFAULTS -- an explicit CLI flag or PFF_* env var always wins. 'per_object' overrides the top-level block for one YCB id.",
+
+  "_comment_kappa": "seed_kappa_max_reject: reject a seed whose larger principal curvature (1/m) exceeds this. Gated on the MESH-FIT curvature when quadratic_mesh_fit is on, i.e. the same surface model the surrogate fits. Measured: 017_orange is a 36.6mm sphere (true kappa 27.6) reading 31 median; genuine box edges on 036_wood_block read 399-601. 150 admits every smooth surface while still rejecting real edges; the old 40 rejected 73% of a smooth sphere.",
+  "seed_kappa_max_reject": 150.0,
+
+  "_comment_tol": "quadratic_sdf_err_tol (m): how far the paraboloid may depart from the true SDF along each axis before that axis's bound stops. Larger = more surface per patch at more model error. Measured on 017_orange: 0.5mm -> 12x11mm patch at 0.33mm error; 4mm -> 34x33mm at 1.12mm. On a FLAT face the patch is capped by quadratic_t_bound_max instead, so tolerance mostly buys error there, not coverage.",
+  "quadratic_sdf_err_tol": 0.004,
+
+  "_comment_cap": "quadratic_t_bound_max (m): hard cap on patch half-width even where the surface stays flat. This, not the tolerance, is what binds on large flat faces.",
+  "quadratic_t_bound_max": 0.10,
+
+  "_comment_outer": "seed_prefer_outer_surface: place seed contacts on the object's OUTER surface by taking the first and last zero crossings of the seed ray. The older nearest-surface projection / first-positive-SDF march are correct only for SOLID objects -- a cup's cavity reads as outside (positive SDF), so both land on the inner wall (measured: 6 of 14 seed contacts inside 065-a_cups). No effect on solid objects. false allows inner-wall seeds, but the squeeze phase drives fingers in the CLOSING direction, which unloads an inner-wall contact rather than pressing it -- internal grasps are not supported downstream yet.",
+  "seed_prefer_outer_surface": true,
+
+  "_comment_floor": "seed_ground_clearance_m (m): vertical room the SEED gate requires under a contact. null = the fingertip's isotropic bounding-sphere radius (19.4mm on the LEAP tip), which bans the bottom 21.4mm of every object. The pad's honest extent along the contact direction is 10.8mm, and the NLP's own ground_clearance_m constraint keeps the FINAL pose off the table, so the seed gate does not have to be the binding one.",
+  "seed_ground_clearance_m": 0.005,
+
+  "per_object": {
+    "_comment": "Overrides for one YCB id. Empty by default -- add an entry only where measurement justifies it."
+  }
+}

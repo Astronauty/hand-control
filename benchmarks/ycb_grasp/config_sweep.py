@@ -119,7 +119,7 @@ def plot(rows, out_path):
     ax2.set_title('Convergence rate vs. proximity')
 
     fig.tight_layout()
-    fig.savefig(out_path, dpi=140)
+    OP.savefig(fig, out_path, dpi=140)
     print(f"-> {out_path}")
 
 
