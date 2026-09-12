@@ -216,7 +216,7 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                    impratio=None, gamma_override=None,
                    squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05,
                    lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS,
-                   contact_profile="stock"):
+                   contact_profile="stock", pairing=None):
     """Plan + execute one grasp on one object, then carry it to the bin."""
     rng = np.random.default_rng(seed)
     t_build = time.time()
@@ -330,11 +330,15 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
     # reported gamma_min values are NOT comparable to runs from before this change.
     cfg_kw.pop("obj_geom", None)
     cfg_kw.setdefault("obj_geom", obj_geom0)
+    # pairing selects WHICH FINGERS from models/grasp_finger_config.json (thumb_index,
+    # thumb_middle, tripod). None = that file's default. The preset applies it with
+    # setdefault, so every CLI/env override above still wins.
     cfg = for_gws_recommender(body_name,
                               cfg_kw.pop("arm_geom_names"),
                               cfg_kw.pop("obj_clearance_by_geom"),
                               accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
                               ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
+                              pairing=pairing,
                               **cfg_kw)
 
     log_dir = None
@@ -704,6 +708,10 @@ def main():
                     help="finger PD multiplier DURING the squeeze ramp. Lower lets the "
                          "internal-force term win against the finger PD; too low and the "
                          "measured force falls short of the commanded gamma.")
+    ap.add_argument("--pairing", default=None,
+                    help="which fingers to grasp with, by name from "
+                         "models/grasp_finger_config.json (thumb_index, thumb_middle, "
+                         "tripod). Default: that file's own 'default' entry.")
     ap.add_argument("--contact-profile", choices=["stock", "tuned"], default="stock",
                     help="stock (default): whatever the scene XML compiles to "
                          "(impratio=100, noslip_iterations=0, fingertip "
@@ -756,6 +764,7 @@ def main():
     _, result = run_pick_place(
         args.object, args.seed, n_seeds=args.n_seeds, n_relin=args.n_relin,
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
+        pairing=args.pairing,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
         sdf_err_tol=args.sdf_err_tol, backend=args.backend,
         quad_sym_normals=args.quad_sym_normals,
