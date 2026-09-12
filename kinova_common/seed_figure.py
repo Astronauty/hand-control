@@ -62,15 +62,133 @@ def _scene_from_planner(planner, model, data):
 
 
 def _as_rec(entry, ok):
-    """One accept/reject table row -> the `rec` shape draw_seed_rays wants."""
+    """One accept/reject table row -> the `rec` shape draw_seed_rays wants.
+
+    p3s/n3_in ride along when the row has them (a tripod seed that cleared the
+    third-contact fan). Absent at n=2, and the caller then draws two contacts --
+    never a fabricated third."""
     seed = dict(p1s=np.asarray(entry["p1s"], float),
                 p2s=np.asarray(entry["p2s"], float),
                 n1_in=np.asarray(entry["n1_in"], float),
                 n2_in=np.asarray(entry["n2_in"], float))
     seed["p1"], seed["p2"] = seed["p1s"], seed["p2s"]
+    if entry.get("p3s") is not None:
+        seed["p3s"] = np.asarray(entry["p3s"], float)
+        seed["n3_in"] = np.asarray(entry["n3_in"], float)
+        seed["p3"] = seed["p3s"]
     return dict(seed=seed, kind=entry.get("kind", "random"), ok=ok,
                 why=entry.get("why", "accepted"),
                 ray=dict(origin=None, u=None))
+
+
+def _contacts_of(rec):
+    """[(role_key, point, inward_normal), ...] for whatever contacts this seed has.
+
+    'index' is the SLOT-2 key plot_seed_quadratic colours. The NLP makes the middle
+    finger share slot 2's patch (grasp_planner_3d.py _run_stage reconstructs p3 from
+    _t2_frame), so no second patch is drawn -- but the SEED does not respect that
+    sharing, and the panel says so rather than hiding it. See the in/out-of-bounds
+    annotation in _draw_block: measured 47-59mm index-to-middle seed separation
+    against a ~19mm patch half-extent on 017_orange, i.e. every third seed starts
+    2-3x OUTSIDE the region it is later confined to."""
+    s_ = rec["seed"]
+    out = [("thumb", s_["p1s"], s_["n1_in"]), ("index", s_["p2s"], s_["n2_in"])]
+    if s_.get("p3s") is not None:
+        out.append(("middle", s_["p3s"], s_["n3_in"]))
+    return out
+
+
+_MIDDLE_COLOR = "#238b45"   # green -- distinct from thumb orange / index blue
+
+
+def _draw_block(fig, gs, col0, recs, sc, header, ok):
+    """One column block (all accepted, or all rejected), two rows deep."""
+    for j, rec in enumerate(recs):
+        c = col0 + j
+        axr = fig.add_subplot(gs[0, c], projection="3d")
+        SQ.draw_mesh(axr, sc)
+        try:
+            SQ.draw_seed_rays(axr, sc, rec)
+        except Exception:
+            for key, p, _n in _contacts_of(rec):
+                col = (_MIDDLE_COLOR if key == "middle"
+                       else SQ.FINGER_COLORS[key]) if ok else "#cb181d"
+                axr.scatter(*p, s=34, color=col, depthshade=False, zorder=10)
+            axr.plot(*np.array([rec["seed"]["p1s"], rec["seed"]["p2s"]]).T,
+                     color="0.35" if ok else "#cb181d", lw=1.1, ls="--", zorder=9)
+        if rec["seed"].get("p3s") is not None:
+            # Middle-finger seed, drawn on the ray panel too so its position
+            # relative to the pinch axis is legible at a glance.
+            axr.scatter(*rec["seed"]["p3s"], s=42, marker="^",
+                        color=_MIDDLE_COLOR if ok else "#cb181d",
+                        edgecolor="k", linewidths=0.4, depthshade=False, zorder=11)
+        axr.set_title(f"{rec['kind']} — {'accepted' if ok else rec['why']}",
+                      fontsize=8.5, color="0.15" if ok else "#cb181d")
+        # WORLD frame. draw_mesh/draw_seed_rays both draw in world, so the limits
+        # must be set from the world vertex cloud -- passing the BODY-LOCAL Vvis
+        # (its y spans [-0.055,0.019] while the world mesh sits at [0.243,0.317])
+        # leaves limits and content disjoint and the panel renders EMPTY.
+        SQ._equal_axes(axr, sc["center"] + sc["Vvis"] @ sc["R"].T)
+        axr.set_axis_off()
+
+        axp = fig.add_subplot(gs[1, c], projection="3d")
+        # MESH UNDER THE PATCH. This call is what the sweep figures were missing:
+        # without it the paraboloids float with no surface beneath them. Safe to
+        # add because _equal_axes turns autoscale OFF before setting limits, so
+        # the full-object shell cannot re-expand a patch-local zoom (the same
+        # reason plot_grasp_contacts draws the mesh in every zoomed panel).
+        SQ.draw_mesh(axp, sc, alpha=0.16)
+        pts = []
+        _patch_by_key = {}
+        for key, p, nin in _contacts_of(rec):
+            if key == "middle":
+                continue          # shares slot 2's patch; drawn as a marker below
+            try:
+                frame = SQ.quad_frame(sc, np.asarray(p, float),
+                                      np.asarray(nin, float), sc["cfg"])
+            except Exception:
+                frame = None
+            if frame is None:
+                continue
+            _patch_by_key[key] = frame
+            SQ.draw_quadratic(axp, sc, frame, key)
+            pts.append(SQ.patch_points(frame, sc["center"], sc["R"],
+                                       (frame["t_lo_0"], frame["t_hi_0"]),
+                                       (frame["t_lo_1"], frame["t_hi_1"]),
+                                       n=7).reshape(-1, 3))
+        # Both slot-2 fingers marked ON the shared patch, which is the thing worth
+        # seeing: whether index and middle are far enough apart to contribute
+        # independent wrench columns, or collapsed onto each other.
+        for key, p, _n in _contacts_of(rec):
+            if key == "thumb":
+                continue
+            col = _MIDDLE_COLOR if key == "middle" else SQ.FINGER_COLORS["index"]
+            axp.scatter(*p, s=46, marker="^" if key == "middle" else "o",
+                        color=col, edgecolor="k", linewidths=0.4,
+                        depthshade=False, zorder=12)
+            pts.append(np.asarray(p, float)[None, :])
+        _s3 = rec["seed"].get("p3s")
+        if _s3 is not None:
+            _d23 = float(np.linalg.norm(np.asarray(_s3) - rec["seed"]["p2s"])) * 1e3
+            # Is the middle SEED actually inside the slot-2 patch it will be
+            # confined to? Compare against that patch's own measured half-extent
+            # rather than asserting "shared": when it is outside, the seed and the
+            # NLP's parameterization disagree, and the solve can only resolve that
+            # by dragging the contact -- which is worth seeing on the figure.
+            _fr2 = _patch_by_key.get("index")
+            if _fr2 is not None:
+                _half = max(abs(_fr2["t_hi_0"]), abs(_fr2["t_lo_0"]),
+                            abs(_fr2["t_hi_1"]), abs(_fr2["t_lo_1"])) * 1e3
+                _in = _d23 <= _half
+                axp.set_title(
+                    f"index↔middle seed {_d23:.0f}mm  vs slot-2 patch ±{_half:.0f}mm\n"
+                    f"{'INSIDE' if _in else 'OUTSIDE patch'}",
+                    fontsize=8, color="0.15" if _in else "#cb181d")
+            else:
+                axp.set_title(f"index↔middle seed {_d23:.0f}mm", fontsize=8)
+        if pts:
+            SQ._equal_axes(axp, np.vstack(pts), min_r=0.012)
+        axp.set_axis_off()
 
 
 def write_seed_figure(planner, model, data, out_path, title_extra=""):
@@ -87,56 +205,34 @@ def write_seed_figure(planner, model, data, out_path, title_extra=""):
     recs = [_as_rec(e, True) for e in acc] + [_as_rec(e, False) for e in rej]
 
     n = len(recs)
-    fig = plt.figure(figsize=(max(4.6 * n, 11.0), 8.6))
-    gs = fig.add_gridspec(2, n, height_ratios=[1.05, 1.0])
+    n_acc, n_rej = len(acc), len(rej)
+    # ACCEPTED LEFT, REJECTED RIGHT, with a narrow spacer column between them, so
+    # the two populations read as two groups instead of one undifferentiated run.
+    _SPACER = 0.22
+    widths = ([1.0] * n_acc) + ([_SPACER] if (n_acc and n_rej) else []) + ([1.0] * n_rej)
+    n_cols = len(widths)
+    fig = plt.figure(figsize=(max(3.3 * n + 1.0, 10.0), 7.2))
+    gs = fig.add_gridspec(2, n_cols, height_ratios=[1.05, 1.0], width_ratios=widths)
     fig.suptitle(
         f"{sc['obj']}  —  contact seeds considered by THIS solve{title_extra}\n"
-        f"{len(acc)} accepted, {len(rej)} rejected "
+        f"{n_acc} accepted (left)   |   {n_rej} rejected (right)   "
         f"(kappa gate {sc['cfg'].seed_kappa_max_reject:.0f}, "
         f"DLS pool x{sc['cfg'].seed_dls_rank_pool})\n"
-        "top: seed ray -> surface   bottom: that seed's thumb + index paraboloid patches",
+        "top: seed ray → surface   bottom: paraboloid patches "
+        "(▲ = middle-finger seed; the NLP confines it to the slot-2 patch)",
         fontsize=10.5)
 
-    for i, rec in enumerate(recs):
-        axr = fig.add_subplot(gs[0, i], projection="3d")
-        SQ.draw_mesh(axr, sc)
-        try:
-            SQ.draw_seed_rays(axr, sc, rec)
-        except Exception:
-            # ray geometry is optional here -- the recorded tables carry contact
-            # points and normals, not the sampling ray that produced them.
-            for key, p in (("thumb", rec["seed"]["p1s"]), ("index", rec["seed"]["p2s"])):
-                axr.scatter(*p, s=34, color=SQ.FINGER_COLORS[key] if rec["ok"] else "#cb181d",
-                            depthshade=False, zorder=10)
-            axr.plot(*np.array([rec["seed"]["p1s"], rec["seed"]["p2s"]]).T,
-                     color="0.35" if rec["ok"] else "#cb181d", lw=1.1, ls="--", zorder=9)
-        axr.set_title(f"{rec['kind']} — {'accepted' if rec['ok'] else rec['why']}",
-                      fontsize=9, color="0.15" if rec["ok"] else "#cb181d")
-        SQ._equal_axes(axr, sc["Vvis"])
-        axr.set_axis_off()
+    acc_recs = [r for r in recs if r["ok"]]
+    rej_recs = [r for r in recs if not r["ok"]]
+    _draw_block(fig, gs, 0, acc_recs, sc, "accepted", True)
+    _draw_block(fig, gs, n_acc + (1 if (n_acc and n_rej) else 0),
+                rej_recs, sc, "rejected", False)
 
-        axp = fig.add_subplot(gs[1, i], projection="3d")
-        pts = []
-        for key, p, nin in (("thumb", rec["seed"]["p1s"], rec["seed"]["n1_in"]),
-                            ("index", rec["seed"]["p2s"], rec["seed"]["n2_in"])):
-            try:
-                frame = SQ.quad_frame(sc, np.asarray(p, float), np.asarray(nin, float),
-                                      sc["cfg"])
-            except Exception:
-                frame = None
-            if frame is None:
-                continue
-            SQ.draw_quadratic(axp, sc, frame, key)
-            pts.append(SQ.patch_points(frame, sc["center"], sc["R"],
-                                       (frame["t_lo_0"], frame["t_hi_0"]),
-                                       (frame["t_lo_1"], frame["t_hi_1"]),
-                                       n=7).reshape(-1, 3))
-        if pts:
-            SQ._equal_axes(axp, np.vstack(pts), min_r=0.012)
-        axp.set_axis_off()
-
-    fig.subplots_adjust(left=0.02, right=0.98, top=0.88, bottom=0.04,
-                        wspace=0.12, hspace=0.16)
+    # Tight vertical packing. The default 3D-axes bbox leaves most of a panel
+    # empty around the rendered sphere, which at two rows read as a large band of
+    # whitespace between them; hspace is negative to pull the rows back together.
+    fig.subplots_adjust(left=0.015, right=0.985, top=0.88, bottom=0.02,
+                        wspace=0.02, hspace=-0.22)
     out = OP.savefig(fig, Path(out_path), dpi=115)
     plt.close(fig)
     return out
