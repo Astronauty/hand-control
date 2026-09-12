@@ -255,7 +255,7 @@ def _build_contact_frame_3d(inward_normal: np.ndarray):
     return n, t1, t2
 
 
-def _symbolic_contact_frame_ca(n_in_sym):
+def _symbolic_contact_frame_ca(n_in_sym, smooth_blend: bool = False):
     """
     Build right-handed (n_in, t1, t2) contact frame as a CasADi MX expression.
 
@@ -266,7 +266,28 @@ def _symbolic_contact_frame_ca(n_in_sym):
     ----------
     n_in_sym : (3,) CasADi MX — inward contact normal (need not be unit-length;
                 normalisation is applied internally).
-
+    smooth_blend : bool — False (default, UNCHANGED): the blend weight is
+                ca.fabs(n[0]) - 0.9. ca.fabs is C0 but not C1 at n[0]==0 (its
+                derivative jumps from -1 to +1), so the exact Hessian of this
+                expression is undefined there and enormous/discontinuous in a
+                neighborhood of it -- exactly the kind of term
+                hessian_approximation='exact' cannot integrate (see the IPOTP
+                dual-indeterminacy investigation: this was the concrete,
+                findable non-twice-differentiable candidate, alongside the
+                grad_norm-style ca.norm_2 calls elsewhere in this file, which
+                are smooth away from the origin and only singular exactly AT
+                a zero vector -- a measure-zero, physically unreachable point
+                for a nonzero normal/tangent, unlike this fabs kink which sits
+                on n[0]==0, a plane the normal can and does cross).
+                True: replace ca.fabs(n[0]) with the smooth surrogate
+                sqrt(n[0]**2 + eps_abs) (eps_abs ~1e-6) -- C-infinity
+                everywhere, agrees with |n[0]| to O(eps_abs) away from 0, and
+                still feeds the same tanh blend. Opt-in and off by default so
+                no existing call site's numerics change; use this only to
+                test whether removing the kink lets hessian_approximation=
+                'exact' actually run (nonzero Lagrangian Hessian evals) and/or
+                changes the dual-multiplier non-uniqueness reported at the
+                antipodal pinch.
     Returns
     -------
     R : (3,3) CasADi MX  — columns are [n_in, t1, t2]
@@ -277,7 +298,11 @@ def _symbolic_contact_frame_ca(n_in_sym):
     e0 = ca.DM([1.0, 0.0, 0.0])
     e1 = ca.DM([0.0, 1.0, 0.0])
     # Blend: use e1 when |n[0]| >= 0.9, else e0
-    w = ca.fabs(n[0]) - 0.9
+    if smooth_blend:
+        _abs_n0 = ca.sqrt(n[0]**2 + 1e-6)   # C-infinity surrogate for ca.fabs(n[0])
+    else:
+        _abs_n0 = ca.fabs(n[0])
+    w = _abs_n0 - 0.9
     alpha = 0.5 * (1.0 + ca.tanh(w / 0.01))   # smooth 0→1 as |n[0]| crosses 0.9
     ref = (1.0 - alpha) * e0 + alpha * e1
     t1 = ca.cross(n, ref);  t1 = t1 / (ca.norm_2(t1) + eps)
@@ -801,6 +826,248 @@ def _seed_pair(geom_type, size, center, obj_mat, bbox_r, rng,
         'offsets':  (0.0, 0.0),
         'delta_deg': float(np.rad2deg(delta)),
     }
+
+
+def _surface_walk_np(p_start, d_tan, dist, geom_type, size, center, obj_mat,
+                     mesh_entry=None, n_step=6):
+    """Walk `dist` along the surface from p_start in tangent direction d_tan.
+
+    A straight step of 45mm from a contact leaves a 36mm-radius sphere entirely,
+    so stepping then projecting lands wherever the projection happens to point.
+    Stepping in n_step increments and re-projecting each time keeps the walk ON
+    the surface and re-derives the tangent as the normal turns -- a cheap
+    geodesic march, which is what "45mm away along this face" has to mean on a
+    curved object.
+    """
+    p = np.asarray(p_start, float).copy()
+    d = np.asarray(d_tan, float).copy()
+    step = float(dist) / max(int(n_step), 1)
+    for _ in range(max(int(n_step), 1)):
+        p_next = p + step * d
+        p_next = _project_to_surface_np(p_next, geom_type, center, obj_mat, size,
+                                        mesh_entry=mesh_entry)
+        if not np.all(np.isfinite(p_next)):
+            return None
+        n_out = _geom_normal_np(p_next, geom_type, center, obj_mat, size,
+                                mesh_entry=mesh_entry)
+        if not np.all(np.isfinite(n_out)) or np.linalg.norm(n_out) < 1e-9:
+            return None
+        n_out = n_out / np.linalg.norm(n_out)
+        d = d - np.dot(d, n_out) * n_out          # re-tangent against the new normal
+        nd = np.linalg.norm(d)
+        if nd < 1e-9:
+            return None
+        d = d / nd
+        p = p_next
+    return p
+
+
+# Measured on the model's own rest pose: the middle fingertip sits at
+# [-0.1, -45.4, 0.0] mm from the index fingertip in the PALM frame -- pure -y,
+# and |mf-rf| is the same 45.4mm, i.e. the fingers are evenly pitched along the
+# palm's -y axis. Handedness is already carried by the palm frame, so nothing
+# needs to infer "right hand" from the thumb/index relationship.
+_MF_FROM_IF_PALM = np.array([0.0, -1.0, 0.0])
+_MF_PITCH_M = 0.0454
+
+
+def _patch_point_np(frame, t0, t1, center_np, mat_np):
+    """World point at patch coordinate (t0,t1), via the frame dict's own
+    reconstruction identity -- the SAME one _run_stage uses symbolically:
+        p_local(t) = seed_l + t0*axis0_l + t1*axis1_l + h(t)*n_l
+        h(t)       = -(kappa0*t0^2 + kappa1*t1^2) / (2*grad_norm)
+    """
+    h = -(float(frame['kappa0']) * t0**2 + float(frame['kappa1']) * t1**2) \
+        / (2.0 * float(frame['grad_norm']))
+    p_l = (np.asarray(frame['seed_l'], float)
+           + t0 * np.asarray(frame['axis0_l'], float)
+           + t1 * np.asarray(frame['axis1_l'], float)
+           + h * np.asarray(frame['n_l'], float))
+    return np.asarray(center_np, float) + np.asarray(mat_np, float) @ p_l
+
+
+def _seed_third_contact(seed, geom_type, size, center, obj_mat, rng,
+                        mesh_entry=None, mf_dir_world=None, n_fan=5,
+                        fan_half_deg=40.0, strategy='tangent',
+                        palm_R=None, pitch_m=_MF_PITCH_M, fk_probe=None,
+                        prefer_outer=True, patch_frame=None,
+                        patch_offset_m=0.030):
+    """Candidate THIRD contacts for a tripod grasp (cfg.n_contacts >= 3).
+
+    strategy:
+      'fan'       -- ORIGINAL. Fan perpendicular to the grasp axis at object
+                     scale (reach = max(size)*1.5 from the pinch midpoint), then
+                     nearest-surface projection. Kept as the ablation baseline.
+                     Two known defects: it places candidates 47-59mm from the
+                     index contact (measured on 017_orange) with nothing tying it
+                     to the index's neighbourhood, and it uses projection rather
+                     than the ray-crossing placement the PAIR seeder was migrated
+                     to (_outer_pair_t), so on a non-convex object it can land on
+                     an inner wall -- the exact failure the crossing scan exists
+                     to prevent.
+      'tangent'   -- (B) MEASURED NON-VIABLE, kept only to document the result.
+                     Steps the rigid palm-frame finger base-pitch (45.4mm along
+                     palm -y, verified identical at qpos0 and TS.home_qpos()) along
+                     the surface from the index contact. The CONSTANT is real; the
+                     failure is that a palm-frame direction maps to an arbitrary
+                     WORLD direction -- at TS.home_qpos() the wrist is oriented so
+                     R_palm @ [0,-1,0] = [-0.001, 0.023, -1.0], i.e. straight DOWN.
+                     Every candidate landed ~21mm below the table-clearance gate:
+                     '5 candidate(s) -> no viable candidate' on every seed of every
+                     object.
+      'kinematic' -- (D) MEASURED NON-VIABLE, for a deeper reason worth recording.
+                     Asks where the middle fingertip IS once the hand is posed for
+                     the pinch. Its premise does not hold: there is no pose in this
+                     pipeline where that finger is near the object.
+                       - at q_ref / rest:            |mf - if| ~ 176-185mm
+                       - after one DLS call:         thumb residual 89mm, index 64mm
+                                                     (the pinch itself has not converged)
+                       - at a SOLVED, LIFTING n=2 grasp:
+                             SDF(middle tip) = +97.7 / +146.4 / +53.3 mm
+                             on orange / lemon / wood_block
+                     The n=2 NLP never asks the middle finger to curl, so it stays
+                     extended into free space. A kinematic seeder therefore reads a
+                     position that does not exist, and no amount of fixing the IK
+                     call changes that.
+
+    CONSEQUENCE: the third contact cannot be seeded from kinematics at all. It has
+    to be chosen GEOMETRICALLY on the object -- off the grasp axis, above the
+    table, curvature-acceptable -- and the NLP then curls the finger to it. That is
+    what 'fan' does, and it is why 'fan' is the only strategy that reliably yields
+    candidates.
+
+    fk_probe: callable(seed) -> world position of the middle fingertip at the
+        pinch pose, or None. Required by 'kinematic'; ignored otherwise.
+
+    Returns a list of dicts, each the seed extended with 'p3'/'p3s'/'n3_in',
+    ready for the SAME gates the pair passes through. Empty list if nothing
+    lands on the surface.
+    """
+    p1s = np.asarray(seed['p1s'], float)
+    p2s = np.asarray(seed['p2s'], float)
+    ax  = p2s - p1s
+    ax_n = float(np.linalg.norm(ax))
+    if ax_n < 1e-9:
+        return []
+    ax = ax / ax_n
+    mid = 0.5 * (p1s + p2s)
+
+    def _finish(p3s, tag):
+        if p3s is None or not np.all(np.isfinite(p3s)):
+            return None
+        n3_in = -_geom_normal_np(p3s, geom_type, center, obj_mat, size,
+                                 mesh_entry=mesh_entry)
+        if not np.all(np.isfinite(n3_in)) or np.linalg.norm(n3_in) < 1e-9:
+            return None
+        cand = dict(seed)
+        cand['p3']    = np.asarray(p3s, float).copy()
+        cand['p3s']   = np.asarray(p3s, float)
+        cand['n3_in'] = n3_in
+        cand['fan_deg'] = float(tag)
+        return cand
+
+    out = []
+
+    if strategy == 'kinematic':
+        # (D) Where the middle finger actually lands when the hand holds this
+        # pinch. Cannot propose a contact the arm can't reach, which is the
+        # failure mode the fan's DLS ranking only screens for after the fact.
+        p_mf = None if fk_probe is None else fk_probe(seed)
+        if p_mf is None:
+            return []
+        p3s = _project_to_surface_np(np.asarray(p_mf, float), geom_type, center,
+                                     obj_mat, size, mesh_entry=mesh_entry)
+        c = _finish(p3s, 0.0)
+        return [c] if c is not None else []
+
+    if strategy == 'patch_offset':
+        # Walk a FIXED distance from the index contact in the index patch's OWN
+        # coordinates. The patch axes are the surface's principal-curvature
+        # directions, so this is defined entirely by object geometry -- no palm
+        # frame, hence none of the world-orientation dependence that made
+        # 'tangent' propose sub-table contacts, and no reliance on the middle
+        # finger being anywhere in particular, which is what 'kinematic'
+        # wrongly assumed.
+        #
+        # The offset is CLAMPED to the patch bounds: the shared-patch branch of
+        # _run_stage confines contact 3 to exactly this region, so a seed outside
+        # it would be discarded the same way the fan's is.
+        if patch_frame is None:
+            return []
+        _lo0, _hi0 = float(patch_frame['t_lo_0']), float(patch_frame['t_hi_0'])
+        _lo1, _hi1 = float(patch_frame['t_lo_1']), float(patch_frame['t_hi_1'])
+        _d = float(patch_offset_m)
+        # Fan over DIRECTIONS IN PATCH COORDINATES (not world), so the DLS rank
+        # has alternatives without any of them leaving the patch.
+        for a in np.linspace(0.0, 2.0 * np.pi, max(int(n_fan), 1), endpoint=False):
+            _t0 = float(np.clip(_d * np.cos(a), _lo0, _hi0))
+            _t1 = float(np.clip(_d * np.sin(a), _lo1, _hi1))
+            if abs(_t0) < 1e-6 and abs(_t1) < 1e-6:
+                continue
+            p3s = _patch_point_np(patch_frame, _t0, _t1, center, obj_mat)
+            c = _finish(p3s, float(np.rad2deg(a)))
+            if c is not None:
+                c['patch_t'] = (_t0, _t1)
+                out.append(c)
+        return out
+
+    if strategy == 'tangent':
+        # (B) Palm -y, projected onto the index contact's tangent plane, walked
+        # along the surface. A small fan is retained ONLY so the DLS ranking has
+        # alternatives when the nominal direction is blocked -- +/-15deg, not the
+        # +/-40deg the old fan used, which is wide enough to leave the face.
+        if palm_R is None:
+            return []
+        n2 = np.asarray(seed['n2_in'], float)
+        n2 = n2 / (np.linalg.norm(n2) + 1e-12)
+        d0 = np.asarray(palm_R, float) @ _MF_FROM_IF_PALM
+        d_tan = d0 - np.dot(d0, n2) * n2
+        if np.linalg.norm(d_tan) < 1e-9:
+            return []
+        d_tan = d_tan / np.linalg.norm(d_tan)
+        _side = np.cross(n2, d_tan)
+        for a_deg in np.linspace(-15.0, 15.0, max(int(n_fan), 1)):
+            a = np.deg2rad(a_deg)
+            d_a = np.cos(a) * d_tan + np.sin(a) * _side
+            d_a = d_a - np.dot(d_a, n2) * n2
+            nd = np.linalg.norm(d_a)
+            if nd < 1e-9:
+                continue
+            p3s = _surface_walk_np(p2s, d_a / nd, float(pitch_m), geom_type, size,
+                                   center, obj_mat, mesh_entry=mesh_entry)
+            c = _finish(p3s, a_deg)
+            if c is not None:
+                out.append(c)
+        return out
+
+    # ---- 'fan': the original, unchanged apart from optional crossing placement ----
+    ref = np.array([1.0, 0.0, 0.0]) if abs(ax[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(ax, ref); u /= (np.linalg.norm(u) + 1e-12)
+    v = np.cross(ax, u)
+    if mf_dir_world is not None:
+        b = np.asarray(mf_dir_world, float)
+        b = b - np.dot(b, ax) * ax
+        if np.linalg.norm(b) > 1e-9:
+            u = b / np.linalg.norm(b)
+            v = np.cross(ax, u)
+            fan = np.linspace(-np.deg2rad(fan_half_deg), np.deg2rad(fan_half_deg),
+                              max(int(n_fan), 1))
+        else:
+            fan = np.linspace(-np.pi, np.pi, max(int(n_fan), 1), endpoint=False)
+    else:
+        fan = np.linspace(-np.pi, np.pi, max(int(n_fan), 1), endpoint=False)
+    reach = max(float(np.max(np.asarray(size, float)[:3])), ax_n) * 1.5
+    for a in fan:
+        d_hat = np.cos(a) * u + np.sin(a) * v
+        try:
+            p3s = _project_to_surface_np(mid + reach * d_hat, geom_type, center,
+                                         obj_mat, size, mesh_entry=mesh_entry)
+        except Exception:
+            continue
+        c = _finish(p3s, float(np.rad2deg(a)))
+        if c is not None:
+            out.append(c)
+    return out
 
 
 def _assign_seed_by_finger(seed, live_thumb, live_index):
@@ -1854,8 +2121,16 @@ def _soft_finger_torque_ca(n_O, mu_t: float):
 
 
 def build_W_ca(p1, p2, R1_param, R2_param, obj_center_np, obj_R_np, mu,
-               mu_t: float = 0.0):
-    """Primitive wrench matrix W (6 x n*s), n=2 contacts x s cone edges each.
+               mu_t: float = 0.0, extra_contacts=None):
+    """Primitive wrench matrix W (6 x n*s), n contacts x s cone edges each.
+
+    extra_contacts: optional [(p, R_param), ...] appended AFTER (p1,R1),(p2,R2).
+    None (default) reproduces the 2-contact matrix byte-for-byte -- the n=2 path
+    is the measured one (12/15 lifts) and must not move. A third contact off the
+    grasp axis is the point of passing it: a 2-contact W is structurally
+    rank-5-of-6 (no moment arm about the line through the two contacts), which is
+    what project_grasp_axis_torque exists to paper over and what the soft-finger
+    columns tried, and measurably failed, to fix by adding near-duplicate columns.
     s=5 (PCwF) when mu_t<=0 (default — unchanged from before); s=7 (soft
     finger) when mu_t>0, adding 2 pure-normal-force+spin-moment generators per
     contact (scripts/3D_minimum_NCF_soft.py's soft-finger linearization) so W
@@ -1870,9 +2145,9 @@ def build_W_ca(p1, p2, R1_param, R2_param, obj_center_np, obj_R_np, mu,
     so the GWS block and the existing wrench-feasibility LP agree on what a
     "primitive wrench" is.
 
-    Returns a (6, 2*(5 or 7)) CasADi MX expression, symbolic in p1/p2 (and
-    R1_param/R2_param if those are themselves expressions, e.g. under
-    symbolic_normals).
+    Returns a (6, n*(5 or 7)) CasADi MX expression, symbolic in the contact
+    positions (and in the R_params if those are themselves expressions, e.g.
+    under symbolic_normals).
     """
     verts_c = _friction_cone_verts(mu)
     obj_c   = ca.DM(obj_center_np)
@@ -1887,7 +2162,10 @@ def build_W_ca(p1, p2, R1_param, R2_param, obj_center_np, obj_R_np, mu,
         return ca.vertcat(tau, f_O)
 
     cols = []
-    for p, R_param in ((p1, R1_param), (p2, R2_param)):
+    _contacts = [(p1, R1_param), (p2, R2_param)]
+    if extra_contacts:
+        _contacts.extend(extra_contacts)
+    for p, R_param in _contacts:
         forces = [R_param @ ca.DM(v) for v in verts_c]
         cols.extend(_col(p, f) for f in forces)
         if mu_t > 0.0:
@@ -1899,10 +2177,10 @@ def build_W_ca(p1, p2, R1_param, R2_param, obj_center_np, obj_R_np, mu,
     return ca.horzcat(*cols)
 
 
-def _embed_gws_ca(opti, W):
+def _embed_gws_ca(opti, W, alpha_reg: float = 0.0):
     """Add the min-weight (FRoGGeR) LP as NLP decision variables/constraints.
 
-        max_{alpha,beta}  beta
+        max_{alpha,beta}  beta - alpha_reg * ||alpha||^2
         s.t.  W @ alpha == 0
               sum(alpha) == 1
               alpha >= beta * 1
@@ -1917,7 +2195,44 @@ def _embed_gws_ca(opti, W):
     yet in force closure, beta < 0 with some alpha_j < 0 is the CORRECT value,
     and must stay smoothly climbable rather than becoming infeasible.
 
-    Returns (alpha, beta).
+    alpha_reg (proximal/Tikhonov term, 0.0 = off, byte-identical to the plain
+    LP embedding): adds -alpha_reg*||alpha||^2, making the embedded problem a
+    strictly convex QP in alpha instead of an LP.
+
+    MEASURED, and it is NOT the fix for the dual indeterminacy -- keep it off
+    unless you have a reason. The hypothesis it was added to test was that at
+    a symmetric antipodal pinch the LP's optimal set is a FACE (several alpha_j
+    tying at beta), making the primal degenerate. That hypothesis is FALSE for
+    this geometry: solving the LP under random 1e-9 cost tilts returns
+    alpha = 0.1*ones to machine precision every time, i.e. the optimum is the
+    single VERTEX where all 10 components tie at beta = 1/n_cols exactly. The
+    primal is already unique, so there is nothing for a proximal term to
+    disambiguate -- measured on 017_orange, eps=1e-6 shifted beta by -1.8%
+    (0.09676 -> 0.09505) and eps=1e-4 pushed the solve to
+    Maximum_Iterations_Exceeded while biasing an already-unique alpha.
+
+    The real mechanism is DUAL, and structural: W is 6 x (n*5) with rank 5,
+    not 6, for a 2-contact pinch (measured singular values
+    4.0/4.0/2.83/0.144/0.144/0.0). Its left-null direction is exactly torque
+    about the GRASP AXIS. Because W^T u = 0 for that u, the multiplier lambda
+    of the 6-row equality W@alpha == 0 is determined only up to lambda + c*u
+    for any scalar c -- non-unique along exactly one direction, by geometry,
+    not by conditioning. No alpha-side regularization touches that; the fixes
+    that would are (a) a third non-collinear contact, giving W a real moment
+    arm about every axis (see build_W_ca's extra_contacts and cfg.n_contacts),
+    or (b) dropping the dependent row / regularizing on the LAMBDA side.
+    See also build_W_ca's "structurally rank-5-of-6" note and
+    for_gws_recommender's soft-finger discussion, which record the same rank
+    deficiency from the primal side.
+
+    Kept (default off) because it is a cheap, already-wired knob for probing
+    the alpha side, and alpha_reg is returned as a separate cost term rather
+    than folded in silently so a caller comparing beta across settings sees
+    both contributions.
+
+    Returns (alpha, beta, cost_alpha_reg) — cost_alpha_reg is alpha_reg *
+    sumsqr(alpha) (a ca.DM(0.0) sentinel when alpha_reg == 0.0), for the
+    caller to add into its own minimize() call alongside -w_gws*beta.
     """
     n_cols = int(W.shape[1])
     alpha  = opti.variable(n_cols)
@@ -1925,7 +2240,8 @@ def _embed_gws_ca(opti, W):
     opti.subject_to(W @ alpha == ca.DM.zeros(6, 1))
     opti.subject_to(ca.sum1(alpha) == 1.0)
     opti.subject_to(alpha - beta * ca.DM.ones(n_cols, 1) >= 0)
-    return alpha, beta
+    cost_alpha_reg = (alpha_reg * ca.sumsqr(alpha)) if alpha_reg > 0.0 else ca.DM(0.0)
+    return alpha, beta, cost_alpha_reg
 
 
 # ca.det/ca.chol have no AD rule for MX (CasADi raises "'eval' not defined for
@@ -2194,6 +2510,49 @@ class GWSConfig:
     # per-fingertip values already authored in the MJCF, combined the way MuJoCo's own
     # contact solver does it (elementwise max), not a hand-picked constant.
     gws_soft_finger:    bool = False
+
+    # Proximal (Tikhonov) regularization on the min-weight LP's alpha: adds
+    # gws_alpha_reg * ||alpha||^2 to the cost, turning
+    #     max_{alpha,beta} beta  s.t. W@alpha==0, sum(alpha)==1, alpha>=beta*1
+    # from an LP (whose optimal face is a FACE, not a vertex, whenever
+    # multiple alpha_j tie at beta -- e.g. any symmetric antipodal pinch with
+    # a 5-vertex polyhedral cone) into a strictly convex QP. Strictly convex
+    # -> unique primal alpha* -> unique KKT multipliers, which is the direct
+    # fix for IPOPT dual non-uniqueness/non-convergence traced to this block
+    # (see the dual-indeterminacy investigation notes). 0.0 = off (byte-
+    # identical to the pre-existing LP embedding). ~1e-6 is the recommended
+    # starting point: small enough that its bias on beta is second-order and
+    # independently quantifiable by comparing beta at reg=0 vs reg=1e-6 on a
+    # solve that DOES converge with reg=0 (e.g. an asymmetric seed).
+    gws_alpha_reg:      float = 0.0
+
+    # Ablation switch for the non-C2 term hunt: passes smooth_blend=True to
+    # every _symbolic_contact_frame_ca call feeding the GWS contact frame(s),
+    # replacing that function's ca.fabs(n[0]) blend weight (C0, not C1, at
+    # n[0]==0) with a C-infinity sqrt(n[0]**2+eps) surrogate. False (default)
+    # is byte-identical to prior behavior.
+    #
+    # MEASURED: this is NOT where the trouble is, and it changes nothing on
+    # either object tested. On 036_wood_block the result is bit-identical to
+    # baseline (beta=0.09915393739443955, 167 iters, same contact gaps) even
+    # though the flag verifiably reaches all 8 frame builds -- because the
+    # solved normals sit at |n[0]| = 0.14/0.22, which is 68-76 tanh widths
+    # from the kink, where the blend is saturated flat (|dalpha/dn0| = 0.00 to
+    # machine precision).
+    #
+    # What the same measurement DID surface: the blend's tanh(w/0.01) has
+    # width 0.01, and 017_orange's solved normals land at |n[0]| = 0.9073 and
+    # 0.9395 -- 0.7 and 4.0 widths from the 0.9 switch point, where
+    # |dalpha/dn0| ~ 31 and |d2alpha/dn0^2| ~ 3.8e3. So the orange's contact
+    # TANGENT BASIS spins violently under infinitesimal normal change, and
+    # that basis multiplies straight into W. It is a smooth term, which is
+    # exactly why smoothing it further cannot help. Note also that beta is
+    # EXACTLY invariant (0.100000000000 across 0-90 deg) to rotating the
+    # tangent basis about n -- a pure gauge freedom -- so this ill-conditioned
+    # dial moves the constraint Jacobian while leaving the objective flat.
+    # Widening the transition (or gauge-fixing the tangent basis) is the
+    # lead worth pulling here, not smoothing the abs.
+    gws_smooth_frame:   bool = False
 
 
 @dataclass
@@ -2528,6 +2887,11 @@ class GeometryNames:
     obj_body:    str = 'obj_red_box'
     thumb_site:  str = 'leap_th_ds_tip'
     index_site:  str = 'leap_if_ds_tip'
+    # Third load-bearing contact (cfg.n_contacts >= 3). The middle finger already had a
+    # GEOM here (middle_geom, used for verify()'s diagnostic gaps and for the collision
+    # tier) but no SITE -- and a site is what the IK cost, the DLS reachability ranking
+    # and the FK callbacks all target. Resolved only when n_contacts >= 3.
+    middle_site: str = 'leap_mf_ds_tip'
     thumb_geom:  str = 'leap_th_tip'
     index_geom:  str = 'leap_if_tip'
     middle_geom: str = 'leap_mf_tip'
@@ -2606,6 +2970,58 @@ class GraspConfig3D:
     wrench_constraint: bool  = True
     max_iter:          int   = 50
     fixed_contacts:    bool  = False
+    # Number of LOAD-BEARING contacts the NLP solves for. 2 = the antipodal pinch
+    # (thumb+index) every measurement in this repo was taken on. 3+ is the tripod
+    # work-in-progress: a third contact OFF the grasp axis supplies the moment arm a
+    # 2-contact pinch structurally lacks (its W is rank-5-of-6, which is why
+    # project_grasp_axis_torque exists and why the soft-finger columns were tried).
+    # Introduced as an EXPLICIT field rather than inferred from the seed count so the
+    # n=2 path's behaviour cannot change as a side effect of how seeding happens to
+    # be configured.
+    n_contacts:        int   = 2
+    # Third-contact seeding strategy: 'fan' (original, ablation baseline),
+    # 'tangent' (palm-pitch walked along the index's surface) or 'kinematic'
+    # (surface under the middle fingertip at the pinch pose). See
+    # _seed_third_contact. Only consulted when n_contacts >= 3.
+    c3_seed_strategy:  str   = 'patch_offset'
+    # Give contact 3 its OWN quadratic patch instead of reconstructing it inside
+    # contact 2's. FALSE (shared) is the MEASURED-BETTER default; True is kept
+    # only so the comparison can be re-run.
+    #
+    # The argument FOR an own patch was that the index patch is too small to hold
+    # two fingertips: 17-24mm half-extent on rounded objects (median 19.7mm)
+    # against a 45.4mm finger pitch. That argument is WRONG, in two ways.
+    #
+    # 1. The 45.4mm "finger pitch" is the rigid base-mount spacing measured at
+    #    qpos0. Fingers curl INDEPENDENTLY, so their tips need not sit one
+    #    base-pitch apart on the surface -- the shared patch's own solves place
+    #    them 36-90mm apart, which is what they actually want.
+    # 2. Measured head-to-head, seed 0, three objects, middle-fingertip gap to
+    #    its assigned contact (pad radius removed, so ~0 = the finger reaches it):
+    #        shared: -0.1 / -0.8 / +0.7 mm   <- converges on all three
+    #        own:    +5.8 / -0.5 / +56.7 mm  <- 036_wood_block misses by 57mm
+    #    and on the block the own-patch cost blew up 0.55 -> 37.25 with beta
+    #    going NEGATIVE. That reproduces the 183mm failure this file's
+    #    shared-patch comment already recorded from an earlier attempt.
+    #
+    # Sharing guarantees the two contacts are adjacent and mutually reachable.
+    # An independent patch can be fitted anywhere the seeder points, including a
+    # face the hand would have to re-approach entirely.
+    c3_own_patch:      bool  = False
+    # Offset distance (m) for c3_seed_strategy='patch_offset': how far from the
+    # index contact to place the third contact, measured in the index patch's own
+    # (t0,t1) coordinates and clamped to that patch's measured bounds.
+    #
+    # 15mm, MEASURED. Must stay strictly INSIDE the patch, not at its edge: the
+    # half-extent is ~20mm on rounded objects, so a 30mm request CLAMPS to the
+    # boundary and pins contact 3 against it. Measured on 017_orange that gives
+    # beta = -0.230 (the only negative beta in the sweep) because a pinned contact
+    # contributes a near-duplicate wrench column. On 036_wood_block, whose patch is
+    # +/-97mm and never clamps, 30mm is harmless -- exactly the pattern clamping
+    # predicts. Per-object, seed 0, orange/lemon/block:
+    #     15mm  cost 4.15/4.98/0.34  beta .039/.033/.041  all 3 fingers within 1.5mm
+    #     30mm  cost 7.31/6.70/0.56  beta -.230/.043/.043
+    c3_patch_offset_m: float = 0.015
     r_thumb:  float | None = None
     r_index:  float | None = None
     r_middle: float | None = None
@@ -2628,6 +3044,10 @@ class GraspConfig3D:
         self.wrench_constraint = kwargs.pop('wrench_constraint', True)
         self.max_iter           = kwargs.pop('max_iter', 50)
         self.fixed_contacts     = kwargs.pop('fixed_contacts', False)
+        self.n_contacts         = kwargs.pop('n_contacts', 2)
+        self.c3_seed_strategy   = kwargs.pop('c3_seed_strategy', 'patch_offset')
+        self.c3_own_patch       = kwargs.pop('c3_own_patch', False)
+        self.c3_patch_offset_m  = kwargs.pop('c3_patch_offset_m', 0.015)
         self.r_thumb  = kwargs.pop('r_thumb', None)
         self.r_index  = kwargs.pop('r_index', None)
         self.r_middle = kwargs.pop('r_middle', None)
@@ -2651,6 +3071,7 @@ class GraspConfig3D:
         groups = ', '.join(f'{g}={getattr(self, g)!r}' for g in sorted(_GRASP_CFG_GROUPS))
         top = ', '.join(f'{k}={getattr(self, k)!r}' for k in
                         ('joint_limits', 'wrench_constraint', 'max_iter', 'fixed_contacts',
+                         'n_contacts', 'c3_seed_strategy', 'c3_own_patch', 'c3_patch_offset_m',
                          'r_thumb', 'r_index', 'r_middle', 'r_ring'))
         return f'GraspConfig3D({groups}, {top})'
 
@@ -2671,7 +3092,7 @@ class GraspConfig3D:
         # group so mutation-after-construction keeps working exactly like the old
         # flat dataclass.
         if name in _GRASP_CFG_GROUPS or name in (
-            'joint_limits', 'wrench_constraint', 'max_iter', 'fixed_contacts',
+            'joint_limits', 'wrench_constraint', 'max_iter', 'fixed_contacts', 'n_contacts', 'c3_seed_strategy', 'c3_own_patch', 'c3_patch_offset_m',
             'r_thumb', 'r_index', 'r_middle', 'r_ring',
         ):
             object.__setattr__(self, name, value)
@@ -2754,6 +3175,16 @@ class GraspPlanner3D:
         self._obj_bid    = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, c.obj_body)
         self._thumb_sid  = self._require_site(c.thumb_site)
         self._index_sid  = self._require_site(c.index_site)
+        # Third contact's site. REQUIRED once n_contacts >= 3 (a missing site would
+        # otherwise surface as a confusing failure deep in the IK cost). Resolved even
+        # at n=2, where nothing in the NLP targets it, for ONE reason: r_middle is
+        # measured from it below, and the site-less fallback (geom_rbound) over-reports
+        # the LEAP middle pad by 4.2mm (23.68 vs the true 19.47mm max-vertex distance).
+        # _has_c3 and every other tripod branch gate on n_contacts, NOT on this being
+        # non-None, so resolving it early cannot switch the tripod on.
+        self._middle_sid = (self._optional_site(c.middle_site)
+                            if int(c.n_contacts) < 3
+                            else self._require_site(c.middle_site))
         self._thumb_gid  = self._require_geom(c.thumb_geom)
         self._index_gid  = self._require_geom(c.index_geom)
         self._middle_gid = self._require_geom(c.middle_geom)
@@ -2814,7 +3245,13 @@ class GraspPlanner3D:
 
         c.r_thumb  = _tip_radius(self._thumb_gid, self._thumb_sid)
         c.r_index  = _tip_radius(self._index_gid, self._index_sid)
-        c.r_middle = _tip_radius(self._middle_gid)
+        # Pass the SITE: without it a mesh tip falls through to geom_rbound, which is
+        # the bounding sphere about the mesh FRAME ORIGIN, not the pad extent from the
+        # site. Measured on the LEAP middle tip: rbound 23.68mm vs 19.47mm true. The
+        # inflated value fed _r3_ik (the tripod's third IK target = p + r*n), pushing
+        # that target ~4mm off the surface. index and middle share mesh dataid 13, so
+        # the corrected r_middle equals r_index exactly.
+        c.r_middle = _tip_radius(self._middle_gid, self._middle_sid)
         c.r_ring   = _tip_radius(self._ring_gid)
         self.log.info(
             f"[tip_radius] r_thumb={c.r_thumb*1e3:.1f}mm  r_index={c.r_index*1e3:.1f}mm  "
@@ -3009,6 +3446,8 @@ class GraspPlanner3D:
               p2_init: np.ndarray | None = None,
               d1:      np.ndarray | None = None,
               d2:      np.ndarray | None = None,
+              p3_init: np.ndarray | None = None,
+              d3:      np.ndarray | None = None,
               iter_callback=None,
               update_normals_in_callback: bool = False,
               gamma_init: float | None = None,
@@ -3024,6 +3463,10 @@ class GraspPlanner3D:
         p2_init : (3,)  optional index contact seed.
         d1, d2  : face-direction unit vectors (from MultiStart seeds).
                   When provided, pins p1/p2 to the corresponding geom face.
+        p3_init : (3,)  optional THIRD contact seed (middle finger), used only
+                  when cfg.n_contacts >= 3. Produced by _seed_third_contact.
+                  None keeps the solve a 2-contact pinch, unchanged.
+        d3      : outward face direction for p3, same convention as d1/d2.
         gamma_init       : optional γ from the caller's pre-solver LP check
                             (min_gamma_for_accel_lp), used to warm-start the
                             embedded wrench-cone LP's γ variable instead of 1.0.
@@ -3103,6 +3546,10 @@ class GraspPlanner3D:
                    else obj_center + np.array([0.0, -hy, 0.0]))
         p2_seed = (np.asarray(p2_init, float) if p2_init is not None
                    else obj_center + np.array([0.0,  hy, 0.0]))
+        # THIRD contact seed. No geometric default: unlike p1/p2 there is no sensible
+        # fallback position for a tripod's third finger, so absence simply means "solve
+        # the 2-contact problem" rather than "invent a contact".
+        p3_seed = (np.asarray(p3_init, float) if p3_init is not None else None)
 
         # UV-atlas CHART assignment — decided ONCE here from the initial seed,
         # held fixed for the whole solve (only the LOCAL neighborhood within
@@ -3196,16 +3643,34 @@ class GraspPlanner3D:
                        iter_callback=None,
                        update_normals_in_callback: bool = False,
                        r1_override: float | None = None,
-                       r2_override: float | None = None) -> dict:
+                       r2_override: float | None = None,
+                       p3_ws: np.ndarray | None = None,
+                       d3_lp: np.ndarray | None = None,
+                       r3_override: float | None = None) -> dict:
+            # p3_ws/d3_lp: the THIRD load-bearing contact (cfg.n_contacts >= 3).
+            # None at n=2 -- every branch below that touches contact 3 is gated on
+            # `_has_c3`, so the 2-contact problem built here is bit-identical to what
+            # it was before the tripod work (verified: 014_lemon gamma_min and both
+            # tip gaps unchanged to full precision).
 
             _t_stage_start = time.perf_counter()
             _uid = id(q_ws)
+            # ONE predicate for the whole stage: a third contact exists iff the config
+            # asks for it AND a seed was actually supplied. Keeping both conditions here
+            # means no downstream branch can half-enable the tripod.
+            _has_c3 = (int(cfg.n_contacts) >= 3 and p3_ws is not None
+                       and self._middle_sid is not None)
 
             # ── FK callbacks (analytic Jacobians via mj_jacSite) ───────────
             thumb_cb = _SitePositionCallbackAnalytic(
                 f'gp3_th_{_uid}', model, self._thumb_sid, n_act, obj_qpos_snap)
             index_cb = _SitePositionCallbackAnalytic(
                 f'gp3_if_{_uid}', model, self._index_sid, n_act, obj_qpos_snap)
+            # Third contact's FK, built only when the tripod is actually active so the
+            # n=2 NLP gains no callback and no variables.
+            middle_cb = (_SitePositionCallbackAnalytic(
+                f'gp3_mf_{_uid}', model, self._middle_sid, n_act, obj_qpos_snap)
+                if _has_c3 else None)
 
             # Fingerpad-axis FK (R_tip(q) @ pad_axis in world) for the orient_weight cost —
             # only built when the term is active, since each adds a q-dependent rotational
@@ -3233,6 +3698,7 @@ class GraspPlanner3D:
             _q  = _opti.variable(n_act)
             _is_mesh = (geom_type == _GEOM_TYPE_MESH and self._mesh_entry is not None)
             _t1_var = _t2_var = None   # set below iff a mesh 2-DOF contact var is built
+            _t3_var = _p3 = _t3_bounds = _t3_frame = None   # third contact (n_contacts>=3)
             _t1_bounds = _t2_bounds = None   # set below iff use_quadratic_contact (per-axis trust region)
             _t1_frame = _t2_frame = None     # set below iff use_quadratic_contact (paraboloid params, for viz)
             if cfg.fixed_contacts:
@@ -3289,6 +3755,84 @@ class GraspPlanner3D:
                     mesh_fit=cfg.quadratic_mesh_fit,
                     mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
                     mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min)
+                # THIRD contact SHARES contact 2's patch (index + middle on one
+                # paraboloid, each with its own 2-DOF coordinate inside the SAME trust
+                # region), reconstructed via the identity _mesh_quadratic_contact_ca's
+                # frame dict documents:
+                #     p_local(t) = seed_l + t0*axis0_l + t1*axis1_l + h(t)*n_l
+                #
+                # An earlier version fitted an INDEPENDENT third patch from a fan seed.
+                # It failed badly -- measured 183mm between the middle fingertip and its
+                # assigned contact on 036_wood_block -- because an independent patch can
+                # land on a face the hand would have to re-approach entirely. Sharing
+                # guarantees the two contacts are adjacent and mutually reachable, and a
+                # standalone test confirmed the optimizer then slides BOTH to reachable
+                # spots inside the bounds (index/middle 10-24mm apart, every finger
+                # converging to its pad radius). The rest-pose fingertip separation
+                # (178-219mm) that motivated separate patches was the wrong measurement:
+                # what matters is whether both fingers can curl onto NEARBY contacts,
+                # not how far apart they hang when extended.
+                if _has_c3 and cfg.c3_own_patch:
+                    # OWN PATCH, fitted at contact 3's own seed exactly as contacts 1
+                    # and 2 are above. The shared-patch alternative (the else branch)
+                    # is structurally unable to hold two fingertips at natural
+                    # spacing: measured across 15 accepted seeds on 5 objects, the
+                    # index patch half-extent is 17-24mm on rounded objects (median
+                    # 19.7mm) against a 45.4mm middle-to-index finger pitch. Only 33%
+                    # of seeds reach 45mm and every one of those is a flat face whose
+                    # bound is quadratic_t_bound_max CLIPPING rather than a measured
+                    # trust region.
+                    #
+                    # An independent patch was tried once before and measured 183mm
+                    # off on 036_wood_block. That attempt paired it with the FAN
+                    # seeder, which places candidates at object scale with nothing
+                    # tying them to contact 2's neighbourhood, so the patch could land
+                    # on a face the hand would have to re-approach. The tangent/
+                    # kinematic seeders exist to remove that failure mode -- if this
+                    # branch still fails under them, the independent patch itself is
+                    # the problem and the finding is genuine rather than confounded.
+                    # EXACTLY the _n1_seed_out/_n2_seed_out convention (:3531): d*_lp is
+                    # INWARD and is negated once to give the outward seed normal, while
+                    # the _geom_normal_np fallback is ALREADY outward and must not be
+                    # negated. An earlier version negated the whole expression and then
+                    # negated again -- a no-op that left the d3_lp path pointing INWARD,
+                    # which fits the third paraboloid facing into the object.
+                    _n3_seed_out = -np.asarray(d3_lp, float) if d3_lp is not None else \
+                        _geom_normal_np(p3_ws, geom_type, obj_center_np, obj_R_np,
+                                        geom_size, mesh_entry=self._mesh_entry)
+                    _t3_var, _p3, _t3_bounds, _t3_frame = _mesh_quadratic_contact_ca(
+                        _opti, np.asarray(p3_ws, float), _n3_seed_out,
+                        obj_center_np, obj_R_np, self._mesh_entry,
+                        t_bound_max=cfg.quadratic_t_bound_max,
+                        sdf_err_tol=cfg.quadratic_sdf_err_tol,
+                        mesh_fit=cfg.quadratic_mesh_fit,
+                        mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
+                        mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min)
+                elif _has_c3:
+                    # SHARED patch (ablation baseline). Contact 3 is reconstructed
+                    # inside contact 2's paraboloid via the identity its frame dict
+                    # documents: p_local(t) = seed_l + t0*axis0_l + t1*axis1_l + h(t)*n_l.
+                    # NOTE this DISCARDS the third seed entirely -- p3_ws never enters,
+                    # and _t3_var starts at the middle of contact 2's patch -- which is
+                    # why seed-to-final measured 64/51/190mm on orange/lemon/block.
+                    _t3_var = _opti.variable(2)
+                    _opti.subject_to(_opti.bounded(_t2_frame['t_lo_0'], _t3_var[0],
+                                                   _t2_frame['t_hi_0']))
+                    _opti.subject_to(_opti.bounded(_t2_frame['t_lo_1'], _t3_var[1],
+                                                   _t2_frame['t_hi_1']))
+                    # Start OFF contact 2's own initial point so the two don't begin
+                    # coincident (identical contacts give a degenerate wrench matrix).
+                    _opti.set_initial(_t3_var, np.array([0.5 * _t2_frame['t_hi_0'],
+                                                         0.5 * _t2_frame['t_hi_1']]))
+                    _h3 = -(_t2_frame['kappa0'] * _t3_var[0]**2
+                            + _t2_frame['kappa1'] * _t3_var[1]**2) / (2.0 * _t2_frame['grad_norm'])
+                    _p3_l = (ca.DM(_t2_frame['seed_l'])
+                             + _t3_var[0] * ca.DM(_t2_frame['axis0_l'])
+                             + _t3_var[1] * ca.DM(_t2_frame['axis1_l'])
+                             + _h3 * ca.DM(_t2_frame['n_l']))
+                    _p3 = ca.DM(obj_center_np) + ca.DM(obj_R_np) @ _p3_l
+                    _t3_bounds = _t2_bounds
+                    _t3_frame  = _t2_frame
             elif _is_mesh:
                 # Tangent-plane parameterization: p1/p2 become 2-DOF expressions
                 # (offset in the local tangent plane at the seed, reprojected
@@ -3379,6 +3923,16 @@ class GraspPlanner3D:
             _tp2_tgt = _p2 + _r2_ik * _n2_out_ik
             _d1_sq = ca.sumsqr(_tp1 - _tp1_tgt)   # m²
             _d2_sq = ca.sumsqr(_tp2 - _tp2_tgt)   # m²
+            # Third contact's IK term, same construction as 1 and 2: the fingertip
+            # CENTER targets contact + r_tip*outward_normal, not the bare contact.
+            _d3_sq = None
+            if _has_c3 and _p3 is not None and middle_cb is not None:
+                _tp3 = middle_cb(_q)
+                _r3_ik = float(cfg.r_middle if cfg.r_middle is not None else cfg.r_index)
+                _n3_out_ik = ca.DM(np.asarray(
+                    d3_lp if d3_lp is not None else _n3_seed_out, float))
+                _tp3_tgt = _p3 + _r3_ik * _n3_out_ik
+                _d3_sq = ca.sumsqr(_tp3 - _tp3_tgt)   # m²
 
             # ── SDF for surface constraints ─────────────────────────────────
             if cfg.smooth_sdf:
@@ -3410,7 +3964,14 @@ class GraspPlanner3D:
             # Reference scales encode what "good enough" means for each term.
             _d_ref  = 0.005                       # m   — acceptable IK residual
             _n_dof  = int(ca.MX(_q).numel())
-            _cost_ik  = 0.5 * (_d1_sq + _d2_sq) / _d_ref**2
+            # Averaged over the contacts present, so w_ik keeps its calibrated meaning:
+            # at n=2 this is exactly the historical 0.5*(d1+d2), and a third contact does
+            # not inflate the IK term relative to reg/align/gws (which would silently
+            # re-tune every other weight).
+            if _d3_sq is not None:
+                _cost_ik = (_d1_sq + _d2_sq + _d3_sq) / (3.0 * _d_ref**2)
+            else:
+                _cost_ik  = 0.5 * (_d1_sq + _d2_sq) / _d_ref**2
             _cost_reg = ca.sumsqr((_q - ca.DM(_q_reg)) / cfg.q_scale) / _n_dof
             _cost = cfg.w_ik * _cost_ik + cfg.w_reg * _cost_reg
 
@@ -3421,7 +3982,19 @@ class GraspPlanner3D:
             # when offset, squeezing makes an unresistable couple (the IK-only failure).
             # Uses the frozen inward normal from the seed face direction d1_lp (box) — a
             # constant per face, so this is a smooth quadratic in p1/p2 only.
-            if cfg.w_align > 0.0 and d1_lp is not None:
+            # n=2 ONLY. The term is (p2-p1)-relational -- it asks that THE grasp axis
+            # align with contact 1's inward normal -- and a tripod has no single grasp
+            # axis, so there is nothing here to generalize. Deliberately left OFF for
+            # n!=2 rather than replaced by a guessed n-contact analogue: for three
+            # non-collinear contacts OPPOSITION is not the right objective anyway
+            # (force closure there means the normals SPAN the origin, which is exactly
+            # what the FRoGGeR min-weight beta measures and w_gws already optimizes).
+            # If beta turns out not to carry it, add an n>2 strategy here then -- see
+            # the caveat that beta measured unreliable at n=2, which was attributed to
+            # the rank-5-of-6 degeneracy a third contact is supposed to remove.
+            # Keeping the gate explicit preserves the measured n=2 path bit-identically
+            # (12/15 lifts across 3 seeds x 5 objects at max_iter=80, n_seeds=3).
+            if cfg.w_align > 0.0 and d1_lp is not None and cfg.n_contacts == 2:
                 _n1_in_al = (_n1_al_s if _n1_al_s is not None
                              else ca.DM(-np.asarray(d1_lp, float)
                                         / (np.linalg.norm(d1_lp) + 1e-12)))
@@ -3589,6 +4162,7 @@ class GraspPlanner3D:
             _n2_in       = None
             _R1_expr     = None   # set below iff a contact frame is actually needed
             _R2_expr     = None
+            _R3_expr     = None   # third contact's frame (n_contacts >= 3 only)
             # Contact frame [n_in|t1|t2] is needed by BOTH the wrench-cone LP
             # (gamma/y/s) and the GWS min-weight LP (alpha/beta) — they share the
             # same _friction_cone_verts/frame convention (see build_W_ca's
@@ -3617,11 +4191,19 @@ class GraspPlanner3D:
                                 and _t1_var is not None and _t2_var is not None)
                 use_sym_normals = (cfg.symbolic_normals and
                                    geom_type in (2, 5))  # sphere / cylinder only
+                _smooth_frame = cfg.gws_smooth_frame
                 if use_quad_sym:
                     _n1_in_sym = _quadratic_inward_normal_ca(_t1_var, _t1_frame, obj_R_np)
                     _n2_in_sym = _quadratic_inward_normal_ca(_t2_var, _t2_frame, obj_R_np)
-                    _R1_expr = _symbolic_contact_frame_ca(_n1_in_sym)
-                    _R2_expr = _symbolic_contact_frame_ca(_n2_in_sym)
+                    _R1_expr = _symbolic_contact_frame_ca(_n1_in_sym, smooth_blend=_smooth_frame)
+                    _R2_expr = _symbolic_contact_frame_ca(_n2_in_sym, smooth_blend=_smooth_frame)
+                    # Contact 3 lives on contact 2's patch (_t3_frame IS _t2_frame),
+                    # so its normal comes from the SAME paraboloid evaluated at the
+                    # third contact's own coordinate -- not a copy of contact 2's.
+                    if _has_c3 and _t3_var is not None and _t3_frame is not None:
+                        _R3_expr = _symbolic_contact_frame_ca(
+                            _quadratic_inward_normal_ca(_t3_var, _t3_frame, obj_R_np),
+                            smooth_blend=_smooth_frame)
                 elif use_sym_normals:
                     # Contact frame built as a CasADi MX expression of _p1/_p2.
                     # CasADi re-evaluates this at every eval_f / eval_grad_f call,
@@ -3632,8 +4214,12 @@ class GraspPlanner3D:
                     _Rt_dm = ca.DM(obj_R_np.T)
                     _n1_in_sym = _sym_inward_normal_ca(_p1, geom_type, _c_dm, _Rt_dm, geom_size)
                     _n2_in_sym = _sym_inward_normal_ca(_p2, geom_type, _c_dm, _Rt_dm, geom_size)
-                    _R1_expr = _symbolic_contact_frame_ca(_n1_in_sym)
-                    _R2_expr = _symbolic_contact_frame_ca(_n2_in_sym)
+                    _R1_expr = _symbolic_contact_frame_ca(_n1_in_sym, smooth_blend=_smooth_frame)
+                    _R2_expr = _symbolic_contact_frame_ca(_n2_in_sym, smooth_blend=_smooth_frame)
+                    if _has_c3 and _p3 is not None:
+                        _R3_expr = _symbolic_contact_frame_ca(
+                            _sym_inward_normal_ca(_p3, geom_type, _c_dm, _Rt_dm, geom_size),
+                            smooth_blend=_smooth_frame)
                 else:
                     # Default: contact frames as 3×3 parameter — frozen per NLP solve,
                     # updated between Picard iterations by the outer loop.
@@ -3649,6 +4235,15 @@ class GraspPlanner3D:
                     _opti.set_value(_R2_param, np.column_stack(_build_contact_frame_3d(_n2_in)))
                     _R1_expr = _R1_param
                     _R2_expr = _R2_param
+                    if _has_c3 and p3_ws is not None:
+                        _n3_in = -(d3_lp if d3_lp is not None else
+                                   _geom_normal_np(p3_ws, geom_type, obj_center_np,
+                                                   obj_R_np, geom_size,
+                                                   mesh_entry=self._mesh_entry))
+                        _R3_param = _opti.parameter(3, 3)
+                        _opti.set_value(_R3_param,
+                                        np.column_stack(_build_contact_frame_3d(_n3_in)))
+                        _R3_expr = _R3_param
 
             if cfg.wrench_constraint:
                 # Grasp-axis torque projection. A 2-contact pinch geometrically CANNOT
@@ -3718,9 +4313,24 @@ class GraspPlanner3D:
                     "frame (_R1_expr) available, GWS terms skipped this stage.")
             if (cfg.w_gws > 0.0 or cfg.w_span > 0.0) and _R1_expr is not None:
                 _gws_mu_t = _mu_t if cfg.gws_soft_finger else 0.0
+                # EVERY load-bearing contact enters W. Omitting contact 3 made beta
+                # the min-weight of the PINCH ALONE: the tripod could not show the
+                # rank-6 improvement it exists for, and -w_gws*beta gave the solver
+                # no gradient pulling contact 3 anywhere useful -- which is half of
+                # why it collapsed onto contact 2. Reported three-finger betas from
+                # before this (-4.56, -4.87) were 2-contact numbers.
+                _gws_extra = ([(_p3, _R3_expr)]
+                              if (_has_c3 and _p3 is not None and _R3_expr is not None)
+                              else None)
                 _gws_W = build_W_ca(_p1, _p2, _R1_expr, _R2_expr,
-                                    obj_center_np, obj_R_np, _mu, mu_t=_gws_mu_t)
-                _gws_alpha, _gws_beta = _embed_gws_ca(_opti, _gws_W)
+                                    obj_center_np, obj_R_np, _mu, mu_t=_gws_mu_t,
+                                    extra_contacts=_gws_extra)
+                if _has_c3 and _gws_extra is None:
+                    self.log.warning(
+                        "[gws] n_contacts>=3 but contact 3 has no frame/position this "
+                        "stage — beta is the 2-contact min-weight, not the tripod's.")
+                _gws_alpha, _gws_beta, _cost_gws_reg = _embed_gws_ca(
+                    _opti, _gws_W, alpha_reg=cfg.gws_alpha_reg)
                 # Uniform witness + beta<0 (not yet necessarily in closure) is a
                 # neutral, always-valid start — mirrors the gamma/y cold-start
                 # convention just above (no LP pre-solve to warm-start from).
@@ -3730,7 +4340,14 @@ class GraspPlanner3D:
                     _cost_gws = -_gws_beta   # maximize beta = minimize -beta
                 if cfg.w_span > 0.0:
                     _cost_span = -_gws_span_logdet_ca(_gws_W, cfg.gws_span_delta)
-                _cost = _cost + cfg.w_gws * _cost_gws + cfg.w_span * _cost_span
+                # cost_gws_reg (alpha_reg*||alpha||^2) is added unconditionally
+                # whenever the embedding was built at all (w_gws>0 or w_span>0),
+                # NOT gated on w_gws — it's a property of the alpha/beta QP
+                # itself (unique primal -> unique duals), independent of
+                # whether beta is currently in the objective or only a
+                # constraint-side variable.
+                _cost = (_cost + cfg.w_gws * _cost_gws + cfg.w_span * _cost_span
+                          + _cost_gws_reg)
 
 
             # Finalize cost (gamma + y regularizer + wrench-cone slack — all normalized)
@@ -4311,6 +4928,11 @@ class GraspPlanner3D:
                     'q':          _sol.value(_q),
                     'p1':         _sol.value(_p1),
                     'p2':         _sol.value(_p2),
+                    # Third contact's solved position (None at n=2). The Picard refresh
+                    # in solve() reads this to re-freeze contact 3's normal between
+                    # stages, and downstream consumers (verify, the wrench layer) need
+                    # it to see the tripod at all.
+                    'p3':         (_sol.value(_p3) if _p3 is not None else None),
                     'cost':       float(_sol.value(_opti.f)),
                     'iterations': _sol.stats()['iter_count'],
                     'status':     'converged',
@@ -4344,6 +4966,7 @@ class GraspPlanner3D:
                         'q':          _opti.debug.value(_q),
                         'p1':         _opti.debug.value(_p1),
                         'p2':         _opti.debug.value(_p2),
+                        'p3':         (_opti.debug.value(_p3) if _p3 is not None else None),
                         'cost':       _opti.debug.value(_opti.f) if _st else None,
                         'iterations': (_st or {}).get('iter_count'),
                         'status':     'best-effort',
@@ -4365,6 +4988,7 @@ class GraspPlanner3D:
                     self.log.error(f"GraspPlanner3D debug extraction: {_e2}")
                     _save_iter_npz('failed')
                     return {'success': False, 'q': None, 'p1': None, 'p2': None,
+                            'p3': None,
                             'cost': None, 'iterations': None, 'status': 'failed',
                             'return_status': None,
                             'gamma_nlp': None, 'slack_norms': None, 'max_slack_norm': None,
@@ -4382,6 +5006,17 @@ class GraspPlanner3D:
                   else _geom_normal_np(p2_seed, geom_type, obj_center_np, obj_R_np, geom_size,
                                        mesh_entry=self._mesh_entry))
         _p1_ws, _p2_ws, _q_ws = p1_seed, p2_seed, q_dls
+        # THIRD contact (cfg.n_contacts >= 3). Bound from the seed dict that
+        # _seed_third_contact produced; None at n=2 so _run_stage's _has_c3 gate stays
+        # False and the 2-contact problem is built exactly as before. The frozen normal
+        # is derived the same way _d1_lp/_d2_lp are when the seed doesn't carry one.
+        _p3_ws = None
+        _d3_lp = None
+        if int(cfg.n_contacts) >= 3 and p3_seed is not None:
+            _p3_ws = p3_seed
+            _d3_lp = (np.asarray(d3, float) if d3 is not None
+                      else _geom_normal_np(p3_seed, geom_type, obj_center_np, obj_R_np,
+                                           geom_size, mesh_entry=self._mesh_entry))
         _tol_p_m   = 5e-4    # 0.5 mm position shift → converged
         _tol_deg   = 2.0     # 2° normal mismatch → normals are accurate enough
         _tol_r_m   = 5e-4    # 0.5 mm directional-r_tip shift → radius is self-consistent
@@ -4417,7 +5052,8 @@ class GraspPlanner3D:
                              stage_label=f'S{_ri+1}',
                              iter_callback=iter_callback,
                              update_normals_in_callback=update_normals_in_callback,
-                             r1_override=_r1_ov, r2_override=_r2_ov)
+                             r1_override=_r1_ov, r2_override=_r2_ov,
+                             p3_ws=_p3_ws, d3_lp=_d3_lp)
             # Keep the cheapest stage result — relinearization has no descent guarantee.
             if (res.get('cost') is not None and
                     (not _best_res or res['cost'] < _best_res.get('cost', float('inf')))):
@@ -4494,6 +5130,15 @@ class GraspPlanner3D:
             _d2_lp = _n2_actual
             _p1_ws = _p1r
             _p2_ws = _p2r
+            # Third contact tracks the same way: re-read its surface normal at the
+            # solved point so the next Picard stage freezes an accurate frame. No-op
+            # under the standardized preset (n_normal_relinearize=0 -> single stage),
+            # kept correct so enabling relinearization later does not silently pin
+            # contact 3 at its seed while 1 and 2 move.
+            if _p3_ws is not None and res.get('p3') is not None:
+                _p3_ws = np.asarray(res['p3'], float)
+                _d3_lp = _geom_normal_np(_p3_ws, geom_type, obj_center_np, obj_R_np,
+                                         geom_size, mesh_entry=self._mesh_entry)
             if res.get('q') is not None:
                 _q_ws = np.asarray(res['q'])
 
@@ -4720,8 +5365,13 @@ class GraspPlanner3D:
         if sid == -1:
             raise ValueError(
                 f"GraspPlanner3D: site '{name}' not found. "
-                f"Check GraspConfig3D thumb_site / index_site fields.")
+                f"Check GraspConfig3D thumb_site / index_site / middle_site fields "
+                f"(set together by grasp_config_builder.load_finger_config).")
         return sid
+
+    def _optional_site(self, name: str):
+        sid = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_SITE, name)
+        return int(sid) if sid != -1 else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4766,6 +5416,9 @@ class MultiStartGraspPlanner3D:
         self._rng           = np.random.default_rng(self._seed_rng_const)
         self.last_chart_rank_table = []   # set by solve() when use_uv_atlas_contact chart-pair seeding runs
         self.last_seed_rank_table = []    # set by solve() when seed_dls_rank_pool > 1
+        # Per-seed THIRD-contact fan ranking (cfg.n_contacts >= 3): one row per
+        # candidate with its fan angle and middle-finger DLS residual. Empty at n=2.
+        self.last_c3_rank_table = []
         # Fingertip effective radii (r_thumb/r_index/r_middle/r_ring) are
         # measured from model geometry inside GraspPlanner3D.__init__ above —
         # nothing left to do here.
@@ -5197,12 +5850,20 @@ class MultiStartGraspPlanner3D:
         # Accepted seeds, same schema as the reject table -- the paired seed figure
         # draws both from ONE solve instead of re-deriving them in a second process
         # with its own RNG (which could not be guaranteed to match).
+        # p3s/n3_in are recorded WHEN PRESENT. They are attached to the seed dict
+        # later (the third-contact fan runs per seed, after this table is first
+        # built), so a row carries them only once that seed has been through the
+        # fan -- which is exactly the condition under which the figure should draw
+        # a middle-finger seed. Absent at n=2, and the figure draws two contacts.
         self.last_seed_accept_table = [
             dict(kind=_s.get('kind', 'random'), why='accepted',
                  p1s=np.asarray(_s['p1s'], float).copy(),
                  p2s=np.asarray(_s['p2s'], float).copy(),
                  n1_in=np.asarray(_s['n1_in'], float).copy(),
-                 n2_in=np.asarray(_s['n2_in'], float).copy())
+                 n2_in=np.asarray(_s['n2_in'], float).copy(),
+                 **({'p3s': np.asarray(_s['p3s'], float).copy(),
+                     'n3_in': np.asarray(_s['n3_in'], float).copy()}
+                    if _s.get('p3s') is not None else {}))
             for _s in seeds]
         log.info(
             f"[seed_gen] {len(seeds)} seeds in {(time.perf_counter()-_t0)*1e3:.1f}ms "
@@ -5318,12 +5979,203 @@ class MultiStartGraspPlanner3D:
                     f"p2s={np.round(seed['p2s'], 4).tolist()}")
                 continue
 
+            # ── THIRD contact (cfg.n_contacts >= 3): fan -> gate -> DLS-rank ──
+            # Attached per seed, because the fan is built around THIS seed's grasp
+            # axis. Same gates the pair already passed (_reachable_contact,
+            # _seed_kappa_ok), then ranked by the SAME DLS-IK reachability screen the
+            # chart-pair path uses -- the only seed screen that knows about the arm.
+            # A seed that yields no viable third contact simply stays a 2-contact
+            # pinch rather than failing: the tripod is an upgrade, not a precondition.
+            if int(cfg.n_contacts) >= 3 and self._planner._middle_sid is not None:
+                try:
+                    _mf_dir = None
+                    _R_palm = None
+                    _palm_bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'leap_palm')
+                    if _palm_bid >= 0:
+                        # Palm-FRAME prior (measured from the model's own rest pose:
+                        # the middle fingertip lies at [0.692,-0.722,0.002] from the
+                        # pinch midpoint, i.e. ~45 deg in the palm's xy-plane). Mapped
+                        # through the LIVE palm rotation so the bias follows the hand
+                        # instead of being a world-frame constant.
+                        _R_palm = self._planner.data.xmat[_palm_bid].reshape(3, 3)
+                        _mf_dir = _R_palm @ np.array([0.692, -0.722, 0.002])
+                    # fk_probe for the 'kinematic' strategy: pose the hand for THIS
+                    # pinch with the same DLS solve the ranking below uses, then read
+                    # where the middle fingertip actually ended up. Returns None if
+                    # the site is unavailable, which makes the strategy yield no
+                    # candidate rather than inventing one.
+                    def _mf_fk_probe(_sd):
+                        """Where the middle fingertip lands when the hand poses for THIS
+                        pinch AND is actually asked to bring that finger to the object.
+
+                        TWO-PHASE, because a 2-target solve does not answer the question.
+                        An earlier version solved DLS for thumb+index ONLY and read the
+                        middle site out of the result -- but nothing drove that site
+                        anywhere: it sat wherever null_gain's pull toward q_ref left it.
+                        Measured consequence: on 017_orange it landed 7-15mm from the
+                        index contact (looked correct, was luck -- that home pose happens
+                        to leave the middle finger there), while on 014_lemon all three
+                        seeds put it on unrelated parts of the surface and on
+                        036_wood_block it drifted to the THUMB side of the block.
+
+                        Phase 1 poses the hand for the pinch. Phase 2 re-solves with a
+                        THIRD target for the middle site: the index contact displaced
+                        along the index's own tangent plane, in the direction the middle
+                        tip ALREADY lies at the phase-1 pose. That direction is read from
+                        the live kinematics rather than a palm-frame constant -- the
+                        constant ([0,-1,0], the rigid finger base-mount offset) is genuine
+                        but maps to world DOWN at TS.home_qpos(), which is what made the
+                        'tangent' strategy propose sub-table contacts on every seed.
+                        """
+                        _sid3 = self._planner._middle_sid
+                        if _sid3 is None:
+                            return None
+                        _dp = self._planner._dls_data
+                        _dp.qpos[:] = self._planner.data.qpos[:]
+                        _dp.qpos[act_idx] = np.asarray(q_ref, float)[:len(act_idx)]
+                        _ta = _sd['p1s'] + cfg.r_thumb * (-np.asarray(_sd['n1_in'], float))
+                        _tb = _sd['p2s'] + cfg.r_index * (-np.asarray(_sd['n2_in'], float))
+                        # Phase 1: pinch pose (thumb + index only).
+                        self._planner._dls_ik.solve(
+                            model, _dp,
+                            [self._planner._thumb_sid, self._planner._index_sid],
+                            [_ta, _tb], q_bias=q_ref, null_gain=0.3)
+                        mj.mj_kinematics(model, _dp)
+                        _mf_now = _dp.site_xpos[_sid3].copy()
+                        _if_now = _dp.site_xpos[self._planner._index_sid].copy()
+                        # Direction index -> middle AT THIS POSE, flattened onto the index
+                        # contact's tangent plane so the target stays on the same face.
+                        _n2 = np.asarray(_sd['n2_in'], float)
+                        _n2 = _n2 / (np.linalg.norm(_n2) + 1e-12)
+                        _dir = _mf_now - _if_now
+                        _dir = _dir - np.dot(_dir, _n2) * _n2
+                        _nd = float(np.linalg.norm(_dir))
+                        if _nd < 1e-6:
+                            return _mf_now          # degenerate: fall back to phase 1
+                        _dir = _dir / _nd
+                        # Phase 2: ask for the middle tip one finger-pitch along that
+                        # direction from the index contact, on the surface.
+                        _r_mf3 = float(cfg.r_middle if cfg.r_middle is not None
+                                       else cfg.r_index)
+                        _p3_guess = _project_to_surface_np(
+                            np.asarray(_sd['p2s'], float) + _MF_PITCH_M * _dir,
+                            geom_type, obj_center_np, obj_R_np, geom_size,
+                            mesh_entry=self._mesh_entry)
+                        if not np.all(np.isfinite(_p3_guess)):
+                            return _mf_now
+                        _n3_guess = _geom_normal_np(_p3_guess, geom_type, obj_center_np,
+                                                    obj_R_np, geom_size,
+                                                    mesh_entry=self._mesh_entry)
+                        if not np.all(np.isfinite(_n3_guess)) or \
+                                np.linalg.norm(_n3_guess) < 1e-9:
+                            return _mf_now
+                        _n3_guess = _n3_guess / np.linalg.norm(_n3_guess)
+                        _tc = _p3_guess + _r_mf3 * _n3_guess
+                        _dp.qpos[:] = self._planner.data.qpos[:]
+                        _dp.qpos[act_idx] = np.asarray(q_ref, float)[:len(act_idx)]
+                        self._planner._dls_ik.solve(
+                            model, _dp,
+                            [self._planner._thumb_sid, self._planner._index_sid, _sid3],
+                            [_ta, _tb, _tc], q_bias=q_ref, null_gain=0.3)
+                        mj.mj_kinematics(model, _dp)
+                        return _dp.site_xpos[_sid3].copy()
+
+                    _c3_strategy = str(getattr(cfg, 'c3_seed_strategy', 'fan'))
+                    # For 'patch_offset': fit contact 2's patch HERE, at seed time,
+                    # with the same call _run_stage makes later. The seeder then
+                    # traverses that patch's own (t0,t1) coordinates, so the offset
+                    # is expressed in the surface's principal-curvature frame and
+                    # is clamped to the exact bounds the NLP will confine it to.
+                    _c3_patch_frame = None
+                    if (_c3_strategy == 'patch_offset'
+                            and geom_type == _GEOM_TYPE_MESH
+                            and self._mesh_entry is not None):
+                        try:
+                            _n2_out_seed = -np.asarray(seed['n2_in'], float)
+                            _throwaway = ca.Opti()
+                            _, _, _, _c3_patch_frame = _mesh_quadratic_contact_ca(
+                                _throwaway, np.asarray(seed['p2s'], float),
+                                _n2_out_seed, obj_center_np, obj_R_np,
+                                self._mesh_entry,
+                                t_bound_max=cfg.quadratic_t_bound_max,
+                                sdf_err_tol=cfg.quadratic_sdf_err_tol,
+                                mesh_fit=cfg.quadratic_mesh_fit,
+                                mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
+                                mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min)
+                        except Exception as _pe:
+                            log.debug(f"[seed {i+1}] patch fit for c3 seeding failed: {_pe}")
+                            _c3_patch_frame = None
+                    _c3_cands = _seed_third_contact(
+                        seed, geom_type, geom_size, obj_center_np, obj_R_np, self._rng,
+                        mesh_entry=self._mesh_entry, mf_dir_world=_mf_dir,
+                        n_fan=5, fan_half_deg=40.0,
+                        strategy=_c3_strategy,
+                        palm_R=(_R_palm if _palm_bid >= 0 else None),
+                        fk_probe=_mf_fk_probe,
+                        prefer_outer=cfg.seed_prefer_outer_surface,
+                        patch_frame=_c3_patch_frame,
+                        patch_offset_m=float(getattr(cfg, 'c3_patch_offset_m', 0.030)))
+                    log.debug(f"[seed {i+1}] c3 strategy={_c3_strategy} "
+                              f"-> {len(_c3_cands)} candidate(s)")
+                    _c3_scored = []
+                    for _c3 in _c3_cands:
+                        if not _reachable_contact(_c3['p3s'], _ground_z, _r_tip_min):
+                            continue
+                        _dls_data3 = self._planner._dls_data
+                        _dls_data3.qpos[:] = self._planner.data.qpos[:]
+                        _dls_data3.qpos[act_idx] = np.asarray(q_ref, float)[:len(act_idx)]
+                        _r_mf = float(cfg.r_middle if cfg.r_middle is not None
+                                      else cfg.r_index)
+                        _t1 = _c3['p1s'] + cfg.r_thumb * (-_c3['n1_in'])
+                        _t2 = _c3['p2s'] + cfg.r_index * (-_c3['n2_in'])
+                        _t3 = _c3['p3s'] + _r_mf * (-_c3['n3_in'])
+                        self._planner._dls_ik.solve(
+                            model, _dls_data3,
+                            [self._planner._thumb_sid, self._planner._index_sid,
+                             self._planner._middle_sid],
+                            [_t1, _t2, _t3], q_bias=q_ref, null_gain=0.3)
+                        mj.mj_kinematics(model, _dls_data3)
+                        _e3 = float(np.linalg.norm(
+                            _dls_data3.site_xpos[self._planner._middle_sid] - _t3))
+                        _c3_scored.append((_e3, _c3))
+                    _c3_scored.sort(key=lambda t: t[0])
+                    self.last_c3_rank_table = [
+                        dict(fan_deg=_c['fan_deg'], mf_dls_res_mm=_e * 1e3,
+                             accepted=(_k == 0))
+                        for _k, (_e, _c) in enumerate(_c3_scored)]
+                    if _c3_scored:
+                        _best_c3 = _c3_scored[0][1]
+                        seed['p3']    = _best_c3['p3s'].copy()
+                        seed['p3s']   = _best_c3['p3s']
+                        seed['n3_in'] = _best_c3['n3_in']
+                        # Back-fill the already-built accept row for THIS seed so
+                        # the seed figure can draw the middle contact on the shared
+                        # patch. Matched by p1s identity, not index: the accept
+                        # table is built from `seeds` in order, but a seed skipped
+                        # by the gamma pre-check never reaches here.
+                        for _row in (self.last_seed_accept_table or []):
+                            if np.allclose(_row.get('p1s'), seed['p1s'], atol=1e-12):
+                                _row['p3s']   = np.asarray(_best_c3['p3s'], float).copy()
+                                _row['n3_in'] = np.asarray(_best_c3['n3_in'], float).copy()
+                                break
+                        log.info(f"[seed {i+1}] third contact: fan={_best_c3['fan_deg']:+.0f}deg "
+                                 f"mf_dls={_c3_scored[0][0]*1e3:.1f}mm "
+                                 f"({len(_c3_scored)}/{len(_c3_cands)} candidates viable)")
+                    else:
+                        log.info(f"[seed {i+1}] third contact: no viable candidate "
+                                 f"of {len(_c3_cands)} -- staying 2-contact")
+                except Exception as _e_c3:
+                    log.warning(f"[seed {i+1}] third-contact seeding failed: {_e_c3}")
+
             # ── Run NLP (warm-started from the pre-check LP's γ and cone y's) ──
             r = self._planner.solve(_q_ref_seed, obj_pos,
                                     p1_init=seed['p1'],
                                     p2_init=seed['p2'],
                                     d1=-seed['n1_in'],   # outward normal
                                     d2=-seed['n2_in'],
+                                    p3_init=seed.get('p3'),
+                                    d3=(-seed['n3_in'] if seed.get('n3_in') is not None
+                                        else None),
                                     gamma_init=g_pre,
                                     y_by_corner_init=y_by_corner_pre)
 
