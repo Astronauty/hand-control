@@ -1,19 +1,15 @@
 {
-  "_comment": "Which FINGERS a grasp uses, by role. Loaded by simulation/grasp_config_builder.load_finger_config(). Replaces the older practice of setting n_contacts as an independent integer: the pairing IS the source of truth and n_contacts is derived from len(fingers), so the two can no longer disagree. PRECEDENCE matches load_seed_config: file -> per-object -> CLI/env, applied by the caller with setdefault.",
+  "_comment": "Which FINGERS a grasp uses. Loaded by simulation/grasp_config_builder.load_finger_config(). The value IS the list -- there is no name to look up, because a named alias like 'tripod' carries no information its list does not, while costing a lookup and a naming decision every time a new combination is wanted.",
 
-  "_comment_roles": "Contact SLOTS are positional in the NLP and always ordered [slot1, slot2, slot3...]. Slot 1 is the opposing/anchor contact (historically the thumb) and slot 2 is the contact it pinches against (historically the index). Slot 3+ are load-bearing off-axis contacts. A role name here must be a key of kinova_common.constants.FINGER_TIP_SITES / FINGER_CODE, which own the site and geom-prefix lookups -- this file never repeats a site name, so it cannot drift from the model.",
+  "_comment_order": "ORDER IS LOAD-BEARING, not a set. Contact SLOTS are positional in the NLP: slot 1 = p1, slot 2 = p2, slot 3 = p3. Slot 1 is what the antipodal seed march starts from (_seed_pair marches ALONG contact 1's inward normal), and w_align is gated to slot-1<->slot-2 opposition. So ['thumb','middle'] and ['middle','thumb'] are DIFFERENT problems -- the first finger anchors the grasp.",
 
-  "_comment_measured": "MEASURED 2026-09-12, seed 0, plan-only, 80/3 GWS preset. thumb_index vs thumb_middle are the same NLP with slot 2 re-bound; committed contact p2 moves from 19.0mm off the index tip to 16.1mm off the middle tip (orange) and 18.5 -> 21.3mm (wood block), while grasp span |p1-p2| is preserved (67.8 -> 68.0mm orange, 88.6 -> 88.1mm block). Costs rise modestly (14.73 -> 18.55 orange, 12.68 -> 15.00 block) because w_align's opposition prior and the seed geometry were tuned for thumb_index. The wood block reached Solved_To_Acceptable_Level on thumb_middle where thumb_index hit Maximum_Iterations_Exceeded -- one seed on one object, not yet a trend.",
+  "_comment_roles": "Each entry must be a key of kinova_common.constants.FINGER_TIP_SITES / FINGER_CODE (index, middle, ring, thumb), which own the model's site and geom naming. This file never repeats a site name, so it cannot drift from the model. 2 or 3 fingers; the NLP has three contact slots.",
 
-  "default": "thumb_index",
+  "_comment_measured": "MEASURED 2026-09-12, seed 0, plan-only, 80/3 GWS preset, five tabletop objects. ['thumb','middle'] is the same NLP with slot 2 re-bound: committed p2 moves from 19.0mm off the index tip to 16.1mm off the middle tip (017_orange) with grasp span preserved (67.8 -> 68.0mm). All ten 2-finger cells certify wrench-feasible, but thumb+middle is uniformly WEAKER -- gamma_min rises on every object, by 4.9x on 036_wood_block (3.08 -> 14.93 N against a 25 N ceiling). w_align and the seed priors are tuned for thumb+index.",
 
-  "pairings": {
-    "thumb_index":  ["thumb", "index"],
-    "thumb_middle": ["thumb", "middle"],
-    "tripod":       ["thumb", "index", "middle"]
-  },
+  "fingers": ["thumb", "index"],
 
   "per_object": {
-    "_comment": "Overrides the default pairing for one YCB id. Empty by default -- add an entry only where measurement justifies it."
+    "_comment": "Overrides the default list for one YCB id, e.g. \"036_wood_block\": [\"thumb\", \"index\", \"middle\"]. Empty by default -- add an entry only where measurement justifies it."
   }
 }
