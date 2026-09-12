@@ -73,9 +73,11 @@ def _as_rec(entry, ok):
                 ray=dict(origin=None, u=None))
 
 
-def write_seed_figure(planner, model, data, out_path, title_extra=""):
-    """Draw every seed this solve considered. Returns the written path, or None
-    when the planner recorded no seeds (e.g. a solve that never reached seeding)."""
+def _build_seed_figure(planner, model, data, title_extra="", max_tris=3000):
+    """Build (but do not save) the seed figure. Returns the matplotlib Figure, or None
+    when the planner recorded no seeds. Shared by write_seed_figure (-> file) and
+    render_seed_figure_png (-> bytes, for the live dashboard). `max_tris` caps the mesh
+    scatter per subplot (draw_mesh already thins triangles) so a live render stays cheap."""
     pl = planner._planner if hasattr(planner, "_planner") else planner
     acc = list(getattr(planner, "last_seed_accept_table", None)
                or getattr(pl, "last_seed_accept_table", None) or [])
@@ -99,7 +101,7 @@ def write_seed_figure(planner, model, data, out_path, title_extra=""):
 
     for i, rec in enumerate(recs):
         axr = fig.add_subplot(gs[0, i], projection="3d")
-        SQ.draw_mesh(axr, sc)
+        SQ.draw_mesh(axr, sc, max_tris=max_tris)
         try:
             SQ.draw_seed_rays(axr, sc, rec)
         except Exception:
@@ -137,6 +139,31 @@ def write_seed_figure(planner, model, data, out_path, title_extra=""):
 
     fig.subplots_adjust(left=0.02, right=0.98, top=0.88, bottom=0.04,
                         wspace=0.12, hspace=0.16)
+    return fig
+
+
+def write_seed_figure(planner, model, data, out_path, title_extra=""):
+    """Draw every seed this solve considered to a PNG file. Returns the written path,
+    or None when the planner recorded no seeds. High-fidelity (dpi 115) for offline use."""
+    fig = _build_seed_figure(planner, model, data, title_extra=title_extra)
+    if fig is None:
+        return None
     out = OP.savefig(fig, Path(out_path), dpi=115)
     plt.close(fig)
     return out
+
+
+def render_seed_figure_png(planner, model, data, title_extra="", dpi=60, max_tris=2000):
+    """Same figure rendered to in-memory PNG BYTES (for the live dashboard), or None when
+    no seeds were recorded. Lower dpi + a tighter triangle cap keep the live render ~0.4 s
+    on the recommender thread; the seed points/patches are unaffected by the mesh thinning."""
+    import io
+    fig = _build_seed_figure(planner, model, data, title_extra=title_extra, max_tris=max_tris)
+    if fig is None:
+        return None
+    buf = io.BytesIO()
+    try:
+        fig.savefig(buf, format="png", dpi=dpi)
+    finally:
+        plt.close(fig)
+    return buf.getvalue()

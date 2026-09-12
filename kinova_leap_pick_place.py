@@ -307,6 +307,17 @@ if __name__ == "__main__":
              "gradient-norm logging, which is full-vector reverse-mode AD and is not "
              "meant for a live 2 s solve cadence. Use it for analysis runs.")
     _arg_parser.add_argument(
+        '--seed-viz', dest='seed_viz', default='off',
+        choices=['off', 'dashboard', 'file', 'both'],
+        help="contact-aware recommender modes: visualize the grasp-recommender SEED "
+             "locations (accepted vs rejected seed contacts + per-seed paraboloid patches) "
+             "LIVE, refreshed every ~2 s recommender solve. off (default): none. dashboard: "
+             "render the seed figure to a PNG and show it in the live dashboard image panel. "
+             "file: save it under logs/<trial-log>/seed_viz/<object>_<NNN>.png (needs "
+             "--trial-log). both: dashboard + file. Rendered on the recommender's own "
+             "background thread (coalesced, mesh thinned, dpi 60 ~0.4 s) so the viewer never "
+             "stalls. Reads the planner's in-memory seed tables — no --rec-log-dir needed.")
+    _arg_parser.add_argument(
         '--contact-profile', dest='contact_profile', default='stock',
         choices=['stock', 'tuned'],
         help="Contact/solver settings. stock (default): whatever the scene XML compiles "
@@ -352,7 +363,8 @@ if __name__ == "__main__":
     args.no_randomize = True       # keep scene_pick_place.xml object layout (no randomization)
     args.physics = True            # dexpilot: PD torques + mj_step (physical collisions)
     args.multicam_max_res = True   # open each multicam camera at its highest resolution
-    args.skeleton_view = True      # orbitable fused-hand skeleton window (teleop modes)
+    args.skeleton_view = False     # orbitable fused-hand skeleton window (teleop modes);
+                                   # OFF by default — flip to True to re-enable
     if args.mode == 'rrt':          # deprecated alias
         args.mode = 'contact_aware_autonomous'
     # Baseline-comparison modes normalize to a CANONICAL pipeline mode + a finger
@@ -2835,6 +2847,20 @@ if __name__ == "__main__":
         os.makedirs(_REC_LOG_ROOT, exist_ok=True)
         print(f"[rec] NLP traces + lock-in analysis figures -> {_REC_LOG_ROOT}/")
     _rec_lockin_n  = [0]      # lock-in counter, for the per-commit figure subdirectory
+    # --seed-viz: live seed-location figure. _SEED_VIZ_DASH/_FILE gate the two sinks;
+    # _seed_viz_n counts saved files. The render runs on the recommender daemon thread
+    # (one solve at a time via the _rec_idle gate), so no extra coalescing lock is needed.
+    _SEED_VIZ_DASH = args.seed_viz in ('dashboard', 'both')
+    _SEED_VIZ_FILE = args.seed_viz in ('file', 'both')
+    _seed_viz_n    = [0]
+    if args.seed_viz != 'off' and not (_CAT_MODE or _AUTO_REC):
+        print(f"[seed-viz] --seed-viz {args.seed_viz} ignored: no grasp recommender in "
+              f"mode {args.mode!r} (needs contact_aware_teleop or "
+              f"contact_aware_autonomous --recommender-grasp).")
+        _SEED_VIZ_DASH = _SEED_VIZ_FILE = False
+    if _SEED_VIZ_FILE and not args.trial_log:
+        print("[seed-viz] file sink needs --trial-log for the output dir; file save disabled.")
+        _SEED_VIZ_FILE = False
     _REC_INTERVAL_S = 2.0     # fixed re-solve cadence (NLP solve ~0.5-2s, runs in a thread)
     _REC_NC         = 5       # planner seeds per solve (was 3; ~60% per-seed IK-convergence
                               # -> 5 seeds gives ~99% chance of >=1 converged vs 3 seeds' ~94%.
@@ -3197,6 +3223,27 @@ if __name__ == "__main__":
                     'n_converged':     _nconv,
                     'n_seeds':         len(_all),
                 })
+            # --seed-viz: render the seed figure (accepted/rejected seeds + per-seed
+            # paraboloid patches) from the planner's just-populated in-memory seed tables
+            # and ship it. On THIS recommender daemon thread (serialized with the solve by
+            # the _rec_idle gate), so it never touches the render/physics thread. Best-effort.
+            if _SEED_VIZ_DASH or _SEED_VIZ_FILE:
+                try:
+                    from kinova_common.seed_figure import render_seed_figure_png
+                    _png = render_seed_figure_png(planner, model, planner._planner.data,
+                                                  title_extra=f"  ({objects[obj_idx]['name']})")
+                    if _png is not None:
+                        if _SEED_VIZ_DASH and dash is not None:
+                            dash.push({'type': 'seed_viz', 'object': objects[obj_idx]['name'],
+                                       'png': _png})
+                        if _SEED_VIZ_FILE:
+                            _sv_dir = Path('logs') / args.trial_log / 'seed_viz'
+                            _sv_dir.mkdir(parents=True, exist_ok=True)
+                            _seed_viz_n[0] += 1
+                            (_sv_dir / f"{objects[obj_idx]['name']}_{_seed_viz_n[0]:03d}.png"
+                             ).write_bytes(_png)
+                except Exception:
+                    traceback.print_exc()
             if _trial_events is not None:
                 # The recommender fires continuously (proximity-based) BEFORE lock-in
                 # starts a trial, so a solve for this object may predate any matching
