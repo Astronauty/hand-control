@@ -111,9 +111,14 @@ def _to_world(P_l, center, R):
     return center + np.asarray(P_l, float) @ np.asarray(R, float).T
 
 
-def plot_grasp_contacts(V, F, stage, object_id, out_path, sdf_fn=None,
-                        verify_info=None, elev=18.0, azim=-60.0, n_relin=None):
-    """One figure: overview + one zoomed panel per solved contact.
+def build_grasp_contacts_figure(V, F, stage, object_id, sdf_fn=None,
+                                verify_info=None, elev=18.0, azim=-60.0, n_relin=None,
+                                max_tris=3000):
+    """Build (but do not save) the solved-grasp-contacts figure. Returns the
+    matplotlib Figure, or None when the stage carries no contacts. Shared by
+    plot_grasp_contacts (-> file) and, via kinova_common.seed_figure, the live
+    dashboard (-> PNG bytes). `max_tris` caps the mesh scatter per subplot so a
+    live render stays cheap.
 
     V, F     : object visual mesh, BODY frame (object_uv_atlas.body_visual_mesh)
     stage    : ONE per-stage dict from
@@ -148,7 +153,7 @@ def plot_grasp_contacts(V, F, stage, object_id, out_path, sdf_fn=None,
 
     # ── overview: both contacts on the whole object ────────────────────────
     ax = fig.add_subplot(1, n_cols, 1, projection="3d")
-    _draw_mesh(ax, Vw, F, alpha=0.10)
+    _draw_mesh(ax, Vw, F, alpha=0.10, max_tris=max_tris)
     pts_w = []
     for ci, fr in contacts:
         p_w = _to_world(np.asarray(fr["seed_l"], float)[None, :], center, R)[0]
@@ -170,7 +175,7 @@ def plot_grasp_contacts(V, F, stage, object_id, out_path, sdf_fn=None,
     # ── one zoomed panel per contact ───────────────────────────────────────
     for k, (ci, fr) in enumerate(contacts):
         axq = fig.add_subplot(1, n_cols, 2 + k, projection="3d")
-        _draw_mesh(axq, Vw, F, alpha=0.12)
+        _draw_mesh(axq, Vw, F, alpha=0.12, max_tris=max_tris)
         c_in, c_out = FINGER_COLORS[ci]
         (lo0, hi0), (lo1, hi1) = _bounds(fr)
 
@@ -225,6 +230,19 @@ def plot_grasp_contacts(V, F, stage, object_id, out_path, sdf_fn=None,
         axq.set_zlabel("z (m)", fontsize=7); axq.tick_params(labelsize=6)
 
     fig.subplots_adjust(left=0.03, right=0.97, top=0.86, bottom=0.05, wspace=0.16)
+    return fig
+
+
+def plot_grasp_contacts(V, F, stage, object_id, out_path, sdf_fn=None,
+                        verify_info=None, elev=18.0, azim=-60.0, n_relin=None):
+    """Draw the solved-grasp-contacts figure to a PNG file (dpi 115). Returns the
+    written path, or None when the stage carries no contacts. Thin saving wrapper
+    around build_grasp_contacts_figure."""
+    fig = build_grasp_contacts_figure(V, F, stage, object_id, sdf_fn=sdf_fn,
+                                      verify_info=verify_info, elev=elev, azim=azim,
+                                      n_relin=n_relin)
+    if fig is None:
+        return None
     out_path = OP.savefig(fig, out_path, dpi=115)
     plt.close(fig)
     return out_path

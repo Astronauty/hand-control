@@ -33,6 +33,7 @@ if str(_BENCH) not in sys.path:
 
 from ycb_grasp import out_paths as OP                       # noqa: E402
 from ycb_grasp import plot_seed_quadratic as SQ             # noqa: E402
+from ycb_grasp import plot_grasp_contacts as GC             # noqa: E402
 
 
 def _scene_from_planner(planner, model, data):
@@ -151,6 +152,66 @@ def write_seed_figure(planner, model, data, out_path, title_extra=""):
     out = OP.savefig(fig, Path(out_path), dpi=115)
     plt.close(fig)
     return out
+
+
+def _stage_from_result(planner, model, data, res):
+    """The `stage` dict plot_grasp_contacts.build_grasp_contacts_figure expects,
+    built from a LIVE solve result instead of from a saved grasp3d_iter_*.npz.
+
+    Object pose comes from _scene_from_planner (BODY frame for meshes, GEOM frame
+    for primitives) -- the SAME convention _run_stage used when it wrote each
+    frame's seed_l/axis*_l (obj_center_np/obj_R_np at grasp_planner_3d.py:3069),
+    so the paraboloid params reproject correctly. The solved offset t{1,2}_sol is
+    injected into the frame copy as `t_sol`, matching how _iter_trace_quadratic_stages
+    folds quad{ci}_t_sol into each contact frame from the npz.
+
+    Returns (V, F, stage) or None when the result carries no paraboloid frames
+    (e.g. a primitive solved with face-pin contacts, or a non-quadratic solve)."""
+    sc = _scene_from_planner(planner, model, data)
+    f1, f2 = res.get("quad1_frame"), res.get("quad2_frame")
+    t1, t2 = res.get("t1_sol"), res.get("t2_sol")
+    contact = {}
+    for ci, fr, ts in ((1, f1, t1), (2, f2, t2)):
+        if fr is None:
+            continue
+        c = dict(fr)
+        if ts is not None:
+            c["t_sol"] = np.asarray(ts, float).reshape(-1)
+        contact[ci] = c
+    if not contact:
+        return None
+    stage = dict(obj_center=sc["center"], obj_mat=sc["R"], contact=contact)
+    return sc["Vvis"], sc["Fvis"], stage
+
+
+def render_grasp_contacts_png(planner, model, data, res, object_id="", verify_info=None,
+                              title_extra="", dpi=60, max_tris=2000):
+    """The SOLVED grasp's contacts rendered to in-memory PNG BYTES (for the live
+    dashboard), or None when the result carries no paraboloid frames. This is the
+    live counterpart of benchmarks/ycb_grasp/plot_grasp_contacts.py: one overview
+    panel (both contacts + grasp axis) plus a per-contact zoom showing that
+    contact's paraboloid patch and the ✕ the solver actually landed on it -- the
+    CHOSEN contact location, as opposed to render_seed_figure_png which draws the
+    seed CANDIDATES. Reads only the in-memory solve result (res carries
+    quad{1,2}_frame / t{1,2}_sol) and the planner's live pose; no npz trace."""
+    import io
+    built = _stage_from_result(planner, model, data, res)
+    if built is None:
+        return None
+    V, F, stage = built
+    pl = planner._planner if hasattr(planner, "_planner") else planner
+    _sdf = pl._mesh_entry["fn"] if getattr(pl, "_mesh_entry", None) else None
+    fig = GC.build_grasp_contacts_figure(
+        V, F, stage, f"{object_id}{title_extra}", sdf_fn=_sdf,
+        verify_info=verify_info, max_tris=max_tris)
+    if fig is None:
+        return None
+    buf = io.BytesIO()
+    try:
+        fig.savefig(buf, format="png", dpi=dpi)
+    finally:
+        plt.close(fig)
+    return buf.getvalue()
 
 
 def render_seed_figure_png(planner, model, data, title_extra="", dpi=60, max_tris=2000):

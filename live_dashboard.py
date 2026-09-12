@@ -351,27 +351,40 @@ def _run(queue, fingers, horizon_s, dt_hint):
     grid.addWidget(plan_log,      4, 0)
     grid.addWidget(grasp_rec_log, 4, 1)
     grid.addWidget(tip_widget,    1, 2, 4, 1)   # spans the plot rows, right column
-    # Seed-visualization image panel (--seed-viz dashboard): a wide strip below the plots
-    # showing the recommender's per-solve seed figure (accepted/rejected seeds + paraboloid
-    # patches), pushed as a PNG and shown via QPixmap. Hidden until the first seed_viz msg.
-    seed_viz_lbl = QtWidgets.QLabel("<b>Grasp seeds (recommender)</b> — waiting…")
-    seed_viz_img = QtWidgets.QLabel()
-    seed_viz_img.setAlignment(QtCore.Qt.AlignCenter)
-    seed_viz_img.setMinimumHeight(180)
-    _seed_viz_box = QtWidgets.QVBoxLayout()
-    _seed_viz_box.addWidget(seed_viz_lbl)
-    _seed_viz_box.addWidget(seed_viz_img, 1)
-    _seed_viz_widget = QtWidgets.QWidget(); _seed_viz_widget.setLayout(_seed_viz_box)
-    grid.addWidget(_seed_viz_widget, 5, 0, 1, 3)   # full-width strip below everything
     grid.setRowStretch(1, 2)
     grid.setRowStretch(2, 2)
     grid.setRowStretch(4, 1)
-    grid.setRowStretch(5, 2)
     grid.setColumnStretch(0, 3)
     grid.setColumnStretch(1, 3)
     grid.setColumnStretch(2, 1)
-    win.resize(1600, 1120)
+    win.resize(1600, 950)
     win.show()
+
+    # Seed-visualization in its OWN top-level window (--seed-viz dashboard) — the multi-seed
+    # figure is too wide/tall to read inside the dashboard grid, so it gets a separate,
+    # independently-resizable window. Created lazily on the first seed_viz message. The label
+    # keeps the original full-res pixmap and rescales it to the window on each resize.
+    _seed_win = QtWidgets.QWidget()
+    _seed_win.setWindowTitle("Grasp contacts (recommender)")
+    _seed_win_lbl = QtWidgets.QLabel("waiting for a recommender solve…")
+    _seed_win_img = QtWidgets.QLabel()
+    _seed_win_img.setAlignment(QtCore.Qt.AlignCenter)
+    _seed_win_img.setMinimumSize(400, 260)
+    _seed_win_img.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                                QtWidgets.QSizePolicy.Ignored)
+    _seed_box = QtWidgets.QVBoxLayout(_seed_win)
+    _seed_box.addWidget(_seed_win_lbl)
+    _seed_box.addWidget(_seed_win_img, 1)
+    _seed_win.resize(1400, 700)
+    _seed_pixmap = {'pm': None}   # last full-res pixmap, for rescale-on-resize
+
+    def _seed_rescale():
+        pm = _seed_pixmap['pm']
+        if pm is not None and not pm.isNull():
+            _seed_win_img.setPixmap(pm.scaled(
+                _seed_win_img.width(), _seed_win_img.height(),
+                QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+    _seed_win.resizeEvent = lambda ev: _seed_rescale()
 
     def drain():
         got_dist = got_norm = got_wrench = False
@@ -577,16 +590,17 @@ def _run(queue, fingers, horizon_s, dt_hint):
                 ]
                 grasp_rec_log.appendPlainText("\n".join(lines))
             elif mt == 'seed_viz':
-                # Recommender seed figure pushed as PNG bytes (--seed-viz dashboard).
+                # Recommender seed figure pushed as PNG bytes (--seed-viz dashboard). Shown
+                # in its OWN top-level window (opened on the first message), rescaled to fit.
                 _png = msg.get('png')
                 if _png:
                     _pm = QtGui.QPixmap()
                     if _pm.loadFromData(_png):
-                        seed_viz_img.setPixmap(_pm.scaled(
-                            seed_viz_img.width(), seed_viz_img.height(),
-                            QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
-                        seed_viz_lbl.setText(
-                            f"<b>Grasp seeds (recommender)</b> — {msg.get('object','')}")
+                        _seed_pixmap['pm'] = _pm          # keep full-res for resize rescaling
+                        _seed_win_lbl.setText(f"object: {msg.get('object','')}")
+                        if not _seed_win.isVisible():
+                            _seed_win.show()
+                        _seed_rescale()
             elif mt == 'tip_err':
                 # Per-stage tip error for the latest lock-in. Each of nlp/ik/rrt is a
                 # per-finger list (mm) in the order given by 'fingers', or None if that

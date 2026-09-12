@@ -44,6 +44,11 @@ import numpy as np
 # ── Tunable constants (all settled in the design conversation) ────────────────────────
 LIFT_HEIGHT_M      = 0.01  # object clearance above rest height counted as "lifted"
 DWELL_S             = 1.0    # continuous sim-time above LIFT_HEIGHT_M to confirm a pick
+DROP_DWELL_S        = 0.3    # continuous sim-time below LIFT_HEIGHT_M (outside the place footprint) to
+                             # confirm a DROP. Symmetric with DWELL_S: without it a single-frame
+                             # sub-threshold dip (slip / physics jitter / momentary sag under squeeze)
+                             # counted a full drop and bounced TRANSPORT->PICK, which re-armed the pick
+                             # dwell and could immediately re-confirm — instantaneous pick/drop cycles.
 CONTACT_PENETRATION_M = 0.0005  # min penetration depth to count as a real contact (not solver margin)
 CONTACT_EPISODE_COOLDOWN_S = 0.5  # min sim-time gap between counted episodes — a
                                    # sustained rest/scrape cycles through many hand
@@ -407,6 +412,9 @@ class TrialState:
     attempt_id: int = 0
     attempt_active: bool = False   # trigger condition currently engaged (pinch/squeeze)
     dwell_t0: float | None = None  # sim-time the current continuous lift began
+    drop_t0: float | None = None   # sim-time the current continuous sub-threshold descent began
+                                    # (outside the footprint) — gates a drop by DROP_DWELL_S, mirror
+                                    # of dwell_t0. Reset whenever height rises back above LIFT_HEIGHT_M.
     pick_confirmed: bool = False
     pick_logged: bool = False   # forward phase_enter PICK emitted for the current PICK entry
                                  # (reset on a drop so a re-pick logs PICK again)
@@ -678,17 +686,34 @@ class TrialRunner:
                 # so the settled-in-place check above fires once it comes to rest. Only a
                 # descent OUTSIDE the footprint is a genuine drop.
                 if in_place:
+                    state.drop_t0 = None   # placement in progress, not a drop — clear any timer
+                    return False
+                # Outside the footprint: require the descent to PERSIST for DROP_DWELL_S before
+                # counting a drop, mirroring the pick-confirm dwell above. A single-frame dip
+                # (slip / jitter / squeeze sag) that recovers within the window is NOT a drop —
+                # drop_t0 is reset the moment height rises back above threshold (below).
+                if state.drop_t0 is None:
+                    state.drop_t0 = t_now
+                    return False
+                if t_now - state.drop_t0 < DROP_DWELL_S:
                     return False
                 state.n_drops += 1
-                self.events.log(state.trial_id, t_now, 'drop', count=state.n_drops)
+                self.events.log(state.trial_id, t_now, 'drop', count=state.n_drops,
+                                dwell_s=round(t_now - state.drop_t0, 3))
                 state.attempt_active = False
                 state.dwell_t0 = None
+                state.drop_t0 = None
                 state.pick_confirmed = False
                 # set_phase logs the TRANSPORT→PICK phase_enter itself; mark pick_logged so
                 # the next attempt_start doesn't emit a second PICK for this same entry.
                 self.set_phase(state, t_now, TrialPhase.PICK)
                 state.pick_logged = True
                 return False
+
+            # Still carrying above the drop threshold — the descent (if any) recovered, so
+            # clear the drop dwell timer. Reached only when height_above_rest > LIFT_HEIGHT_M
+            # and the settled-in-place arrival above did not fire.
+            state.drop_t0 = None
 
         return False
 

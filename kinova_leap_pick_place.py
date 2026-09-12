@@ -309,14 +309,15 @@ if __name__ == "__main__":
     _arg_parser.add_argument(
         '--seed-viz', dest='seed_viz', default='off',
         choices=['off', 'dashboard', 'file', 'both'],
-        help="contact-aware recommender modes: visualize the grasp-recommender SEED "
-             "locations (accepted vs rejected seed contacts + per-seed paraboloid patches) "
-             "LIVE, refreshed every ~2 s recommender solve. off (default): none. dashboard: "
-             "render the seed figure to a PNG and show it in the live dashboard image panel. "
-             "file: save it under logs/<trial-log>/seed_viz/<object>_<NNN>.png (needs "
-             "--trial-log). both: dashboard + file. Rendered on the recommender's own "
-             "background thread (coalesced, mesh thinned, dpi 60 ~0.4 s) so the viewer never "
-             "stalls. Reads the planner's in-memory seed tables — no --rec-log-dir needed.")
+        help="contact-aware recommender modes: visualize the SOLVED grasp's CHOSEN contact "
+             "locations LIVE (overview with both contacts + grasp axis, then a per-contact "
+             "zoom showing that contact's paraboloid patch and the ✕ the solver landed on), "
+             "refreshed every ~2 s recommender solve. off (default): none. dashboard: render "
+             "the contacts figure to a PNG and show it in a separate resizable window. file: "
+             "save it under logs/<trial-log>/seed_viz/<object>_<NNN>.png (needs --trial-log). "
+             "both: dashboard + file. Rendered on the recommender's own background thread "
+             "(mesh thinned, dpi 60 ~0.4 s) so the viewer never stalls. Reads THIS solve's "
+             "in-memory result (quad frames + solved t) — no --rec-log-dir needed.")
     _arg_parser.add_argument(
         '--contact-profile', dest='contact_profile', default='stock',
         choices=['stock', 'tuned'],
@@ -996,6 +997,13 @@ if __name__ == "__main__":
     _SEQ_SPAWN = args.sequential_spawn
     _seq_next = 1                 # next stowed obj index to present (0 starts on the table)
     _seq_last_ended_id = None     # trial_id of the last trial we already advanced past
+    # One-shot "skip physics THIS iteration" flag for the sequential reset. Distinct
+    # from _dp_reset_frame because the sequential reset fires from the trial-end block
+    # ABOVE the drive block, and the drive block re-inits _dp_reset_frame = False every
+    # iteration — which would clobber a True set by _seq_reset_robot_home() before the
+    # physics-skip check runs, stepping physics on the just-teleported scene (penetration
+    # -> badqacc / arm flings vertical). This flag is cleared only at the skip check.
+    _seq_skip_physics = [False]
     _seq_spawn_xy = None
     _seq_spawn_quat = {}          # obj_idx -> the object's authored spawn quat (upright default)
     if _SEQ_SPAWN:
@@ -3223,15 +3231,18 @@ if __name__ == "__main__":
                     'n_converged':     _nconv,
                     'n_seeds':         len(_all),
                 })
-            # --seed-viz: render the seed figure (accepted/rejected seeds + per-seed
-            # paraboloid patches) from the planner's just-populated in-memory seed tables
-            # and ship it. On THIS recommender daemon thread (serialized with the solve by
-            # the _rec_idle gate), so it never touches the render/physics thread. Best-effort.
+            # --seed-viz: render the SOLVED grasp's contacts (overview + per-contact
+            # paraboloid patch with the ✕ the solver landed on — the CHOSEN contact
+            # location) from THIS solve's in-memory result (res carries quad{1,2}_frame /
+            # t{1,2}_sol) and ship it. On THIS recommender daemon thread (serialized with
+            # the solve by the _rec_idle gate), so it never touches the render/physics
+            # thread. Best-effort.
             if _SEED_VIZ_DASH or _SEED_VIZ_FILE:
                 try:
-                    from kinova_common.seed_figure import render_seed_figure_png
-                    _png = render_seed_figure_png(planner, model, planner._planner.data,
-                                                  title_extra=f"  ({objects[obj_idx]['name']})")
+                    from kinova_common.seed_figure import render_grasp_contacts_png
+                    _png = render_grasp_contacts_png(
+                        planner, model, planner._planner.data, res,
+                        object_id=objects[obj_idx]['name'], verify_info=_vinfo)
                     if _png is not None:
                         if _SEED_VIZ_DASH and dash is not None:
                             dash.push({'type': 'seed_viz', 'object': objects[obj_idx]['name'],
@@ -3869,18 +3880,50 @@ if __name__ == "__main__":
         global _teleop_spin_t, _teleop_cam_t, _teleop_step_t, _teleop_damping_zeroed
         global _rec_vis, _rec_ik_mode, _rec_last_solve, _dp_reset_frame, _dp_target
         global _last_sim_time
-        data.qpos[:N_ROBOT] = Q_BIAS            # arm+hand to the home bias (mode-agnostic)
+        # Home the robot to the SAME pose the Backspace reset uses. In teleop modes
+        # that is _Q_BIAS_DP (arm[:7] = _HOME_WRIST_DOWN), NOT the mode-agnostic
+        # Q_BIAS whose arm[:7] = HOME_ARM is the old FORWARD-REACH pose. This matters
+        # for press-8 calibration: init_home() below snapshots the robot's wrist
+        # orientation as the reference the auto-calib maps your hand to, so homing to
+        # the forward-reach pose (wrist not down) made the next object track from a
+        # wrong, near-vertical wrist. Fall back to Q_BIAS only when there is no
+        # teleop controller (autonomous modes), matching how _Q_BIAS_DP is scoped.
+        _home_q = _Q_BIAS_DP if _dexpilot_ctrl is not None else Q_BIAS
+        # INVOKE THE SAME TEARDOWN AS THE BACKSPACE RESET. Backspace calls mj_resetData,
+        # which (a) zeros data.time and (b) clears qvel/qacc/warmstart to a clean state —
+        # killing the intermittent badqacc / vertical snap that the previous in-place
+        # teleport left as residual solver state; and (c) restores every object to
+        # model.qpos0 — which is SAFE (and matches what you see on Backspace: only the
+        # active object on the table) because _stow_object/_spawn_object_at have already
+        # mirrored the sequential layout (this object at the spawn point, the rest stowed)
+        # INTO qpos0, so reset-to-qpos0 reproduces exactly that layout, not the authored
+        # scene. The arm's own qpos0 is the singular straight-up pose, so we immediately
+        # set qpos[:N_ROBOT] = _home_q below. The arm then HOLDS at home not via any reset
+        # gate but because _teleop_wrist_tgt is nulled below -> the shared wrist tracker
+        # commands zero velocity, and _dexpilot_ctrl.stop() makes step() return None, so
+        # nothing moves until press-8.
+        mj.mj_resetData(model, data)
+        data.qpos[:N_ROBOT] = _home_q           # arm+hand to the teleop wrist-down home
         data.qvel[:] = 0.0
         data.qacc[:] = 0.0
         data.qfrc_applied[:] = 0.0
+        data.qacc_warmstart[:] = 0.0
         mj.mj_forward(model, data)
         _dp_reset_frame = True                  # skip physics this frame so the teleport settles
-        _dp_target = Q_BIAS.copy()
+        _seq_skip_physics[0] = True             # survives the drive block's per-iter _dp_reset_frame=False
+        _dp_target = _home_q.copy()
         control_phase = 'REACH'
         squeeze_on = False
         grasp_ctrl = None
         _grasp_wrist_track = False
-        _teleop_active = False                  # FROZEN until press-8
+        # Leave _teleop_active TRUE, exactly like the Backspace reset. The freeze is NOT
+        # done by disabling the drive — it is done by nulling _teleop_wrist_tgt below, so
+        # the drive loop's shared wrist tracker gets None and commands ZERO velocity (the
+        # arm holds at _home_q). _dexpilot_ctrl.stop() further makes step() return None so
+        # no hand target moves until press-8. Setting _teleop_active=False instead skips
+        # the hold entirely, which let physics/leftover state drift the arm off home with
+        # a stale finger pose — the bug just seen. press-8's start() re-zeros + calibrates.
+        _teleop_active = True
         _teleop_q = None
         _teleop_arm_hold = None
         _teleop_wrist_tgt = None
@@ -4161,14 +4204,15 @@ if __name__ == "__main__":
                     # baselines; each mode's press-8 handler starts the trial for the presented
                     # object (_prox_idx / _seq_next-1).
                     #
-                    # Mirror the Backspace reset teardown (robot+scene to home, zero all DOF
-                    # velocity/accel/force, skip one physics frame so the teleport settles),
-                    # but WITHOUT snapping objects to qpos0 — the sequential layout (this new
-                    # object at the spawn point, the rest stowed) is already in data.qpos and
-                    # mirrored into qpos0 by _spawn_object_at/_stow_object.
+                    # Run the SAME teardown as the Backspace reset (see _seq_reset_robot_home):
+                    # mj_resetData clears sim time + solver state and snaps objects to qpos0,
+                    # which is exactly the sequential layout (this new object at the spawn
+                    # point, the rest stowed) since _spawn_object_at/_stow_object mirror it
+                    # INTO qpos0. So this reproduces the just-arranged layout, not the authored
+                    # scene — matching what Backspace shows (only the active object on the table).
                     active_idx = _new_idx
                     objects[_new_idx].pop('rec_local', None)
-                    _seq_reset_robot_home()   # mode-agnostic reset-to-home + freeze (see below)
+                    _seq_reset_robot_home()   # Backspace-equivalent reset-to-home + freeze
                     print(f"[sequential-spawn] trial ended ({_trial_state.outcome}); "
                           f"robot RESET to home, tracking FROZEN. Presenting object "
                           f"{_new_idx + 1}/{len(objects)} ({objects[_new_idx]['name']}) — "
@@ -4356,6 +4400,12 @@ if __name__ == "__main__":
                               "Press 8 to set the offset (capture your current hand pose).")
                     elif _k == 'teleop_start':
                         _dexpilot_ctrl.start(data)
+                        # Ensure the CAT teleop drive is enabled so step() runs (and fires
+                        # the press-8 orientation calibration armed in start()). Both the
+                        # Backspace reset and _seq_reset_robot_home() now leave _teleop_active
+                        # True, so this is normally redundant — kept as a guard so press-8
+                        # always turns tracking on regardless of how we got here.
+                        _teleop_active = True
                         print("[teleop] tracking started — home pose captured.")
                         if _trial_runner is not None:
                             # Trial starts on press-8, same as dexpilot mode. Re-pressing
@@ -4463,10 +4513,13 @@ if __name__ == "__main__":
                 #   O  -> collision-aware IK, warm-started from the recommender's q
                 #   I  -> collision-aware IK, warm-started from a fresh DLS
                 # A/B them to see the collision-vs-reach gap and warm-start effect.
-                if _dp_reset_frame:
+                if _dp_reset_frame or _seq_skip_physics[0]:
                     # Reset just teleported the scene; render it at rest without a physics
                     # step (or kinematic drive) so no teleport-penetration impulse spins up
                     # the objects. Tracking is already frozen (init_home in the handler).
+                    # _seq_skip_physics covers the sequential reset, whose _dp_reset_frame
+                    # True was clobbered by the drive block's per-iteration re-init above.
+                    _seq_skip_physics[0] = False
                     mj.mj_forward(model, data)
                 elif _rec_vis and _cand is not None and _cand.get('q') is not None:
                     data.qpos[:N_ROBOT] = Q_BIAS
@@ -4927,10 +4980,13 @@ if __name__ == "__main__":
                     _dexpilot_ctrl.step(model, data)
                     data.qpos[:7] = _CALIB_POSES[_calib_idx]
                     mj.mj_forward(model, data)
-                elif _dp_reset_frame:
+                elif _dp_reset_frame or _seq_skip_physics[0]:
                     # Reset just teleported the scene; render it at rest without a
                     # physics step so no teleport-penetration impulse spins up the
                     # objects. Tracking is already frozen (init_home above).
+                    # _seq_skip_physics covers the sequential reset, whose _dp_reset_frame
+                    # True was clobbered by this branch's per-iteration re-init above.
+                    _seq_skip_physics[0] = False
                     mj.mj_forward(model, data)
                 else:
                     _dpp_t0 = time.perf_counter() if DP_PROFILE else 0.0
