@@ -64,10 +64,12 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "benchmarks"))
 
 from grasp_control import GraspController                                       # noqa: E402
-from kinova_common.constants import FINGER_CODE, FINGER_SET, FINGER_TIP_SITES   # noqa: E402
+from kinova_common.constants import (FINGER_CODE, FINGER_SET,                    # noqa: E402
+                                     FINGER_TIP_SITES, SLOT_ROLES)
 from kinova_common.grasp_plots import write_grasp_plots                         # noqa: E402
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
-from simulation.grasp_config_builder import (for_gws_recommender,               # noqa: E402
+from simulation.grasp_config_builder import (parse_fingers as _parse_fingers,    # noqa: E402
+                                             for_gws_recommender,
                                              for_ablation_default,
                                              load_seed_config)                  # noqa: E402
 from simulation.grasp_planner_3d import MultiStartGraspPlanner3D                # noqa: E402
@@ -149,7 +151,8 @@ def _jog_steps(distance_m, speed_mps, dt):
 
 
 def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
-            obj_bid=None, tip_geom_ids=None, obj_gid=None, label="jog"):
+            obj_bid=None, tip_geom_ids=None, obj_gid=None, label="jog",
+            finger_set=None):
     """Resolved-rate DLS jog driven by a per-step world-frame palm twist.
 
     Same singularity-robust pattern as pick_from_floor._run_lift_jog (JOG_SING_EPS
@@ -159,7 +162,11 @@ def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
     """
     n = model.nv
     dt = model.opt.timestep
-    contact_lost = {f: False for f in FINGER_SET}
+    # This run's fingers, not the import-time default: under --fingers thumb,middle
+    # the module global still says ['index','thumb'], so contact loss would be
+    # attributed to a finger that is not grasping.
+    _fset = list(finger_set) if finger_set else list(FINGER_SET)
+    contact_lost = {f: False for f in _fset}
     # Slew-limited velocity command, exactly as the teleop GRASP branch drives
     # it (kinova_leap_pick_place.py ~:5449): clip the TARGET to the peak-speed
     # cap, then move the COMMAND toward it by at most ACCEL*dt per step, and
@@ -198,7 +205,7 @@ def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
 
         if tip_geom_ids is not None and obj_gid is not None:
             f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
-            for fname, force in zip(FINGER_SET, f):
+            for fname, force in zip(_fset, f):
                 if force <= 1e-6:
                     contact_lost[fname] = True
         if i % PRINT_EVERY == 0 and obj_bid is not None:
@@ -216,7 +223,7 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                    impratio=None, gamma_override=None,
                    squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05,
                    lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS,
-                   contact_profile="stock", pairing=None):
+                   contact_profile="stock", fingers=None):
     """Plan + execute one grasp on one object, then carry it to the bin."""
     rng = np.random.default_rng(seed)
     t_build = time.time()
@@ -330,15 +337,16 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
     # reported gamma_min values are NOT comparable to runs from before this change.
     cfg_kw.pop("obj_geom", None)
     cfg_kw.setdefault("obj_geom", obj_geom0)
-    # pairing selects WHICH FINGERS from models/grasp_finger_config.json (thumb_index,
-    # thumb_middle, tripod). None = that file's default. The preset applies it with
-    # setdefault, so every CLI/env override above still wins.
+    # fingers: ordered role list, e.g. ['thumb','middle']. None = whatever
+    # models/grasp_finger_config.json holds for this object (or its default list).
+    # ORDER MATTERS: slot 1 anchors the antipodal seed march. The preset applies it
+    # with setdefault, so every CLI/env override above still wins.
     cfg = for_gws_recommender(body_name,
                               cfg_kw.pop("arm_geom_names"),
                               cfg_kw.pop("obj_clearance_by_geom"),
                               accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
                               ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
-                              pairing=pairing,
+                              fingers=fingers,
                               **cfg_kw)
 
     log_dir = None
@@ -377,10 +385,19 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
     q_target[:len(res["q"])] = res["q"]
     q_target[len(res["q"]):] = q_home[len(res["q"]):]
 
+    # THIS RUN's fingers, derived from --fingers (slot order) and reversed into
+    # FINGER_SET order, exactly as the teleop entry point does. Everything below --
+    # tip sites/geoms, pad offsets, contact-loss bookkeeping, reported gaps -- is
+    # built from _FSET so the squeeze monitors the fingers the NLP actually planned
+    # for. Reading the module global here was the bug: it is resolved at import from
+    # the config default and never sees --fingers.
+    _SLOTS = _parse_fingers(fingers) or list(SLOT_ROLES)
+    _FSET = list(reversed(_SLOTS))
+    print(f"[fingers] slots={_SLOTS}  monitored order={_FSET}")
     tip_site_ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, FINGER_TIP_SITES[f])
-                    for f in FINGER_SET]
+                    for f in _FSET]
     tip_geom_ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, f"leap_{FINGER_CODE[f]}_tip")
-                    for f in FINGER_SET]
+                    for f in _FSET]
 
     data.qpos[:N_ROBOT] = q_target
     mj.mj_forward(model, data)
@@ -398,13 +415,17 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
     n1_in, n2_in = recommended_inward_normals(
         model, data, planner._planner._obj_gid, planner._planner._mesh_entry,
         np.asarray(res["p1"], float), np.asarray(res["p2"], float))
-    by_p = {"thumb": res["p1"], "index": res["p2"]}
-    by_n = {"thumb": n1_in, "index": n2_in}
+    # Slot -> finger by POSITION. These were {"thumb": p1, "index": p2}, which
+    # KeyErrors the moment a run's fingers do not include an 'index' (--fingers
+    # thumb,middle). _SLOTS is this run's slot order, so zipping it against
+    # (p1, p2) binds each NLP contact to whichever finger actually serves it.
+    by_p = {r: v for r, v in zip(_SLOTS, [res["p1"], res["p2"]])}
+    by_n = {r: v for r, v in zip(_SLOTS, [n1_in, n2_in])}
     rec_local = [local_contact_frame(np.asarray(by_p[f], float),
                                      np.asarray(by_n[f], float), p_WoO, R_WO)
-                 for f in FINGER_SET]
+                 for f in _FSET]
     pad_offset = {f: _pad_surface_offset(model, data, f, tip_site_ids[i], tip_geom_ids[i])
-                  for i, f in enumerate(FINGER_SET)}
+                  for i, f in enumerate(_FSET)}
 
     if os.environ.get("PFF_CONTACT_TRACE"):
         # The disturbance LP's feasibility is decided by the contact GEOMETRY,
@@ -440,7 +461,7 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
         model, N_ROBOT, tip_site_ids=tip_site_ids, obj_site_ids=None,
         obj_body_id=obj_bid, kp=Kp, kd=Kd,
         gamma=gamma_live, squeeze_pd_scale=squeeze_pd_scale, support_weight=True,
-        pad_offsets=[pad_offset[f] for f in FINGER_SET],
+        pad_offsets=[pad_offset[f] for f in _FSET],
         obj_contact_provider=make_object_contact_provider(rec_local, obj_bid))
 
     # Start from HOME (not a random configuration -- see the module docstring).
@@ -465,8 +486,15 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                             pos[2] + 0.5 * LIFT_DISTANCE_M])
     _span = float(np.linalg.norm(np.asarray(TS.BIN_CENTER) - np.asarray(pos)[:2]))
     _cam_dist = max(0.9, 1.4 * _span + LIFT_DISTANCE_M)
+    # VIEW FROM THE FAR SIDE OF THE TABLE. The robot base is mounted at
+    # TS.BASE_POS=(0.0,-0.15), i.e. the -y edge, so the default azimuth 135 looks
+    # from behind/beside the arm and the arm's own links occlude the fingers at
+    # the moment of grasp. Looking back toward the base from +y puts the hand
+    # between the camera and the arm, so the contacts stay visible.
+    _cam_azim = -70
     recorder = (VideoRecorder(str(Path(out_dir) / f"seed{seed}.mp4"),
-                              lookat=_cam_lookat, dist=_cam_dist, elev=-25)
+                              lookat=_cam_lookat, dist=_cam_dist,
+                              azim=_cam_azim, elev=-25)
                 if out_dir is not None else None)
     VIDEO_STRIDE = 4
     frame_i = [0]
@@ -489,6 +517,14 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
             mj.mj_forward(model, data)
             _sync()
         result["phase_log"].append("approach_done")
+        # PLANNED GRASP POSE: the hand where the NLP put it, before any squeeze
+        # moves the object. Same far-side camera as the video.
+        if out_dir is not None:
+            try:
+                render(model, data, str(Path(out_dir) / f"seed{seed}_planned.png"),
+                       lookat=pos, dist=0.7, azim=_cam_azim, elev=-25)
+            except Exception as _e:
+                print(f"[exec] planned-pose render failed: {_e}")
 
         # HOLD: quasi-static settle at the planned pose.
         for _ in range(200):
@@ -499,7 +535,7 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
         result["phase_log"].append("hold_settled")
 
         gaps = _tip_gaps_mm(model, data, tip_geom_ids, obj_gid, obj_geom_ids=obj_gids)
-        result["tip_gaps_mm"] = dict(zip(FINGER_SET, gaps))
+        result["tip_gaps_mm"] = dict(zip(_FSET, gaps))
         if any(g > CONTACT_GAP_TOL_M * 1000 for g in gaps):
             print(f"[exec] ABORT before SQUEEZE — gap too large: {result['tip_gaps_mm']}")
             result["phase_log"].append("squeeze_aborted_no_contact")
@@ -533,7 +569,9 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                 print(f"[squeeze] i={i:4d} scale={scale:.2f} "
                       f"gap={np.round(_g, 2).tolist()} f={np.round(_f, 2).tolist()}")
         f_meas = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
-        result["squeeze_forces_N"] = dict(zip(FINGER_SET, np.round(f_meas, 3).tolist()))
+        # _FSET, not the global: these are the MEASURED per-fingertip forces and
+        # mislabelling them would report the middle finger's load under 'index'.
+        result["squeeze_forces_N"] = dict(zip(_FSET, np.round(f_meas, 3).tolist()))
         result["phase_log"].append("squeeze_done")
         print(f"[squeeze] final={result['squeeze_forces_N']}")
 
@@ -547,7 +585,7 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
         n_lift = _jog_steps(LIFT_DISTANCE_M, lift_speed, dt)
         q_cmd, lost_lift = _jog_to(
             model, data, ctrl, q_cmd, lambda i: np.array([0, 0, lift_speed, 0, 0, 0.]),
-            n_lift, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="lift")
+            n_lift, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="lift", finger_set=_FSET)
         result["lift_obj_dz_mm"] = (float(data.xpos[obj_bid][2]) - obj_z0) * 1000
         result["lift_contact_lost"] = lost_lift
         result["phase_log"].append("lift_done")
@@ -563,7 +601,7 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                 model, data, ctrl, q_cmd,
                 lambda i: np.array([dirn[0] * transport_speed,
                                     dirn[1] * transport_speed, 0, 0, 0, 0.]),
-                n_tr, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="transport")
+                n_tr, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="transport", finger_set=_FSET)
             result["transport_contact_lost"] = lost_tr
             result["phase_log"].append("transport_done")
 
@@ -597,8 +635,9 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
 
         if out_dir is not None:
             try:
+                # Final-state render, same far-side viewpoint as the video.
                 render(model, data, str(Path(out_dir) / f"seed{seed}.png"),
-                       lookat=pos, dist=0.9, elev=-25)
+                       lookat=pos, dist=0.9, azim=_cam_azim, elev=-25)
             except Exception as e:
                 print(f"[exec] render failed: {e}")
     finally:
@@ -629,7 +668,12 @@ def _solve_gamma(model, data, obj_bid, R_WO, rec_local, obj_gid, tip_geom_ids,
     ACCEL = NCF_ACCEL_BUDGET_XYZ
     ANG = NCF_ANG_ACCEL_BUDGET
     g_O = R_WO.T @ model.opt.gravity
-    mu = [float(model.geom_friction[obj_gid, 0])] * len(FINGER_SET)
+    # One friction entry per CONTACT. Taken from rec_local, which this function
+    # already receives and which IS the per-run contact list -- _FSET is a local
+    # of run_pick_place and is NOT in scope here (referencing it raised NameError
+    # and broke the default thumb+index path), and len(FINGER_SET) is the
+    # import-time default (always 2) which under-sizes this at n_contacts=3.
+    mu = [float(model.geom_friction[obj_gid, 0])] * len(rec_local)
     gamma = solve_gamma_live([p for p, _ in rec_local], [R for _, R in rec_local],
                              mu, float(model.body_mass[obj_bid]), ACCEL, ANG,
                              model.body_inertia[obj_bid], grav_O=g_O)
@@ -708,10 +752,11 @@ def main():
                     help="finger PD multiplier DURING the squeeze ramp. Lower lets the "
                          "internal-force term win against the finger PD; too low and the "
                          "measured force falls short of the commanded gamma.")
-    ap.add_argument("--pairing", default=None,
-                    help="which fingers to grasp with, by name from "
-                         "models/grasp_finger_config.json (thumb_index, thumb_middle, "
-                         "tripod). Default: that file's own 'default' entry.")
+    ap.add_argument("--fingers", default=None,
+                    help="comma-separated fingers to grasp with, IN SLOT ORDER, e.g. "
+                         "'thumb,middle' or 'thumb,index,middle'. Slot 1 anchors the "
+                         "grasp (the antipodal seed marches from it), so the order is "
+                         "not interchangeable. Default: models/grasp_finger_config.json.")
     ap.add_argument("--contact-profile", choices=["stock", "tuned"], default="stock",
                     help="stock (default): whatever the scene XML compiles to "
                          "(impratio=100, noslip_iterations=0, fingertip "
@@ -764,7 +809,7 @@ def main():
     _, result = run_pick_place(
         args.object, args.seed, n_seeds=args.n_seeds, n_relin=args.n_relin,
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
-        pairing=args.pairing,
+        fingers=args.fingers,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
         sdf_err_tol=args.sdf_err_tol, backend=args.backend,
         quad_sym_normals=args.quad_sym_normals,
