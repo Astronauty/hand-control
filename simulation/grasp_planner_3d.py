@@ -4331,6 +4331,16 @@ class GraspPlanner3D:
                     'gws_beta':      float(_sol.value(_gws_beta)) if _gws_beta is not None else None,
                     'quad_pinned':   _quad_pinned(_sol.value),
                     'grad_z':        _eval_grad_z(_sol.value),
+                    # Paraboloid patch frames + solved surface offsets, carried on the RESULT
+                    # so the contact-patch figure can render WITHOUT the grasp3d_iter_*.npz
+                    # traces (which are written only under --rec-log-dir and drag in the
+                    # expensive per-term gradient-norm logging). None for primitive objects.
+                    'quad1_frame':   _t1_frame,
+                    'quad2_frame':   _t2_frame,
+                    't1_sol':        (np.asarray(_sol.value(_t1_var), float)
+                                      if _t1_frame is not None else None),
+                    't2_sol':        (np.asarray(_sol.value(_t2_var), float)
+                                      if _t2_frame is not None else None),
                 }
             except Exception as _e:
                 self.log.warning(f"GraspPlanner3D._run_stage({stage_label}): {_e}")
@@ -4365,6 +4375,12 @@ class GraspPlanner3D:
                                            if _gws_beta is not None else None),
                         'quad_pinned':   _quad_pinned(_opti.debug.value),
                         'grad_z':        _eval_grad_z(_opti.debug.value),
+                        'quad1_frame':   _t1_frame,
+                        'quad2_frame':   _t2_frame,
+                        't1_sol':        (np.asarray(_opti.debug.value(_t1_var), float)
+                                          if _t1_frame is not None else None),
+                        't2_sol':        (np.asarray(_opti.debug.value(_t2_var), float)
+                                          if _t2_frame is not None else None),
                     }
                 except Exception as _e2:
                     self.log.error(f"GraspPlanner3D debug extraction: {_e2}")
