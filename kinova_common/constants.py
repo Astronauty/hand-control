@@ -16,11 +16,41 @@ FINGER_TIP_SITES = {
 # build the RRT's finger_geom_names list.
 FINGER_CODE = {"index": "if", "middle": "mf", "ring": "rf", "thumb": "th"}
 
-# v1: 2-finger pinch grasp — matches the 2 antipodal contact sites currently defined per
-# object (obj_xxx_c1/c2 in models/scene_pick_place.xml). Extend by adding more contact
-# sites to the object XML and listing more fingers here; the controller below loops over
-# however many entries this has.
-FINGER_SET = ["index", "thumb"]
+# Which fingers the grasp uses, derived from models/grasp_finger_config.json so the
+# EXECUTOR and the PLANNER cannot disagree about it. Previously this was a literal
+# ["index", "thumb"] duplicated in five files while the planner learned the finger
+# identities from GraspConfig3D's site fields -- so re-pointing the planner at the
+# middle finger left the controller still squeezing with the index.
+#
+# ORDER IS A SEPARATE CONVENTION FROM SLOT ORDER, and the difference is load-bearing.
+# The planner's contact SLOTS are thumb-first: slot 1 = p1 = thumb, slot 2 = p2 = the
+# opposing finger. FINGER_SET is the REVERSE, opposing-finger-first, because id_C is
+# built in FINGER_SET order (kinova_leap_pick_place.py:624) and then zipped against
+# per-finger forces (:1209), contact sites (:1645) and IK targets (:1825) -- all of
+# which document the pairing as "[index, thumb]: index<-p2, thumb<-p1" (:1643).
+# Reversing the slot list here is what preserves that mapping; deriving it in slot
+# order would silently swap every one of those zips.
+#
+# _finger_set_from_config() falls back to the historical literal if the file is
+# missing or unreadable, so a fresh checkout behaves exactly as before.
+def _finger_set_from_config():
+    import json
+    from pathlib import Path
+    p = Path(__file__).resolve().parent.parent / "models" / "grasp_finger_config.json"
+    try:
+        raw = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return ["index", "thumb"]
+    pairings = {k: v for k, v in (raw.get("pairings") or {}).items()
+                if not k.startswith("_")}
+    roles = pairings.get(raw.get("default"))
+    if not roles:
+        return ["index", "thumb"]
+    # slot order (thumb-first) -> FINGER_SET order (opposing-finger-first)
+    return list(reversed(roles))
+
+
+FINGER_SET = _finger_set_from_config()
 
 # Gen3 arm "home" pose — a natural elbow-bent reach-forward configuration. Read at
 # runtime from gen3.xml's "home" keyframe (see GEN3_XML / HOME_ARM in main) rather than
