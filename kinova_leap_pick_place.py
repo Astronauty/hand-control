@@ -1143,15 +1143,16 @@ if __name__ == "__main__":
         wn = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, 'bowl_wall_n')
         if wn >= 0:
             z_hi = float(data.geom_xpos[wn][2] + model.geom_size[wn][2])
-        # All tray collision geoms (base + 4 walls) — the object counts as "in the tray" if
-        # it rests in contact with any of them (or on another object already in the tray).
+        # All tray collision geoms (base + 4 walls). base_gid is kept SEPARATELY: placement is
+        # certified by contact with the BASE (resting on the bin floor), not the walls — a
+        # hovering object can graze a wall rim without being placed.
         _bg = set()
         for _bn in ('bowl_base', 'bowl_wall_n', 'bowl_wall_s', 'bowl_wall_e', 'bowl_wall_w'):
             _bgid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, _bn)
             if _bgid >= 0:
                 _bg.add(_bgid)
         return {'xy': c[:2].copy(), 'hx': hx, 'hy': hy, 'z_lo': z_lo, 'z_hi': z_hi,
-                'gids': _bg}
+                'gids': _bg, 'base_gid': base}
 
     _BOWL = _bowl_geometry() if args.trial_log else None
 
@@ -1197,23 +1198,41 @@ if __name__ == "__main__":
                 and abs(float(p[1]) - _BOWL['xy'][1]) <= _BOWL['hy'] + margin)
 
     def _object_in_bowl(obj_idx):
-        """True if objects[obj_idx] is placed IN the tray. Robust to orientation and stacking:
-        the object's center is over the tray footprint AND it is physically RESTING in the
-        tray — in contact with a tray geom (base/wall) OR with another object that is itself
-        over the tray (a stack). Using contact rather than a tight center-z band means a block
-        resting on its EDGE, leaning on a wall, or sitting on another object (center above the
-        rim) is still recognised. Falls back to the center z-band if no contacts are computed
-        this step. Replaces the old geom-center + tight-z-band test that missed those cases."""
+        """True if objects[obj_idx] is placed DOWN IN the tray = center over the tray footprint
+        AND the object is RESTING ON THE BIN BASE — directly in contact with bowl_base, or in
+        contact with another object that is itself resting on the base (a stack). Contact with
+        a WALL alone does NOT count: an object held in the air over the bin can graze a wall
+        rim while hovering (observed false 'place' on the wood block held above the bin), but it
+        cannot touch the base until it's actually set down. This is orientation- and
+        size-independent (no geom-center-z threshold, which varies with object shape/pose).
+        Falls back to the footprint z-band only if no contacts are computed this step."""
         if _BOWL is None or not (0 <= obj_idx < len(objects)):
             return None                              # → caller falls back to flat footprint
         if not _center_over_tray(obj_idx):
             return False
         my_gids = set(_OBJ_COL_GIDS.get(obj_idx) or [objects[obj_idx]['id_geom']])
-        # Support = the tray geoms plus any OTHER object currently over the tray (for stacks).
-        support = set(_BOWL['gids'])
-        for _j in range(len(objects)):
-            if _j != obj_idx and _center_over_tray(_j):
-                support.update(_OBJ_COL_GIDS.get(_j) or [objects[_j]['id_geom']])
+        # Support = the bin BASE only (NOT the walls) + transitively any object already resting
+        # on that support and over the footprint (a stack). Walls are excluded so a hovering
+        # object grazing a wall is not counted as placed.
+        support = {_BOWL['base_gid']} if _BOWL.get('base_gid', -1) >= 0 else set()
+        # Transitive closure over stacked objects: an object counts as support if it is over
+        # the footprint AND itself touches the current support set (resting on the base/stack).
+        _added = True
+        while _added:
+            _added = False
+            for _j in range(len(objects)):
+                if _j == obj_idx or not _center_over_tray(_j):
+                    continue
+                _jg = set(_OBJ_COL_GIDS.get(_j) or [objects[_j]['id_geom']])
+                if _jg & support:
+                    continue                          # already counted
+                for ci in range(data.ncon):
+                    c = data.contact[ci]
+                    if (c.geom1 in _jg and c.geom2 in support) or \
+                       (c.geom2 in _jg and c.geom1 in support):
+                        support |= _jg
+                        _added = True
+                        break
         for ci in range(data.ncon):
             c = data.contact[ci]
             g1, g2 = c.geom1, c.geom2
@@ -1221,9 +1240,9 @@ if __name__ == "__main__":
                 return True
         if data.ncon > 0:
             return False
-        # No contacts this step: fall back to the center z-band inside the footprint.
-        p = data.geom_xpos[objects[obj_idx]['id_geom']]
-        return bool(_BOWL['z_lo'] <= float(p[2]) <= _BOWL['z_hi'])
+        # No contacts this step: fall back to the footprint z-band.
+        _cz = float(data.geom_xpos[objects[obj_idx]['id_geom']][2])
+        return bool(_BOWL['z_lo'] <= _cz <= _BOWL['z_hi'])
 
     def _hand_object_contact_metrics(obj_idx):
         """Scan live contacts once and return
@@ -3791,6 +3810,57 @@ if __name__ == "__main__":
     _kb_listener = _pynput_kb.Listener(on_press=_on_press, on_release=_on_release)
     _kb_listener.start()
 
+    # --sequential-spawn: reset the robot to home + FREEZE tracking between objects, for
+    # object-wise experimental consistency (every object starts from an identical robot state;
+    # press-8 then recalibrates and starts the object's trial). Mode-agnostic — uses Q_BIAS
+    # (always defined) for the arm home and guards all teleop/DexPilot state on availability,
+    # so it is safe for the dexpilot/anyteleop baselines and contact_aware_autonomous too.
+    # Defined here (after all control-state vars exist) as a plain global-rebinding helper.
+    def _seq_reset_robot_home():
+        global control_phase, squeeze_on, grasp_ctrl, _grasp_wrist_track
+        global _teleop_active, _teleop_q, _teleop_arm_hold, _teleop_wrist_tgt
+        global _teleop_spin_t, _teleop_cam_t, _teleop_step_t, _teleop_damping_zeroed
+        global _rec_vis, _rec_ik_mode, _rec_last_solve, _dp_reset_frame, _dp_target
+        global _last_sim_time
+        data.qpos[:N_ROBOT] = Q_BIAS            # arm+hand to the home bias (mode-agnostic)
+        data.qvel[:] = 0.0
+        data.qacc[:] = 0.0
+        data.qfrc_applied[:] = 0.0
+        mj.mj_forward(model, data)
+        _dp_reset_frame = True                  # skip physics this frame so the teleport settles
+        _dp_target = Q_BIAS.copy()
+        control_phase = 'REACH'
+        squeeze_on = False
+        grasp_ctrl = None
+        _grasp_wrist_track = False
+        _teleop_active = False                  # FROZEN until press-8
+        _teleop_q = None
+        _teleop_arm_hold = None
+        _teleop_wrist_tgt = None
+        _teleop_jog_v[:] = 0.0                  # arrays: mutate in place, no global needed
+        _teleop_jog_w[:] = 0.0
+        _teleop_spin_t = _teleop_cam_t = _teleop_step_t = 0.0
+        _teleop_damping_zeroed = False
+        _rec_vis = False
+        _rec_ik_mode = None
+        _rec_last_solve = 0.0
+        with _rec_result_lock:
+            _rec_result.clear()
+        with _rec_ik_lock:
+            _rec_ik_result.clear()
+        if _rec1_mocap >= 0: data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
+        if _rec2_mocap >= 0: data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
+        _last_sim_time = 0.0
+        if _dp_trigger is not None:  _dp_trigger.reset()
+        if _cat_trigger is not None: _cat_trigger.reset()
+        if _phys_trigger is not None: _phys_trigger.reset()
+        if _dexpilot_ctrl is not None:
+            _dexpilot_ctrl._hand_tracking = True
+            _dexpilot_ctrl._arm._ik.max_iter = _ARM_IK_ITER_SAVE
+            model.dof_damping[:7] = _ARM_DAMPING_TRACK
+            _dexpilot_ctrl.stop()               # freeze — no tracking until press-8
+            _dexpilot_ctrl.init_home(data)      # re-anchor home to the reset pose
+
     with mj.viewer.launch_passive(model, data, key_callback=make_key_callback(keys)) as viewer:
         viewer.opt.frame = mj.mjtFrame.mjFRAME_WORLD
         # Start the viewer looking through the saved 'viewer' camera (a fixed 3/4 side angle
@@ -4026,7 +4096,7 @@ if __name__ == "__main__":
                     and _trial_state.trial_id != _seq_last_ended_id):
                 _seq_last_ended_id = _trial_state.trial_id
                 # The presented object is always _seq_next-1 (index 0 first, then 1, ...),
-                # independent of how each mode sets active_idx (dexpilot pins active_idx=0).
+                # independent of how each mode sets active_idx.
                 _seq_done = _seq_next - 1
                 if 0 <= _seq_done < len(objects):
                     _stow_object(_seq_done)
@@ -4034,68 +4104,32 @@ if __name__ == "__main__":
                     _spawn_object_at(_seq_next, _seq_spawn_xy)
                     _new_idx = _seq_next
                     _seq_next += 1
-                    # AUTO-START a fresh trial for the newly presented object. Without this the
-                    # trial state keeps the just-ended object (outcome != None), so the
-                    # per-frame arrival machine — gated on `outcome is None` and keyed to
-                    # _seq_next-1 / active_idx — never scores the new object: the operator
-                    # would place it but no 'arrival' fires (observed: block scored, next
-                    # object never did). Start it here so the new object is immediately the
-                    # active, outcome=None trial. Sets active_idx too so the contact-aware
-                    # arrival path (which keys on active_idx) tracks it as well.
-                    if _trial_runner is not None:
-                        _nobj = objects[_new_idx]
-                        _new_tid = (_trial_state.trial_id + 1) if _trial_state is not None else 1
-                        _trial_state = _trial_runner.start_trial(
-                            _new_tid, args.mode, _nobj['name'], data.time,
-                            props=object_props_from_model(
-                                model, _nobj['id_body'], _nobj['id_geom']))
-                        active_idx = _new_idx
-                        if _dp_trigger is not None:
-                            _dp_trigger.reset()
-                        if _cat_trigger is not None:
-                            _cat_trigger.reset()
-                        if _phys_trigger is not None:
-                            _phys_trigger.reset()
-                    # RETURN TO PRE-LOCK-IN TELEOP for the new object. The just-ended trial
-                    # left the control state post-lock-in (control_phase past REACH,
-                    # _teleop_active False, the grasp carry having modified the DexPilot
-                    # controller) — so without this reset the recommender-tick branch (gated on
-                    # the pre-lock-in teleop phase) is never re-entered and the recommender
-                    # STOPS FOR EVERY OBJECT AFTER THE FIRST. Mirror the N-release teardown: hand
-                    # control back to the operator, drop any committed contacts, re-seed the arm
-                    # drive at the live pose, clear the recommender state so it re-fires
-                    # immediately, and restore the DexPilot controller from the carry config.
-                    if _CAT_MODE:
-                        objects[_new_idx].pop('rec_local', None)
-                        _teleop_active = True
-                        _teleop_arm_hold = None
-                        _teleop_wrist_tgt = None
-                        _teleop_jog_v[:] = 0.0
-                        _teleop_jog_w[:] = 0.0
-                        data.qvel[:7] = 0.0
-                        _teleop_damping_zeroed = False
-                        _rec_vis = False
-                        _rec_ik_mode = None
-                        _rec_last_solve = 0.0          # force an immediate re-solve
-                        with _rec_result_lock:
-                            _rec_result.clear()         # drop the previous object's candidate
-                        with _rec_ik_lock:
-                            _rec_ik_result.clear()
-                        control_phase = 'REACH'
-                        squeeze_on = False
-                        grasp_ctrl = None
-                        _grasp_wrist_track = False
-                        if _dexpilot_ctrl is not None:
-                            _dexpilot_ctrl._hand_tracking = True
-                            _dexpilot_ctrl._arm._ik.max_iter = _ARM_IK_ITER_SAVE
-                            model.dof_damping[:7] = _ARM_DAMPING_TRACK
-                    print(f"[sequential-spawn] trial ended ({_seq_last_ended_id}); "
-                          f"presenting object {_new_idx + 1}/{len(objects)} "
-                          f"({objects[_new_idx]['name']}) — new trial started, "
-                          f"recommender re-armed.")
+                    # OBJECT-WISE EXPERIMENTAL CONSISTENCY: after each placement, RESET THE
+                    # ROBOT TO HOME and FREEZE tracking, then REQUIRE press-8 to recalibrate
+                    # before the next object — so every object starts from an identical robot
+                    # state, not wherever the arm ended the previous carry. The next trial
+                    # starts on press-8 (not here), so the reset->recalibrate setup gap is not
+                    # counted against the object's completion time. Mode-agnostic: the same
+                    # reset+freeze applies to contact-aware AND the dexpilot/anyteleop
+                    # baselines; each mode's press-8 handler starts the trial for the presented
+                    # object (_prox_idx / _seq_next-1).
+                    #
+                    # Mirror the Backspace reset teardown (robot+scene to home, zero all DOF
+                    # velocity/accel/force, skip one physics frame so the teleport settles),
+                    # but WITHOUT snapping objects to qpos0 — the sequential layout (this new
+                    # object at the spawn point, the rest stowed) is already in data.qpos and
+                    # mirrored into qpos0 by _spawn_object_at/_stow_object.
+                    active_idx = _new_idx
+                    objects[_new_idx].pop('rec_local', None)
+                    _seq_reset_robot_home()   # mode-agnostic reset-to-home + freeze (see below)
+                    print(f"[sequential-spawn] trial ended ({_trial_state.outcome}); "
+                          f"robot RESET to home, tracking FROZEN. Presenting object "
+                          f"{_new_idx + 1}/{len(objects)} ({objects[_new_idx]['name']}) — "
+                          f"press 8 to recalibrate and start its trial.")
                 else:
-                    print(f"[sequential-spawn] trial ended; all {len(objects)} object(s) "
-                          f"presented — table clear.")
+                    _seq_reset_robot_home()   # last object done: end in a clean home state
+                    print(f"[sequential-spawn] trial ended ({_trial_state.outcome}); all "
+                          f"{len(objects)} object(s) presented — table clear, robot home.")
 
             # Always-on pose recorder: one throttled row per iteration, ALL phases (the
             # trial trace only runs post-lock-in). Phase is reconstructed offline from
@@ -4796,7 +4830,13 @@ if __name__ == "__main__":
                                 _trial_runner.abandon_trial(_trial_state, data.time)
                             _trial_id = (_trial_state.trial_id + 1
                                         if _trial_state is not None else 1)
-                            _tobj = objects[0]
+                            # Normally objects[0] (single-object batch). Under
+                            # --sequential-spawn the presented object is _seq_next-1 (the one
+                            # just teleported to the spawn point), so press-8 starts the trial
+                            # for THAT object, not a stowed objects[0].
+                            _dp_start_idx = (_seq_next - 1) if _SEQ_SPAWN else 0
+                            _tobj = objects[_dp_start_idx]
+                            active_idx = _dp_start_idx
                             _trial_state = _trial_runner.start_trial(
                                 _trial_id, 'dexpilot', _tobj['name'], data.time,
                                 props=object_props_from_model(
