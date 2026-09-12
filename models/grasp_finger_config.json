@@ -1,0 +1,19 @@
+{
+  "_comment": "Which FINGERS a grasp uses, by role. Loaded by simulation/grasp_config_builder.load_finger_config(). Replaces the older practice of setting n_contacts as an independent integer: the pairing IS the source of truth and n_contacts is derived from len(fingers), so the two can no longer disagree. PRECEDENCE matches load_seed_config: file -> per-object -> CLI/env, applied by the caller with setdefault.",
+
+  "_comment_roles": "Contact SLOTS are positional in the NLP and always ordered [slot1, slot2, slot3...]. Slot 1 is the opposing/anchor contact (historically the thumb) and slot 2 is the contact it pinches against (historically the index). Slot 3+ are load-bearing off-axis contacts. A role name here must be a key of kinova_common.constants.FINGER_TIP_SITES / FINGER_CODE, which own the site and geom-prefix lookups -- this file never repeats a site name, so it cannot drift from the model.",
+
+  "_comment_measured": "MEASURED 2026-09-12, seed 0, plan-only, 80/3 GWS preset. thumb_index vs thumb_middle are the same NLP with slot 2 re-bound; committed contact p2 moves from 19.0mm off the index tip to 16.1mm off the middle tip (orange) and 18.5 -> 21.3mm (wood block), while grasp span |p1-p2| is preserved (67.8 -> 68.0mm orange, 88.6 -> 88.1mm block). Costs rise modestly (14.73 -> 18.55 orange, 12.68 -> 15.00 block) because w_align's opposition prior and the seed geometry were tuned for thumb_index. The wood block reached Solved_To_Acceptable_Level on thumb_middle where thumb_index hit Maximum_Iterations_Exceeded -- one seed on one object, not yet a trend.",
+
+  "default": "thumb_index",
+
+  "pairings": {
+    "thumb_index":  ["thumb", "index"],
+    "thumb_middle": ["thumb", "middle"],
+    "tripod":       ["thumb", "index", "middle"]
+  },
+
+  "per_object": {
+    "_comment": "Overrides the default pairing for one YCB id. Empty by default -- add an entry only where measurement justifies it."
+  }
+}

@@ -56,6 +56,86 @@ def load_seed_config(obj_id: str | None = None,
     return out
 
 
+FINGER_CONFIG_PATH = Path(__file__).resolve().parent.parent / "models" / "grasp_finger_config.json"
+
+# Contact SLOTS are positional in the NLP. Slot 1 is the anchor/opposing contact,
+# slot 2 the contact it pinches against, slot 3+ the off-axis load-bearing ones.
+# The GeometryNames fields are still named thumb_*/index_*/middle_* for slots 1/2/3
+# because every consumer in grasp_planner_3d.py reads them by those names -- this
+# table is the ONE place that knows the mapping is positional, not anatomical.
+_SLOT_FIELDS = (("thumb_site", "thumb_geom"),
+                ("index_site", "index_geom"),
+                ("middle_site", "middle_geom"))
+
+
+def load_finger_config(obj_id: str | None = None,
+                       pairing: str | None = None,
+                       path: str | Path | None = None) -> dict:
+    """GraspConfig3D kwargs selecting WHICH FINGERS a grasp uses.
+
+    Returns a flat dict of site/geom names plus a derived n_contacts, suitable for
+    **-splatting into a builder. Same contract as load_seed_config(): '_' keys are
+    comments, 'per_object' overrides the default for one YCB id, and a missing or
+    unreadable file returns {} rather than raising -- the dataclass defaults
+    (thumb+index) must remain sufficient on a fresh checkout.
+
+    n_contacts is DERIVED from len(roles), never passed independently, so the
+    pairing and the contact count cannot disagree. That was the failure mode this
+    replaces: n_contacts was an explicit int while the finger identities were
+    fixed, so "3 contacts" and "which third finger" were two separate facts that
+    had to be kept in sync by hand.
+
+    Role names resolve through kinova_common.constants.FINGER_TIP_SITES /
+    FINGER_CODE, which own the model's site and geom naming -- this loader never
+    repeats a site name, so it cannot drift from the model.
+
+    pairing : name from the file's 'pairings' block. None uses the per-object
+        entry if present, else the file's 'default'.
+    """
+    from kinova_common.constants import FINGER_CODE, FINGER_TIP_SITES
+
+    p = Path(path) if path is not None else FINGER_CONFIG_PATH
+    try:
+        raw = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
+
+    pairings = {k: v for k, v in (raw.get("pairings") or {}).items()
+                if not k.startswith("_")}
+    if pairing is None and obj_id is not None:
+        per = raw.get("per_object") or {}
+        pairing = (per.get(obj_id) or None)
+    if pairing is None:
+        pairing = raw.get("default")
+    if pairing is None:
+        return {}
+
+    roles = pairings.get(pairing)
+    if roles is None:
+        raise ValueError(
+            f"load_finger_config: unknown pairing {pairing!r}. "
+            f"Known pairings: {sorted(pairings)!r} (models/grasp_finger_config.json).")
+    if not 2 <= len(roles) <= len(_SLOT_FIELDS):
+        raise ValueError(
+            f"load_finger_config: pairing {pairing!r} names {len(roles)} fingers; "
+            f"the NLP supports 2..{len(_SLOT_FIELDS)} contact slots.")
+
+    out: dict = {"n_contacts": len(roles)}
+    for slot, role in enumerate(roles):
+        if role not in FINGER_TIP_SITES or role not in FINGER_CODE:
+            raise ValueError(
+                f"load_finger_config: pairing {pairing!r} names unknown finger "
+                f"{role!r}. Known fingers: {sorted(FINGER_TIP_SITES)!r}.")
+        site_field, geom_field = _SLOT_FIELDS[slot]
+        out[site_field] = FINGER_TIP_SITES[role]
+        out[geom_field] = f"leap_{FINGER_CODE[role]}_tip"
+    # NOTE: no '_roles' or other metadata key is returned. The whole point of this
+    # dict is to be **-splatted into GraspConfig3D, whose __init__ raises TypeError on
+    # any key it does not recognise -- so a diagnostic key here would break every
+    # caller. Callers that want the role list can read it from the pairing name.
+    return out
+
+
 def for_ablation_default(obj_geom: str, obj_body: str,
                          arm_geom_names: list, obj_clearance_by_geom: dict,
                          n_seeds: int = 5, max_iter: int = 200,
@@ -123,6 +203,7 @@ def for_gws_recommender(obj_name: str, arm_geom_names: list,
                         max_iter: int = 80,
                         w_gws: float = 5.0, w_span: float = 1.0,
                         obj_id: str | None = None,
+                        pairing: str | None = None,
                         **overrides) -> GraspConfig3D:
     """for_teleop_recommender + the FRoGGeR min-weight (GWS) quality objective.
 
@@ -180,6 +261,19 @@ def for_gws_recommender(obj_name: str, arm_geom_names: list,
     # both paths gate on the same numbers, matching plot_seed_quadratic, which reads
     # the same file so "this diagnostic cannot drift from the gate it is drawing".
     for _k, _v in load_seed_config(obj_id).items():
+        cfg_kw.setdefault(_k, _v)
+    # WHICH FINGERS, from models/grasp_finger_config.json, as DEFAULTS (setdefault) on
+    # the same file -> per-object -> CLI/env precedence the seed config uses. This sets
+    # the slot site/geom names AND derives n_contacts from the pairing's length, so the
+    # contact count can no longer disagree with the finger identities.
+    #
+    # MEASURED: slot 2 is bound to the index ONLY through index_site/index_geom --
+    # every downstream consumer reads self._index_sid / cfg.r_index, never a literal
+    # name -- so re-pointing those two fields genuinely moves the contact. Verified by
+    # the committed contact p2 inverting which fingertip it sits on (19.0mm off the
+    # index -> 16.1mm off the middle on 017_orange) while the grasp span |p1-p2| is
+    # preserved (67.8 -> 68.0mm). See models/grasp_finger_config.json for the table.
+    for _k, _v in load_finger_config(obj_id, pairing).items():
         cfg_kw.setdefault(_k, _v)
     # DLS-IK reachability screen ON by default. This is the ONLY seed screen that
     # knows about the ARM -- the other two are geometric (above the table, not on an
