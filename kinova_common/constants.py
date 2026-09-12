@@ -50,6 +50,28 @@ def _finger_set_from_config():
     return list(reversed(roles))
 
 
+def _slot_roles_from_config(pairing=None):
+    """The pairing's roles in PLANNER SLOT order (slot 1 first = p1 = thumb).
+
+    FINGER_SET is this list reversed; see the ordering note above. Exposed so the
+    controller can map an NLP slot to the finger that serves it WITHOUT keying on
+    the role name -- the two dicts at kinova_leap_pick_place.py:1644/:1822 used to
+    hardcode {'thumb': p1, 'index': p2}, which KeyErrors the moment a pairing does
+    not contain an 'index'."""
+    import json
+    from pathlib import Path
+    p = Path(__file__).resolve().parent.parent / "models" / "grasp_finger_config.json"
+    try:
+        raw = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return ["thumb", "index"]
+    pairings = {k: v for k, v in (raw.get("pairings") or {}).items()
+                if not k.startswith("_")}
+    roles = pairings.get(pairing or raw.get("default"))
+    return list(roles) if roles else ["thumb", "index"]
+
+
+SLOT_ROLES = _slot_roles_from_config()
 FINGER_SET = _finger_set_from_config()
 
 # Gen3 arm "home" pose — a natural elbow-bent reach-forward configuration. Read at
