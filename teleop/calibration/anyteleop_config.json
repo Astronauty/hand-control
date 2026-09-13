@@ -7,8 +7,8 @@
   "_comment_output_alpha": "Extra EMA smoothing our wrapper applies on top of dex-retargeting's own low_pass_alpha. 1.0 = none.",
   "output_alpha": 1.0,
   "_comment_finger_knobs": "dex-retargeting's OWN finger-retargeting knobs, overriding the vendored LEAP YAML so you can tune them here instead of editing anyteleop/assets/.../leap_hand_right*.yml. null = keep the YAML value (scaling_factor 1.6, low_pass_alpha 0.2). Hot-reloaded (rebuilds the solver).",
-  "_comment_scaling_factor": "Robot-to-human hand-size gain. null = each type's YAML-native 1.6, which is correct for VECTOR (higher breaks its curl). If you want extra curl for the dexpilot type specifically, override per-run rather than here, since a single value serves both conditions.",
-  "scaling_factor": null,
+  "_comment_scaling_factor": "Robot-to-human hand-size gain (null = YAML-native 1.6). LOWERED to 1.2: at 1.6 the dexpilot type AMPLIFIES hand closure 1.6x, so the commanded fingers close deeper than your actual hand -> they penetrate a grasped object, and the thumb under-abducts when you spread it wide (the pinch-optimizer already resists spreading). 1.2 makes the commanded pose track your real hand more faithfully (less penetration, better thumb spread) at some cost to auto-curl. Hot-reloaded (rebuilds the solver) so tune live; raise back toward 1.4-1.6 if pinch closure weakens too much.",
+  "scaling_factor": 1.2,
   "_comment_low_pass_alpha": "dex-retargeting's internal low-pass. Smaller = smoother but laggier (0..1); <0 disables.",
   "low_pass_alpha": null
 }
