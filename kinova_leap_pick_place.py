@@ -3647,6 +3647,11 @@ if __name__ == "__main__":
         print(f"[teleop] --tune-wrist: hot-reloading {_wt_cfg.config_path}\n"
               f"          logging tracking error -> {_wt_cfg.log_path}\n"
               f"          edit the JSON (or run: python teleop/wrist_tune.py) to tune live.")
+    # One-shot diagnostics for the --tune-wrist logger: _wt_log_seen flips true on the first
+    # logged sample; _wt_log_none counts iterations where the drive ran but had no wrist
+    # target (the usual 'plot stays blank' cause). Lists so _solve_wrist_qdot mutates in place.
+    _wt_log_seen = [False]
+    _wt_log_none = [0]
     # Debug/control experiment: TELE_AUTO_JOG=1 makes teleop's GRASP phase use the
     # AUTONOMOUS carry path — the arrow-key jog (world-frame palm velocity, orientation
     # held) instead of DexPilot wrist tracking. Everything upstream (recommender grasp,
@@ -3770,6 +3775,20 @@ if __name__ == "__main__":
                                speed_cmd=float(np.linalg.norm(jog_v)), sigma_min=sigma_min,
                                ang_err=_ang_err, ang_speed_cmd=float(np.linalg.norm(jog_w)),
                                tgt_z=_tgt_z, cur_z=_cur_z)
+            if _wt_cfg.logging and not _wt_log_seen[0]:
+                _wt_log_seen[0] = True
+                print(f"[teleop] --tune-wrist: FIRST tracking sample logged -> "
+                      f"{_wt_cfg.log_path} (the GUI plot should now update).")
+        elif _wt_cfg.logging and wrist_tgt is None:
+            # No wrist target => nothing to log. This is the usual reason the --tune-wrist
+            # plot stays blank: _dexpilot_ctrl.step() is returning None (no /hand/joint_angles
+            # input, or the arm-IK worker hasn't produced its first solution) so the cached
+            # _teleop_wrist_tgt was never set. Warn ONCE (throttled) so the operator sees why.
+            _wt_log_none[0] += 1
+            if _wt_log_none[0] == 200:   # ~1s of iterations with a live drive but no target
+                print("[teleop] --tune-wrist: tracking drive is running but the WRIST TARGET "
+                      "is None — no rows logged yet. Press 8 to start tracking; if already "
+                      "pressed, /hand/joint_angles isn't delivering a pose (check the input).")
         return qdot_arm, jog_v, jog_w, sigma_min
 
     # Joint limits for the 7 arm DOF, and a mask of which are actually bounded.
