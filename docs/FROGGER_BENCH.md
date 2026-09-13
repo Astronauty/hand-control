@@ -13,6 +13,20 @@ Paper: [FRoGGeR: Fast Robust Grasp Generation via the Min-Weight Metric][paper]
 
 ---
 
+## 0a. Reproducibility caveat: numbers here depend on a dirty tree
+
+**Every figure in this document was measured with uncommitted local changes present**,
+notably in `simulation/grasp_config_builder.py` (a `w_gws` signature change and an
+`n_seeds` change that predate this work). They are not reproducible from a commit hash
+alone, and numbers taken at different points in the session are not necessarily
+comparable to each other.
+
+Measured instance: the `ours` configuration returns `l_bar* = 0.5877` on `017_orange`
+seed 0 with those changes stashed, and `0.7476` with them applied. Both are correct for
+their respective trees. Where a comparison spans that boundary it is noted.
+
+Anything paper-bound should be re-measured against a committed tree.
+
 ## 0. Relationship to the existing solver
 
 The min-weight metric is already implemented here. `_embed_gws_ca`
