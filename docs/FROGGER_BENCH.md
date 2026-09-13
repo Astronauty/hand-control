@@ -766,3 +766,55 @@ lie ON the surface, which is exactly what the faithful port does.
 
 `constrained_ik` already uses `mj_geomDistance` (exact, guarded by a bounding-sphere
 lower bound) rather than the sphere proxy, so an exact path exists in this repo.
+
+---
+
+## 13. n=2 sweep, both configurations (2026-09-13)
+
+6 objects x 3 seeds, `thumb,index`, with the OBB sampler seeding the frogger
+configuration and HOME seeding ours. **Dirty tree (§0a).**
+
+| | ours | frogger |
+|---|---|---|
+| median `l_bar*` | **+0.8879** | +0.2968 |
+| wrench-feasible | **16/18** | 10/18 |
+| median `\|lp_gap\|` | 0.00090 | **0.00000** |
+| median solve time | **2.4 s** | 34.5 s |
+
+The frogger configuration is **worse on this benchmark as ported**, not better. Two
+columns should not be read as method differences:
+
+- **`lp_gap` = 0 exactly** is the bilevel LP doing what it is for: the inner problem is
+  solved to optimality at every iterate, so there is no optimality gap to report. This
+  is a genuine advantage of their formulation and the one clean result here.
+- **34.5 s vs 2.4 s** measures our finite-differenced collision gradient, not their
+  method. See FROGGER_COMPARISON §6: 504,630 distance evaluations against their
+  analytic `grad sigma = (-1)^Ic (J_B^T - J_A^T) n_AB`, which needs one query per
+  constraint per iteration.
+
+### 13.1 The failures are in the solve, not the seed
+
+7 of 18 frogger cells return exactly `l_bar* = 0`. Seed quality does not explain them:
+
+| | cells | straddling seeds | median seed error |
+|---|---|---|---|
+| zero-score | 7 | **7/7** | 5.49 mm |
+| nonzero | 11 | 11/11 | 13.44 mm |
+
+Every seed straddles the object, and the FAILING cells have *better* seeds than the
+succeeding ones. `056_tennis_ball` fails on all three seeds despite 2.3-3.6 mm seed
+errors, while `036_wood_block` succeeds on all three from 39-53 mm errors.
+
+So the remaining defect is in the NLP, not the sampler. Every failing cell is
+`best-effort` / `Maximum_Iterations_Exceeded`, and the frogger configuration never
+reaches `converged` on any cell, against 8/18 for ours -- consistent with the
+finite-differenced gradient being too noisy for IPOPT to certify a solution, but that
+is a hypothesis, not a measurement.
+
+### 13.2 What this does and does not license
+
+It does NOT license "our method beats FRoGGeR". The port carries a known
+non-faithful gradient implementation (FROGGER_COMPARISON §6), never converges, and
+was measured on a dirty tree. What it licenses is: **the port is not yet good enough
+to benchmark against**, and the next step is the analytic collision gradient, which
+addresses both the time and, plausibly, the convergence.
