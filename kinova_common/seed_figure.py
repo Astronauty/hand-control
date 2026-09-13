@@ -205,17 +205,22 @@ def write_seed_figure(planner, model, data, out_path, title_extra=""):
     recs = [_as_rec(e, True) for e in acc] + [_as_rec(e, False) for e in rej]
 
     n = len(recs)
-    n_acc, n_rej = len(acc), len(rej)
+    n_acc = len(acc)
     # ACCEPTED LEFT, REJECTED RIGHT, with a narrow spacer column between them, so
     # the two populations read as two groups instead of one undifferentiated run.
     _SPACER = 0.22
+    _acc_n = len([r for r in recs if r["ok"]])
+    _rej_all = [r for r in recs if not r["ok"]]
+    _REJ_CAP = 4
+    _rej_n = min(len(_rej_all), _REJ_CAP)
+    n_acc, n_rej = _acc_n, _rej_n
     widths = ([1.0] * n_acc) + ([_SPACER] if (n_acc and n_rej) else []) + ([1.0] * n_rej)
     n_cols = len(widths)
-    fig = plt.figure(figsize=(max(3.3 * n + 1.0, 10.0), 7.2))
+    fig = plt.figure(figsize=(max(3.3 * (n_acc + n_rej) + 1.0, 10.0), 7.2))
     gs = fig.add_gridspec(2, n_cols, height_ratios=[1.05, 1.0], width_ratios=widths)
     fig.suptitle(
         f"{sc['obj']}  —  contact seeds considered by THIS solve{title_extra}\n"
-        f"{n_acc} accepted (left)   |   {n_rej} rejected (right)   "
+        f"{n_acc} accepted (left)   |   {len(rej)} rejected (right, showing {n_rej})   "
         f"(kappa gate {sc['cfg'].seed_kappa_max_reject:.0f}, "
         f"DLS pool x{sc['cfg'].seed_dls_rank_pool})\n"
         "top: seed ray → surface   bottom: paraboloid patches "
@@ -224,6 +229,18 @@ def write_seed_figure(planner, model, data, out_path, title_extra=""):
 
     acc_recs = [r for r in recs if r["ok"]]
     rej_recs = [r for r in recs if not r["ok"]]
+    # CAP the rejected columns. 009_gelatin_box rejects 20 seeds (its faces are
+    # mostly within seed_ground_clearance_m of the table), and drawing all of them
+    # made the figure 8843px wide with ~2mm panels -- the ACCEPTED seeds, which are
+    # the subject, became unreadable. Rejects are a diagnostic tail: a
+    # representative handful plus a count carries the same information.
+    _REJ_CAP = 4
+    _n_rej_total = len(rej_recs)
+    if _n_rej_total > _REJ_CAP:
+        # Spread the sample across the run rather than taking the first few, so a
+        # gate that only fires late is still represented.
+        _idx = np.linspace(0, _n_rej_total - 1, _REJ_CAP).astype(int)
+        rej_recs = [rej_recs[i] for i in _idx]
     _draw_block(fig, gs, 0, acc_recs, sc, "accepted", True)
     _draw_block(fig, gs, n_acc + (1 if (n_acc and n_rej) else 0),
                 rej_recs, sc, "rejected", False)

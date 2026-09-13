@@ -89,3 +89,32 @@ GEN3_XML = 'mujoco_menagerie/kinova_gen3/gen3.xml'
 # Not currently used in the main IK loop (position-only + HOME_ARM bias suffices), but
 # available if a caller wants to add per-site orientation control in future.
 FINGERTIP_POINTING_AXIS = np.array([0.0, -1.0, 0.0])
+
+
+def finger_joint_slices(model, fingers=None):
+    """(start, stop) qpos slices for the GRASPING fingers' joints.
+
+    GraspController gates two things on these slices: effective_gains() (the
+    CLOSING-vs-HOLDING finger-gain switch) and slip_correction_torques(). Its
+    default was hardcoded ((7, 11), (19, 23)) -- LEAP index and thumb -- which
+    silently EXCLUDES any other finger: at --fingers thumb,index,middle the
+    middle finger's joints (11..14) fell outside both slices, so it kept full
+    stiff gains while index and thumb were softened to close, and it never
+    participated in the squeeze/transport gain switch at all.
+
+    Derived from the model's own joint names (leap_<code>_*), so it tracks the
+    model rather than restating its layout.
+    """
+    import mujoco as mj
+    fingers = list(fingers) if fingers else list(FINGER_SET)
+    out = []
+    for f in fingers:
+        code = FINGER_CODE.get(f)
+        if code is None:
+            continue
+        adrs = [model.jnt_qposadr[j] for j in range(model.njnt)
+                if (mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, j) or '')
+                .startswith(f'leap_{code}_')]
+        if adrs:
+            out.append((int(min(adrs)), int(max(adrs)) + 1))
+    return tuple(sorted(out))
