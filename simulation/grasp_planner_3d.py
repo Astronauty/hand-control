@@ -3324,6 +3324,18 @@ class UVAtlasConfig:
     # the same surface and cannot conflict. Costs one mj_geomDistance query per geom
     # per NLP iteration and is finite-differenced rather than analytic.
     frogger_exact_collision: bool = False
+
+    # Distance from the fingertip SITE to the fixed contact point on the pad, along
+    # pad_axis. FRoGGeR selects "a specific desired point of contact on each
+    # fingertip such that the forward kinematics were fixed" (App. B-F), at 60 deg
+    # tilted toward the palm from the very tip of each finger.
+    #
+    # The LEAP tip site sits at the tip GEOM's centre (measured 0.0-0.1 mm off
+    # geom_xpos) and that geom is a box of half-extents ~11 x 12 x 17 mm, so the pad
+    # surface along pad_axis is roughly one half-extent out. 0.011 m is that value;
+    # it is a fixed body-frame quantity, which is the property their sentence
+    # requires, unlike an offset along the object's own surface normal.
+    frogger_pad_offset_m:   float = 0.011
     quadratic_t_bound_max:  float = 0.10    # metres, cap even where the surface stays flat
     quadratic_sdf_err_tol:  float = 4e-3    # metres, max surrogate-vs-true-SDF gap per axis
     # Constant amount (m) shaved off EVERY side of the trust-region rectangle
@@ -4190,7 +4202,21 @@ class GraspPlanner3D:
             else:
                 self.log.warning(f"GraspPlanner3D: arm_geom '{gname}' not found — skipped")
 
-        self._dls_ik   = SpatialIKSolver(n_robot=n_act)
+        # DLS-IK for seeding/ranking. PFF_DLS_* override the solver gains so the
+        # damping-vs-null_gain interaction can be A/B'd through the real pipeline:
+        # the posture bias (null_gain, applied per call) is only orthogonal to the
+        # task when I - J^+ J is a TRUE projector, and J^+ here is the DAMPED
+        # pseudo-inverse, so a large damping lets the bias leak into the task
+        # direction. Measured standalone: a 20mm reachable target converges to
+        # 8.29mm with damping=0.01/null_gain=0.3, and to 0.06mm at damping=1e-4.
+        _dls_kw = {}
+        if os.environ.get("PFF_DLS_DAMPING"):
+            _dls_kw["damping"] = float(os.environ["PFF_DLS_DAMPING"])
+        if os.environ.get("PFF_DLS_STEP"):
+            _dls_kw["step"] = float(os.environ["PFF_DLS_STEP"])
+        if os.environ.get("PFF_DLS_ADAPTIVE"):
+            _dls_kw["adaptive_damping"] = True
+        self._dls_ik   = SpatialIKSolver(n_robot=n_act, **_dls_kw)
         self._dls_data = mj.MjData(model)
         # Separate scratch MjData for _tip_support_along -- _dls_data's qpos is
         # live state for the DLS seeding path, not safe to stomp mid-solve.
@@ -4541,6 +4567,20 @@ class GraspPlanner3D:
             _tp1_fk = thumb_cb(_q)
             _tp2_fk = index_cb(_q)
             _tp3_fk = middle_cb(_q) if middle_cb is not None else None
+            # Pad-normal direction in WORLD as a function of q, for the fixed contact
+            # point under frogger_fk_contacts. Same callback the orient_weight term
+            # uses, built here whenever the FK-contact path needs it.
+            _thumb_pad_cb = _index_pad_cb = _middle_pad_cb = None
+            if cfg.frogger_fk_contacts:
+                _pa = np.asarray(cfg.pad_axis, float)
+                _thumb_pad_cb = _SiteAxisCallbackAnalytic(
+                    f'gp3_th_pad_{_uid}', model, self._thumb_sid, _pa, n_act, obj_qpos_snap)
+                _index_pad_cb = _SiteAxisCallbackAnalytic(
+                    f'gp3_if_pad_{_uid}', model, self._index_sid, _pa, n_act, obj_qpos_snap)
+                if _has_c3:
+                    _middle_pad_cb = _SiteAxisCallbackAnalytic(
+                        f'gp3_mf_pad_{_uid}', model, self._middle_sid, _pa, n_act,
+                        obj_qpos_snap)
             _is_mesh = (geom_type == _GEOM_TYPE_MESH and self._mesh_entry is not None)
             _t1_var = _t2_var = None   # set below iff a mesh 2-DOF contact var is built
             _t3_var = _p3 = _t3_bounds = _t3_frame = None   # third contact (n_contacts>=3)
@@ -5039,24 +5079,48 @@ class GraspPlanner3D:
                 # a fixed point in principle. One step from the site is sufficient
                 # here because r_tip is small against the local radius of curvature,
                 # and the residual is reported per solve (sdf_mm) rather than assumed.
-                _cons_pts = [(_tp1_fk, float(cfg.r_thumb)), (_tp2_fk, float(cfg.r_index))]
-                if _has_c3 and _tp3_fk is not None:
-                    _cons_pts.append((_tp3_fk, float(cfg.r_middle)))
+                # THE CONTACT POINT IS FIXED ON THE FINGERTIP, as FRoGGeR specifies:
+                # "We selected a specific desired point of contact on each fingertip
+                # such that the forward kinematics were fixed" (their App. B-F).
+                #
+                # An earlier version used `site - r_tip * n_sdf`, offsetting along the
+                # OBJECT's normal. That was wrong twice over. The tip SITE sits at the
+                # tip geom's CENTRE (measured 0.0-0.1 mm from geom_xpos) and the geom
+                # is a box of half-extents ~11 x 12 x 17 mm, so a single isotropic
+                # r_tip does not describe the pad in any direction; and offsetting
+                # along the object normal made the constraint point move as the
+                # object's surface curved, which is exactly the non-fixed forward
+                # kinematics their sentence rules out.
+                #
+                # Measured consequence: a seed whose fingertip SITES sit on the
+                # surface (+0.41, -0.15 mm) had its constraint points 19 mm INSIDE the
+                # object, so the solve pushed the tips ~130 mm away to satisfy it and
+                # beta collapsed to 0.
+                #
+                # The fixed point is `site + pad_offset * pad_axis` in the SITE frame,
+                # with pad_axis the fingerpad normal (-x of the LEAP tip site frame,
+                # GraspConfig3D.pad_axis) and pad_offset the pad half-extent along it.
+                _pad_ax = np.asarray(cfg.pad_axis, float)
+                _pad_ax = _pad_ax / (np.linalg.norm(_pad_ax) + 1e-12)
+                _cons_pts = []
+                for _fk, _axcb, _off in (
+                        (_tp1_fk, _thumb_pad_cb, float(cfg.frogger_pad_offset_m)),
+                        (_tp2_fk, _index_pad_cb, float(cfg.frogger_pad_offset_m))):
+                    _cons_pts.append(_fk + _off * _axcb(_q))
+                if _has_c3 and _tp3_fk is not None and _middle_pad_cb is not None:
+                    _cons_pts.append(
+                        _tp3_fk + float(cfg.frogger_pad_offset_m) * _middle_pad_cb(_q))
                 if _is_mesh and self._mesh_entry is not None:
                     _sfn = self._mesh_entry["fn"]
-                    _nfn = self._mesh_entry["normal_fn"]
-                    _Rt = ca.DM(obj_R_np.T); _Rw = ca.DM(obj_R_np)
+                    _Rt = ca.DM(obj_R_np.T)
                     _cd = ca.DM(obj_center_np)
-                    for _tp, _r in _cons_pts:
-                        _tp_l = _Rt @ (_tp - _cd)
-                        _n_l  = _nfn(_tp_l)                 # unit outward, object frame
-                        _c_l  = _tp_l - _r * _n_l           # pad surface, object frame
-                        _opti.subject_to(_sfn(_c_l) == 0.0)
+                    for _cp in _cons_pts:
+                        _opti.subject_to(_sfn(_Rt @ (_cp - _cd)) == 0.0)
                 else:
                     # Primitive: the analytic surface constraint already in the file.
-                    for (_tp, _r), _d_lp in zip(_cons_pts, (d1_lp, d2_lp, d3_lp)):
+                    for _cp, _d_lp in zip(_cons_pts, (d1_lp, d2_lp, d3_lp)):
                         _sym_geom_surface_con(
-                            _opti, _tp - _r * ca.DM(np.asarray(_d_lp, float)), _d_lp,
+                            _opti, _cp, _d_lp,
                             geom_type, obj_center_np, obj_R_np, geom_size,
                             edge_margin=cfg.edge_margin_m)
             elif include_surface and not _is_mesh and not cfg.fixed_contacts:
@@ -6731,11 +6795,26 @@ class MultiStartGraspPlanner3D:
         _fs = _fixed_antipodal_seed(geom_type, geom_size, c, obj_R_np, _axis_local,
                                     prefer_outer=cfg.seed_prefer_outer_surface,
                                     mesh_entry=self._mesh_entry)
+        # The minor-axis seed COMPETES rather than jumping the queue. It used to
+        # be appended straight into `seeds`, which gave it unconditional
+        # priority on the strength of two GEOMETRIC gates (above the table, not
+        # on an edge) while the random candidates were DLS-ranked among
+        # themselves -- so the one seed that never had to prove the arm could
+        # reach it was the one guaranteed to be solved first. At n_seeds=1 that
+        # made it the only seed solved whenever it cleared the gates: measured
+        # on 015_peach, the minor-axis seed was accepted with 0 rejected and
+        # handed the NLP a grasp axis tilted 26 deg out of horizontal.
+        # Holding it in _minor_pool instead lets _dls_residual rank it against
+        # the random candidates on the one screen that knows about the ARM. It
+        # keeps a tie-break edge (see the sort below), so on objects where it
+        # is genuinely reachable it still goes first.
+        _minor_pool = []
         if (_reachable_contact(_fs['p1s'], _ground_z, _r_tip_min) and
                 _reachable_contact(_fs['p2s'], _ground_z, _r_tip_min) and
                 _seed_kappa_ok(_fs)):
             _assign_seed_by_finger(_fs, _live_th, _live_if)
-            seeds.append(_fs)
+            _fs['kind'] = 'minor-axis'
+            _minor_pool.append(_fs)
         else:
             self.last_seed_reject_table.append(
                 dict(kind='minor-axis', why='unreachable or too-curved',
@@ -6901,15 +6980,25 @@ class MultiStartGraspPlanner3D:
             _assign_seed_by_finger(s, _live_th, _live_if)
             _pool.append(s)
 
-        if _rank_random and _pool:
-            # Best-reachable first. Seeds already accepted above (minor-axis,
-            # chart-pair) keep their priority -- they have their own rationale
-            # for going first and the chart-pair ones are already DLS-ranked.
+        if _rank_random and (_pool or _minor_pool):
+            # Best-reachable first, with the MINOR-AXIS seed in the same pool
+            # (chart-pair seeds are already DLS-ranked upstream and keep their
+            # priority). The minor-axis candidate is given index -1 so that the
+            # (residual, index) sort breaks an EXACT residual tie in its favour
+            # -- it keeps its "well-conditioned pinch axis" rationale where the
+            # arm reaches it equally well, and loses only when some random
+            # candidate is measurably more reachable.
+            _rank_pool = [(-1, _s) for _s in _minor_pool] + list(enumerate(_pool))
             _scored = sorted(((_dls_residual(_s), _i, _s)
-                              for _i, _s in enumerate(_pool)), key=lambda t: t[:2])
-            log.info(f"[seed_gen] DLS-ranked {len(_pool)} random candidates; "
+                              for _i, _s in _rank_pool), key=lambda t: t[:2])
+            _minor_rank = next((_k for _k, (_r, _i, _s) in enumerate(_scored)
+                                if _i == -1), None)
+            log.info(f"[seed_gen] DLS-ranked {len(_pool)} random"
+                     f"{' + 1 minor-axis' if _minor_pool else ''} candidates; "
                      f"residuals {_scored[0][0]*1e3:.1f}..{_scored[-1][0]*1e3:.1f}mm, "
-                     f"keeping best {max(n_seeds - len(seeds), 0)}")
+                     f"keeping best {max(n_seeds - len(seeds), 0)}"
+                     + (f"; minor-axis ranked {_minor_rank + 1}/{len(_scored)}"
+                        if _minor_rank is not None else ""))
             self.last_seed_rank_table = [
                 dict(dls_res_mm=_r * 1e3, accepted=(_k < max(n_seeds - len(seeds), 0)))
                 for _k, (_r, _i, _s) in enumerate(_scored)
@@ -6919,7 +7008,10 @@ class MultiStartGraspPlanner3D:
                     break
                 seeds.append(_s)
         else:
-            seeds.extend(_pool[:max(n_seeds - len(seeds), 0)])
+            # No DLS ranking (seed_dls_rank_pool <= 1): the minor-axis seed has
+            # nothing to be ranked against, so it keeps its historical
+            # first-place slot rather than being dropped.
+            seeds.extend((_minor_pool + _pool)[:max(n_seeds - len(seeds), 0)])
 
         if len(seeds) < n_seeds:
             log.warning(
@@ -7252,7 +7344,8 @@ class MultiStartGraspPlanner3D:
                             model, _dls_data3,
                             [self._planner._thumb_sid, self._planner._index_sid,
                              self._planner._middle_sid],
-                            [_t1, _t2, _t3], q_bias=q_ref, null_gain=0.3)
+                            [_t1, _t2, _t3], q_bias=q_ref,
+                            null_gain=float(os.environ.get("PFF_DLS_NULLGAIN", 0.3)))
                         mj.mj_kinematics(model, _dls_data3)
                         _e3 = float(np.linalg.norm(
                             _dls_data3.site_xpos[self._planner._middle_sid] - _t3))
