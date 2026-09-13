@@ -664,7 +664,12 @@ if __name__ == "__main__":
 
     STEPS_PER_WP    = 5    # max sim steps before forcing waypoint advance (timeout, 1 step = 1ms)
     WP_REACH_TOL    = 0.02  # joint-space radius to consider a waypoint reached (rad)
-    JOG_VEL         = 0.3  # jog speed while arrow key held (m/s)
+    JOG_VEL         = 0.6  # jog speed while arrow key held (m/s); ALSO the peak-speed cap on
+                           # live wrist tracking (see _solve_wrist_qdot). Env-overridable below.
+                           # Raised 0.3->0.6: a headless step/oscillation sweep (tune_wrist)
+                           # showed the wrist trailing on larger motions at 0.3; 0.6 roughly
+                           # halves the catch-up time with no stability cost (critical arm
+                           # damping during tracking). Tune live with TELEOP_JOG_VEL.
     # Singularity-robust DLS jog damping (see the GRASP-branch resolved-rate solve):
     # JOG_SING_EPS is the smallest-singular-value threshold below which damping ramps
     # in; JOG_LAM_MAX caps the peak joint-rate gain at ~1/(2*JOG_LAM_MAX). With
@@ -682,6 +687,27 @@ if __name__ == "__main__":
     # final hard clamp so no single frame can ever integrate a runaway solve.
     JOG_LAM_MIN     = 0.02  # rad·m base DLS damping (peak arm rate ~0.2/(2*sqrt(0.02))≈0.7 rad/s)
     JOG_QDOT_MAX    = 2.0   # rad/s hard cap on the mapped arm joint rate (safety backstop)
+
+    # --- Live wrist-tracking RESPONSIVENESS env overrides (baseline dexpilot + CAT pre-lock-in) ---
+    # The arm follows the operator's wrist via a resolved-rate velocity loop (_solve_wrist_qdot):
+    #   v = clip(WRIST_TRACK_GAIN * pos_error, ±JOG_VEL), accel-slewed by NCF_ACCEL_BUDGET_XYZ,
+    #   then mapped to joint rates and hard-capped at JOG_QDOT_MAX. All of these are in SIM-time,
+    #   so when the sim runs slower than real-time the effective wall-clock speed is scaled down
+    #   too — the main reason the wrist can trail the reference by seconds. These env vars let you
+    #   dial responsiveness live on the headset without recompiling; bake in the value you like.
+    #     TELEOP_JOG_VEL=<m/s>      peak wrist speed cap (default 0.3; try 0.6-1.0 for snappier)
+    #     TELEOP_TRACK_GAIN=<k>     P-gain on position error (default 7.0; try 12-20; higher = the
+    #                               cap is reached at a smaller error, but more jitter on noisy VR)
+    #     TELEOP_QDOT_MAX=<rad/s>   final per-joint arm-rate cap (default 2.0; raise if it binds)
+    #   Raise JOG_VEL/TRACK_GAIN first; QDOT_MAX only if a big fast motion visibly clips.
+    def _env_float(_name, _default):
+        try:
+            return float(os.environ.get(_name, _default))
+        except (TypeError, ValueError):
+            return _default
+    JOG_VEL      = _env_float('TELEOP_JOG_VEL',   JOG_VEL)
+    WRIST_TRACK_GAIN_ENV = 'TELEOP_TRACK_GAIN'   # applied where WRIST_TRACK_GAIN is defined
+    JOG_QDOT_MAX = _env_float('TELEOP_QDOT_MAX',  JOG_QDOT_MAX)
     # --- Arm velocity-injection SAFETY NETS (guardrails, NOT dynamics tuning) ---------
     # The dexpilot/pre-lock-in drive injects _qdot_arm straight into data.qvel[:7] and
     # runs a stiff (wn=100) PD with the arm's model damping zeroed (matching the GRASP
@@ -721,7 +747,11 @@ if __name__ == "__main__":
     # Cartesian velocity command (1/s). The command is then slew-limited to the NCF accel
     # budget and DLS-mapped to joint rates, so this only sets how briskly the wrist closes
     # a tracking gap; the budget still caps peak acceleration for the no-slip guarantee.
-    WRIST_TRACK_GAIN = 7.0
+    WRIST_TRACK_GAIN = _env_float(WRIST_TRACK_GAIN_ENV, 12.0)  # TELEOP_TRACK_GAIN override.
+    # Raised 7->12 alongside JOG_VEL: reaches the (now higher) speed cap at a smaller error
+    # (~5cm at gain 7 -> ~5cm/(12/7)~3cm), so medium corrections track briskly. 12 stayed
+    # well-behaved in the sweep; raise toward 20 live via TELEOP_TRACK_GAIN if you want more
+    # snap and the wrist doesn't jitter on noisy VR input.
 
     # Object definitions: rigid objects only (obj_soft deferred — vertex-level contact,
     # not a rigid grasp-map problem). Each object maps every FINGER_SET finger to the
@@ -3593,6 +3623,11 @@ if __name__ == "__main__":
     elif WRIST_ANG_GAIN_SCALE != 1.0:
         print(f"[teleop] WRIST_ANG_GAIN_SCALE={WRIST_ANG_GAIN_SCALE:.3g} — "
               "angular tracking gain scaled independently of position.")
+    # Responsiveness knobs — always print the active tracking config so a run is self-documenting
+    # (defaults JOG_VEL=0.6, WRIST_TRACK_GAIN=12; override live via the TELEOP_* env vars).
+    print(f"[teleop] wrist-tracking responsiveness: JOG_VEL={JOG_VEL:.3g} m/s "
+          f"(TELEOP_JOG_VEL), WRIST_TRACK_GAIN={WRIST_TRACK_GAIN:.3g} (TELEOP_TRACK_GAIN), "
+          f"JOG_QDOT_MAX={JOG_QDOT_MAX:.3g} rad/s (TELEOP_QDOT_MAX)")
     # Debug/control experiment: TELE_AUTO_JOG=1 makes teleop's GRASP phase use the
     # AUTONOMOUS carry path — the arrow-key jog (world-frame palm velocity, orientation
     # held) instead of DexPilot wrist tracking. Everything upstream (recommender grasp,
