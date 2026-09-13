@@ -198,9 +198,10 @@ class DexPilotController:
 
         --output-ema off forces 1.0 (no smoothing). Otherwise, for the DexPilot
         retargeter the value is its hot-reloadable HAND_ALPHA (a method knob in
-        retarget_config.json), so edits apply without a restart. AnyTeleop applies its
-        OWN output_alpha inside its wrapper, so we don't smooth again here (use the
-        constructor _hand_alpha, which the app leaves at 1.0 for anyteleop)."""
+        retarget_config.json), so edits apply without a restart. AnyTeleop keeps the
+        constructor _hand_alpha (the app passes the same 0.4 it always did) — its own
+        output_alpha defaults to a no-op, so this controller-side EMA is AnyTeleop's
+        only finger smoothing and must stay on."""
         if not self._output_ema:
             return 1.0
         if isinstance(self._retarg, DexPilotRetargeter):

@@ -2701,14 +2701,13 @@ if __name__ == "__main__":
         # smoothing: it never touches the physics, so it can't cause the singularity reset.
         # (Lower to 0.3 for an even softer close if the shove persists; raise toward 0.6 if the
         # fingers feel laggy to close.)
-        # Finger-output EMA. For DexPilot the value now lives in retarget_config.json
-        # (HAND_ALPHA, method-specific + hot-reloadable) and the controller reads it live,
-        # so the constructor arg here is only the fallback + the AnyTeleop path's value.
-        # AnyTeleop applies its OWN output_alpha internally, so pass 1.0 for it to avoid
-        # double-smoothing; DexPilot's arg (0.4 kinematic fallback) is superseded by the
-        # config's HAND_ALPHA under --physics.
-        _dp_hand_alpha = (1.0 if _RETARGETER != 'dexpilot'
-                          else (0.4 if args.physics else 0.3))
+        # Finger-output EMA (controller-side smoothing on the 16 hand joints). For DexPilot
+        # the value now ALSO lives in retarget_config.json (HAND_ALPHA, method-specific +
+        # hot-reloadable), read live by the controller. AnyTeleop keeps this controller-side
+        # EMA too (its own output_alpha defaults to 1.0 = no-op, so THIS is its only finger
+        # smoothing — removing it made the curl jittery). Same 0.4/0.3 value both paths had
+        # before the consolidation, so behaviour is unchanged; only DexPilot's is now tunable.
+        _dp_hand_alpha = 0.4 if args.physics else 0.3
         _cam_kwargs.setdefault("alpha", _dp_arm_alpha)
         _dexpilot_ctrl = DexPilotController(model, q_bias=_Q_BIAS_DP,
             debug=_retarg_debug, eps=0.03, hand_tracking=_hand_tracking,
