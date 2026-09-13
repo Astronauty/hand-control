@@ -648,3 +648,57 @@ and `beta` alone — with `w_ik = 0`, `w_align = 0` — supplies no term that pr
 contacts from a same-side start. FRoGGeR's own sampler addresses this by aligning the palm
 with the object's OBB axes and setting the fingertip span from the bounding box, which this
 benchmark has not implemented (§5, phase 2 note). That is the next thing to build.
+
+
+---
+
+## 11. Sampler wired; the frogger arm is still blocked (2026-09-13)
+
+`frogger_bench` now seeds the frogger arm from the OBB sampler
+(`simulation/obb_sampler.py`, their App. B-C) rather than from HOME, via
+`_frogger_seed`. `ours` keeps HOME, which is what the tabletop benchmark has always
+characterized. Seed provenance is recorded per row (`seed_source`, `seed_draw`,
+`seed_seg_dist_mm`, `seed_straddles`).
+
+### 11.1 The sampler works; it was not the blocker
+
+The seed is good. On `017_orange` seed 0 the accepted draw straddles the object with
+a fingertip-segment distance of **0.27 mm**, and the sampler straddles on 60-100% of
+reachable draws across four objects. But the solve still returns `l_bar* = -0.0`.
+
+Isolated with that seed held fixed:
+
+| configuration | `beta` |
+|---|---|
+| embedded LP, no (7e) | +0.0549 |
+| bilevel LP, no (7e) | +0.0407 |
+| embedded LP + (7e) | +0.0198 |
+| **bilevel LP + (7e)** | **-0.0000** |
+
+Identical ordering to the HOME-seeded run in §10.2, so the seed was never the cause.
+Each component degrades `beta` independently and the combination zeroes it.
+
+### 11.2 What is ruled out
+
+- **The seed** (§11.1, straddling at 0.27 mm).
+- **The hard floor.** `beta = -0.00000` is identical at `k_l` = 0.3, 0.1 and **0.0**,
+  and at margins -0.002 and -0.0005. A constraint that is off cannot be the binding
+  one.
+- **The LP callback.** Embedded in a standalone `Opti` problem it solves correctly
+  (12 evaluations, `beta = 0.046154` recovered), and against finite differences its
+  gradient matches to ~1e-11 away from degenerate vertices.
+- **Iteration budget** (unchanged at `max_iter = 400`) and **contact count**
+  (n=2 pairs behave as n=3).
+
+### 11.3 What that leaves
+
+The composition inside `_run_stage`, not any single component: most likely the
+interaction between the FK-contact parameterization and (7e)'s negative clearance.
+With `frogger_fk_contacts` the contacts ARE the fingertips, and (7e) simultaneously
+permits those same fingertips to penetrate the object, so the surface equality (7d)
+and the clearance constraint now act on the same geometry in opposite directions.
+That is a real modelling question in their formulation as ported here, not a bug in
+one of the pieces, and it is where the next session should start.
+
+**`--arms frogger` remains unsuitable for reported numbers.** The `ours` arm is
+unaffected throughout.

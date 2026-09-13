@@ -54,6 +54,9 @@ from simulation.grasp_config_builder import (                 # noqa: E402
     for_frogger, for_gws_recommender, load_seed_config, parse_fingers)
 from simulation.grasp_planner_3d import (                     # noqa: E402
     MultiStartGraspPlanner3D, _contact_friction)
+from simulation.obb_sampler import (                          # noqa: E402
+    object_obb, palm_frame_for_preshape, sample_palm_pose, solve_palm_ik,
+    solve_preshape)
 
 ARMS = ("ours", "frogger")
 
@@ -98,6 +101,78 @@ def _build_cfg(arm, object_id, body_name, rgeoms, obj_geom0, *,
                                **common, **cfg_kw)
 
 
+def _frogger_seed(model, data, info, body_name, q_home, roles, seed,
+                  n_draws=40, palm_tol_mm=20.0):
+    """q0 from FRoGGeR's heuristic sampler (their steps 1-5).
+
+    Draws palm poses until one is REACHABLE -- the arm cannot achieve every sampled
+    orientation, and their step 5 solves IK per draw for the same reason. Measured
+    acceptance on this arm is 10-30%, so `n_draws` is sized well above that.
+
+    Ranked by whether the fingertip segment passes through the object, which is the
+    property the seed exists to supply; the first straddling draw wins, and the
+    closest non-straddling one is the fallback. Returns (q0, info_dict).
+    """
+    import mujoco as mj
+    from kinova_common.constants import FINGER_TIP_SITES
+
+    bid = info[body_name]["bid"]
+    mj.mj_forward(model, data)
+    V = TS.hull_vertices(model, body_name)
+    obb = object_obb(V, data.xmat[bid].reshape(3, 3), data.xpos[bid])
+    c, _, h = obb
+    R_obj = float(np.mean(h))
+    pb = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "leap_palm")
+    n_robot = len(q_home)
+    pair = tuple(roles[:2])
+    sids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, FINGER_TIP_SITES[r])
+            for r in pair]
+
+    def _seg_dist(p, a, b):
+        ab = b - a
+        t = float(np.clip(np.dot(p - a, ab) / max(np.dot(ab, ab), 1e-12), 0.0, 1.0))
+        return float(np.linalg.norm(p - (a + t * ab)))
+
+    best = (float("inf"), None, None)
+    d_chk = mj.MjData(model)
+    for k in range(int(n_draws)):
+        rng = np.random.default_rng(int(seed) * 10007 + k)
+        try:
+            s0 = sample_palm_pose(V, rng, obb=obb, min_height_axis=(0, 0, 1),
+                                  hand_frame=palm_frame_for_preshape(
+                                      model, q_home, roles=pair))
+            qp = solve_preshape(model, q_home, s0["width"], roles=pair)
+            s = sample_palm_pose(V, np.random.default_rng(int(seed) * 10007 + k),
+                                 obb=obb, min_height_axis=(0, 0, 1),
+                                 hand_frame=palm_frame_for_preshape(
+                                     model, qp, roles=pair))
+            q = solve_palm_ik(model, data, pb, s["R_WP"], s["p_WP"], qp,
+                              n_robot, iters=600, step=0.9)
+        except Exception:
+            continue
+        if q is None:
+            continue
+        q = np.asarray(q, float)
+        q[7:] = qp[7:]                     # keep the preshape the palm was aimed for
+        d_chk.qpos[:] = data.qpos[:]
+        d_chk.qpos[:n_robot] = q
+        mj.mj_forward(model, d_chk)
+        if 1e3 * np.linalg.norm(d_chk.xpos[pb] - s["p_WP"]) > palm_tol_mm:
+            continue                       # palm pose not reachable
+        tips = [d_chk.site_xpos[i].copy() for i in sids]
+        sd = _seg_dist(c, tips[0], tips[1])
+        if sd < best[0]:
+            best = (sd, q.copy(), k)
+        if sd < R_obj:                     # straddles the object; take it
+            break
+    sd, q0, k = best
+    if q0 is None:
+        return np.asarray(q_home, float), {"seed_source": "home_fallback"}
+    return q0, {"seed_source": "obb_sampler", "seed_draw": k,
+                "seed_seg_dist_mm": 1e3 * sd,
+                "seed_straddles": bool(sd < R_obj)}
+
+
 def plan_one(arm, object_id, seed, *, n_seeds=3, max_iter=80, fingers=None,
              k_l=0.3, sdf_normals=True):
     """Plan (not execute) one grasp with one arm, and score it."""
@@ -114,14 +189,29 @@ def plan_one(arm, object_id, seed, *, n_seeds=3, max_iter=80, fingers=None,
                      n_seeds=n_seeds, max_iter=max_iter, fingers=fingers,
                      k_l=k_l, sdf_normals=sdf_normals)
 
+    # SEED. The frogger arm starts from FRoGGeR's own heuristic sampler (their
+    # App. B-C), not from HOME. This is not a convenience: (7a) is `max l*(q)` with
+    # no alignment or IK term, so nothing in their objective prefers opposed
+    # contacts -- that preference lives entirely in the seed, which is why they
+    # describe the sampler as part of the method. Measured without it, the solve
+    # returned all three contacts on one side (normal dots +0.914/+0.966/+0.931).
+    #
+    # `ours` keeps HOME, which is what the tabletop benchmark has always
+    # characterized and what its numbers are comparable to.
+    q0 = np.asarray(q_home, float)
+    seed_info = {}
+    if arm == "frogger":
+        q0, seed_info = _frogger_seed(model, data, info, body_name, q0,
+                                      fingers or ["thumb", "index"], seed)
+
     planner = MultiStartGraspPlanner3D(model, data, cfg, seed=seed)
     t0 = time.time()
-    res = planner.solve(np.asarray(q_home, float), np.asarray(pos, float),
-                        max_seeds=n_seeds)
+    res = planner.solve(q0, np.asarray(pos, float), max_seeds=n_seeds)
     t_solve = time.time() - t0
 
     row = dict(arm=arm, object=object_id, seed=seed, t_solve_s=t_solve,
-               status=res.get("status"), return_status=res.get("return_status"))
+               status=res.get("status"), return_status=res.get("return_status"),
+               **seed_info)
     ctx = dict(model=model, data=data, res=res, pos=np.asarray(pos, float))
     if res.get("p1") is None:
         row["plan_failed"] = True
