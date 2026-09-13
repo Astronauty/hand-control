@@ -462,6 +462,142 @@ def solve_preshape(model, q, target_sep_m, roles=("thumb", "index"),
     return best if best is not None else q
 
 
+def solve_preshape_tripod(model, q, target_radius_m, roles=("thumb", "index", "middle"),
+                          iters=80, tol=5e-4):
+    """Preshape THREE fingers so their fingertips cradle a sphere of the given radius.
+
+    `solve_preshape` sets a thumb-to-one-finger SEPARATION, which is the right target
+    for a pinch and the wrong one for a tripod: two tips can be the correct distance
+    apart while the third sits far outside, and the surface constraint then has no
+    solution. Measured on 017_orange from a two-finger seed, the middle finger's
+    contact point lands 41 mm off the surface, and flexing that finger alone only
+    recovers 41 -> 34 mm -- it cannot reach, because the PALM was never placed for it.
+
+    The target here is the CIRCUMRADIUS of the triangle the three fingertips form,
+    which is the radius of the object they can cradle. Measured in the palm frame at
+    a 70 mm thumb-index span the tips give sides 71/57/102 mm and a circumradius of
+    53 mm, against an orange of 36 mm -- i.e. the default posture is far too open,
+    which is what the third contact needs closed.
+
+    Solved by bisection on the same scalar closure parameter `solve_preshape` uses,
+    extended over all three fingers' flexion joints. Monotone over the useful range:
+    more flexion draws every tip inward and shrinks the circumradius.
+
+    Returns a new q (copy); on failure returns the input unchanged.
+    """
+    import mujoco as mj
+    from kinova_common.constants import FINGER_TIP_SITES
+
+    q = np.asarray(q, float).copy()
+    try:
+        sids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, FINGER_TIP_SITES[r])
+                for r in roles[:3]]
+        if any(s < 0 for s in sids):
+            return q
+        flex = []
+        for r in roles[:3]:
+            j4 = FINGER_QPOS[r]
+            flex += [j4[0], j4[2]]
+    except Exception:
+        return q
+
+    lim = {}
+    for adr in flex:
+        j = next((jj for jj in range(model.njnt)
+                  if model.jnt_qposadr[jj] == adr), None)
+        if j is None:
+            return q
+        lim[adr] = (float(model.jnt_range[j, 0]), float(model.jnt_range[j, 1]))
+
+    d = mj.MjData(model)
+
+    def circumradius_at(u):
+        qq = q.copy()
+        for adr in flex:
+            lo, hi = lim[adr]
+            qq[adr] = lo + float(np.clip(u, 0.0, 1.0)) * (hi - lo)
+        d.qpos[:] = 0.0
+        d.qpos[:len(qq)] = qq
+        mj.mj_kinematics(model, d)
+        P = [d.site_xpos[s].copy() for s in sids]
+        a = np.linalg.norm(P[0] - P[1])
+        b = np.linalg.norm(P[1] - P[2])
+        c = np.linalg.norm(P[2] - P[0])
+        sp = 0.5 * (a + b + c)
+        area = np.sqrt(max(sp * (sp - a) * (sp - b) * (sp - c), 1e-18))
+        return float(a * b * c / (4.0 * max(area, 1e-9))), qq
+
+    target = float(target_radius_m)
+    r_lo, _ = circumradius_at(0.0)     # extended  -> large circumradius
+    r_hi, _ = circumradius_at(1.0)     # flexed    -> small
+    if not (min(r_lo, r_hi) - 1e-6 <= target <= max(r_lo, r_hi) + 1e-6):
+        _, qq = circumradius_at(0.0 if abs(r_lo - target) < abs(r_hi - target) else 1.0)
+        return qq
+    u_lo, u_hi, best = 0.0, 1.0, None
+    for _ in range(int(iters)):
+        u = 0.5 * (u_lo + u_hi)
+        r, qq = circumradius_at(u)
+        best = qq
+        if abs(r - target) < tol:
+            break
+        if r > target:
+            u_lo = u
+        else:
+            u_hi = u
+    return best if best is not None else q
+
+
+def tripod_frame_for_preshape(model, q, roles=("thumb", "index", "middle"),
+                              palm_body="leap_palm"):
+    """Grasp frame for a THREE-finger preshape, in the PALM frame.
+
+    Returns (sep_hat, centroid, out_hat) with the same meaning
+    `palm_frame_for_preshape` gives them, so `sample_palm_pose` consumes either
+    without change:
+      sep_hat   the widest tip-to-tip direction, which is what the OBB axis should
+                align with -- for three contacts there is no single closing
+                direction, and the longest side is the one the box edge must span.
+      centroid  the three tips' centroid, i.e. where the object should sit. Replaces
+                the pinch midpoint as the point the standoff references.
+      out_hat   palm origin toward that centroid, orthogonalized against sep_hat.
+    """
+    import mujoco as mj
+    from kinova_common.constants import FINGER_TIP_SITES
+    pb = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, palm_body)
+    if pb < 0:
+        return None
+    d = mj.MjData(model)
+    d.qpos[:] = 0.0
+    q = np.asarray(q, float)
+    d.qpos[:len(q)] = q
+    mj.mj_kinematics(model, d)
+    P = d.xpos[pb].copy()
+    R = d.xmat[pb].reshape(3, 3).copy()
+    tips = []
+    for r in roles[:3]:
+        sid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, FINGER_TIP_SITES[r])
+        if sid < 0:
+            return None
+        tips.append(R.T @ (d.site_xpos[sid] - P))
+    pairs = [(0, 1), (1, 2), (2, 0)]
+    i, j = max(pairs, key=lambda ij: np.linalg.norm(tips[ij[0]] - tips[ij[1]]))
+    sep = tips[i] - tips[j]
+    n = np.linalg.norm(sep)
+    if n < 1e-9:
+        return None
+    sep /= n
+    cen = sum(tips) / 3.0
+    out = cen - cen.dot(sep) * sep
+    n_out = np.linalg.norm(out)
+    if n_out < 1e-9:
+        tmp = np.array([1.0, 0.0, 0.0])
+        if abs(tmp.dot(sep)) > 0.9:
+            tmp = np.array([0.0, 1.0, 0.0])
+        out = tmp - tmp.dot(sep) * sep
+        n_out = np.linalg.norm(out)
+    return sep, cen, out / n_out
+
+
 def palm_frame_for_preshape(model, q, roles=("thumb", "index"),
                             palm_body="leap_palm"):
     """The hand's own grasp frame at posture q, expressed in the PALM frame.

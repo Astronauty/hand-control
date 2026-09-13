@@ -56,7 +56,7 @@ from simulation.grasp_planner_3d import (                     # noqa: E402
     MultiStartGraspPlanner3D, _contact_friction)
 from simulation.obb_sampler import (                          # noqa: E402
     object_obb, palm_frame_for_preshape, sample_palm_pose, solve_palm_ik,
-    solve_preshape)
+    solve_preshape, solve_preshape_tripod, tripod_frame_for_preshape)
 
 ARMS = ("ours", "frogger")
 
@@ -128,24 +128,51 @@ def _frogger_seed(model, data, info, body_name, q_home, roles, seed,
     sids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, FINGER_TIP_SITES[r])
             for r in pair]
 
+    n_c = min(len(roles), 3)
+    tri = n_c >= 3
+    if tri:
+        sids3 = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, FINGER_TIP_SITES[r])
+                 for r in roles[:3]]
+
     def _seg_dist(p, a, b):
         ab = b - a
         t = float(np.clip(np.dot(p - a, ab) / max(np.dot(ab, ab), 1e-12), 0.0, 1.0))
         return float(np.linalg.norm(p - (a + t * ab)))
+
+    def _tripod_err(tips):
+        """How far the three tips are from cradling the object: distance from the
+        object centre to the tips' centroid. The two-finger metric (distance to the
+        tip-tip segment) does not generalize -- three tips have three segments and
+        a grasp can straddle one while the third finger is nowhere near."""
+        return float(np.linalg.norm(c - sum(tips) / 3.0))
 
     best = (float("inf"), None, None)
     d_chk = mj.MjData(model)
     for k in range(int(n_draws)):
         rng = np.random.default_rng(int(seed) * 10007 + k)
         try:
-            s0 = sample_palm_pose(V, rng, obb=obb, min_height_axis=(0, 0, 1),
-                                  hand_frame=palm_frame_for_preshape(
-                                      model, q_home, roles=pair))
-            qp = solve_preshape(model, q_home, s0["width"], roles=pair)
+            if tri:
+                # THREE contacts: preshape to cradle a sphere of the object's own
+                # size, and align the palm by the tips' widest side and centroid.
+                # A two-finger separation target leaves the third finger far off the
+                # surface (measured 41 mm on 017_orange), and flexing that one finger
+                # cannot recover it (41 -> 34 mm) because the PALM was never placed
+                # for three contacts.
+                _hf0 = tripod_frame_for_preshape(model, q_home, roles=tuple(roles[:3]))
+                s0 = sample_palm_pose(V, rng, obb=obb, min_height_axis=(0, 0, 1),
+                                      hand_frame=_hf0)
+                qp = solve_preshape_tripod(model, q_home, R_obj,
+                                           roles=tuple(roles[:3]))
+                _hf = tripod_frame_for_preshape(model, qp, roles=tuple(roles[:3]))
+            else:
+                s0 = sample_palm_pose(V, rng, obb=obb, min_height_axis=(0, 0, 1),
+                                      hand_frame=palm_frame_for_preshape(
+                                          model, q_home, roles=pair))
+                qp = solve_preshape(model, q_home, s0["width"], roles=pair)
+                _hf = palm_frame_for_preshape(model, qp, roles=pair)
             s = sample_palm_pose(V, np.random.default_rng(int(seed) * 10007 + k),
                                  obb=obb, min_height_axis=(0, 0, 1),
-                                 hand_frame=palm_frame_for_preshape(
-                                     model, qp, roles=pair))
+                                 hand_frame=_hf)
             q = solve_palm_ik(model, data, pb, s["R_WP"], s["p_WP"], qp,
                               n_robot, iters=600, step=0.9)
         except Exception:
@@ -159,8 +186,12 @@ def _frogger_seed(model, data, info, body_name, q_home, roles, seed,
         mj.mj_forward(model, d_chk)
         if 1e3 * np.linalg.norm(d_chk.xpos[pb] - s["p_WP"]) > palm_tol_mm:
             continue                       # palm pose not reachable
-        tips = [d_chk.site_xpos[i].copy() for i in sids]
-        sd = _seg_dist(c, tips[0], tips[1])
+        if tri:
+            tips3 = [d_chk.site_xpos[i].copy() for i in sids3]
+            sd = _tripod_err(tips3)
+        else:
+            tips = [d_chk.site_xpos[i].copy() for i in sids]
+            sd = _seg_dist(c, tips[0], tips[1])
         if sd < best[0]:
             best = (sd, q.copy(), k)
         if sd < R_obj:                     # straddles the object; take it
