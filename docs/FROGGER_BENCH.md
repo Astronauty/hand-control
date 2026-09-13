@@ -471,6 +471,48 @@ structure, robustness floor, contact parameterization and normal source.
 `l_bar* = n_cols * beta` (ceiling 1.0). `l_bar_converged` is the same LP re-solved to
 optimality on the same `W`. `lp_gap = l_bar_converged - l_bar` in normalized units.
 
+### 9.0 RETRACTION: the §9.2 numbers do not describe reachable grasps
+
+**The `l_bar*` comparison in §9.2 is invalid as published and is retracted.** Found by
+rendering the planned pose (`seed<N>_planned.png`), which is why the artifact work
+mattered: the scored table alone did not reveal it.
+
+`for_frogger` zeroes every cost term except `beta` and a small `w_reg`, including
+**`w_ik = 0.0`**. `w_ik` is the term tying each FINGERTIP to its assigned CONTACT POINT.
+With it at zero, nothing in the NLP connects the hand to the contacts, so the optimizer
+places contacts that maximize `beta` on the object while the arm stays wherever `w_reg`
+leaves it.
+
+Measured on `017_orange` seed 0, tripod, fingertip-to-assigned-contact distance:
+
+| arm | thumb | index | middle | reported `l_bar*` |
+|---|---|---|---|---|
+| ours | 19.1 mm | 17.4 mm | 20.6 mm | +0.5877 |
+| frogger | **1211.5 mm** | **1314.7 mm** | **1259.4 mm** | +0.9993 |
+
+The contacts themselves are well placed (verified on the object surface, 62-119 mm
+apart). The grasp is simply not one any hand is performing: the render shows the hand out
+of frame entirely while `beta` reports near-perfect closure.
+
+So `l_bar* ~ 1.0` for the frogger arm measures *contact placement in isolation*, not a
+grasp. It is unsurprising that an unconstrained-by-kinematics contact optimizer beats one
+that must also satisfy reachability; that is not the comparison this benchmark intends.
+
+**Why the error was possible.** FRoGGeR does not need an IK cost term because its
+constraint (7d) is `s(FK_i(q)) = 0` — the fingertip FORWARD KINEMATICS are what lie on
+the surface, so reachability is structural. Our NLP instead carries contact positions as
+independent variables and *couples* them to the hand through `w_ik`. Dropping `w_ik` to
+mimic "beta as the sole objective" removed that coupling, which their formulation never
+had to state as a cost because it is built into their variables.
+
+**The fix** is to make the frogger arm's contacts be fingertip FK, as in (7d), rather
+than free variables plus a surface equality. Until then, treat every frogger-arm `l_bar*`
+in this document as an upper bound on an unreachable configuration.
+
+Unaffected by this: §8 in full (it concerns `beta` computed at contacts from a single
+solver configuration, with no cross-arm claim), and the `lp_gap`/`resid_Walpha`
+observations below, which are properties of the shared embedding.
+
 ### 9.1 Read `resid_Walpha` before `l_bar*`
 
 The min-weight LP constrains `||W alpha|| = 0`. A solve that exits with that residual
@@ -501,10 +543,11 @@ single largest threat to this table's validity. Report `l_bar_converged` alongsi
 | median `gamma_min` (N) | 1.863 (16) | **1.214** (17) |
 | median solve time | 2.8 s | **2.0 s** |
 
-The FRoGGeR arm reaches a substantially higher min-weight margin, needs ~35% less
-internal force for the same task, and solves ~30% faster. The `l_bar*` gap is robust to
-the §9.1 caveat: it holds on `l_bar_converged` over all rows (+0.9983 vs +0.6871), which
-is the LP-optimal value and therefore immune to the residual problem.
+**Retracted — see §9.0.** The frogger arm's fingertips are ~1.2 m from its own contacts,
+so these `l_bar*` values describe contact placement without reachability, not grasps. The
+solve-time and `gamma_min` columns are affected for the same reason: an arm that need not
+reach its contacts has a smaller problem to solve. Retained only as a record of what was
+run.
 
 ### 9.3 The parameterization matters, and by how much
 

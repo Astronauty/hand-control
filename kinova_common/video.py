@@ -130,3 +130,62 @@ class H264Writer:
         elif self._backend == "mp4v":
             self._writer.release()
         self._backend = None
+
+
+# Default capture geometry. Lives here with the recorder that uses it, so a caller
+# does not import framing constants from a benchmark script.
+VIDEO_FPS = 30
+VIDEO_W, VIDEO_H = 960, 720
+
+
+class VideoRecorder:
+    """Fixed external camera -> MP4, one frame per call to capture(). Uses the
+    same offscreen mj.Renderer + camera convention as ik_demo.render/
+    plot_quadratic_path._render_hand_rgb (not the interactive viewer, which
+    can't be captured this way), so the video's framing matches the repo's
+    existing static renders. The writer encodes BGR; MuJoCo's Renderer returns
+    RGB, hence the channel-swap in capture(). H264Writer emits H.264 rather than
+    cv2's mp4v so the clips preview in browsers and desktop viewers.
+
+    Moved here from benchmarks/ycb_grasp/pick_from_floor.py: it is a general
+    offscreen recorder with no floor-benchmark specifics, it sits beside the
+    H264Writer it wraps, and kinova_common is the module the benchmarks and the
+    live teleop loop already share (see grasp_plots.py). pick_from_floor re-exports
+    it so existing imports keep working.
+
+    mujoco, cv2 and numpy are imported lazily so `kinova_common.video.H264Writer`
+    stays importable in a context with no GL stack.
+    """
+
+    def __init__(self, path, lookat, dist=0.6, azim=135, elev=-55,
+                 w=VIDEO_W, h=VIDEO_H, fps=VIDEO_FPS, groups=(0, 1, 2, 5)):
+        import mujoco as mj
+        self.path = str(path)
+        self.w, self.h = w, h
+        self._writer = H264Writer(self.path, fps, (w, h))
+        self._opt = mj.MjvOption()
+        mj.mjv_defaultOption(self._opt)
+        for g in range(6):
+            self._opt.geomgroup[g] = 1 if g in groups else 0
+        self._cam = mj.MjvCamera()
+        mj.mjv_defaultCamera(self._cam)
+        self._cam.lookat[:] = lookat
+        self._cam.distance, self._cam.azimuth, self._cam.elevation = dist, azim, elev
+        self._renderer = None
+        self._model = None
+
+    def capture(self, model, data):
+        import cv2
+        import mujoco as mj
+        if self._renderer is None or self._model is not model:
+            self._renderer = mj.Renderer(model, self.h, self.w)
+            self._model = model
+        self._renderer.update_scene(data, camera=self._cam, scene_option=self._opt)
+        rgb = self._renderer.render()
+        self._writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+    def close(self):
+        self._writer.release()
+        if self._renderer is not None:
+            del self._renderer
+            self._renderer = None

@@ -46,8 +46,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import mujoco as mj                                          # noqa: E402
 
+from ycb_grasp import out_paths as OP                          # noqa: E402
 from ycb_grasp import table_scene as TS                       # noqa: E402
-from ycb_grasp.ik_demo import clearance_by_geom, robot_geom_names   # noqa: E402
+from ycb_grasp.ik_demo import clearance_by_geom, render, robot_geom_names   # noqa: E402
 from simulation.beta_audit import audit, audit_embedded_lp     # noqa: E402
 from simulation.grasp_config_builder import (                 # noqa: E402
     for_frogger, for_gws_recommender, load_seed_config, parse_fingers)
@@ -113,9 +114,10 @@ def plan_one(arm, object_id, seed, *, n_seeds=3, max_iter=80, fingers=None,
 
     row = dict(arm=arm, object=object_id, seed=seed, t_solve_s=t_solve,
                status=res.get("status"), return_status=res.get("return_status"))
+    ctx = dict(model=model, data=data, res=res, pos=np.asarray(pos, float))
     if res.get("p1") is None:
         row["plan_failed"] = True
-        return row
+        return row, ctx
 
     verify_info = planner._planner.verify(res)
     inner = planner._planner
@@ -154,7 +156,59 @@ def plan_one(arm, object_id, seed, *, n_seeds=3, max_iter=80, fingers=None,
     # Drop the bulky arrays from the persisted row; they are re-derivable.
     for k in ("gws_W", "gws_alpha"):
         row.pop(k, None)
-    return row
+    return row, ctx
+
+
+def write_artifacts(model, data, res, row, out_dir, seed, pos):
+    """Per-solve artifacts for one arm.
+
+    DELIBERATELY NOT `write_grasp_plots`. That figure reconstructs the local
+    paraboloid from the saved `quad_*` frame (kappa0/kappa1/axis0_l/axis1_l/
+    grad_norm) and draws the trust region as a bound -- see
+    plot_grasp_contacts._patch_points. The frogger arm sets
+    use_quadratic_contact=False, so it has no patch, no trust region and no
+    per-stage `quad_*` trace; the function returns None for it. Emitting it for
+    one arm only would also make the two arms' figure sets non-comparable, which
+    is the opposite of what a benchmark artifact is for.
+
+    What IS common to both arms and therefore written here:
+      seed<N>_planned.png   the posed scene at the planned grasp, before any
+                            squeeze moves the object. Same camera for both arms,
+                            so the two are readable side by side.
+      seed<N>.json          the scored row, so a figure can be regenerated or
+                            audited without re-solving.
+
+    Video is NOT written: this harness is plan-only, so there is no motion to
+    record and a clip would be a single held frame. It belongs with the
+    execution path (the paper's shaky-pickup protocol), not here.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    # Pose the robot at the planned grasp. The solve returns only the ACTUATED
+    # joints, so scatter them back by index rather than assuming a contiguous block.
+    if res.get("q") is not None:
+        try:
+            from simulation.grasp_planner_3d import _get_actuated_indices
+            d_p = mj.MjData(model)
+            d_p.qpos[:] = data.qpos[:]
+            for idx, val in zip(_get_actuated_indices(model), res["q"]):
+                d_p.qpos[idx] = val
+            mj.mj_forward(model, d_p)
+            png = out_dir / f"seed{seed}_planned.png"
+            # Framing matches pick_and_place's planned-pose render (far-side
+            # azimuth, so the arm's own links do not occlude the fingers).
+            render(model, d_p, str(png), lookat=pos, dist=0.7, azim=-70, elev=-25)
+            written.append(png)
+        except Exception as e:
+            print(f"[artifacts] planned-pose render failed: {e}")
+    try:
+        js = out_dir / f"seed{seed}.json"
+        js.write_text(json.dumps(row, indent=2, default=str))
+        written.append(js)
+    except Exception as e:
+        print(f"[artifacts] row write failed: {e}")
+    return written
 
 
 def _fmt(v, spec="%+.4f", na="--"):
@@ -181,6 +235,9 @@ def main():
                     help="run the frogger arm on PATCH normals instead of the SDF "
                          "gradient, isolating objective structure from normal source.")
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--no-artifacts", dest="artifacts", action="store_false",
+                    help="skip per-solve renders (the scored table is unaffected)")
+    OP.add_out_args(ap, OP.TABLETOP)
     args = ap.parse_args()
 
     objects = [o for o in args.objects.split(",") if o]
@@ -197,10 +254,18 @@ def main():
             for arm in arms:
                 print(f"\n===== {arm} | {obj} seed {sd} =====", flush=True)
                 try:
-                    r = plan_one(arm, obj, sd, n_seeds=args.n_seeds,
-                                 max_iter=args.max_iter, fingers=fingers,
-                                 k_l=args.k_l,
-                                 sdf_normals=not args.patch_normals)
+                    r, ctx = plan_one(arm, obj, sd, n_seeds=args.n_seeds,
+                                      max_iter=args.max_iter, fingers=fingers,
+                                      k_l=args.k_l,
+                                      sdf_normals=not args.patch_normals)
+                    if args.artifacts:
+                        # out/tabletop/<tag>/<arm>/<object>/ -- the arm level keeps
+                        # the two methods' artifacts from overwriting each other
+                        # while staying inside one run's tree.
+                        od = OP.resolve_out(args, OP.TABLETOP, arm=arm) / obj
+                        for w in write_artifacts(ctx["model"], ctx["data"],
+                                                 ctx["res"], r, od, sd, ctx["pos"]):
+                            print(f"[artifacts] {w}")
                 except Exception as e:
                     import traceback
                     traceback.print_exc()
