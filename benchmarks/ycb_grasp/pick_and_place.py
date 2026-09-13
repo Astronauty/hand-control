@@ -226,7 +226,7 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                    impratio=None, gamma_override=None,
                    squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05,
                    lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS,
-                   contact_profile="stock", fingers=None):
+                   contact_profile="stock", fingers=None, force_execute=False):
     """Plan + execute one grasp on one object, then carry it to the bin."""
     rng = np.random.default_rng(seed)
     t_build = time.time()
@@ -512,6 +512,17 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                               planner._planner._obj_gid, tip_geom_ids,
                               gamma_override)
     result["gamma"] = gamma_live
+    if gamma_live is None and force_execute:
+        # This return is UPSTREAM of the VideoRecorder's construction, so an
+        # infeasible gamma produced no .mp4 at all -- the one failure mode with no
+        # visual record. Substitute a nominal gamma purely so the run reaches the
+        # recorder; the result still carries wrench_infeasible=True.
+        print("[exec] wrench-infeasible contacts but --force-execute set: "
+              "continuing at a NOMINAL gamma (result is still a failure)")
+        result["wrench_infeasible"] = True
+        result["gamma_substituted"] = True
+        gamma_live = 1.0
+        result["gamma"] = gamma_live
     if gamma_live is None:
         # Wrench-infeasible contact geometry: there is no grasp to execute. Report
         # it as a planning outcome rather than squeezing at a fabricated gamma.
@@ -614,9 +625,18 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
         gaps = _tip_gaps_mm(model, data, tip_geom_ids, obj_gid, obj_geom_ids=obj_gids)
         result["tip_gaps_mm"] = dict(zip(_FSET, gaps))
         if any(g > CONTACT_GAP_TOL_M * 1000 for g in gaps):
-            print(f"[exec] ABORT before SQUEEZE — gap too large: {result['tip_gaps_mm']}")
-            result["phase_log"].append("squeeze_aborted_no_contact")
-            return res, result
+            result["gap_check_failed"] = True
+            if not force_execute:
+                print(f"[exec] ABORT before SQUEEZE — gap too large: {result['tip_gaps_mm']}")
+                result["phase_log"].append("squeeze_aborted_no_contact")
+                return res, result
+            # --force-execute: carry on so the recorded video SHOWS the failure
+            # (fingers closing on nothing, object shoved) instead of the clip
+            # ending at the abort with a frozen pre-squeeze pose. The outcome is
+            # still reported as a failure -- see squeeze_forces_N / lift_*.
+            print(f"[exec] gap too large but --force-execute set, continuing: "
+                  f"{result['tip_gaps_mm']}")
+            result["phase_log"].append("gap_check_failed_forced")
         print(f"[exec] gap check OK: {result['tip_gaps_mm']}")
 
         # SQUEEZE: ramp the internal force in.
@@ -852,6 +872,11 @@ def main():
                     help="finger PD multiplier DURING the squeeze ramp. Lower lets the "
                          "internal-force term win against the finger PD; too low and the "
                          "measured force falls short of the commanded gamma.")
+    ap.add_argument("--force-execute", action="store_true",
+                    help="run the squeeze/lift even when the pre-squeeze gap check "
+                         "fails or gamma is infeasible, so the FAILURE is visible in "
+                         "the recorded video instead of the clip ending at the abort. "
+                         "Diagnostic only -- the run is still reported as failed.")
     ap.add_argument("--fingers", default=None,
                     help="comma-separated fingers to grasp with, IN SLOT ORDER, e.g. "
                          "'thumb,middle' or 'thumb,index,middle'. Slot 1 anchors the "
@@ -909,7 +934,7 @@ def main():
     _, result = run_pick_place(
         args.object, args.seed, n_seeds=args.n_seeds, n_relin=args.n_relin,
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
-        fingers=args.fingers,
+        fingers=args.fingers, force_execute=args.force_execute,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
         sdf_err_tol=args.sdf_err_tol, bound_inset=args.bound_inset,
         bound_inset_kappa_ref=args.bound_inset_kappa_ref,
