@@ -37,7 +37,7 @@ import mujoco as mj                                          # noqa: E402
 
 from ycb_grasp import table_scene as TS                       # noqa: E402
 from ycb_grasp.ik_demo import clearance_by_geom, robot_geom_names   # noqa: E402
-from simulation.beta_audit import audit                       # noqa: E402
+from simulation.beta_audit import audit, audit_embedded_lp     # noqa: E402
 from simulation.grasp_config_builder import (                 # noqa: E402
     for_gws_recommender, load_seed_config)
 from simulation.grasp_planner_3d import (                     # noqa: E402
@@ -115,6 +115,8 @@ def plan_one(object_id, seed, n_seeds=3, max_iter=80, fingers=None):
                                       mesh_entry=inner._mesh_entry)
                    for p in a.get("points", [])]
 
+    a.update(audit_embedded_lp(res))
+
     return {
         "object": object_id, "seed": seed,
         "status": res.get("status"),
@@ -155,8 +157,8 @@ def main():
                 r = {"object": obj, "seed": sd, "status": f"ERROR: {e}"}
             rows.append(r)
 
-    hdr = (f"\n{'object':<20}{'sd':>3}{'n':>3}{'beta_rep':>11}{'beta_true':>11}"
-           f"{'delta':>10}{'span_marg':>11}{'gamma_min':>11}{'wf':>6}  !!")
+    hdr = (f"\n{'object':<20}{'sd':>3}{'n':>3}{'beta_rep':>11}{'beta_relp':>11}"
+           f"{'lp_gap':>10}{'|Wa|':>10}{'beta_true':>11}{'delta':>10}{'span_marg':>11}")
     print(hdr)
     print("-" * (len(hdr) + 2))
     n_contra = 0
@@ -166,16 +168,16 @@ def main():
             continue
         br, bt = r.get("beta_reported"), r.get("beta_true")
         dl, sm = r.get("beta_delta"), r.get("span_margin")
-        gm, wf = r.get("gamma_min"), r.get("wrench_feasible")
-        flag = "!!" if r.get("contradiction") else ""
+        rl, lg, rw = r.get("beta_relp"), r.get("lp_gap"), r.get("resid_Walpha")
         n_contra += bool(r.get("contradiction"))
         print(f"{r['object']:<20}{r['seed']:>3}{r['n_contacts']:>3}"
               f"{(f'{br:+.5f}' if br is not None else '--'):>11}"
+              f"{(f'{rl:+.5f}' if rl is not None else '--'):>11}"
+              f"{(f'{lg:+.5f}' if lg is not None else '--'):>10}"
+              f"{(f'{rw:.2e}' if rw is not None else '--'):>10}"
               f"{(f'{bt:+.5f}' if bt is not None else '--'):>11}"
               f"{(f'{dl:+.5f}' if dl is not None else '--'):>10}"
-              f"{(f'{sm:+.4f}' if sm is not None else '--'):>11}"
-              f"{(f'{gm:.3f}' if gm is not None else 'INFEAS'):>11}"
-              f"{str(wf):>6}  {flag}")
+              f"{(f'{sm:+.4f}' if sm is not None else '--'):>11}")
     n_ok = sum(1 for r in rows if "beta_true" in r)
     print(f"\n{n_contra}/{n_ok} solves report beta > 0.01 on geometry that cannot close.")
 

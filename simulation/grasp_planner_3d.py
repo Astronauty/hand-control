@@ -891,7 +891,7 @@ def _seed_third_contact(seed, geom_type, size, center, obj_mat, rng,
                         fan_half_deg=40.0, strategy='tangent',
                         palm_R=None, pitch_m=_MF_PITCH_M, fk_probe=None,
                         prefer_outer=True, patch_frame=None,
-                        patch_offset_m=0.030):
+                        patch_offset_m=0.030, _frac_of_patch=0.8):
     """Candidate THIRD contacts for a tripod grasp (cfg.n_contacts >= 3).
 
     strategy:
@@ -996,7 +996,26 @@ def _seed_third_contact(seed, geom_type, size, center, obj_mat, rng,
             return []
         _lo0, _hi0 = float(patch_frame['t_lo_0']), float(patch_frame['t_hi_0'])
         _lo1, _hi1 = float(patch_frame['t_lo_1']), float(patch_frame['t_hi_1'])
-        _d = float(patch_offset_m)
+        # ADAPT the offset to the patch actually fitted, rather than clamping a
+        # fixed request against it. Clamping pins the contact ON the boundary,
+        # which makes it a near-duplicate wrench column: measured beta = -0.230
+        # on 017_orange when a 30mm request met a ~20mm patch.
+        #
+        # The binding dimension is the SMALLEST of the four half-extents, not the
+        # largest: the offset fans a full circle in (t0,t1), so a candidate at the
+        # bearing of the tightest bound clamps even when the other three are
+        # roomy. Measured min-half-extent at the shipped sdf_err_tol=4mm --
+        # 017_orange 16.2, 014_lemon 11.9, 056_tennis_ball 14.3,
+        # 009_gelatin_box 12.2 mm -- so a fixed 15mm request would clamp on THREE
+        # of those four objects.
+        #
+        # Raising sdf_err_tol to buy room is a bad trade: the surrogate error
+        # tracks it almost linearly (tol 8mm -> max|SDF| 4.8-8.0mm over the patch,
+        # against a fingertip pad extent of ~10.8mm), and over-large patches are
+        # already implicated in the 41-degree paraboloid-vs-true normal deviation
+        # measured on flat faces.
+        _room = min(abs(_lo0), abs(_hi0), abs(_lo1), abs(_hi1))
+        _d = min(float(patch_offset_m), _frac_of_patch * _room)
         # Fan over DIRECTIONS IN PATCH COORDINATES (not world), so the DLS rank
         # has alternatives without any of them leaving the patch.
         for a in np.linspace(0.0, 2.0 * np.pi, max(int(n_fan), 1), endpoint=False):
@@ -1842,7 +1861,9 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
                                center_np, mat_np, mesh_entry: dict,
                                t_bound_max: float = 0.05, sdf_err_tol: float = 5e-4,
                                mesh_fit: bool = False, mesh_fit_radius: float = 0.04,
-                               mesh_fit_quad_gain_min: float = 0.5):
+                               mesh_fit_quad_gain_min: float = 0.5,
+                               bound_inset: float = 0.0,
+                               bound_keep_frac: float = 0.5):
     """Mesh contact as a 2-DOF offset along the two PRINCIPAL CURVATURE AXES at
     the seed, placed on a LOCAL QUADRATIC (paraboloid) surrogate of the
     surface fit from the SDF's own gradient + Hessian -- no per-candidate SDF
@@ -1884,6 +1905,19 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
         along each axis -- the model-validity tolerance _sdf_axis_bound_np
         searches for. Independent of t_bound_max, which is only a hard cap
         for directions where the surface stays flat well past a useful range.
+    bound_inset : constant amount (metres) removed from EVERY side of the
+        bound rectangle, applied LAST (after both the per-axis SDF searches and
+        the patch-wide shrink -- see the inline comment for why the order
+        matters). The SDF-error criterion alone lets a contact sit arbitrarily
+        close to a sharp edge, because "the paraboloid still matches the
+        surface" stays true right up to the crease. Applies ONLY to a planar
+        axis (kappa == 0); a curved one is already self-limiting. 0.0 = off
+        (pure SDF-error bounds).
+    bound_keep_frac : fraction of each SIDE the inset may never consume, so a
+        patch always keeps usable room (0.5 = a side can lose at most half).
+        Guards the case where bound_inset exceeds the measured room and would
+        otherwise freeze that axis at its seed. 1.0 disables the inset entirely;
+        0.0 lets it take the whole side (the old unbounded behaviour).
     """
     t1, t2 = _tangent_basis_np(seed_normal_out)
     seed_l = mat_np.T @ (np.asarray(seed_world, float) - np.asarray(center_np, float))
@@ -1958,6 +1992,13 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     t_lo_1 = -_sdf_axis_bound_np(mesh_entry, seed_l, -axis1_l, t_bound_max, tol=sdf_err_tol)
     t_hi_1 = _sdf_axis_bound_np(mesh_entry, seed_l, axis1_l, t_bound_max, tol=sdf_err_tol)
 
+    # Raw, pre-inset bounds. Kept because the edge-margin cost in _run_stage
+    # distinguishes "the search found a real surface boundary" from "the search
+    # ran the whole way and hit the t_bound_max cap" by comparing the bound
+    # against that cap -- a test the inset below would silently break, since an
+    # inset flat axis lands at t_bound_max - inset and no longer matches.
+    _raw = (t_lo_0, t_hi_0, t_lo_1, t_hi_1)
+
     # PATCH-WIDE shrink. The four searches above each walk ONE axis, so they
     # bound the error along the rectangle's two centre-lines and say nothing
     # about its interior or corners -- and the corner is where a paraboloid
@@ -1985,6 +2026,143 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
         mesh_entry, seed_l, axis0_l, axis1_l, n_l_unit,
         kappa0, kappa1, grad_norm, (t_lo_0, t_hi_0, t_lo_1, t_hi_1),
         tol=sdf_err_tol)
+
+    # CONSTANT INSET on every side, applied LAST.
+    #
+    # WHY IT IS NEEDED. The SDF-error criterion above measures the wrong thing
+    # near a SHARP EDGE. It asks "does the paraboloid still agree with the true
+    # surface here", and on a box face the answer stays yes right up to the
+    # crease: the face is planar, the planar surrogate tracks it exactly, and
+    # _sdf_axis_bound_np only starts reporting divergence once the offset has
+    # walked PAST the edge onto the adjacent face. So the measured bound lands
+    # essentially ON the edge, and the optimizer -- which has every incentive to
+    # widen the grasp -- is free to park a contact arbitrarily close to it,
+    # where the friction cone falls off the face and the pinch slips. This is
+    # the same failure the BOX path already guards with
+    # CollisionConfig.edge_margin_m; the quadratic path had no equivalent
+    # because its bounds are MEASURED rather than derived from known face
+    # extents. Measured on 036_wood_block, a seed 3mm from a vertical edge: the
+    # +axis0 bound comes back at 6.25mm with 0.0 inset, i.e. the contact may sit
+    # 6mm past the seed and straight onto the crease.
+    #
+    # CONSTANT, not fractional: what is being reserved is a strip of physical
+    # surface between the contact and the crease, whose required width is set by
+    # the fingertip patch and friction cone, not by how large the surrounding
+    # face happens to be. A fraction would reserve centimetres on a big face and
+    # microns on a small one -- backwards, since the small face is where falling
+    # off matters most.
+    #
+    # WHY AFTER THE SHRINK, not before. _shrink_patch_to_tol scales the whole
+    # rectangle by a single factor found by bisection, so insetting first lets
+    # the shrink UNDO the inset: a smaller tight side means less corner error,
+    # which lets the bisection accept a larger scale, which re-expands the loose
+    # sides past their own measured limits. Measured on the same block seed,
+    # inset-then-shrink took -axis0 from -37.6mm to -65.8mm -- 28mm of bound the
+    # SDF search never validated, the exact opposite of the intent. Applying the
+    # inset last makes it monotone by construction: every side can only move
+    # inward, so the inset rectangle is a strict subset of a rectangle already
+    # verified within sdf_err_tol (and _shrink_patch_to_tol's own argument
+    # applies -- a subset's max error cannot exceed its superset's).
+    #
+    # Clamped so a side can be driven to 0 but never inverted: an axis whose
+    # validated room is already below the inset collapses to a point, which is
+    # the correct answer (there is no safe room there), and _quad_pinned's
+    # near-zero-bound guard already handles a degenerate axis without declaring
+    # it pinned forever.
+    # PER-AXIS PLANAR GATE. The inset applies to a PLANAR axis and to nothing
+    # else -- a quadratic patch gets no inset at all.
+    #
+    # The two cases are physically distinct even though both can report the same
+    # max|SDF| at their bound:
+    #   PLANAR (kappa == 0): the surrogate is a PLANE and is exact on the face,
+    #     so the only way error accumulates is the offset walking off this face
+    #     onto an adjacent one. The bound IS the face's edge -- a real cliff that
+    #     the representation is BLIND to, since a plane tracks a flat face
+    #     perfectly right up to the crease. Nothing in the surrogate shrinks the
+    #     patch, so the reserve has to be added by hand. This is the whole reason
+    #     bound_inset exists.
+    #   CURVED (kappa != 0): the paraboloid BENDS with the surface, and the
+    #     SDF-error search shrinks the patch on its own exactly where the fit
+    #     degrades -- including at a crease, where curvature runs away and the
+    #     axis collapses without help (measured on a near-edge 036_wood_block
+    #     seed, kappa +344: the axis was already limited to [-6.15,+6.34]mm
+    #     BEFORE any inset). A quadratic patch is self-limiting, so insetting it
+    #     removes usable surface to guard a cliff the model has already handled.
+    #
+    # BINARY, not a smooth falloff in kappa. An earlier version scaled the inset
+    # by 1/(1 + |kappa|/kappa_ref), which still shaved ~1mm off genuinely curved
+    # patches (measured on 014_lemon: 1.01mm and 0.70mm on axes of kappa 24.7 and
+    # 37.7) -- a small tax on exactly the case that needs no reserve, plus a
+    # kappa_ref constant to justify. The binary form needs NO new threshold at
+    # all: _mesh_local_surface_fit_np's model-selection test already decides
+    # planar-vs-curved and returns kappa EXACTLY 0.0 when a quadratic fails to
+    # beat a plane by quad_gain_min in RMS residual. Reusing that decision keeps
+    # one classifier in the code instead of two that can disagree.
+    #
+    # PER-AXIS because kappa0 and kappa1 are independent: on a CYLINDER (a can,
+    # a bottle) the axial direction is planar and runs to a real rim, while the
+    # hoop direction is curved with no edge at all. One shared factor would
+    # either strand the rim unprotected or shrink the hoop axis for nothing.
+    # KEEP-FRACTION FLOOR. bound_inset is a constant, so on a side with less room
+    # than the inset it takes everything and freezes that axis (measured 6 of 40
+    # patches on 036_wood_block at a 10mm inset). bound_keep_frac caps how much
+    # of any one side the inset may consume, guaranteeing a usable patch:
+    # 1 - keep_frac is the most that can ever be removed.
+    #
+    # A FLOOR ON THE RESULT, not a percentage reserve. Sizing the reserve itself
+    # as a fraction of the measured room inverts the safety argument: the amount
+    # of surface a fingertip needs between it and a crease is set by the pad and
+    # the friction cone, not by how big the face happens to be. Measured over 136
+    # planar sides on 036_wood_block, a 25% reserve gives 24.6mm on the roomiest
+    # side (far more than any pad needs) but only 0.68mm on the tightest -- and
+    # the tightest side is a seed nearly ON the crease, precisely where the full
+    # reserve matters most. So the constant stays the target and the fraction only
+    # bounds what it may take, which is the combination that is conservative at
+    # both ends.
+    if bound_inset > 0.0:
+        _keep = min(max(float(bound_keep_frac), 0.0), 1.0)
+
+        def _inset_for(kappa: float, lo: float, hi: float) -> float:
+            # CURVED axis: no inset at all. The paraboloid bends with the surface
+            # and the SDF-error search already shrank it where the fit degrades.
+            if float(kappa) != 0.0:
+                return 0.0
+            # PLANAR axis: the constant, capped so each side keeps _keep of itself.
+            # Capped per-SIDE (the tighter of the two) rather than on the total
+            # width, so the asymmetry the four searches measured is preserved --
+            # a side with 4mm of room cannot be handed the same absolute cut as
+            # the 90mm side opposite it.
+            _room = min(abs(lo), abs(hi))
+            return min(bound_inset, (1.0 - _keep) * _room) if _room > 0.0 else 0.0
+
+        _in0 = _inset_for(kappa0, t_lo_0, t_hi_0)
+        _in1 = _inset_for(kappa1, t_lo_1, t_hi_1)
+        t_lo_0 = min(t_lo_0 + _in0, 0.0)
+        t_hi_0 = max(t_hi_0 - _in0, 0.0)
+        t_lo_1 = min(t_lo_1 + _in1, 0.0)
+        t_hi_1 = max(t_hi_1 - _in1, 0.0)
+        # WARN when an axis still collapsed. With bound_keep_frac < 1 this should
+        # be unreachable for a planar axis -- the cap leaves keep_frac of each
+        # side -- so reaching it means the axis had essentially NO measured room
+        # to begin with (the SDF search itself returned ~0, i.e. the seed is
+        # sitting on a crease) rather than the inset having been too greedy.
+        # Kept as a genuine anomaly signal, not an expected tuning message.
+        #
+        # Note this can never make the NLP infeasible: the clamps keep
+        # lo <= 0 <= hi, so the seed's own t=(0,0) stays inside the box and
+        # set_initial(zeros) is always a valid start (verified at an absurd 50mm
+        # inset, 0 of 40 patches excluded the seed). A zero-width axis means the
+        # contact is FROZEN at its seed along that direction, and it degrades
+        # SILENTLY -- _quad_pinned deliberately skips near-zero bounds (its
+        # _bound_eps guard), so the Picard loop will not relinearize and the
+        # stage looks like an ordinary converged solve.
+        if (t_hi_0 - t_lo_0) <= 0.0 or (t_hi_1 - t_lo_1) <= 0.0:
+            log.warning(
+                "quadratic patch: an axis has zero width after bound_inset=%.1fmm "
+                "with keep_frac=%.2f (t0 %.2fmm, t1 %.2fmm) -- that contact is frozen "
+                "at its seed along it. Expect this only for a seed already on a crease.",
+                bound_inset * 1e3, _keep,
+                (t_hi_0 - t_lo_0) * 1e3, (t_hi_1 - t_lo_1) * 1e3)
 
     # Reported bound stays the SYMMETRIC half-width (the smaller side), since
     # that is what the Picard loop's pinned-at-trust-region test and the
@@ -2019,7 +2197,14 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     frame = dict(seed_l=seed_l, axis0_l=axis0_l, axis1_l=axis1_l, n_l=n_l,
                 kappa0=kappa0, kappa1=kappa1, grad_norm=grad_norm,
                 t_bound_0=t_bound_0, t_bound_1=t_bound_1,
-                t_lo_0=t_lo_0, t_hi_0=t_hi_0, t_lo_1=t_lo_1, t_hi_1=t_hi_1)
+                t_lo_0=t_lo_0, t_hi_0=t_hi_0, t_lo_1=t_lo_1, t_hi_1=t_hi_1,
+                # Pre-inset, pre-shrink measured half-widths. ONLY for telling a
+                # measured surface boundary apart from the t_bound_max cap (the
+                # edge-margin cost's test) -- never the box the NLP sees, which
+                # is t_lo_*/t_hi_* above.
+                t_bound_raw_0=min(-_raw[0], _raw[1]),
+                t_bound_raw_1=min(-_raw[2], _raw[3]),
+                bound_inset=float(bound_inset))
     return t_var, p_world, (t_bound_0, t_bound_1), frame
 
 
@@ -2084,6 +2269,76 @@ def _quadratic_inward_normal_ca(t_var, frame: dict, mat_np):
     n_out_sym = (_sgn * nc) / (ca.norm_2(nc) + 1e-12)
     n_in_local = -n_out_sym
     return ca.DM(np.asarray(mat_np, float)) @ n_in_local
+
+
+def _quadratic_contact_frame_ca(t_var, frame: dict, mat_np):
+    """Full contact frame [n_in | t1 | t2] (WORLD, 3x3 MX) from the local
+    paraboloid at (t0,t1) -- the whole frame, not just the normal.
+
+    Why this exists. _quadratic_inward_normal_ca already computes the patch's
+    OWN tangents
+
+        dp/dt0 = a0 - (kappa0*t0/grad_norm) * n
+        dp/dt1 = a1 - (kappa1*t1/grad_norm) * n
+
+    crosses them for the normal, and DISCARDS them. Callers then rebuilt a
+    tangent basis by handing that bare normal to _symbolic_contact_frame_ca,
+    which has no access to a0/a1 and so re-derives tangents from a world
+    reference axis blended with tanh((|n[0]|-0.9)/0.01). That blend is the
+    only reason the 0.9 switch, the ca.fabs and the 0.01 transition width
+    exist -- and its derivatives scale as 1/0.01 and 1/0.01^2, measuring
+    |dalpha/dn0| ~ 31 and |d2alpha/dn0^2| ~ 3.8e3 at 017_orange's solved
+    normals (|n[0]| = 0.9073, 0.9395, i.e. 0.7 and 4.0 transition widths from
+    the switch). Rebuilding the basis that way rotates it ~14.7 deg per 0.005
+    of n[0] near the switch, against ~1.5 deg/mm for the patch's own tangents.
+
+    Using dp0/dp1 directly removes the blend entirely: no reference axis, no
+    switch, no fabs, no width to tune. The basis is a low-degree polynomial in
+    t_var (same as the normal), continuous by construction, and consistent with
+    the curvature the position surrogate already uses. On a planar patch
+    (kappa=0) it reduces to exactly (a0, a1), the correct degenerate case.
+
+    This also matters because beta is EXACTLY invariant to rotating t1/t2 about
+    n (measured 0.100000000000 across 0-90 deg): that rotation is pure gauge,
+    so the tanh blend was spinning the constraint Jacobian along a direction
+    the objective cannot see -- a flat objective direction coupled to a
+    violently varying constraint.
+
+    Orthonormalization: t1 is dp0 with its normal component removed (Gram-
+    Schmidt against n_in), t2 = n_in x t1. Both stay smooth -- the only
+    normalizations are ca.norm_2 of vectors that cannot vanish (dp0 is a0 plus
+    a multiple of n, and a0 is a unit eigenvector orthogonal to n, so its
+    in-plane part has magnitude >= 1).
+
+    Returns a (3,3) MX whose columns are [n_in | t1 | t2] in WORLD, matching
+    _build_contact_frame_3d / _symbolic_contact_frame_ca's convention
+    (R[:,0] = inward normal).
+    """
+    a0 = ca.DM(np.asarray(frame["axis0_l"], float))
+    a1 = ca.DM(np.asarray(frame["axis1_l"], float))
+    n_l = np.asarray(frame["n_l"], float)
+    n_dm = ca.DM(n_l)
+    k0 = float(frame["kappa0"]); k1 = float(frame["kappa1"])
+    gn = float(frame["grad_norm"])
+
+    dp0 = a0 - (k0 * t_var[0] / gn) * n_dm
+    dp1 = a1 - (k1 * t_var[1] / gn) * n_dm
+    nc = ca.cross(dp0, dp1)
+    _sgn = float(np.sign(np.dot(np.cross(np.asarray(frame["axis0_l"], float),
+                                         np.asarray(frame["axis1_l"], float)), n_l)))
+    if _sgn == 0.0:
+        _sgn = 1.0
+    n_out = (_sgn * nc) / (ca.norm_2(nc) + 1e-12)
+    n_in  = -n_out
+
+    # t1 from the patch's own first tangent, orthogonalized against n_in.
+    t1 = dp0 - ca.dot(dp0, n_in) * n_in
+    t1 = t1 / (ca.norm_2(t1) + 1e-12)
+    t2 = ca.cross(n_in, t1)
+    t2 = t2 / (ca.norm_2(t2) + 1e-12)
+
+    R_w = ca.DM(np.asarray(mat_np, float))
+    return ca.horzcat(R_w @ n_in, R_w @ t1, R_w @ t2)
 
 
 def _friction_cone_verts(mu: float) -> np.ndarray:
@@ -2190,6 +2445,58 @@ def _embed_gws_ca(opti, W, alpha_reg: float = 0.0):
     IPOPT's KKT system couples everything and gives exact gradients. At
     convergence beta == the min-weight metric's optimal value and alpha is the
     closure witness (see module-level GWS brief).
+
+    *** beta IS ONLY AS TRUE AS THE PATCH THE CONTACT IS PARAMETERIZED ON. ***
+    Measured on the 35-solve tabletop sweep: 6 of 35 solves (17%, spanning 3
+    objects and 4 of 5 arms INCLUDING the pcwf-equivalent baseline) report
+    beta > 0.01 on contacts the wrench certificate rejects as INFEASIBLE.
+
+    Two candidate causes have been RULED OUT by measurement; the cause is
+    still open. Do not re-litigate these two:
+      * NOT a frozen contact frame. for_gws_recommender sets
+        quadratic_symbolic_normals=True (with n_normal_relinearize=0), so the
+        frame comes from _quadratic_inward_normal_ca in CLOSED FORM and tracks
+        the contact within the stage -- verified by call-count instrumentation
+        on the default config (16 calls).
+      * NOT an oversized trust region. On 036_wood_block the two contact
+        patches come back +/-42.3 x +/-95.3 mm and +/-43.1 x +/-96.9 mm, which
+        LOOKS larger than the object only if you read the extents off
+        `--mode scene-only`: that prints TS.hull_vertices, a WORLD-frame bbox
+        of the settled (tilted) object, 72 x 74 x 71 mm. The block's true
+        object-local mesh extent is 101 x 102 x 206 mm (half-extents 50.6 x
+        51.0 x 103.2), i.e. a tall post, and 95.3 < 103.2 so the bound is
+        INSIDE the face. _sdf_axis_bound_np is also working correctly there:
+        the measured SDF departure stays 0.00-0.02 mm over the full 100 mm
+        march against a 4.0 mm tolerance, because that face really is flat for
+        that whole distance. kappa=0 on every patch, so all of them already
+        route through the planar SDF-search bound rather than a fake curvature.
+    What IS established is the SYMPTOM: beta disagrees with the geometry at the
+    solved point. n*_final and _span_margin are re-read from the TRUE mesh,
+    beta is not, and on 17% of solves they contradict each other.
+    Two worked examples (default config, n_seeds=1):
+      036_wood_block, soft: contact 2 ends on the +z (top) face while contact 1
+        is on -y -- perpendicular, 99.4 deg splay, span_margin 2.124 -> 0.479.
+        Reported beta=+0.0692; recomputed on the TRUE normals at the same
+        solved points, beta = -0.0.
+      061_foam_brick, pcwf (BASELINE): BOTH contacts on the same top face
+        (n1.n2=+0.84, both ~ +z -- two fingers pressing one surface, not a
+        pinch). True beta = -0.0 and span_margin = -0.359: arccos(n1.n2) =
+        32.6 deg against the pi-2*atan(mu) = 53.1 deg closure limit, i.e.
+        closure GEOMETRICALLY IMPOSSIBLE. Yet reported beta = +0.0996, 99.6%
+        of its 0.1 ceiling.
+    Consequences: (1) never trust beta as a closure certificate -- verify()'s
+    min_gamma_for_accel_lp and _span_margin are the certificates of record, and
+    they disagree with beta on 17% of solves; (2) a beta-driven objective can
+    be actively misled, optimizing a fiction; (3) when comparing beta across
+    ANY config change, confirm the contact FACES did not move first.
+
+    The cheap guard, independent of root cause: gate on span_margin_final < 0
+    before beta is believed at all. That is a pure geometric test on the TRUE
+    re-read normals (arccos(n1.n2) vs the pi-2*atan(mu) closure limit), needs
+    no extra solve, and would have caught every one of the 6 bad solves --
+    061_foam_brick's baseline case reports span_margin = -0.359 while beta
+    claims +0.0996, so the disagreement is already detectable with data both
+    quantities have on hand.
 
     alpha is left free (no alpha >= 0): if the current contact geometry is not
     yet in force closure, beta < 0 with some alpha_j < 0 is the CORRECT value,
@@ -2526,6 +2833,44 @@ class GWSConfig:
     # solve that DOES converge with reg=0 (e.g. an asymmetric seed).
     gws_alpha_reg:      float = 0.0
 
+    # Weight -w_gws*beta*n_cols instead of -w_gws*beta, making the objective
+    # term budget-invariant. beta's ceiling is 1/n_cols, so raw beta changes
+    # SCALE (not quality) whenever the column count does: gws_soft_finger takes
+    # a 2-contact W from 10 to 14 columns, n_contacts 2->3 takes it 10 to 15.
+    # With raw beta, w_gws=5.0 is silently a different effective weight in each
+    # case; beta*n_cols == 1.0 whenever the grasp saturates its ceiling
+    # regardless of n_cols, so w_gws keeps one meaning. False (default) is
+    # byte-identical to prior behavior; note that turning it ON multiplies the
+    # effective GWS weight by ~10-15x, so drop w_gws proportionally (w_gws=5.0
+    # raw ~= w_gws=0.5 scaled at 10 cols) rather than changing both at once.
+    #
+    # VERIFIED as a pure reparameterization: w_gws=0.5 scaled reproduces
+    # w_gws=5.0 raw BIT-IDENTICALLY (same beta to all digits, same iteration
+    # count) on 5 of 7 tabletop objects. The 2 that differ (061_foam_brick,
+    # 065-a_cups) do so because _best_res ranks Picard relinearization stages
+    # by COST, and w_gws is a cost weight -- so changing its scale can select a
+    # different stage. That is a real side effect of retuning w_gws by any
+    # means, not specific to this flag, but it means A/B-ing w_gws scale is not
+    # a clean control on objects where stages are close in cost.
+    gws_beta_scale_ncols: bool = False
+
+    # Build the quadratic-contact frame's TANGENT basis from the paraboloid's
+    # own dp0/dp1 (_quadratic_contact_frame_ca) instead of re-deriving it from
+    # the bare normal via _symbolic_contact_frame_ca's tanh-blended world
+    # reference. Only meaningful under quadratic_symbolic_normals (the
+    # use_quad_sym branch); column 0 (the inward normal) is identical either
+    # way, so this changes ONLY the tangent basis -- which beta is provably
+    # invariant to (measured 0.100000000000 across 0-90 deg of rotation about
+    # n). It therefore cannot change the grasp QUALITY the objective sees, only
+    # the conditioning of the constraint Jacobian that expresses it.
+    #
+    # Default TRUE: the reconstruction it replaces is strictly worse with no
+    # compensating advantage -- it needs a reference-axis switch at
+    # |n[0]|=0.9 whose tanh width 0.01 gives |d2alpha/dn0^2| ~ 3.8e3 right
+    # where 017_orange's solved normals land, rotating the basis ~14.7 deg per
+    # 0.005 of n[0] against ~1.5 deg/mm for dp0/dp1. Set False to A/B it.
+    quad_tangent_frame:  bool = True
+
     # Ablation switch for the non-C2 term hunt: passes smooth_blend=True to
     # every _symbolic_contact_frame_ca call feeding the GWS contact frame(s),
     # replacing that function's ca.fabs(n[0]) blend weight (C0, not C1, at
@@ -2586,6 +2931,43 @@ class UVAtlasConfig:
     use_quadratic_contact: bool = False
     quadratic_t_bound_max:  float = 0.10    # metres, cap even where the surface stays flat
     quadratic_sdf_err_tol:  float = 4e-3    # metres, max surrogate-vs-true-SDF gap per axis
+    # Constant amount (m) shaved off EVERY side of the trust-region rectangle
+    # after the SDF-error searches size it. The SDF-error criterion cannot see a
+    # sharp edge: on a box face a planar surrogate matches the true surface right
+    # up to the crease, so the measured bound lands ON the edge and the optimizer
+    # is free to place a contact arbitrarily close to it -- where the friction
+    # cone falls off the face and the pinch slips. This reserves a strip of
+    # surface. Constant rather than a fraction of the bound: the width needed is
+    # set by the contact patch and friction cone, not by how large the
+    # surrounding face is. Distinct from edge_margin_sdf_m (a soft COST on
+    # approaching a measured bound, w_edge_margin-weighted) and from
+    # CollisionConfig.edge_margin_m (the BOX-only hard face-edge band): this one
+    # is a hard box bound on the quadratic patch itself. 0.0 = off.
+    #
+    # Applies ONLY to a PLANAR axis (kappa == 0 from the mesh-fit's
+    # model-selection test). A curved axis gets no inset at all: the paraboloid
+    # bends with the surface and the SDF-error search already shrinks it where
+    # the fit degrades, so a reserve there would remove usable surface to guard
+    # a cliff the model has handled. See the gate in _mesh_quadratic_contact_ca.
+    #
+    # 10mm because it only ever lands on a flat face, where the patch spans most
+    # of that face (measured 93x184mm mid-face on 036_wood_block), so the reserve
+    # is a small fraction of a planar patch while being comfortably larger than
+    # the ~10.8mm LEAP fingertip pad extent it exists to keep clear of an edge.
+    quadratic_bound_inset:  float = 0.010
+    # Fraction of each SIDE that quadratic_bound_inset may never consume -- the
+    # guarantee that a patch always retains usable search room. At 0.5 a side can
+    # lose at most half of itself, so a seed sitting 4mm from a crease keeps 2mm
+    # of travel instead of being frozen at its seed (which a flat 10mm inset did
+    # for 6 of 40 patches on 036_wood_block).
+    #
+    # This is a FLOOR on the result, not a percentage-sized reserve. Sizing the
+    # reserve itself as a fraction inverts the safety argument -- measured over
+    # 136 planar sides on the block, a 25% reserve yields 24.6mm on the roomiest
+    # side and 0.68mm on the tightest, i.e. most where it is least needed and
+    # least where a contact is nearly on the crease. Constant target, fractional
+    # cap: conservative at both ends.
+    quadratic_bound_keep_frac: float = 0.5
     # Fit the local patch's curvature to the VISUAL MESH vertices around the
     # seed instead of to the SDF Hessian. The SDF's second derivative is a
     # global quantity and reports curvature belonging to nearby features rather
@@ -3747,14 +4129,18 @@ class GraspPlanner3D:
                     sdf_err_tol=cfg.quadratic_sdf_err_tol,
                     mesh_fit=cfg.quadratic_mesh_fit,
                     mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
-                    mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min)
+                    mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
+                    bound_inset=cfg.quadratic_bound_inset,
+                    bound_keep_frac=cfg.quadratic_bound_keep_frac)
                 _t2_var, _p2, _t2_bounds, _t2_frame = _mesh_quadratic_contact_ca(
                     _opti, p2_ws, _n2_seed_out, obj_center_np, obj_R_np, self._mesh_entry,
                     t_bound_max=cfg.quadratic_t_bound_max,
                     sdf_err_tol=cfg.quadratic_sdf_err_tol,
                     mesh_fit=cfg.quadratic_mesh_fit,
                     mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
-                    mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min)
+                    mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
+                    bound_inset=cfg.quadratic_bound_inset,
+                    bound_keep_frac=cfg.quadratic_bound_keep_frac)
                 # THIRD contact SHARES contact 2's patch (index + middle on one
                 # paraboloid, each with its own 2-DOF coordinate inside the SAME trust
                 # region), reconstructed via the identity _mesh_quadratic_contact_ca's
@@ -3807,7 +4193,9 @@ class GraspPlanner3D:
                         sdf_err_tol=cfg.quadratic_sdf_err_tol,
                         mesh_fit=cfg.quadratic_mesh_fit,
                         mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
-                        mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min)
+                        mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
+                    bound_inset=cfg.quadratic_bound_inset,
+                    bound_keep_frac=cfg.quadratic_bound_keep_frac)
                 elif _has_c3:
                     # SHARED patch (ablation baseline). Contact 3 is reconstructed
                     # inside contact 2's paraboloid via the identity its frame dict
@@ -4113,7 +4501,16 @@ class GraspPlanner3D:
                         continue
                     for _i, _key in ((0, 't_bound_0'), (1, 't_bound_1')):
                         _tb = float(_frame[_key])
-                        if _tb >= _cap - 1e-9:
+                        # Cap test on the RAW (pre-inset) bound. quadratic_bound_inset
+                        # shaves a constant off every side, so an axis that ran the
+                        # whole search without finding an edge comes back at
+                        # t_bound_max - inset and would fail a test against the cap --
+                        # reading as "measured edge" and penalizing the middle of a
+                        # large flat face, exactly what this test exists to prevent.
+                        # The hinge itself still uses the inset bound, which is the
+                        # box the solver actually sees.
+                        _tb_raw = float(_frame.get(f't_bound_raw_{_i}', _tb))
+                        if _tb_raw >= _cap - 1e-9:
                             continue          # capped => flat, no edge found
                         _safe = max(_tb - _margin, 0.0)
                         _excess = ca.fmax(0.0, ca.fabs(_t_var[_i]) - _safe)
@@ -4195,15 +4592,32 @@ class GraspPlanner3D:
                 if use_quad_sym:
                     _n1_in_sym = _quadratic_inward_normal_ca(_t1_var, _t1_frame, obj_R_np)
                     _n2_in_sym = _quadratic_inward_normal_ca(_t2_var, _t2_frame, obj_R_np)
-                    _R1_expr = _symbolic_contact_frame_ca(_n1_in_sym, smooth_blend=_smooth_frame)
-                    _R2_expr = _symbolic_contact_frame_ca(_n2_in_sym, smooth_blend=_smooth_frame)
+                    # Build the frame from the PATCH's own tangents (dp0/dp1)
+                    # rather than re-deriving a basis from the bare normal: the
+                    # paraboloid already carries a continuous, curvature-
+                    # consistent tangent basis, and _symbolic_contact_frame_ca
+                    # has to reconstruct one from a world reference axis blended
+                    # with tanh(.../0.01) -- whose second derivative reaches
+                    # ~3.8e3 exactly where 017_orange's normals sit. See
+                    # _quadratic_contact_frame_ca. Only the tangent basis
+                    # changes; column 0 is the same normal either way.
+                    if cfg.quad_tangent_frame:
+                        _R1_expr = _quadratic_contact_frame_ca(_t1_var, _t1_frame, obj_R_np)
+                        _R2_expr = _quadratic_contact_frame_ca(_t2_var, _t2_frame, obj_R_np)
+                    else:
+                        _R1_expr = _symbolic_contact_frame_ca(_n1_in_sym, smooth_blend=_smooth_frame)
+                        _R2_expr = _symbolic_contact_frame_ca(_n2_in_sym, smooth_blend=_smooth_frame)
                     # Contact 3 lives on contact 2's patch (_t3_frame IS _t2_frame),
                     # so its normal comes from the SAME paraboloid evaluated at the
                     # third contact's own coordinate -- not a copy of contact 2's.
                     if _has_c3 and _t3_var is not None and _t3_frame is not None:
-                        _R3_expr = _symbolic_contact_frame_ca(
-                            _quadratic_inward_normal_ca(_t3_var, _t3_frame, obj_R_np),
-                            smooth_blend=_smooth_frame)
+                        if cfg.quad_tangent_frame:
+                            _R3_expr = _quadratic_contact_frame_ca(
+                                _t3_var, _t3_frame, obj_R_np)
+                        else:
+                            _R3_expr = _symbolic_contact_frame_ca(
+                                _quadratic_inward_normal_ca(_t3_var, _t3_frame, obj_R_np),
+                                smooth_blend=_smooth_frame)
                 elif use_sym_normals:
                     # Contact frame built as a CasADi MX expression of _p1/_p2.
                     # CasADi re-evaluates this at every eval_f / eval_grad_f call,
@@ -4337,7 +4751,20 @@ class GraspPlanner3D:
                 _opti.set_initial(_gws_alpha, np.ones(_gws_W.shape[1]) / _gws_W.shape[1])
                 _opti.set_initial(_gws_beta, -1e-3)
                 if cfg.w_gws > 0.0:
-                    _cost_gws = -_gws_beta   # maximize beta = minimize -beta
+                    # beta's attainable ceiling is 1/n_cols (all alpha_j tied at
+                    # beta under sum(alpha)==1), so RAW beta silently changes
+                    # scale whenever n_cols does -- gws_soft_finger 10->14 cols
+                    # per 2 contacts, or n_contacts 2->3 going 10->15. Weighting
+                    # raw beta therefore means w_gws=5.0 is a DIFFERENT effective
+                    # weight under each, which is what made the old soft-finger
+                    # beta numbers incomparable (see for_gws_recommender's
+                    # retraction). beta*n_cols is budget-invariant: it is 1.0
+                    # when the grasp saturates its arithmetic ceiling, whatever
+                    # n_cols is, so w_gws keeps one meaning across both flags.
+                    if cfg.gws_beta_scale_ncols:
+                        _cost_gws = -_gws_beta * float(_gws_W.shape[1])
+                    else:
+                        _cost_gws = -_gws_beta   # maximize beta = minimize -beta
                 if cfg.w_span > 0.0:
                     _cost_span = -_gws_span_logdet_ca(_gws_W, cfg.gws_span_delta)
                 # cost_gws_reg (alpha_reg*||alpha||^2) is added unconditionally
@@ -4946,6 +5373,19 @@ class GraspPlanner3D:
                     'n2_frozen':     _n2_in.tolist() if _n2_in is not None else None,
                     'stability_last20': _stab,
                     'gws_beta':      float(_sol.value(_gws_beta)) if _gws_beta is not None else None,
+                    # W and alpha AT THE SOLUTION, so the embedded LP can be re-solved
+                    # externally on its OWN wrench matrix (patch normals, unchanged).
+                    # This separates two failure modes that both show up as a reported
+                    # beta disagreeing with the geometry: a SURROGATE error (W is built
+                    # from patch normals that differ from the surface) versus a STOPPING
+                    # artifact (alpha/beta are IPOPT variables in the main NLP, so on a
+                    # best-effort exit the reported beta is whatever the last iterate
+                    # held, not the optimum of even its own W). Only the second is
+                    # visible here; see simulation/beta_audit.audit_embedded_lp.
+                    'gws_W':         (np.asarray(_sol.value(_gws_W), float).tolist()
+                                       if _gws_W is not None else None),
+                    'gws_alpha':     (np.asarray(_sol.value(_gws_alpha), float).flatten().tolist()
+                                       if _gws_alpha is not None else None),
                     'quad_pinned':   _quad_pinned(_sol.value),
                     'grad_z':        _eval_grad_z(_sol.value),
                 }
@@ -4981,6 +5421,10 @@ class GraspPlanner3D:
                         'stability_last20': _stab,
                         'gws_beta':      (float(_opti.debug.value(_gws_beta))
                                            if _gws_beta is not None else None),
+                        'gws_W':         (np.asarray(_opti.debug.value(_gws_W), float).tolist()
+                                           if _gws_W is not None else None),
+                        'gws_alpha':     (np.asarray(_opti.debug.value(_gws_alpha), float).flatten().tolist()
+                                           if _gws_alpha is not None else None),
                         'quad_pinned':   _quad_pinned(_opti.debug.value),
                         'grad_z':        _eval_grad_z(_opti.debug.value),
                     }
@@ -5235,22 +5679,33 @@ class GraspPlanner3D:
         wf_feasible    = False
         wf_tag         = 'SKIP'
         n1_out = n2_out = None
+        _n_v_out = None
         try:
             if (_NCF_AVAILABLE
                     and result.get('p1') is not None
                     and result.get('p2') is not None):
-                p1_np = np.asarray(result['p1'], float)
-                p2_np = np.asarray(result['p2'], float)
-                n1_out = _geom_normal_np(p1_np, self._obj_geom_type,
-                                          obj_pos, obj_mat, self._obj_size,
-                                          mesh_entry=self._mesh_entry)
-                n2_out = _geom_normal_np(p2_np, self._obj_geom_type,
-                                          obj_pos, obj_mat, self._obj_size,
-                                          mesh_entry=self._mesh_entry)
-                _, t1_1, t2_1 = _build_contact_frame_3d(-n1_out)
-                _, t1_2, t2_2 = _build_contact_frame_3d(-n2_out)
-                R1 = np.column_stack([-n1_out, t1_1, t2_1])
-                R2 = np.column_stack([-n2_out, t1_2, t2_2])
+                # EVERY load-bearing contact is certified, not just the pinch.
+                # verify() used to be hardcoded n=2, so at cfg.n_contacts>=3 it
+                # reported the wrench feasibility of the THUMB+INDEX PAIR while the
+                # NLP had solved a tripod -- a certificate for a different grasp
+                # than the one being executed, and conservative in the direction
+                # that hides the third contact's whole reason for existing (a real
+                # moment arm about the grasp axis).
+                _pts_v = [np.asarray(result[_k], float)
+                          for _k in ('p1', 'p2', 'p3')
+                          if result.get(_k) is not None]
+                _n_v = len(_pts_v)
+                p1_np, p2_np = _pts_v[0], _pts_v[1]
+                _nouts_v = [_geom_normal_np(_p, self._obj_geom_type,
+                                            obj_pos, obj_mat, self._obj_size,
+                                            mesh_entry=self._mesh_entry)
+                            for _p in _pts_v]
+                n1_out, n2_out = _nouts_v[0], _nouts_v[1]
+                _R_list = []
+                for _n in _nouts_v:
+                    _, _ta, _tb = _build_contact_frame_3d(-_n)
+                    _R_list.append(np.column_stack([-_n, _ta, _tb]))
+                R1, R2 = _R_list[0], _R_list[1]
                 # Mass-scaled gamma — same approach as solve_gamma_live in
                 # kinova_leap_pick_place.py. Contacts expressed in object body frame.
                 _bid_v   = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, cfg.obj_body)
@@ -5262,11 +5717,11 @@ class GraspPlanner3D:
                 R_WO_v   = data_v.xmat[_bid_v].reshape(3, 3)
                 _g_O_v   = R_WO_v.T @ model.opt.gravity
                 _ab_v    = cfg.accel_budget_xyz
-                _p1_O_v  = R_WO_v.T @ (p1_np - obj_pos)
-                _p2_O_v  = R_WO_v.T @ (p2_np - obj_pos)
-                R1_O     = R_WO_v.T @ R1
-                R2_O     = R_WO_v.T @ R2
-                _pos_v   = [_p1_O_v.reshape(3, 1), _p2_O_v.reshape(3, 1)]
+                _pts_O_v = [R_WO_v.T @ (_p - obj_pos) for _p in _pts_v]
+                _R_O_v   = [R_WO_v.T @ _R for _R in _R_list]
+                _p1_O_v, _p2_O_v = _pts_O_v[0], _pts_O_v[1]
+                R1_O, R2_O = _R_O_v[0], _R_O_v[1]
+                _pos_v   = [_p.reshape(3, 1) for _p in _pts_O_v]
                 # Torque box = I * angular budget (principal axes).
                 _T_v = np.array([float(_inert_v[i]) * _aab_v[i] for i in range(3)])
                 if cfg.datum_gamma:
@@ -5276,19 +5731,31 @@ class GraspPlanner3D:
                     # grasp-axis torque out of EACH corner (project_grasp_axis_torque) — the
                     # exact per-corner removal, so the FULL per-axis budget _T_v is passed
                     # (no lossy budget-vector pre-projection). Accel box is a PURE force box.
-                    _mref_v = (0.5 * (_p1_O_v + _p2_O_v)).reshape(3)
+                    # Moment reference generalizes as the contact CENTROID, which
+                    # reduces to the midpoint at n=2 -- so the measured 2-contact
+                    # path is unchanged. Same convention as solve_gamma_live.
+                    _mref_v = (sum(_pts_O_v) / float(_n_v)).reshape(3)
                     _grav_v = _mass_v * _g_O_v
+                    # Grasp-axis projections are HONEST ONLY AT n=2: a two-contact
+                    # pinch cannot resist any torque about the line through its
+                    # contacts, so removing that component states a real limitation.
+                    # A third contact off that axis is exactly what removes the
+                    # premise, so projecting at n>=3 would make the certificate
+                    # CONSERVATIVE against a capability the tripod actually has --
+                    # wrong, not merely cautious. Matches solve_gamma_live's `n == 2`
+                    # gate and the LP's own self-disabling gates.
+                    _proj_v = (_n_v == 2)
                     # HARD LP (no slack): returns a single γ or None — a true feasibility
                     # gate identical to solve_gamma_live. max_slack_norm is N/A here.
                     gamma_min = min_gamma_for_accel_lp_hard(
                         _mass_v * _ab_v[0], _mass_v * _ab_v[1], _mass_v * _ab_v[2],
                         _T_v[0], _T_v[1], _T_v[2],
-                        n=2, pos=_pos_v, R=[R1_O, R2_O],
-                        ncf=[1.0, 1.0], tan_y=[0.0, 0.0], tan_z=[0.0, 0.0],
-                        mu=[_mu_v, _mu_v],
+                        n=_n_v, pos=_pos_v, R=_R_O_v,
+                        ncf=[1.0] * _n_v, tan_y=[0.0] * _n_v, tan_z=[0.0] * _n_v,
+                        mu=[_mu_v] * _n_v,
                         moment_ref=_mref_v, grav_force=_grav_v,
-                        project_grasp_axis_moment=True,
-                        project_grasp_axis_torque=True,
+                        project_grasp_axis_moment=_proj_v,
+                        project_grasp_axis_torque=_proj_v,
                     )
                     max_slack_norm = None
                 else:
@@ -5297,11 +5764,12 @@ class GraspPlanner3D:
                     gamma_min, max_slack_norm = min_gamma_for_accel_lp(
                         _mass_v * _accel_v[0], _mass_v * _accel_v[1], _mass_v * _accel_v[2],
                         _T_v[0], _T_v[1], _T_v[2],
-                        n=2, pos=_pos_v, R=[R1_O, R2_O],
-                        ncf=[1.0, 1.0], tan_y=[0.0, 0.0], tan_z=[0.0, 0.0],
-                        mu=[_mu_v, _mu_v],
+                        n=_n_v, pos=_pos_v, R=_R_O_v,
+                        ncf=[1.0] * _n_v, tan_y=[0.0] * _n_v, tan_z=[0.0] * _n_v,
+                        mu=[_mu_v] * _n_v,
                         slack_penalty=cfg.verify_slack_penalty,
                     )
+                _n_v_out = _n_v
                 wf_feasible = (gamma_min is not None)
                 _slack_bad = (max_slack_norm is not None
                               and max_slack_norm > cfg.verify_slack_tol)
@@ -5336,6 +5804,10 @@ class GraspPlanner3D:
             'gws_beta':             result.get('gws_beta'),
             'n1_verify':            n1_out.tolist() if n1_out is not None else None,
             'n2_verify':            n2_out.tolist() if n2_out is not None else None,
+            # How many contacts the wrench certificate above actually covered.
+            # Read this before comparing gamma_min across runs: a 3-contact
+            # gamma_min is a different (and strictly less projected) quantity.
+            'n_contacts_verified':  _n_v_out,
         }
         self.log.info(
             f"[verify3d] IK=({ik_t*1e3:.2f},{ik_i*1e3:.2f})mm "
@@ -6101,7 +6573,9 @@ class MultiStartGraspPlanner3D:
                                 sdf_err_tol=cfg.quadratic_sdf_err_tol,
                                 mesh_fit=cfg.quadratic_mesh_fit,
                                 mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
-                                mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min)
+                                mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
+                                bound_inset=cfg.quadratic_bound_inset,
+                    bound_keep_frac=cfg.quadratic_bound_keep_frac)
                         except Exception as _pe:
                             log.debug(f"[seed {i+1}] patch fit for c3 seeding failed: {_pe}")
                             _c3_patch_frame = None

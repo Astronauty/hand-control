@@ -165,3 +165,66 @@ def audit(result: dict, *, geom_type: int, obj_center, obj_R, obj_size,
         "alpha_min": float(np.min(alpha)) if alpha is not None else None,
         "contradiction": contradiction,
     }
+
+
+def audit_embedded_lp(result: dict) -> dict:
+    """Re-solve the NLP's OWN min-weight LP on its OWN wrench matrix.
+
+    Separates two failure modes that both present as a reported beta disagreeing with
+    the geometry:
+
+      * SURROGATE error -- W is assembled from quadratic-patch normals, which differ
+        from the surface normal. `audit()` above measures this by rebuilding W from
+        true normals.
+      * STOPPING artifact -- alpha and beta are IPOPT decision variables inside the
+        main NLP, not a nested LP solved to optimality. On a best-effort exit the
+        reported beta is whatever the final iterate held, which need not be the
+        optimum of even its own W.
+
+    This function isolates the second: it takes `result['gws_W']` unchanged (patch
+    normals and all) and solves the min-weight LP on it to optimality. Any difference
+    from `result['gws_beta']` is attributable to the NLP not converging its own
+    embedded LP, with the surrogate held fixed by construction.
+
+    Returns {} when the result carries no W (w_gws == 0, or the stage built no GWS
+    block).
+
+    Keys:
+      beta_embedded  -- what the NLP reported (result['gws_beta'])
+      beta_relp      -- the same LP re-solved to optimality on the same W
+      lp_gap         -- beta_relp - beta_embedded; > 0 means the NLP stopped short
+                        of its own LP's optimum
+      resid_Walpha   -- ||W @ alpha|| at the NLP's alpha. The LP constrains this to
+                        0, so a nonzero value is direct evidence the equality is
+                        unconverged rather than merely the objective being loose.
+      resid_sum      -- |sum(alpha) - 1| at the NLP's alpha, same reasoning.
+      alpha_min_gap  -- min(alpha) - beta at the NLP's values. The LP constrains
+                        alpha >= beta*1 and beta is maximized, so at optimality the
+                        smallest alpha equals beta and this is 0.
+    """
+    W = result.get("gws_W")
+    if W is None:
+        return {}
+    W = np.asarray(W, float)
+    if W.ndim != 2 or W.shape[0] != 6:
+        return {}
+    beta_relp, _ = min_weight_beta(W)
+    beta_emb = result.get("gws_beta")
+    beta_emb = float(beta_emb) if beta_emb is not None else None
+
+    out = {
+        "beta_embedded": beta_emb,
+        "beta_relp": beta_relp,
+        "lp_gap": (beta_relp - beta_emb)
+                  if (beta_emb is not None and np.isfinite(beta_relp)) else None,
+        "n_cols": int(W.shape[1]),
+    }
+    a = result.get("gws_alpha")
+    if a is not None:
+        a = np.asarray(a, float).flatten()
+        if a.size == W.shape[1]:
+            out["resid_Walpha"] = float(np.linalg.norm(W @ a))
+            out["resid_sum"] = float(abs(a.sum() - 1.0))
+            out["alpha_min_gap"] = (float(a.min() - beta_emb)
+                                    if beta_emb is not None else None)
+    return out

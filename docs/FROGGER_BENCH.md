@@ -305,9 +305,8 @@ max 2.97 mm, and the largest disagreements do not track it: `056_tennis_ball` ha
 largest `delta` (-0.131) with contacts 0.47-0.58 mm off-surface, while `009_gelatin_box` sd0
 sits furthest off-surface (2.68/2.97 mm) with `delta` of the opposite sign.
 
-The remaining candidate is §8.3's best-effort iterate: `017_orange` is best-effort on all
-three seeds, and §8.3 shows the disagreement is 6x larger in that regime. This has not been
-isolated. `delta` should be read as a direction, not a calibrated magnitude, until it is.
+The remaining candidate — that `beta_rep` is not the optimum of its own LP — is confirmed,
+and it dominates. See §8.4a.
 
 Two conditions concentrate the error at the solved contacts. First, the solution sits at a
 trust-region bound on 9/9 measured stages (SOLVER_STATE §2), which is where a paraboloid
@@ -320,6 +319,48 @@ perturbation direction, but a perturbation that happens to align the wrench colu
 favourably than the true geometry can raise `beta`; `009_gelatin_box` sd0 is such a case,
 and it occurs where the true configuration is near-degenerate (62.4 deg splay,
 `beta_true = -0.0`), so the reference value is at the bottom of its range.
+
+### 8.4a The dominant term is a stopping artifact, not surrogate error
+
+`alpha` and `beta` are IPOPT decision variables inside the main NLP, not a nested LP solved
+to optimality. `audit_embedded_lp` re-solves the min-weight LP on the NLP's OWN wrench
+matrix — patch normals unchanged — giving **`beta_rep_converged`**, and
+**`lp_gap = beta_rep_converged - beta_rep`**. Since W is held fixed, `lp_gap` isolates
+non-convergence from surrogate error. This decomposes `delta` exactly:
+
+```
+delta = (beta_rep - beta_rep_converged) + (beta_rep_converged - beta_true)
+      =      -lp_gap                    +      surrogate residual
+```
+
+Over the 18-cell sweep:
+
+| term | median abs | interpretation |
+|---|---|---|
+| `-lp_gap` | **0.00740** | the NLP stopping short of its own LP's optimum |
+| surrogate residual | **0.00045** | patch normals vs SDF-gradient normals |
+
+The stopping term is **16x** the surrogate term. `lp_gap > 0` on **18/18** solves, including
+all six converged ones (median 0.00321; best-effort median 0.01099). The equality residual
+`||W alpha||`, which the LP constrains to zero, reaches 1.0e-2 on `017_orange` — direct
+evidence the constraint itself is unconverged rather than the objective merely being loose.
+
+Re-solving repairs three of the four sign disagreements in §8.2:
+
+| object | sd | `beta_rep` | `beta_rep_converged` | `beta_true` | resolved |
+|---|---|---|---|---|---|
+| `014_lemon` | 1 | -0.00926 | +0.06420 | +0.05383 | yes |
+| `056_tennis_ball` | 0/1/2 | -0.05220 | +0.08213 | +0.07913 | yes |
+| `009_gelatin_box` | 0 | +0.07438 | +0.08822 | -0.00000 | no |
+
+The three false rejections were non-convergence, not the patch. The one false acceptance
+(`009_gelatin_box` sd0) is genuine surrogate error: re-solving moves `beta` further from the
+geometry, because the patch normals there describe a 62.4 deg splay configuration as
+closable when it is not.
+
+This reorders the conclusions. §8.1's downward bias is predominantly a stopping artifact;
+§8.4's perturbation analysis explains the surrogate term, which is real but roughly 1/16 the
+magnitude. The patch quadratic's role as a 2-DOF parameterization is not implicated.
 
 ### 8.5 Accuracy of the two normal estimators
 
