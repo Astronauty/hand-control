@@ -25,6 +25,10 @@ max_{alpha, beta}  beta    s.t.  W(q) alpha = 0,  sum(alpha) = 1,  alpha >= beta
 therefore an ablation between two formulations sharing a metric, not an implementation of
 an absent method.
 
+A component-by-component comparison of the two formulations, including where each is ahead
+and what improvements each suggests, is in [`FROGGER_COMPARISON.md`](FROGGER_COMPARISON.md).
+This section lists only the axes the benchmark varies.
+
 ## 1. Points of difference
 
 | | FRoGGeR (7a)-(7e) | this solver |
