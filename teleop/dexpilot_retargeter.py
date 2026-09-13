@@ -91,12 +91,20 @@ class DexPilotRetargeter:
     PINCH_ENTER_N = 2       # consecutive frames below enter-threshold to latch pinch
     PINCH_EXIT_N  = 3       # consecutive frames above exit-threshold to release
 
+    # HAND_ALPHA: output EMA on the 16 retargeted hand joints (applied by DexPilotController
+    # AFTER the solve), the DexPilot-side counterpart of AnyTeleop's output_alpha. 1.0 = none
+    # (raw solve each frame); smaller = smoother but laggier. This is a DexPilot-METHOD knob,
+    # so it lives here / in retarget_config.json (not hardcoded in the app). The controller
+    # reads it from the retargeter, so hot-reload applies. The --output-ema off flag still
+    # forces 1.0 (no smoothing) regardless of this value.
+    HAND_ALPHA = 0.4
+
     # Attribute names the tuner sweeps, in slider order. Kept here so the tuner
     # and any config file agree on exactly which fields are tunable.
     TUNABLE = ('BETA', 'GAMMA', 'EPS', 'ETA1', 'ETA2', 'S1_GAIN', 'S2_GAIN',
                'PINCH_MEDIAN_N', 'PINCH_ENTER_FRAC', 'PINCH_EXIT_FRAC',
                'PINCH_ENTER_N', 'PINCH_EXIT_N', 'PINCH_SNAP',
-               'PINCH_SMOOTH', 'PINCH_EPS1', 'PINCH_EPS2', 'PINCH_K')
+               'PINCH_SMOOTH', 'PINCH_EPS1', 'PINCH_EPS2', 'PINCH_K', 'HAND_ALPHA')
 
     # MediaPipe landmark indices
     _LM_WRIST   = 0

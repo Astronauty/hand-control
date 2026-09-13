@@ -193,6 +193,23 @@ class DexPilotController:
         """Disable tracking; the arm holds its last pose until start() again."""
         self._active = False
 
+    def _effective_hand_alpha(self) -> float:
+        """Output-EMA factor for the retargeted hand joints, resolved LIVE.
+
+        --output-ema off forces 1.0 (no smoothing). Otherwise, for the DexPilot
+        retargeter the value is its hot-reloadable HAND_ALPHA (a method knob in
+        retarget_config.json), so edits apply without a restart. AnyTeleop applies its
+        OWN output_alpha inside its wrapper, so we don't smooth again here (use the
+        constructor _hand_alpha, which the app leaves at 1.0 for anyteleop)."""
+        if not self._output_ema:
+            return 1.0
+        if isinstance(self._retarg, DexPilotRetargeter):
+            try:
+                return float(self._retarg.HAND_ALPHA)
+            except (AttributeError, TypeError, ValueError):
+                return self._hand_alpha
+        return self._hand_alpha
+
     def step(self, model: mj.MjModel, data: mj.MjData) -> np.ndarray | None:
         """Compute a 23-DOF joint target from the latest hand message.
 
@@ -240,9 +257,15 @@ class DexPilotController:
             else:
                 # EMA smoothing on hand joints (on the control thread, against the
                 # last RETURNED q_hand — independent of the worker's solve cadence).
+                # For the DexPilot retargeter the alpha is a METHOD knob living in
+                # retarget_config.json (HAND_ALPHA), read live so hot-reload applies;
+                # AnyTeleop does its own output_alpha internally, so we don't double-
+                # smooth it here (keeps the controller's alpha at the constructor value,
+                # which is 1.0 unless overridden). --output-ema off forces 1.0 either way.
+                _alpha = self._effective_hand_alpha()
                 if self._q_hand_prev is not None:
-                    q_hand = (self._hand_alpha * q_solved
-                              + (1.0 - self._hand_alpha) * self._q_hand_prev)
+                    q_hand = (_alpha * q_solved
+                              + (1.0 - _alpha) * self._q_hand_prev)
                 else:
                     q_hand = q_solved
                 self._q_hand_prev = q_hand.copy()
