@@ -673,11 +673,8 @@ if __name__ == "__main__":
     STEPS_PER_WP    = 5    # max sim steps before forcing waypoint advance (timeout, 1 step = 1ms)
     WP_REACH_TOL    = 0.02  # joint-space radius to consider a waypoint reached (rad)
     JOG_VEL         = 0.6  # jog speed while arrow key held (m/s); ALSO the peak-speed cap on
-                           # live wrist tracking (see _solve_wrist_qdot). Env-overridable below.
-                           # Raised 0.3->0.6: a headless step/oscillation sweep (tune_wrist)
-                           # showed the wrist trailing on larger motions at 0.3; 0.6 roughly
-                           # halves the catch-up time with no stability cost (critical arm
-                           # damping during tracking). Tune live with TELEOP_JOG_VEL.
+                           # live wrist tracking (see _solve_wrist_qdot). Env-overridable below
+                           # via TELEOP_JOG_VEL.
     # Singularity-robust DLS jog damping (see the GRASP-branch resolved-rate solve):
     # JOG_SING_EPS is the smallest-singular-value threshold below which damping ramps
     # in; JOG_LAM_MAX caps the peak joint-rate gain at ~1/(2*JOG_LAM_MAX). With
@@ -755,11 +752,9 @@ if __name__ == "__main__":
     # Cartesian velocity command (1/s). The command is then slew-limited to the NCF accel
     # budget and DLS-mapped to joint rates, so this only sets how briskly the wrist closes
     # a tracking gap; the budget still caps peak acceleration for the no-slip guarantee.
-    WRIST_TRACK_GAIN = _env_float(WRIST_TRACK_GAIN_ENV, 12.0)  # TELEOP_TRACK_GAIN override.
-    # Raised 7->12 alongside JOG_VEL: reaches the (now higher) speed cap at a smaller error
-    # (~5cm at gain 7 -> ~5cm/(12/7)~3cm), so medium corrections track briskly. 12 stayed
-    # well-behaved in the sweep; raise toward 20 live via TELEOP_TRACK_GAIN if you want more
-    # snap and the wrist doesn't jitter on noisy VR input.
+    WRIST_TRACK_GAIN = _env_float(WRIST_TRACK_GAIN_ENV, 12.0)   # TELEOP_TRACK_GAIN override.
+    # Reverted to the original 7.0 (was briefly raised to 12 during tuning). Raise live via
+    # TELEOP_TRACK_GAIN if you want snappier tracking once the wrist-rotation issue is resolved.
 
     # Object definitions: rigid objects only (obj_soft deferred — vertex-level contact,
     # not a rigid grasp-map problem). Each object maps every FINGER_SET finger to the
@@ -3632,7 +3627,7 @@ if __name__ == "__main__":
         print(f"[teleop] WRIST_ANG_GAIN_SCALE={WRIST_ANG_GAIN_SCALE:.3g} — "
               "angular tracking gain scaled independently of position.")
     # Responsiveness knobs — always print the active tracking config so a run is self-documenting
-    # (defaults JOG_VEL=0.6, WRIST_TRACK_GAIN=12; override live via the TELEOP_* env vars).
+    # (defaults JOG_VEL=0.3, WRIST_TRACK_GAIN=7; override live via the TELEOP_* env vars).
     print(f"[teleop] wrist-tracking responsiveness: JOG_VEL={JOG_VEL:.3g} m/s "
           f"(TELEOP_JOG_VEL), WRIST_TRACK_GAIN={WRIST_TRACK_GAIN:.3g} (TELEOP_TRACK_GAIN), "
           f"JOG_QDOT_MAX={JOG_QDOT_MAX:.3g} rad/s (TELEOP_QDOT_MAX)")
@@ -3645,6 +3640,9 @@ if __name__ == "__main__":
     from teleop.wrist_track_tune import WristTrackConfig
     _wt_cfg = WristTrackConfig(JOG_VEL, WRIST_TRACK_GAIN, JOG_QDOT_MAX,
                                logging=bool(getattr(args, 'tune_wrist', False)))
+    print(f"[teleop]   + trajectory shaping: TRACK_ACCEL={_wt_cfg.TRACK_ACCEL:.3g} m/s^2 "
+          f"(TELEOP_TRACK_ACCEL), TRACK_DAMP={_wt_cfg.TRACK_DAMP:.3g} (TELEOP_TRACK_DAMP) "
+          f"— raise ACCEL / gain for speed, add DAMP or lower ACCEL to kill overshoot.")
     if getattr(args, 'tune_wrist', False):
         print(f"[teleop] --tune-wrist: hot-reloading {_wt_cfg.config_path}\n"
               f"          logging tracking error -> {_wt_cfg.log_path}\n"
@@ -3704,8 +3702,14 @@ if __name__ == "__main__":
         _gain = _wt_cfg.WRIST_TRACK_GAIN
         _jog_vel = _wt_cfg.JOG_VEL
         _qdot_max = _wt_cfg.JOG_QDOT_MAX
-        dv_max = np.array(NCF_ACCEL_BUDGET_XYZ) * model.opt.timestep
+        # TRACK_ACCEL: Cartesian accel-slew cap on the velocity command (decoupled from the
+        # wrench LP's NCF budget). TRACK_DAMP: velocity-decay so the jog eases into the target
+        # instead of coasting past it. Together with the gain these trade speed vs overshoot.
+        dv_max = float(_wt_cfg.TRACK_ACCEL) * model.opt.timestep
+        _track_damp = float(_wt_cfg.TRACK_DAMP)
         _err_xyz = None
+        _ang_err = None      # rotation error vector (rad-ish); norm ~= angular error magnitude
+        _tgt_z = _cur_z = None   # target vs actual wrist +Z axis in world (to SEE if target rotates)
         if wrist_tgt is not None:
             p_cur = data.site_xpos[_PINCH_SID]
             R_cur = data.site_xmat[_PINCH_SID].reshape(3, 3)
@@ -3716,12 +3720,21 @@ if __name__ == "__main__":
             ang   = np.array([R_err[2, 1] - R_err[1, 2],
                               R_err[0, 2] - R_err[2, 0],
                               R_err[1, 0] - R_err[0, 1]]) * 0.5
+            _ang_err = ang.copy()
+            _tgt_z = np.asarray(R_tgt, float)[:, 2].copy()   # target wrist Z in world
+            _cur_z = np.asarray(R_cur, float)[:, 2].copy()   # actual wrist Z in world
             v_ang = (np.zeros(3) if not WRIST_TRACK_ORI
                      else (_gain * WRIST_ANG_GAIN_SCALE) * ang)
         else:
             v_lin = np.zeros(3)
             v_ang = np.zeros(3)
         v_lin = np.clip(v_lin, -_jog_vel, _jog_vel)        # cap peak speed
+        # Velocity damping: decay the command toward zero so the jog eases in instead of
+        # coasting past the target (overshoot). At TRACK_DAMP=0 this is a no-op (original).
+        if _track_damp > 0.0:
+            _decay = _track_damp * model.opt.timestep
+            v_lin = v_lin - _decay * jog_v
+            v_ang = v_ang - _decay * jog_w
         jog_v = jog_v + np.clip(v_lin - jog_v, -dv_max, dv_max)
         jog_w = jog_w + np.clip(v_ang - jog_w, -dv_max, dv_max)
         # Always compute the pinch-site Jacobian's smallest singular value, even when
@@ -3754,7 +3767,9 @@ if __name__ == "__main__":
         # --tune-wrist. Only when actually tracking a target; no-op unless logging is on.
         if _err_xyz is not None:
             _wt_cfg.log_sample(t_sim=float(data.time), err_xyz=_err_xyz,
-                               speed_cmd=float(np.linalg.norm(jog_v)), sigma_min=sigma_min)
+                               speed_cmd=float(np.linalg.norm(jog_v)), sigma_min=sigma_min,
+                               ang_err=_ang_err, ang_speed_cmd=float(np.linalg.norm(jog_w)),
+                               tgt_z=_tgt_z, cur_z=_cur_z)
         return qdot_arm, jog_v, jog_w, sigma_min
 
     # Joint limits for the 7 arm DOF, and a mask of which are actually bounded.

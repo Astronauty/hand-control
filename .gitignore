@@ -248,3 +248,8 @@ wrist
 
 # Claude Code local settings/temp
 .claude/
+
+# Live wrist-tracking tuner runtime files (seeded from code defaults; local-only,
+# not authoritative — see teleop/wrist_track_tune.py DEFAULTS).
+teleop/calibration/wrist_track_config.json
+teleop/calibration/wrist_track_error.jsonl

@@ -57,6 +57,8 @@ RANGES = {
     "JOG_VEL":          (0.1, 1.5),
     "WRIST_TRACK_GAIN": (2.0, 30.0),
     "JOG_QDOT_MAX":     (1.0, 6.0),
+    "TRACK_ACCEL":      (1.0, 30.0),   # m/s^2 accel-slew cap (higher = snappier, more overshoot)
+    "TRACK_DAMP":       (0.0, 15.0),   # velocity damping (higher = less overshoot, slower)
 }
 
 
@@ -128,38 +130,44 @@ def main():
                            bbox=dict(boxstyle="round", fc="#fff3", ec="#e4572e"))
     ax_err.legend(loc="upper right", fontsize=8)
 
-    s_jv = Slider(fig.add_axes([0.13, 0.26, 0.6, 0.03]), "JOG_VEL (m/s)",
-                  *RANGES["JOG_VEL"], valinit=vals["JOG_VEL"])
-    s_gn = Slider(fig.add_axes([0.13, 0.19, 0.6, 0.03]), "WRIST_TRACK_GAIN",
-                  *RANGES["WRIST_TRACK_GAIN"], valinit=vals["WRIST_TRACK_GAIN"])
-    s_qd = Slider(fig.add_axes([0.13, 0.12, 0.6, 0.03]), "JOG_QDOT_MAX (rad/s)",
-                  *RANGES["JOG_QDOT_MAX"], valinit=vals["JOG_QDOT_MAX"])
-    b_apply = Button(fig.add_axes([0.79, 0.22, 0.16, 0.05]), "Apply (write config)")
-    b_reset = Button(fig.add_axes([0.79, 0.14, 0.16, 0.05]), "Reset to defaults")
-    status = fig.text(0.13, 0.06, "", fontsize=9, color="#2e7d32")
+    # One slider per tunable in DEFAULTS order (labels annotate the two that trade
+    # speed vs overshoot). Stacked from the bottom up.
+    _LABELS = {
+        "JOG_VEL":          "JOG_VEL (m/s) — peak speed",
+        "WRIST_TRACK_GAIN": "WRIST_TRACK_GAIN — P-gain",
+        "JOG_QDOT_MAX":     "JOG_QDOT_MAX (rad/s)",
+        "TRACK_ACCEL":      "TRACK_ACCEL (m/s²) — snappier↑",
+        "TRACK_DAMP":       "TRACK_DAMP — less overshoot↑",
+    }
+    keys = list(DEFAULTS.keys())
+    sliders = {}
+    y0, dy = 0.05, 0.055
+    for i, k in enumerate(reversed(keys)):
+        sliders[k] = Slider(fig.add_axes([0.16, y0 + i * dy, 0.55, 0.028]),
+                            _LABELS.get(k, k), *RANGES[k], valinit=vals[k])
+    b_apply = Button(fig.add_axes([0.79, 0.20, 0.17, 0.05]), "Apply (write config)")
+    b_reset = Button(fig.add_axes([0.79, 0.13, 0.17, 0.05]), "Reset to defaults")
+    status = fig.text(0.16, 0.005, "", fontsize=8.5, color="#2e7d32")
 
     def _apply(_event=None):
-        v = {"JOG_VEL": s_jv.val, "WRIST_TRACK_GAIN": s_gn.val, "JOG_QDOT_MAX": s_qd.val}
+        v = {k: sliders[k].val for k in keys}
         _write_config(args.config, v)
-        status.set_text(f"applied -> {os.path.relpath(args.config)}: "
-                        f"JOG_VEL={v['JOG_VEL']:.2f}  GAIN={v['WRIST_TRACK_GAIN']:.1f}  "
-                        f"QDOT_MAX={v['JOG_QDOT_MAX']:.2f}  (app reloads on next frame)")
+        status.set_text("applied -> " + os.path.relpath(args.config) + ":  "
+                        + "  ".join(f"{k}={v[k]:.2f}" for k in keys)
+                        + "   (app reloads next frame)")
         fig.canvas.draw_idle()
 
     def _reset(_event=None):
-        s_jv.set_val(DEFAULTS["JOG_VEL"])
-        s_gn.set_val(DEFAULTS["WRIST_TRACK_GAIN"])
-        s_qd.set_val(DEFAULTS["JOG_QDOT_MAX"])
+        for k in keys:
+            sliders[k].set_val(DEFAULTS[k])
         _apply()
 
-    # Apply on release so dragging doesn't spam the file (write on mouse-up).
-    for s in (s_jv, s_gn, s_qd):
-        s.on_changed(lambda _v: None)  # live label only; write on Apply / release
     b_apply.on_clicked(_apply)
     b_reset.on_clicked(_reset)
-    # Also write on slider release for a hands-free feel.
+    # Write on slider release (mouse-up) for a hands-free feel; dragging doesn't spam.
+    _slider_axes = {sliders[k].ax for k in keys}
     def _on_release(_evt):
-        if _evt.inaxes in (s_jv.ax, s_gn.ax, s_qd.ax):
+        if _evt.inaxes in _slider_axes:
             _apply()
     fig.canvas.mpl_connect("button_release_event", _on_release)
 
