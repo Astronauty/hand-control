@@ -753,8 +753,8 @@ if __name__ == "__main__":
     # budget and DLS-mapped to joint rates, so this only sets how briskly the wrist closes
     # a tracking gap; the budget still caps peak acceleration for the no-slip guarantee.
     WRIST_TRACK_GAIN = _env_float(WRIST_TRACK_GAIN_ENV, 12.0)   # TELEOP_TRACK_GAIN override.
-    # Reverted to the original 7.0 (was briefly raised to 12 during tuning). Raise live via
-    # TELEOP_TRACK_GAIN if you want snappier tracking once the wrist-rotation issue is resolved.
+    # 12 (raised from the original 7) for snappier tracking; tune live via TELEOP_TRACK_GAIN
+    # or the wrist_tune slider. Pair with TRACK_ACCEL/TRACK_DAMP to trade speed vs overshoot.
 
     # Object definitions: rigid objects only (obj_soft deferred — vertex-level contact,
     # not a rigid grasp-map problem). Each object maps every FINGER_SET finger to the
@@ -3627,7 +3627,7 @@ if __name__ == "__main__":
         print(f"[teleop] WRIST_ANG_GAIN_SCALE={WRIST_ANG_GAIN_SCALE:.3g} — "
               "angular tracking gain scaled independently of position.")
     # Responsiveness knobs — always print the active tracking config so a run is self-documenting
-    # (defaults JOG_VEL=0.3, WRIST_TRACK_GAIN=7; override live via the TELEOP_* env vars).
+    # (defaults JOG_VEL=0.6, WRIST_TRACK_GAIN=12; override live via the TELEOP_* env vars).
     print(f"[teleop] wrist-tracking responsiveness: JOG_VEL={JOG_VEL:.3g} m/s "
           f"(TELEOP_JOG_VEL), WRIST_TRACK_GAIN={WRIST_TRACK_GAIN:.3g} (TELEOP_TRACK_GAIN), "
           f"JOG_QDOT_MAX={JOG_QDOT_MAX:.3g} rad/s (TELEOP_QDOT_MAX)")
