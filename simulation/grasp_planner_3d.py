@@ -2465,6 +2465,80 @@ def build_W_ca(p1, p2, R1_param, R2_param, obj_center_np, obj_R_np, mu,
     return ca.horzcat(*cols)
 
 
+class _ExactGeomDistanceCallback(ca.Callback):
+    """Exact signed distance from one robot geom to the target object, as a function
+    of q -- FRoGGeR's collision model rather than our bounding-sphere proxy.
+
+    WHY THIS EXISTS. Everywhere else in this repo a robot geom is approximated by its
+    bounding sphere so CasADi can differentiate the distance analytically (see
+    `constrained_ik`'s module docstring). That is conservative and harmless while the
+    contacts are free variables held OFF the surface by an IK cost. It becomes
+    self-contradictory in the faithful FRoGGeR port, where the contacts ARE the
+    fingertips and must lie ON the surface:
+
+        the surface constraint pins the tip centre at the PAD radius, 19.4 mm;
+        the sphere collision constraint uses geom_rbound = 23.8 mm and, at a 2 mm
+        interpenetration allowance, demands the centre stay >= 21.8 mm out.
+
+    Infeasible by 2.4 mm, and the solve returns beta = 0 exactly -- invariant to the
+    robustness floor and to the allowance, which is what gave the diagnosis away.
+    The 4.4 mm gap is geom_rbound over-reporting the LEAP pad (SOLVER_STATE sec 10).
+
+    FRoGGeR has no such conflict because it never approximates: Drake witness points
+    on V-HACD convex decompositions, so "the pad touches" and "the fingertip may sink
+    in 3 mm" refer to the same surface. `mj_geomDistance` is MuJoCo's equivalent, and
+    this wraps it.
+
+    GUARDED against MuJoCo's GJK returning a phantom 0.0 for well-separated pairs by
+    taking the max with the bounding-sphere lower bound -- the same guard
+    `constrained_ik` applies (see the memory note on mj_geomDistance instability).
+
+    Differentiated by finite differences (`enable_fd`), matching how every FK
+    callback in this repo is handled. Exact distance is piecewise-smooth with kinks
+    at face/edge/vertex transitions, so an analytic Jacobian would not be better
+    behaved here.
+    """
+
+    def __init__(self, name, model, geom_id, obj_gids, n_robot, obj_qpos=None,
+                 cutoff=0.2):
+        ca.Callback.__init__(self)
+        self._model = model
+        self._data = mj.MjData(model)
+        self._gid = int(geom_id)
+        self._obj_gids = [int(g) for g in obj_gids]
+        self._n = int(n_robot)
+        self._cutoff = float(cutoff)
+        self._ft6 = np.zeros(6)
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self.construct(name, {"enable_fd": True})
+
+    def get_n_in(self):  return 1
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, _):  return ca.Sparsity.dense(self._n, 1)
+    def get_sparsity_out(self, _): return ca.Sparsity.dense(1, 1)
+
+    def eval(self, arg):
+        self.eval_count += 1
+        self._data.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(self._model, self._data)
+        m, d = self._model, self._data
+        best = float("inf")
+        for og in self._obj_gids:
+            # Bounding-sphere lower bound, and the guard against a phantom 0.0.
+            lb = (float(np.linalg.norm(d.geom_xpos[og] - d.geom_xpos[self._gid]))
+                  - float(m.geom_rbound[self._gid]) - float(m.geom_rbound[og]))
+            if lb > self._cutoff:
+                best = min(best, lb)
+                continue
+            dist = mj.mj_geomDistance(m, d, self._gid, og, self._cutoff, self._ft6)
+            if dist >= self._cutoff:
+                dist = max(lb, self._cutoff)
+            best = min(best, max(dist, lb))
+        return [ca.DM(best if np.isfinite(best) else self._cutoff)]
+
+
 class _MinWeightLPCallback(ca.Callback):
     """FRoGGeR's bilevel inner problem: l*(q) as a CasADi Function of the wrench
     matrix, with grad l* from implicit differentiation of the LP's KKT system.
@@ -3234,7 +3308,22 @@ class UVAtlasConfig:
     # contact ON the surface while the pad is a finite sphere, so requiring
     # non-negative clearance for the pad and surface contact simultaneously is
     # over-constrained. Their allowance is what reconciles the two.
-    frogger_finger_obj_margin_m: float = -0.002
+    frogger_finger_obj_margin_m: float = -0.003
+
+    # Use EXACT geom-vs-object distance (mj_geomDistance) for the object-collision
+    # constraint instead of this repo's bounding-sphere proxy.
+    #
+    # The proxy exists so CasADi can differentiate the distance analytically, and is
+    # conservative and harmless while contacts are free variables held off the
+    # surface by an IK cost. Under frogger_fk_contacts it is CONTRADICTORY: the
+    # surface constraint pins the tip centre at the pad radius (19.4 mm) while the
+    # proxy, using geom_rbound = 23.8 mm, demands >= 21.8 mm at a 2 mm allowance.
+    # Infeasible by 2.4 mm, and the solve returns beta = 0 exactly.
+    #
+    # FRoGGeR uses exact witness points (Drake + V-HACD), so both constraints act on
+    # the same surface and cannot conflict. Costs one mj_geomDistance query per geom
+    # per NLP iteration and is finite-differenced rather than analytic.
+    frogger_exact_collision: bool = False
     quadratic_t_bound_max:  float = 0.10    # metres, cap even where the surface stays flat
     quadratic_sdf_err_tol:  float = 4e-3    # metres, max surrogate-vs-true-SDF gap per axis
     # Constant amount (m) shaved off EVERY side of the trust-region rectangle
@@ -3864,6 +3953,16 @@ class GraspPlanner3D:
 
         c = self.cfg
         self._obj_gid    = self._require_geom(c.obj_geom)
+        # EVERY collision hull on the object body, not just the representative geom
+        # cfg.obj_geom names. A CoACD mesh decomposes into many hulls (median 23,
+        # max 126 across the YCB set), and exact distance must be the MINIMUM over
+        # all of them -- testing one hull reports clearance against a piece the
+        # fingertip is not near. Only used by frogger_exact_collision; the sphere
+        # proxy path is unchanged and still uses the single representative geom.
+        _obj_bid_all = int(model.geom_bodyid[self._obj_gid])
+        self._obj_all_gids = [g for g in range(model.ngeom)
+                              if int(model.geom_bodyid[g]) == _obj_bid_all
+                              and int(model.geom_group[g]) == 3] or [self._obj_gid]
         self._obj_bid    = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, c.obj_body)
         self._thumb_sid  = self._require_site(c.thumb_site)
         self._index_sid  = self._require_site(c.index_site)
@@ -3975,6 +4074,13 @@ class GraspPlanner3D:
             return (V_world - spos) @ smat
         self._thumb_verts_sl = _tip_verts_site_local(self._thumb_gid, self._thumb_sid)
         self._index_verts_sl = _tip_verts_site_local(self._index_gid, self._index_sid)
+        # Third contact's pad, cached on the same terms as thumb/index so
+        # _tip_support_along can serve it. Without this the tripod's middle finger
+        # fell back to the ISOTROPIC cfg.r_middle while contacts 1 and 2 used the
+        # directional support -- an ~8.5mm asymmetry in the IK target of one
+        # contact only (see _tip_support_along and the r3_override plumbing).
+        self._middle_verts_sl = (_tip_verts_site_local(self._middle_gid, self._middle_sid)
+                                 if self._middle_sid is not None else None)
 
         def _maybe_mocap(bname):
             bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, bname)
@@ -4151,10 +4257,16 @@ class GraspPlanner3D:
 
         Falls back to r_fallback (the isotropic radius) for a non-mesh tip.
         """
-        verts_sl = (self._thumb_verts_sl if which == 'thumb' else self._index_verts_sl)
+        verts_sl = {'thumb':  self._thumb_verts_sl,
+                    'index':  self._index_verts_sl,
+                    'middle': self._middle_verts_sl}.get(which, self._index_verts_sl)
         if verts_sl is None:
             return float(r_fallback)
-        sid = self._thumb_sid if which == 'thumb' else self._index_sid
+        sid = {'thumb':  self._thumb_sid,
+               'index':  self._index_sid,
+               'middle': self._middle_sid}.get(which, self._index_sid)
+        if sid is None:
+            return float(r_fallback)
         d = self._tip_data
         d.qpos[:len(q)] = q
         mj.mj_forward(self.model, d)
@@ -4705,7 +4817,9 @@ class GraspPlanner3D:
             _d3_sq = None
             if _has_c3 and _p3 is not None and middle_cb is not None:
                 _tp3   = _tp3_fk
-                _r3_ik = float(cfg.r_middle if cfg.r_middle is not None else cfg.r_index)
+                _r3_ik = float(
+                    (cfg.r_middle if cfg.r_middle is not None else cfg.r_index)
+                    if r3_override is None else r3_override)
                 _n3_out_ik = ca.DM(np.asarray(
                     d3_lp if d3_lp is not None else _n3_seed_out, float))
                 _tp3_tgt = _p3 + _r3_ik * _n3_out_ik
@@ -5397,7 +5511,19 @@ class GraspPlanner3D:
                     # fingertips/distal links that must touch), but the FLOOR constraint below
                     # is still applied so it can never drop underground.
                     _clr_obj = float(self._arm_obj_clearance[_ai])
-                    if _clr_obj > _COL_DISABLE_SENTINEL:
+                    if _clr_obj > _COL_DISABLE_SENTINEL and cfg.frogger_exact_collision:
+                        # FRoGGeR's collision model: EXACT geom-vs-object distance,
+                        # not our bounding-sphere proxy. Required by the faithful
+                        # port -- with FK contacts the sphere's 4.4 mm over-report
+                        # of the pad makes the surface and collision constraints
+                        # jointly infeasible. See _ExactGeomDistanceCallback.
+                        _ex_cb = _ExactGeomDistanceCallback(
+                            f'gp3_exd_{_uid}_{stage_label}_{_ai}', model,
+                            self._arm_gids[_ai], self._obj_all_gids, n_act,
+                            obj_qpos_snap)
+                        self._lp_callbacks.append(_ex_cb)   # keepalive
+                        _opti.subject_to(_ex_cb(_q) >= _clr_obj)
+                    elif _clr_obj > _COL_DISABLE_SENTINEL:
                         if geom_type == 6:   # BOX
                             _d_obj = _softplus_sphere_box_distance(
                                 _gp, _r, _obj_c_dm, _obj_R_dm, ca.DM([hx, hy, hz]))
@@ -5945,14 +6071,27 @@ class GraspPlanner3D:
             # -d*_lp is the OUTWARD direction: _d*_lp is the object's outward
             # surface normal used as the IK offset direction, and the pad extends
             # from the site back toward the finger, i.e. along -n_out.
-            _r1_ov = _r2_ov = None
+            _r1_ov = _r2_ov = _r3_ov = None
             if cfg.directional_r_tip:
                 _m = float(cfg.directional_r_tip_margin_m)
                 _r1_ov = self._tip_support_along('thumb', _q_ws, -_d1_lp, cfg.r_thumb) + _m
                 _r2_ov = self._tip_support_along('index', _q_ws, -_d2_lp, cfg.r_index) + _m
+                # Contact 3 gets the same treatment when a third contact exists and
+                # its normal is frozen for this stage; otherwise it keeps the
+                # isotropic fallback (a missing _d3_lp means no direction to
+                # support along).
+                if _d3_lp is not None:
+                    import os as _os
+                    if _os.environ.get("PFF_R3_TRACE"):
+                        print(f"[r3] computing directional middle radius, _d3_lp={_d3_lp}")
+                    _r3_ov = self._tip_support_along(
+                        'middle', _q_ws, -np.asarray(_d3_lp, float),
+                        cfg.r_middle if cfg.r_middle is not None else cfg.r_index) + _m
                 self.log.info(
                     f"[S{_ri+1}|r_tip] directional thumb={_r1_ov*1e3:.2f}mm "
-                    f"index={_r2_ov*1e3:.2f}mm  (isotropic {cfg.r_thumb*1e3:.2f}/"
+                    f"index={_r2_ov*1e3:.2f}mm"
+                    + (f" middle={_r3_ov*1e3:.2f}mm" if _r3_ov is not None else "")
+                    + f"  (isotropic {cfg.r_thumb*1e3:.2f}/"
                     f"{cfg.r_index*1e3:.2f}mm, margin {_m*1e3:.1f}mm)")
             res = _run_stage(_q_ws, _p1_ws, _p2_ws,
                              include_surface=True,
@@ -5963,6 +6102,7 @@ class GraspPlanner3D:
                              iter_callback=iter_callback,
                              update_normals_in_callback=update_normals_in_callback,
                              r1_override=_r1_ov, r2_override=_r2_ov,
+                             r3_override=_r3_ov,
                              p3_ws=_p3_ws, d3_lp=_d3_lp)
             # Keep the cheapest stage result — relinearization has no descent guarantee.
             if (res.get('cost') is not None and
@@ -7064,10 +7204,49 @@ class MultiStartGraspPlanner3D:
                         _dls_data3 = self._planner._dls_data
                         _dls_data3.qpos[:] = self._planner.data.qpos[:]
                         _dls_data3.qpos[act_idx] = np.asarray(q_ref, float)[:len(act_idx)]
-                        _r_mf = float(cfg.r_middle if cfg.r_middle is not None
-                                      else cfg.r_index)
-                        _t1 = _c3['p1s'] + cfg.r_thumb * (-_c3['n1_in'])
-                        _t2 = _c3['p2s'] + cfg.r_index * (-_c3['n2_in'])
+                        # Fingertip-site targets for the ranking IK. These use the
+                        # DIRECTIONAL support distance (pad extent along THIS
+                        # candidate's own contact normal) rather than the isotropic
+                        # bounding radius, for the same reason _run_stage does: the
+                        # isotropic value is a sphere around an elongated pad and
+                        # parks the target ~7-9mm proud of the surface.
+                        #
+                        # It matters MORE here than in the NLP. _e3 below scores each
+                        # candidate against its own _t3, and the best-scoring candidate
+                        # becomes seed['p3'] -- which warm-starts the NLP, which then
+                        # converges near it. Ranking under a wrong offset therefore
+                        # picks the wrong CONTACT, not merely a slightly wrong target;
+                        # correcting _run_stage alone left the solve bit-identical
+                        # because the seeder had already committed.
+                        #
+                        # Computed per candidate (each has its own n*_in) and at q_ref
+                        # rather than the solved pose -- the pad orientation is only
+                        # approximate here, but it is strictly closer than assuming the
+                        # pad is a sphere. Falls back to the isotropic radius whenever
+                        # directional_r_tip is off or the tip is not a mesh.
+                        import os as _os2
+                        if _os2.environ.get("PFF_SEED_TRACE"):
+                            print(f"[seedc3] candidate ranking IK running, "
+                                  f"n3_in={np.round(_c3['n3_in'],3)}")
+                        if cfg.directional_r_tip:
+                            _m_seed = float(cfg.directional_r_tip_margin_m)
+                            _r_th_s = self._planner._tip_support_along(
+                                'thumb', q_ref, -np.asarray(_c3['n1_in'], float),
+                                cfg.r_thumb) + _m_seed
+                            _r_ix_s = self._planner._tip_support_along(
+                                'index', q_ref, -np.asarray(_c3['n2_in'], float),
+                                cfg.r_index) + _m_seed
+                            _r_mf = self._planner._tip_support_along(
+                                'middle', q_ref, -np.asarray(_c3['n3_in'], float),
+                                cfg.r_middle if cfg.r_middle is not None
+                                else cfg.r_index) + _m_seed
+                        else:
+                            _r_th_s = float(cfg.r_thumb)
+                            _r_ix_s = float(cfg.r_index)
+                            _r_mf = float(cfg.r_middle if cfg.r_middle is not None
+                                          else cfg.r_index)
+                        _t1 = _c3['p1s'] + _r_th_s * (-_c3['n1_in'])
+                        _t2 = _c3['p2s'] + _r_ix_s * (-_c3['n2_in'])
                         _t3 = _c3['p3s'] + _r_mf * (-_c3['n3_in'])
                         self._planner._dls_ik.solve(
                             model, _dls_data3,
@@ -7078,6 +7257,9 @@ class MultiStartGraspPlanner3D:
                         _e3 = float(np.linalg.norm(
                             _dls_data3.site_xpos[self._planner._middle_sid] - _t3))
                         _c3_scored.append((_e3, _c3))
+                        if _os2.environ.get("PFF_SEED_TRACE"):
+                            print(f"[seedc3]   r_mf={_r_mf*1e3:.2f}mm fan={_c3.get('fan_deg')} "
+                                  f"e3={_e3*1e3:.2f}mm")
                     _c3_scored.sort(key=lambda t: t[0])
                     self.last_c3_rank_table = [
                         dict(fan_deg=_c['fan_deg'], mf_dls_res_mm=_e * 1e3,
