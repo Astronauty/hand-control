@@ -1418,6 +1418,39 @@ def _tangent_basis_np(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return t1, t2
 
 
+def _mesh_sdf_surface_contact_ca(opti, seed_world: np.ndarray,
+                                 center_np, mat_np, mesh_entry: dict):
+    """FRoGGeR's contact parameterization: a FREE world 3-vector pinned to the
+    surface by the SDF equality s(p) = 0, their constraint (7d).
+
+    This is structurally different from every other mesh branch here. The
+    quadratic/UV/tangent parameterizations give the contact 2 DOF on a LOCAL
+    surface model and bound it to a trust region, so a contact cannot leave the
+    neighborhood it was seeded in. Here the contact has 3 DOF and one equality,
+    which is 2 effective DOF on the surface but with NO locality: the optimizer
+    may slide it anywhere the SDF's zero level set reaches, including onto a
+    different face.
+
+    That difference is the point when benchmarking against FRoGGeR. Holding
+    position on our patch would confine their objective to our trust region --
+    a bound measured as ACTIVE (the solution sits on it 9/9 stages, SOLVER_STATE
+    sec 2) -- and would understate what their formulation can reach.
+
+    The cost is the property the patch was built to provide: there is no local
+    surface model, so curvature is unavailable here and any cost term wanting
+    kappa must fall back. The SDF gradient still supplies the normal.
+
+    Returns (p_sym, ) as a 1-tuple for symmetry with the other branches' (t, p).
+    The caller keeps `t_var = None`, which already means "no patch coordinates".
+    """
+    fn = mesh_entry["fn"]
+    p = opti.variable(3)
+    opti.set_initial(p, np.asarray(seed_world, float))
+    p_loc = ca.DM(np.asarray(mat_np, float).T) @ (p - ca.DM(np.asarray(center_np, float)))
+    opti.subject_to(fn(p_loc) == 0.0)
+    return p
+
+
 def _mesh_tangent_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np.ndarray,
                              center_np, mat_np, mesh_entry: dict, t_bound: float = 0.05):
     """Mesh contact as a 2-DOF tangent-plane offset from a seed point, reprojected onto
@@ -2969,6 +3002,28 @@ class UVAtlasConfig:
     # so this does NOT interact with the chart-pair antipodal seeding gated on
     # use_uv_atlas_contact elsewhere (_seed_pair, last_chart_rank_table).
     use_quadratic_contact: bool = False
+
+    # FRoGGeR's contact parameterization (7d): mesh contacts become FREE world
+    # 3-vectors pinned to the surface by the SDF equality s(p) = 0, instead of
+    # 2-DOF coordinates on a local paraboloid inside a trust region.
+    #
+    # Takes precedence over use_quadratic_contact and the UV atlas when set.
+    # Mesh objects only -- primitives already get an exact surface constraint from
+    # _sym_geom_surface_con, which is the same idea in closed form.
+    #
+    # WHY IT IS NOT INTERCHANGEABLE WITH THE PATCH. The patch bounds a contact to
+    # the neighborhood it was seeded in, and that bound is ACTIVE: the solution
+    # sits on it 9/9 measured stages (SOLVER_STATE sec 2). A free vector on the
+    # zero level set can traverse the whole surface, including onto another face.
+    # Benchmarking FRoGGeR's objective while holding position on our patch would
+    # therefore confine their formulation to our trust region and understate it.
+    #
+    # WHAT IT COSTS, and why it is not our default: there is no local surface
+    # model, so curvature is unavailable and the trust region that keeps the
+    # paraboloid honest does not exist. The patch was built to supply exactly
+    # those. The SDF gradient still gives the normal (see gws_sdf_normals), and
+    # the 4mm-accurate quadratic_sdf_err_tol machinery simply does not apply.
+    sdf_surface_contact:    bool = False
     quadratic_t_bound_max:  float = 0.10    # metres, cap even where the surface stays flat
     quadratic_sdf_err_tol:  float = 4e-3    # metres, max surrogate-vs-true-SDF gap per axis
     # Constant amount (m) shaved off EVERY side of the trust-region rectangle
@@ -4165,6 +4220,30 @@ class GraspPlanner3D:
                 # gating (see include_surface branch).
                 _p1 = ca.DM(np.asarray(p1_ws, float))
                 _p2 = ca.DM(np.asarray(p2_ws, float))
+            elif _is_mesh and cfg.sdf_surface_contact:
+                # FRoGGeR (7d): free 3-vectors pinned by s(p) = 0. No trust region
+                # and no local surface model, so contacts are free to traverse the
+                # whole surface. See _mesh_sdf_surface_contact_ca for why this is
+                # NOT interchangeable with the patch parameterization, and
+                # GraspConfig3D.sdf_surface_contact for what it costs.
+                _p1 = _mesh_sdf_surface_contact_ca(
+                    _opti, p1_ws, obj_center_np, obj_R_np, self._mesh_entry)
+                _p2 = _mesh_sdf_surface_contact_ca(
+                    _opti, p2_ws, obj_center_np, obj_R_np, self._mesh_entry)
+                if _has_c3:
+                    # Contact 3 gets its OWN free vector here, unlike the quadratic
+                    # path where it shares contact 2's patch. Sharing exists because
+                    # an independent PATCH can land on a face the hand cannot reach
+                    # (measured 183 mm tip-to-contact on 036_wood_block); that failure
+                    # mode is a property of fitting a second local model, not of the
+                    # surface constraint, and it does not apply to a free vector on
+                    # the global zero level set. Seeded from the fan when available,
+                    # else offset from contact 2 so the two do not start coincident
+                    # (identical contacts give a degenerate wrench matrix).
+                    _p3_seed = (np.asarray(p3_ws, float) if p3_ws is not None
+                                else np.asarray(p2_ws, float))
+                    _p3 = _mesh_sdf_surface_contact_ca(
+                        _opti, _p3_seed, obj_center_np, obj_R_np, self._mesh_entry)
             elif _is_mesh and _p1_chart_id is not None:
                 # UV-atlas local-neighborhood parameterization: p1/p2 become 2-DOF
                 # expressions (offset in a plane fit to the seed's local mesh

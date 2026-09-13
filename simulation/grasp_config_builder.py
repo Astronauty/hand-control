@@ -416,6 +416,7 @@ def for_frogger(obj_name: str, arm_geom_names: list,
                 max_iter: int = 80,
                 k_l: float = 0.3,
                 sdf_normals: bool = True,
+                sdf_surface: bool = True,
                 fingers=None,
                 **overrides) -> GraspConfig3D:
     """The FRoGGeR arm of the benchmark: beta as the SOLE objective.
@@ -445,14 +446,22 @@ def for_frogger(obj_name: str, arm_geom_names: list,
         which is the configuration to use when measuring how often the floor is
         what rejects a grasp.
 
+    sdf_surface : use FRoGGeR's contact parameterization (7d) -- free world
+        3-vectors pinned by s(p) = 0 -- instead of our 2-DOF patch coordinates.
+        **This is the faithful setting and the default.** Holding position on the
+        patch would confine their objective to OUR trust region, and that bound is
+        active (the solution sits on it 9/9 measured stages, SOLVER_STATE sec 2),
+        so it would understate what their formulation reaches. Set False to run
+        their objective inside our patch, which isolates objective structure from
+        the parameterization.
+
     sdf_normals : take contact normals from the object's SDF gradient rather than
         the quadratic patch, which is FRoGGeR's own formulation (n = -grad s(p))
         and is the better-conditioned estimator here: measured 1.80/2.64 deg
         against the patch's 4.80/4.92 deg on 056_tennis_ball/017_orange
-        (FROGGER_BENCH sec 8.5). The patch is retained for POSITION -- p(t) still
-        supplies the 2-DOF parameterization and the trust region -- so this
-        switches only the normal source. Set False to run the FRoGGeR objective on
-        patch normals, which isolates objective structure from normal source.
+        (FROGGER_BENCH sec 8.5). Under sdf_surface=True there is no patch to take
+        a normal from and this is the only available source; it becomes an
+        independent axis only when sdf_surface=False.
 
     NOTE the contact count. A 2-contact pinch has rank(W) = 5 of 6 and cannot
     satisfy l_bar* >= 0.3 meaningfully, so a faithful run needs `fingers` of
@@ -486,7 +495,14 @@ def for_frogger(obj_name: str, arm_geom_names: list,
     # The hard robustness floor (7c).
     cfg_kw.setdefault('gws_beta_min_normalized', float(k_l))
 
-    if sdf_normals:
+    if sdf_surface:
+        # FRoGGeR (7d). Disables the patch, so the paraboloid-dependent machinery
+        # (symbolic normals, trust-region edge hinge) has nothing to act on --
+        # turn it off explicitly rather than relying on the branch not firing.
+        cfg_kw.setdefault('sdf_surface_contact', True)
+        cfg_kw.setdefault('use_quadratic_contact', False)
+        cfg_kw.setdefault('quadratic_symbolic_normals', False)
+    if sdf_normals or sdf_surface:
         cfg_kw.setdefault('gws_sdf_normals', True)
 
     return for_gws_recommender(

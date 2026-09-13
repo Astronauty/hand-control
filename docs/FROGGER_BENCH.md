@@ -101,10 +101,17 @@ Varied: decision variables, objective, closure constraint, normal source.
    contact counts, the hard floor `gws_beta_min_normalized` (FRoGGeR's (7c)), and
    `gws_sdf_normals` for their `n = -grad s(p)`.
 
-   Two deliberate departures from the paper, both recorded rather than hidden:
-   the patch is kept for POSITION (only the normal source changes, so the 2-DOF
-   parameterization is not a variable in the comparison), and the LP embedding stays
-   single-level (the bilevel rewrite needs `rank(W) = 6` first — see
+   Contact parameterization is FRoGGeR's (7d): free world 3-vectors pinned by
+   `s(p) = 0` (`sdf_surface_contact`), not our 2-DOF patch coordinates. Holding
+   position on the patch would confine their objective to OUR trust region, and that
+   bound is active — the solution sits on it 9/9 measured stages (SOLVER_STATE §2) —
+   so it understates their formulation. Measured on `017_orange` seed 0: `l_bar*`
+   0.869 on the patch against **0.999** with the surface equality, against a
+   theoretical ceiling of 1.0. `--patch-normals` keeps the patch, isolating objective
+   structure from parameterization.
+
+   One departure from the paper remains, recorded rather than hidden: the LP embedding
+   stays single-level (the bilevel rewrite needs `rank(W) = 6` first — see
    [`GWS_IMPROVEMENTS.md`](GWS_IMPROVEMENTS.md) items 2-3). `lp_gap` is therefore a
    COMMON-MODE limitation of both arms and is reported per solve.
 
