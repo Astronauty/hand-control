@@ -702,3 +702,53 @@ one of the pieces, and it is where the next session should start.
 
 **`--arms frogger` remains unsuitable for reported numbers.** The `ours` arm is
 unaffected throughout.
+
+
+---
+
+## 12. Root cause of the frogger regression: our sphere proxy, not their formulation
+
+§11.3 guessed that the surface constraint and the interpenetration allowance conflict
+"as a modelling question in their formulation". That was wrong. **FRoGGeR does not have
+this conflict, because it never approximates the fingertip.**
+
+### 12.1 The arithmetic
+
+| quantity | value |
+|---|---|
+| fingertip PAD radius (what the surface constraint uses) | 19.4 mm |
+| fingertip COLLISION sphere, `geom_rbound` | 23.8 mm |
+| interpenetration we allowed | 2.0 mm |
+
+The surface constraint pins the tip CENTRE 19.4 mm from the object. The collision
+constraint, working on the 23.8 mm sphere, demands the centre stay at least
+23.8 - 2.0 = 21.8 mm out. **Jointly infeasible by 2.4 mm**, so the solver satisfies
+neither and `beta` collapses to exactly 0 -- which is why it was invariant to `k_l`
+(0.3, 0.1, 0.0) and to the margin magnitude.
+
+The 4.4 mm gap is a known repo defect in a new place: SOLVER_STATE §10 already records
+`geom_rbound` over-reporting the LEAP pad, being the bounding sphere about the mesh
+frame origin rather than the pad.
+
+### 12.2 What FRoGGeR actually does (App. B-F)
+
+- **Exact collision geometry.** Drake witness points on V-HACD convex decompositions --
+  the true fingertip shape against the true object. "Pad touches the object" and
+  "fingertip may sink in" therefore refer to the SAME surface and cannot contradict.
+- **Interpenetration allowance: 3 mm** for fingertip/object pairs. We used 2 mm.
+- **Every other pair: 1 mm** minimum safety margin. Ours are larger and per-geom.
+- **Contact point: a FIXED point on each fingertip**, at 60 degrees tilted toward the
+  palm from the very tip, chosen so the forward kinematics are fixed. We instead
+  compute `site - r_tip * n_sdf`, which moves with the SDF normal.
+- Constraint tolerances: joint 1e-2, surface contact 5e-4, collision 1e-3.
+
+### 12.3 Consequence for the port
+
+The bounding-sphere collision proxy is OUR approximation, adopted so CasADi can
+differentiate the distance (see `constrained_ik`'s module docstring). It is
+conservative and harmless when contacts are free variables held off the surface by an
+IK cost. It becomes contradictory the moment the contacts ARE the fingertips and must
+lie ON the surface, which is exactly what the faithful port does.
+
+`constrained_ik` already uses `mj_geomDistance` (exact, guarded by a bounding-sphere
+lower bound) rather than the sphere proxy, so an exact path exists in this repo.
