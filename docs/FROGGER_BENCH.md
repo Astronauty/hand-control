@@ -283,12 +283,31 @@ analytic patch normals (9.22 deg frozen). Reconstructing that solve's geometry f
 mu = 0.6 and do not transfer directly; friction coefficient changes the cone aperture and
 hence the sensitivity.
 
-The residual factor of ~5 is unexplained. Candidate contributions, not yet separated: the
-normal error at a trust-region bound exceeding the patch median quoted above; the
-contribution of §8.3's best-effort iterate (`017_orange` is best-effort on all three
-seeds); and a systematic rather than random tilt direction, which the random-direction
-model above would understate. This should be resolved before `delta` is used
-quantitatively rather than as a direction.
+Two of the three candidate explanations for the residual have been tested and rejected.
+
+**A systematic tilt does not account for it, and has the opposite sign.** A quadratic patch
+on a locally convex surface tilts its normal in a consistent direction as the contact slides
+outward, so both contacts of an antipodal pair tilt coherently rather than independently. At
+2.02 deg, comparing the three models on the reconstructed `017_orange` geometry:
+
+| model | mu = 0.6 | mu = 2.0 |
+|---|---|---|
+| random direction | -0.00562 | -0.00165 |
+| coherent, toward antipodal | **+0.00497** | **+0.00144** |
+| coherent, away from antipodal | -0.00513 | -0.00146 |
+
+A coherent tilt toward antipodal raises `beta`. Curvature-driven correlated patch error
+would therefore bias `beta` upward, not explain a measured -0.0084.
+
+**Off-surface evaluation does not account for it.** The SDF gradient is a surface normal
+only near the zero level set. Measured at the solved contacts, `|s|` has median 0.37 mm and
+max 2.97 mm, and the largest disagreements do not track it: `056_tennis_ball` has the
+largest `delta` (-0.131) with contacts 0.47-0.58 mm off-surface, while `009_gelatin_box` sd0
+sits furthest off-surface (2.68/2.97 mm) with `delta` of the opposite sign.
+
+The remaining candidate is §8.3's best-effort iterate: `017_orange` is best-effort on all
+three seeds, and §8.3 shows the disagreement is 6x larger in that regime. This has not been
+isolated. `delta` should be read as a direction, not a calibrated magnitude, until it is.
 
 Two conditions concentrate the error at the solved contacts. First, the solution sits at a
 trust-region bound on 9/9 measured stages (SOLVER_STATE §2), which is where a paraboloid
@@ -302,7 +321,42 @@ favourably than the true geometry can raise `beta`; `009_gelatin_box` sd0 is suc
 and it occurs where the true configuration is near-degenerate (62.4 deg splay,
 `beta_true = -0.0`), so the reference value is at the bottom of its range.
 
-### 8.5 Dependence on contact count
+### 8.5 Accuracy of the two normal estimators
+
+`beta_true` is computed from `_geom_normal_np`, the gradient of the baked SDF B-spline.
+`beta_rep` is computed from the quadratic patch's analytic normal. Both are estimators of
+the same quantity, and the patch is NOT the noisier of the two by construction: its normal
+field is a low-degree polynomial in `t` (`_quadratic_inward_normal_ca`), exactly
+differentiable, and its curvature aggregates a neighbourhood of mesh vertices. Smoothness
+and accuracy are independent properties; the relevant comparison is accuracy.
+
+Measured against the analytic normal of a sphere least-squares fitted to each object's own
+visual vertices. `056_tennis_ball` and `017_orange` are near-spherical, and the fit residual
+bounds how much of each error is the object's true non-sphericity — a term common to both
+estimators — rather than representation error:
+
+| object | sphere fit residual (median / p95) | SDF-gradient normal | patch normal |
+|---|---|---|---|
+| `056_tennis_ball` | 0.115 / 0.560 mm | 1.80 deg | 4.80 deg |
+| `017_orange` | 0.377 / 1.289 mm | 2.64 deg | 4.92 deg |
+
+The difference, 2.3-3.0 deg, is representation error and favours the SDF gradient. This is
+consistent with the paraboloid being a second-order fit evaluated at a trust-region bound
+(SOLVER_STATE §2 records the solution as pinned to a bound on 9/9 stages), which is where a
+second-order surrogate departs furthest from the surface it was fitted to.
+
+Note that the two estimators read different surface representations: the patch is fitted to
+mesh **visual vertices**, while `_geom_normal_np` evaluates the **baked SDF spline**. The
+SDF gradient is not high-frequency noise — averaging it over a 5 mm neighbourhood, the
+smoothing a quadratic fit performs, displaces it by a median of 0.03-0.17 deg (p90 <= 1.03
+deg) across four objects — but that is a statement about its smoothness, and the table above
+is the statement about its accuracy.
+
+`beta_true` is therefore the better-conditioned of two estimates, not a ground truth. The
+claims in §8.1-§8.3 should be read as "relative to the SDF-gradient normal", which is also
+the quantity FRoGGeR's formulation uses.
+
+### 8.6 Dependence on contact count
 
 `036_wood_block` seed 0, varying only the finger list:
 
@@ -324,7 +378,7 @@ Raw `beta` is lower at n=3 because its ceiling is `1/n_cols` and n_cols goes 10 
 Compare `beta_true_scaled` (`beta * n_cols`) across contact counts. `gamma_min` is likewise
 not comparable across n — see §7.2.
 
-### 8.6 Determinism
+### 8.7 Determinism
 
 Four full 18-cell sweeps. Runs 1, 3 and 4 are byte-identical (md5 `29edc6c1ad41` over the
 table body). Run 2 differed in two cells (`056_tennis_ball` sd0, `061_foam_brick` sd2).

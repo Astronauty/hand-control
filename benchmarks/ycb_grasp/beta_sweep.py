@@ -106,6 +106,15 @@ def plan_one(object_id, seed, n_seeds=3, max_iter=80, fingers=None):
               mesh_entry=inner._mesh_entry, mu=mu,
               mu_t=mu_t if cfg.gws_soft_finger else 0.0)
 
+    # Distance of each solved contact off the true surface. The SDF gradient is only a
+    # surface normal near the zero level set, so this bounds how much of any
+    # normal disagreement is attributable to evaluating away from the surface.
+    from simulation.grasp_planner_3d import _geom_sdf_np
+    a["sdf_mm"] = [1e3 * _geom_sdf_np(np.asarray(p, float), inner._obj_geom_type,
+                                      obj_center, obj_R, inner._obj_size,
+                                      mesh_entry=inner._mesh_entry)
+                   for p in a.get("points", [])]
+
     return {
         "object": object_id, "seed": seed,
         "status": res.get("status"),

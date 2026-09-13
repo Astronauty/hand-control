@@ -159,6 +159,8 @@ def audit(result: dict, *, geom_type: int, obj_center, obj_R, obj_size,
         "beta_true_scaled": beta_true * n_cols if np.isfinite(beta_true) else float("nan"),
         "beta_reported_scaled": reported * n_cols if reported is not None else None,
         "span_margin": sm,
+        "points": [np.asarray(p, float).tolist() for p in pts],
+        "sdf_mm": [None] * len(pts),   # filled by the caller when it has the geom args
         "normals": [n.tolist() for n in normals],
         "alpha_min": float(np.min(alpha)) if alpha is not None else None,
         "contradiction": contradiction,
