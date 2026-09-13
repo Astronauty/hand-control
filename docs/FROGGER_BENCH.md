@@ -458,3 +458,74 @@ in a different object grouping, reproduces the runs-1/3/4 values.
 SOLVER_STATE §12's determinism claim holds, including across a multi-object sweep in one
 process. The operational constraint is narrower: do not run two sweeps concurrently, and do
 not modify planner source while one is in flight. Treat any overlapped run as void.
+
+---
+
+## 9. Benchmark results, plan-only (2026-09-13)
+
+`benchmarks/ycb_grasp/frogger_bench.py`, 6 objects x 3 seeds, tripod
+(`thumb,index,middle`), `k_l = 0.3`, 80/3 preset. Both arms share scene, settle,
+seeding pool, collision model, solver backend and scoring; they differ in objective
+structure, robustness floor, contact parameterization and normal source.
+
+`l_bar* = n_cols * beta` (ceiling 1.0). `l_bar_converged` is the same LP re-solved to
+optimality on the same `W`. `lp_gap = l_bar_converged - l_bar` in normalized units.
+
+### 9.1 Read `resid_Walpha` before `l_bar*`
+
+The min-weight LP constrains `||W alpha|| = 0`. A solve that exits with that residual
+nonzero has a reported `beta` that is **not a min-weight value at all** — it is an
+infeasible iterate, and `l_bar*` computed from it is meaningless in either direction.
+
+At a `1e-4` threshold, **9 of 36 solves are LP-infeasible** (ours 9/18 feasible,
+frogger 11/18). The extreme cases: `056_tennis_ball` ours sd1/sd2 report
+`l_bar* = -1.0813` with `||W alpha|| = 1.4e-2`, and `009_gelatin_box` frogger sd0
+reports `l_bar* = +0.8959` with `||W alpha|| = 6.1e-1` while its converged value is
+`-0.0000`. The wrench certificate independently rejects that last one (`wf=False`),
+which is the certificate doing its job on a grasp the NLP should not have offered.
+
+**This is common-mode**, a property of the shared single-level embedding
+(GWS_IMPROVEMENTS.md §0-§1), not of either formulation. It affects both arms and is the
+single largest threat to this table's validity. Report `l_bar_converged` alongside
+`l_bar*`, and treat `resid_Walpha > 1e-4` rows as unscored.
+
+### 9.2 Summary
+
+| | ours | frogger |
+|---|---|---|
+| median `l_bar*` (LP-feasible rows only) | +0.5762 | **+1.0000** |
+| median `l_bar_converged` (all rows) | +0.6871 | **+0.9983** |
+| LP-feasible (`resid_Walpha <= 1e-4`) | 9/18 | 11/18 |
+| wrench-feasible (`verify()`) | 16/18 | 17/18 |
+| IPOPT converged | 8/18 | 10/18 |
+| median `gamma_min` (N) | 1.863 (16) | **1.214** (17) |
+| median solve time | 2.8 s | **2.0 s** |
+
+The FRoGGeR arm reaches a substantially higher min-weight margin, needs ~35% less
+internal force for the same task, and solves ~30% faster. The `l_bar*` gap is robust to
+the §9.1 caveat: it holds on `l_bar_converged` over all rows (+0.9983 vs +0.6871), which
+is the LP-optimal value and therefore immune to the residual problem.
+
+### 9.3 The parameterization matters, and by how much
+
+The same benchmark with the frogger arm confined to OUR patch (`--patch-normals`,
+preserved as `fb_patchpos`) gives median `l_bar* = +0.8723` against **+0.9990** under
+FRoGGeR's own surface equality. Holding position on the patch understates their
+formulation by ~0.13 in normalized units, because the trust region is an active bound
+(SOLVER_STATE §2, pinned 9/9 stages).
+
+Both configurations are worth reporting: the patch-position arm isolates objective
+structure, the surface-equality arm tests the full formulation.
+
+### 9.4 What is not yet measured
+
+- **Execution.** Plan-only. The paper's shaky-pickup protocol is not wired, so nothing
+  here speaks to pick success — which is FRoGGeR's headline claim and the quantity
+  `l_bar*` is only a proxy for. Their own data has `l_bar*` as a noisy success
+  predictor (0.61 vs 0.47 for successes vs failures).
+- **The floor's contribution.** `--k-l 0` would separate the objective change from the
+  hard constraint. The 17/18 vs 16/18 wrench-feasibility difference is the one number
+  where the floor plausibly does visible work.
+- **Fairness of the gamma comparison.** Lower `gamma_min` is better, but the two arms
+  place contacts differently, so this compares grasps, not solvers, and is not
+  normalized for contact separation.
