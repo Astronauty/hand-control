@@ -319,6 +319,14 @@ if __name__ == "__main__":
              "(mesh thinned, dpi 60 ~0.4 s) so the viewer never stalls. Reads THIS solve's "
              "in-memory result (quad frames + solved t) — no --rec-log-dir needed.")
     _arg_parser.add_argument(
+        '--tune-wrist', dest='tune_wrist', action='store_true',
+        help="baseline dexpilot / contact_aware_teleop: live-tune the wrist-tracking "
+             "responsiveness. Hot-reloads JOG_VEL / WRIST_TRACK_GAIN / JOG_QDOT_MAX from "
+             "teleop/calibration/wrist_track_config.json every frame (edit-and-save, or use "
+             "the slider GUI teleop/wrist_tune.py), and LOGS the live tracking error "
+             "(|reference wrist - actual pinch site|) + the active params per control step to "
+             "teleop/calibration/wrist_track_error.jsonl for offline analysis.")
+    _arg_parser.add_argument(
         '--contact-profile', dest='contact_profile', default='stock',
         choices=['stock', 'tuned'],
         help="Contact/solver settings. stock (default): whatever the scene XML compiles "
@@ -3628,6 +3636,19 @@ if __name__ == "__main__":
     print(f"[teleop] wrist-tracking responsiveness: JOG_VEL={JOG_VEL:.3g} m/s "
           f"(TELEOP_JOG_VEL), WRIST_TRACK_GAIN={WRIST_TRACK_GAIN:.3g} (TELEOP_TRACK_GAIN), "
           f"JOG_QDOT_MAX={JOG_QDOT_MAX:.3g} rad/s (TELEOP_QDOT_MAX)")
+    # Live wrist-tracking tuner (--tune-wrist): the config object holds the three tunables,
+    # hot-reloads them from wrist_track_config.json each frame, and (when --tune-wrist) logs the
+    # tracking error per control step. _solve_wrist_qdot reads JOG_VEL/WRIST_TRACK_GAIN/
+    # JOG_QDOT_MAX from it so an edit takes effect live. Seeded from the env-overridden values
+    # above so the first config write matches this launch. Always constructed (so the same code
+    # path serves tuned and untuned runs); logging only when --tune-wrist.
+    from teleop.wrist_track_tune import WristTrackConfig
+    _wt_cfg = WristTrackConfig(JOG_VEL, WRIST_TRACK_GAIN, JOG_QDOT_MAX,
+                               logging=bool(getattr(args, 'tune_wrist', False)))
+    if getattr(args, 'tune_wrist', False):
+        print(f"[teleop] --tune-wrist: hot-reloading {_wt_cfg.config_path}\n"
+              f"          logging tracking error -> {_wt_cfg.log_path}\n"
+              f"          edit the JSON (or run: python teleop/wrist_tune.py) to tune live.")
     # Debug/control experiment: TELE_AUTO_JOG=1 makes teleop's GRASP phase use the
     # AUTONOMOUS carry path — the arrow-key jog (world-frame palm velocity, orientation
     # held) instead of DexPilot wrist tracking. Everything upstream (recommender grasp,
@@ -3677,22 +3698,30 @@ if __name__ == "__main__":
         into qvel[:7] and integrates its arm-hold in lockstep. Pure w.r.t. globals: it
         reads model/data + the tuning constants but mutates nothing, so it's safe to
         call from either drive branch."""
+        # Read the three tunables from the live config so --tune-wrist edits take effect
+        # this frame (hot-reloaded by _wt_cfg.poll() in the drive loop). Falls back to the
+        # module constants' values, which _wt_cfg was seeded with.
+        _gain = _wt_cfg.WRIST_TRACK_GAIN
+        _jog_vel = _wt_cfg.JOG_VEL
+        _qdot_max = _wt_cfg.JOG_QDOT_MAX
         dv_max = np.array(NCF_ACCEL_BUDGET_XYZ) * model.opt.timestep
+        _err_xyz = None
         if wrist_tgt is not None:
             p_cur = data.site_xpos[_PINCH_SID]
             R_cur = data.site_xmat[_PINCH_SID].reshape(3, 3)
             p_tgt, R_tgt = wrist_tgt
-            v_lin = WRIST_TRACK_GAIN * (p_tgt - p_cur)
+            _err_xyz = np.asarray(p_tgt, float) - np.asarray(p_cur, float)  # reference - actual
+            v_lin = _gain * (p_tgt - p_cur)
             R_err = R_tgt @ R_cur.T
             ang   = np.array([R_err[2, 1] - R_err[1, 2],
                               R_err[0, 2] - R_err[2, 0],
                               R_err[1, 0] - R_err[0, 1]]) * 0.5
             v_ang = (np.zeros(3) if not WRIST_TRACK_ORI
-                     else (WRIST_TRACK_GAIN * WRIST_ANG_GAIN_SCALE) * ang)
+                     else (_gain * WRIST_ANG_GAIN_SCALE) * ang)
         else:
             v_lin = np.zeros(3)
             v_ang = np.zeros(3)
-        v_lin = np.clip(v_lin, -JOG_VEL, JOG_VEL)          # cap peak speed
+        v_lin = np.clip(v_lin, -_jog_vel, _jog_vel)        # cap peak speed
         jog_v = jog_v + np.clip(v_lin - jog_v, -dv_max, dv_max)
         jog_w = jog_w + np.clip(v_ang - jog_w, -dv_max, dv_max)
         # Always compute the pinch-site Jacobian's smallest singular value, even when
@@ -3719,8 +3748,13 @@ if __name__ == "__main__":
             # integrate more than JOG_QDOT_MAX rad/s into any joint. Scales the whole vector
             # so the wrist direction is preserved, only the magnitude is capped.
             _qdmax = np.abs(qdot_arm).max()
-            if _qdmax > JOG_QDOT_MAX:
-                qdot_arm *= JOG_QDOT_MAX / _qdmax
+            if _qdmax > _qdot_max:
+                qdot_arm *= _qdot_max / _qdmax
+        # Log the tracking error (reference wrist vs actual pinch site) + active params for
+        # --tune-wrist. Only when actually tracking a target; no-op unless logging is on.
+        if _err_xyz is not None:
+            _wt_cfg.log_sample(t_sim=float(data.time), err_xyz=_err_xyz,
+                               speed_cmd=float(np.linalg.norm(jog_v)), sigma_min=sigma_min)
         return qdot_arm, jog_v, jog_w, sigma_min
 
     # Joint limits for the 7 arm DOF, and a mask of which are actually bounded.
@@ -4129,6 +4163,11 @@ if __name__ == "__main__":
         while viewer.is_running() and running:
             step_start = time.time()
             _n_sub = 1   # physics catch-up substeps this iteration (dexpilot --physics)
+
+            # Hot-reload the wrist-tracking tunables (--tune-wrist). Cheap (mtime stat);
+            # applies edits to JOG_VEL/WRIST_TRACK_GAIN/JOG_QDOT_MAX live in _solve_wrist_qdot.
+            if _wt_cfg.poll():
+                print(f"[teleop] wrist-track config reloaded: {_wt_cfg.values()}")
 
             # Standardized phase marker: log a phase_enter to events.jsonl whenever the
             # STANDARDIZED (phase, approach_sub) changes, detected here in one place
