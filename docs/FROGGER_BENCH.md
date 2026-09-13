@@ -1,207 +1,188 @@
 # FRoGGeR as a benchmark arm
 
-**Status: design note, Phase 0.** Nothing here is implemented yet. This file fixes what
-the comparison *is* before any code is written, so the ablation stays honest about what
-the two arms share and what they do not.
+**Status: design note plus Phase 1 results.** The benchmark harness itself is not yet
+built. This file fixes the terms of the comparison before further code is written, and
+records what Phase 1 established.
 
 Paper: [FRoGGeR: Fast Robust Grasp Generation via the Min-Weight Metric][paper]
-(Li, Culbertson, Ames, et al., IROS 2023). Reference code: [alberthli/frogger][code].
+(Li, Culbertson, Ames, et al., IROS 2023). Reference implementation: [alberthli/frogger][code].
 
 [paper]: https://arxiv.org/abs/2302.13687
 [code]: https://github.com/alberthli/frogger
 
 ---
 
-## 0. The thing to be clear about first
+## 0. Relationship to the existing solver
 
-**We already have the min-weight metric.** `_embed_gws_ca`
-(`simulation/grasp_planner_3d.py`) is the paper's LP (2a)-(2d) verbatim:
+The min-weight metric is already implemented here. `_embed_gws_ca`
+(`simulation/grasp_planner_3d.py`) is the paper's LP (2a)-(2d):
 
 ```
 max_{alpha, beta}  beta    s.t.  W(q) alpha = 0,  sum(alpha) = 1,  alpha >= beta * 1
 ```
 
-`docs/SOLVER_STATE.md` already names it "the FRoGGeR min-weight metric". So this benchmark
-is **an ablation of two formulations that share a metric**, not a port of a method we
-lack. Describing it as a reimplementation would misstate the contribution.
+`docs/SOLVER_STATE.md` refers to it as the FRoGGeR min-weight metric. The benchmark is
+therefore an ablation between two formulations sharing a metric, not an implementation of
+an absent method.
 
-## 1. What actually differs
+## 1. Points of difference
 
-| | FRoGGeR (7a-7e) | ours |
+| | FRoGGeR (7a)-(7e) | this solver |
 |---|---|---|
-| decision variables | `q` alone | `q`, patch coords `t1/t2/t3`, `gamma`, cone coeffs `y`, slacks `s` |
-| contacts | FK outputs, pinned by SDF equality `s(FK_i(q)) = 0` | 2-DOF coordinates on a locally-fitted quadratic patch + trust region |
+| decision variables | `q` | `q`, patch coordinates `t1/t2/t3`, `gamma`, cone coefficients `y`, slacks `s` |
+| contacts | FK outputs, constrained by `s(FK_i(q)) = 0` | 2-DOF coordinates on a fitted quadratic patch with a trust region |
 | normals | `-grad s(p)` from the object SDF | patch-symbolic (`quadratic_symbolic_normals`) or Picard-frozen |
-| objective | `max l*(q)`, sole term | weighted sum of ~10 terms; `w_gws = 5.0` is one of them, `w_ik = 0.70` dominates |
-| closure | hard constraint `l_bar* >= k_l = 0.3` | none — `beta` is free, only pushed by its cost weight |
-| collision | witness points via Drake, `sigma >= d_j`, `d_j < 0` for finger-object | softplus bounding-sphere vs primitive + baked SDF table |
+| objective | `max l*(q)`, sole term | weighted sum of ~10 terms; `w_gws = 5.0`, `w_ik = 0.70` dominant |
+| closure | hard constraint `l_bar* >= k_l = 0.3` | none; `beta` is free, weighted only through its cost term |
+| collision | Drake witness points, `sigma >= d_j` | softplus bounding-sphere vs primitive, plus a baked SDF table |
 | solver | NLopt SLSQP | IPOPT (SQP available via `--backend`) |
-| fingers | 4 (Allegro) | 2 today; 3 slots exist, tripod is planner-side only |
+| contacts used | 4 (Allegro) | 2 by default; 3 slots exist |
 
-The interesting question is not "can we run their code" but: **does the leaner
-formulation beat the patch machinery on our hardware, and where?**
+The question under test is whether the leaner formulation produces better grasps on this
+hardware, and under what conditions.
 
-## 2. Two decisions, and why
+## 2. Two decisions
 
-### 2.1 Finish the `n >= 3` wiring first
+### 2.1 Complete the `n >= 3` wiring first
 
-A 2-contact pinch has a rank-5-of-6 wrench matrix (this is why
-`project_grasp_axis_torque` exists) and therefore **cannot** satisfy `l_bar* >= 0.3` in
-any meaningful sense. Benchmarking FRoGGeR as a pinch would test a claim the paper does
-not make.
-
-`SOLVER_STATE.md` §10 already lists the gap: `build_W_ca` accepts `extra_contacts`, but
-the sole call site — the `w_gws`/`w_span` block — does not pass it, so `beta` is computed
-from a 2-contact `W` even when the NLP solved a third contact. §4 argues that at `n > 2`
-opposition is the wrong objective *because* `beta` measures the right thing, and that
-argument does not hold until the third column is actually in `W`.
-
-So Phase 1 is not benchmark scaffolding; it is the top open item in the solver doc, and
-the benchmark is its forcing function.
+A 2-contact pinch has a rank-5-of-6 wrench matrix, which is the reason
+`project_grasp_axis_torque` exists. It cannot satisfy `l_bar* >= 0.3` in a meaningful
+sense, so a 2-contact FRoGGeR arm would not test the paper's claim. §8.5 gives a second,
+measured reason: `beta`'s agreement with the true-normal value is 60x tighter at n=3.
 
 ### 2.2 The FRoGGeR arm uses true SDF normals
 
-`SOLVER_STATE.md` is explicit that **`beta` is only as true as the patch its normals come
-from**, with two measured cases: a reported `beta = +0.0692` that recomputes to `-0.0` on
-true normals, and `061_foam_brick` at `beta = +0.0996` on a grasp where
-`arccos(n1 . n2) = 76.3 deg` against a `61.4 deg` friction limit — force closure
-*geometrically impossible*. The two disagree on 17% of solves.
+`beta` is computed from the wrench matrix the NLP assembles, whose normals come from the
+quadratic patch rather than the object surface. §8 measures the consequence. The decisive
+case is §8.2: on three solves, patch-derived `beta` reports non-closure for grasps that
+both independent certificates accept. A hard `l_bar* >= k_l` constraint on that quantity
+would reject them.
 
-FRoGGeR's entire objective is `beta`. Feeding it patch normals would have it optimize
-exactly that fiction. The paper's own formulation takes normals as `-grad s(p)` from the
-SDF, so using the baked `object_sdf` gradient is both the faithful reading and the
-defensible one.
+The paper's own formulation takes normals as `-grad s(p)`, so using the baked
+`object_sdf` gradient is both the faithful reading and the defensible one. This makes
+surface representation a second measurable axis rather than a confound: the patch exists
+because SDF-Hessian curvature was measured to be unreliable (SOLVER_STATE §2: -12.33 on a
+flat face, sourced from a corner 50 mm away), which bears directly on FRoGGeR's
+finite-differenced mesh Hessian (their `delta ~ 10x` mean edge length). Ours is analytic
+from the spline. The disagreement should be reported as a result.
 
-Consequence worth stating: this makes **surface representation a second measurable axis**,
-not a confound. Our patch exists because SDF-Hessian curvature was measured to be garbage
-(§2: `-12.33` on a flat face, sourced from a corner 50 mm away) — which is a real finding
-against FRoGGeR's finite-differenced mesh Hessian (their `delta ~ 10x` mean edge length).
-Ours is analytic from the spline. That disagreement is a result, and it should be reported
-as one.
+Neither arm's `beta` is treated as a certificate. Both are scored by `_span_margin` (a
+geometric test on true normals) and `solve_gamma_live` (the wrench LP), as `verify()`
+does.
 
-**Neither arm's `beta` is a certificate.** Both are scored by `_span_margin` (a pure
-geometric test on true normals) and `solve_gamma_live` (the wrench LP), exactly as
-`verify()` does today.
+## 3. Shared components
 
-## 3. What the two arms share
+Held constant across arms: object set, poses, friction, scene (`table_scene`); seeding
+pool; collision model; execution (approach, hold, gap gate, squeeze ramp, lift,
+transport); and scoring (`_span_margin`, `solve_gamma_live`, epsilon from
+`composite_wrench_cone`, `phase_log` outcomes).
 
-Shared, so the comparison is about the formulation:
+Varied: decision variables, objective, closure constraint, normal source.
 
-- object set, poses, friction, and scene (`table_scene`)
-- seeding pool (both get the OBB palm sampler from Phase 2 *and* our existing seeds)
-- collision model (bounding-sphere + SDF table — ours, for both)
-- execution: approach, hold, gap gate, squeeze ramp, lift, transport
-- scoring: `_span_margin`, `solve_gamma_live`, true epsilon from `composite_wrench_cone`,
-  phase_log outcomes
+## 4. Limitations to report
 
-Not shared (this *is* the experiment): decision variables, objective, closure constraint,
-normal source.
-
-## 4. Known limitations to report, not fix
-
-- **Robot-side collision is bounding-sphere, not witness-point.** Conservative relative to
-  Drake, so FRoGGeR may look more constrained on our arm than in the paper. Stated, not
-  engineered around.
-- **Our LEAP hand has 3 NLP contact slots; the paper uses 4 Allegro fingers.** Results are
+- Robot-side collision uses bounding spheres, not witness points. This is conservative
+  relative to Drake and may make the FRoGGeR arm appear more constrained than in the paper.
+- The LEAP hand exposes 3 NLP contact slots; the paper uses 4 Allegro fingers. Results are
   3-contact and should be labelled as such.
-- **`FINGER_SET` is import-time** (§10), so today `--pairing` steers the planner only.
-  Phase 1 fixes this; until it does, execution runs with a non-default pairing are not
-  meaningful.
 
 ## 5. Phases
 
-0. **This note.**
-1. **`n >= 3` wiring** — `extra_contacts` into `build_W_ca` at the `w_gws` call site;
-   `verify()` past hardcoded `n = 2`; `FINGER_SET` runtime rather than import-time.
+0. Design note.
+1. **`n >= 3` wiring** — see §7.
 2. **`frogger` planner mode** — sole `beta` objective, SDF surface equality on free
-   3-vectors in place of patch coords, `beta >= k_l / m` hard constraint, true SDF
-   normals. Plus the OBB palm sampler (noisy alignment to OBB axes weighted by side
-   length, palm 4 cm out, collision-free IK) as a seed generator beside
+   3-vectors in place of patch coordinates, `beta >= k_l / m` as a hard constraint, true
+   SDF normals. Plus the OBB palm sampler (noisy alignment to OBB axes weighted by side
+   length, palm 4 cm out, collision-free IK) as a seed generator alongside
    `_fixed_antipodal_seed`.
 3. **`benchmarks/ycb_grasp/frogger_bench.py`** — `--planner {ours,frogger}`, N objects x M
-   seeds, logging `l_bar*`, true epsilon, `gamma_min`, span margin, solve time, solve
-   count, pick success. Adds the paper's **shaky pickup**: lift 10 cm in 1 s, hold 1.5 s,
-   3 mm sinusoidal perturbation in all axes from t+0.25 s; fail on >30 deg rotation or
-   >7.5 cm deviation, or >60 s synthesis.
+   seeds, logging `l_bar*`, epsilon, `gamma_min`, span margin, solve time, solve count, and
+   pick success. Includes the paper's shaky pickup: lift 10 cm in 1 s, hold 1.5 s, 3 mm
+   sinusoidal perturbation in all axes from t+0.25 s; failure on >30 deg rotation, >7.5 cm
+   deviation, or >60 s synthesis.
 4. **Teleop setpoint path** — FRoGGeR as an alternate producer of `obj['q_target']`,
    reusing the existing `_commit_recommended_pose` -> `rebranch` -> `plan` -> GRASP-hold
-   contract unchanged.
+   contract.
 
-Phases 1-3 produce the result; Phase 4 is the demo and can be pulled forward.
+Phases 1-3 produce the result; Phase 4 is the demonstration.
 
-## 6. Paper reference numbers
+## 6. Paper reference values
 
 43 pruned watertight YCB objects, `mu = 0.7` (optimizer assumed 0.5), uniform density
-150 kg/m^3, 20 trials each. Overall: **99.4% converged** vs 44.8% baseline; **78.8% pick
-success** vs 58.0%; epsilon `4.6e-3` vs `2.0e-3`; normalized `l*` 0.58 vs 0.19; **0.21 s
-per solve, 3 solves, 0.83 s total** vs 0.73 s / 50 / 13.8 s. They note `l_bar*` is a
-*noisy* predictor of success: 0.61 (0.49, 0.67) for successes vs 0.47 (0.39, 0.60) for
-failures — worth replicating, since it bears directly on whether a `beta`-driven
-objective is the right one.
+150 kg/m^3, 20 trials each. Overall: 99.4% converged vs 44.8% baseline; 78.8% pick success
+vs 58.0%; epsilon `4.6e-3` vs `2.0e-3`; normalized `l*` 0.58 vs 0.19; 0.21 s per solve,
+3 solves, 0.83 s total vs 0.73 s / 50 / 13.8 s. They report `l_bar*` as a noisy predictor
+of success: 0.61 (0.49, 0.67) for successes vs 0.47 (0.39, 0.60) for failures. Worth
+replicating, as it bears on whether a `beta`-driven objective is well-posed.
 
-Our object set is 85 in `assets/ycb_mjcf/`; the watertight-prune list needs to be
-established before any cross-paper number is quoted.
+This repository holds 85 objects in `assets/ycb_mjcf/`; the watertight-prune list must be
+established before any cross-paper comparison is quoted.
 
 ---
 
-## 7. Phase 1 progress (2026-09-13)
+## 7. Phase 1 (2026-09-13)
 
-### 7.1 The `extra_contacts` gap was already closed
+### 7.1 The `extra_contacts` call site
 
-`SOLVER_STATE.md` §10 says the `w_gws` call site "does not pass" `extra_contacts`, so
-`beta` is a 2-contact number even at `n_contacts >= 3`. **That is stale** — commit
-`5fabede` ("third contact enters the GWS metric") fixed it, and the call site now passes
-`_gws_extra` and warns when contact 3 has no frame. The doc needs updating, not the code.
+SOLVER_STATE §10 listed the `w_gws` call site as not passing `extra_contacts`, leaving
+`beta` a 2-contact quantity at `n_contacts >= 3`. This was stale: commit `5fabede` passes
+`_gws_extra` and warns when contact 3 has no frame. No code change required; the doc was
+corrected.
 
-### 7.2 `verify()` generalized to n contacts (done)
+### 7.2 `verify()` generalized to n contacts
 
-This was the real remaining gap. `verify()` built `_pos_v` from `p1`/`p2` only and passed
-`n=2` to the wrench LP, so at `n_contacts >= 3` it certified **the thumb+index pair while
-the NLP had solved a tripod** — a certificate for a different grasp than the one executed.
+`verify()` built `_pos_v` from `p1`/`p2` and passed `n=2` to the wrench LP, so at
+`n_contacts >= 3` it certified the thumb+index pair while the NLP had solved a tripod.
 
-Generalized to every contact present, following `solve_gamma_live`'s conventions:
-moment reference = contact **centroid** (reduces to the midpoint at n=2), and the
-grasp-axis moment/torque projections gated to `n == 2`. That gate is the load-bearing
-part: a pinch genuinely cannot resist torque about the line through its contacts, so
-projecting is honest; a third contact off that axis removes the premise, so projecting at
-n>=3 would make the certificate conservative against a capability the tripod has.
+It now covers every contact present, following `solve_gamma_live`'s conventions: the
+moment reference is the contact centroid (reducing to the midpoint at n=2), and the
+grasp-axis moment/torque projections are gated to `n == 2`. The gate is load-bearing: a
+pinch cannot resist torque about the line through its contacts, so projecting states a real
+limitation; a third off-axis contact removes that premise, so projecting at n>=3 would make
+the certificate conservative against a capability the tripod has.
 
-`verify()` now also returns **`n_contacts_verified`**.
+`verify()` now returns `n_contacts_verified`. A 3-contact `gamma_min` is not comparable to
+a 2-contact one, the latter having had a disturbance component projected out. Measured on
+`036_wood_block` seed 0: 28.387 N at n=2 (projected) against 38.855 N at n=3
+(unprojected).
 
-> **Read `n_contacts_verified` before comparing `gamma_min` across runs.** A 3-contact
-> `gamma_min` is a *different quantity* from a 2-contact one — strictly less projected.
-> Measured on `036_wood_block` seed 0: pinch `gamma_min = 28.387 N` (projected), tripod
-> `gamma_min = 38.855 N` (unprojected). The tripod is not "worse"; it is certified against
-> a disturbance the pinch was excused from resisting.
+The n=2 path is unchanged bit-for-bit (`036_wood_block` seed 0, `gamma_min = 28.387`,
+`beta` identical to all digits).
 
-Regression: the n=2 path is bit-identical (`036_wood_block` seed 0, `gamma_min = 28.387`,
-`beta` unchanged to all digits).
+### 7.3 `beta` instrumentation
 
-### 7.3 `beta` instrumentation (done)
+- **`simulation/beta_audit.py`** — rebuilds W from `_geom_normal_np` at the solve's own
+  contact points and re-solves the min-weight LP in numpy. Imports the planner's
+  `_friction_cone_verts` / `_build_contact_frame_3d` / `_span_margin`, so the cone geometry
+  and frame convention cannot drift from the NLP's. Generalizes to n contacts. Read-only.
+- **`benchmarks/ycb_grasp/beta_sweep.py`** — plan-only sweep reporting `beta` from both
+  sources per solve, with `span_margin` and `gamma_min`.
 
-- **`simulation/beta_audit.py`** — rebuilds W from `_geom_normal_np` (the TRUE surface
-  normal) at the solve's own contact points and re-solves the min-weight LP in numpy.
-  Imports the planner's own `_friction_cone_verts` / `_build_contact_frame_3d` /
-  `_span_margin` so it cannot drift from what the NLP means by a primitive wrench.
-  Generalizes to n contacts. Read-only; nothing on the solve path.
-- **`benchmarks/ycb_grasp/beta_sweep.py`** — plan-only sweep printing reported vs true
-  `beta` per solve, with `span_margin` and `gamma_min` alongside.
-
-LP validated against two facts the planner docstring states independently:
+LP validated against two independently documented facts:
 
 | check | expected | measured |
 |---|---|---|
-| symmetric antipodal pinch | `alpha = 0.1*ones`, `beta = 1/n_cols` exactly | `beta = 0.100000000000`, `alpha` all equal, `‖Wα‖ = 3.5e-17` |
-| `061_foam_brick` splay 76.3 deg at mu=0.6 | closure impossible | `beta_true = -0.0`, `span_margin = -0.729` |
+| symmetric antipodal pinch | `alpha = 0.1*ones`, `beta = 1/n_cols` | `beta = 0.100000000000`, `alpha` uniform, `norm(W alpha) = 3.5e-17` |
+| 76.3 deg splay at mu=0.6 | closure not achievable | `beta_true = -0.0`, `span_margin = -0.729` |
+
+### 7.4 `constants.py` finger-set resolution
+
+`_finger_set_from_config` and `_slot_roles_from_config` read a `pairings[default]` schema
+that `models/grasp_finger_config.json` does not contain, so both always returned the
+hardcoded fallback. The fallback equals the file's current default, which concealed the
+fault; a `per_object` entry was honoured by the planner (through `load_finger_config`) and
+ignored by the executor. Both now read the `fingers`/`per_object` schema. `resolve_fingers()`
+was added for call-time resolution, since the module-level constants bind at import and are
+why `--fingers` historically steered the planner only.
 
 ---
 
-## 8. Measured: reported `beta` vs true-normal `beta` (2026-09-13)
+## 8. Reported `beta` against true-normal `beta`
 
 `benchmarks/ycb_grasp/beta_sweep.py`, 6 objects x 3 seeds, plan-only, 80/3 GWS preset,
 `thumb,index` (n=2), tabletop scene. `beta_true` is the same LP re-solved on
-`_geom_normal_np` normals at the solve's OWN contact points, so the only thing that
-differs is the surface the normals come from.
+`_geom_normal_np` normals at each solve's own contact points; the normal source is the only
+quantity that differs.
 
 ```
 object             sd  status        beta_rep   beta_true      delta   span_marg   gamma_min
@@ -222,104 +203,137 @@ object             sd  status        beta_rep   beta_true      delta   span_marg
 009_gelatin_box     2  converged     -0.06319    -0.00000   -0.06319     +0.6033      INFEAS
 061_foam_brick      0  converged     +0.08855    +0.09512   -0.00658     +2.1947       1.092
 061_foam_brick      1  best-effort   +0.07948    +0.09338   -0.01390     +2.1963       1.127
-061_foam_brick      2  converged     +0.08981    +0.08972   +0.00009     +2.1298       1.143
+061_foam_brick      2  converged     +0.08056    +0.09764   -0.01708     +2.1964       1.073
 ```
 
-### 8.1 The headline: the NLP is mostly PESSIMISTIC, not optimistic
+### 8.1 Direction of the error
 
-**15/18 solves have `delta <= 0`** — the reported `beta` is *below* the true-normal value.
-This is the opposite of the framing in `_embed_gws_ca`'s docstring, which is written around
-the optimistic failure mode (reporting closure where none exists). That mode is real but
-**rare: 1/18 here** (`009_gelatin_box` sd0). The dominant error is the NLP *understating*
-its own grasp.
+15/18 solves have `delta <= 0`: the reported `beta` is below the true-normal value. The
+optimistic case that `_embed_gws_ca`'s docstring is written around occurs once
+(`009_gelatin_box` sd0).
 
-Why it matters for FRoGGeR: a pessimistic `beta` is a **weak objective**, not an unsafe
-certificate. The solver is climbing a surrogate that reads lower than the truth, so it
-keeps pushing on grasps that are already good. That is a direct argument for FRoGGeR's
-formulation — a hard `l_bar* >= k_l` constraint on a *trustworthy* beta — over our current
-"beta as one weighted cost term among ten".
+A downward-biased `beta` is a weak objective rather than an unsatisfied certificate: the
+solver ascends a surrogate that reads below the true value, so `w_gws` does not carry the
+effective weight its tuning assumed.
 
-### 8.2 Four sign flips: `beta` crosses zero differently from the geometry
+### 8.2 Sign disagreements
 
-| object | sd | `beta_rep` | `beta_true` | span_margin | wrench cert |
+| object | sd | `beta_rep` | `beta_true` | span_margin | wrench certificate |
 |---|---|---|---|---|---|
-| `014_lemon` | 1 | **-0.00926** | +0.05383 | +1.2973 | feasible, γ=2.03 |
-| `056_tennis_ball` | 1 | **-0.05220** | +0.07913 | +1.5650 | feasible, γ=2.38 |
-| `056_tennis_ball` | 2 | **-0.05220** | +0.07913 | +1.5650 | feasible, γ=2.38 |
-| `009_gelatin_box` | 0 | **+0.07438** | -0.00000 | +0.1626 | **INFEASIBLE** |
+| `014_lemon` | 1 | -0.00926 | +0.05383 | +1.2973 | feasible, gamma = 2.03 |
+| `056_tennis_ball` | 1 | -0.05220 | +0.07913 | +1.5650 | feasible, gamma = 2.38 |
+| `056_tennis_ball` | 2 | -0.05220 | +0.07913 | +1.5650 | feasible, gamma = 2.38 |
+| `009_gelatin_box` | 0 | +0.07438 | -0.00000 | +0.1626 | INFEASIBLE |
 
-The first three report NON-closure (`beta < 0`) on grasps that are genuinely in closure by
-both independent certificates. Under a FRoGGeR-style hard constraint `l_bar* >= 0.3` these
-three would be **rejected as infeasible despite being good grasps** — so porting the hard
-constraint onto patch-derived normals would not merely be unsafe, it would throw away
-working grasps. This is the strongest evidence yet for §2.2's decision to give the FRoGGeR
-arm true SDF normals.
+The first three report non-closure for grasps both independent certificates accept. Under a
+hard `l_bar* >= 0.3` constraint on patch-derived normals, these would be rejected as
+infeasible. The fourth is the optimistic case: `beta = +0.074` on 62.4 deg splay contacts
+whose wrench LP is infeasible.
 
-The fourth is the classic optimistic case and reproduces the docstring's pattern exactly:
-`beta = +0.074` on 62.4-deg-splay contacts whose wrench LP is infeasible.
-
-### 8.3 `beta`'s error tracks solver convergence
+### 8.3 Dependence on solver convergence
 
 | status | n | median abs(delta) | max abs(delta) |
 |---|---|---|---|
-| `converged` | 7 | **0.00312** | 0.06319 |
-| `best-effort` | 11 | **0.01897** | 0.13132 |
+| `converged` | 7 | 0.00312 | 0.06319 |
+| `best-effort` | 11 | 0.01897 | 0.13132 |
 
-A 6x median gap. Every large disagreement is a best-effort solve, and SOLVER_STATE §11
-already establishes those are IPOPT cycling under a genuinely indeterminate dual (the
-active set is degenerate under the antipodal minimax symmetry), *not* truncation. So
-`beta`'s unreliability is substantially **an artifact of stopping mid-cycle**, which is a
-different and more tractable diagnosis than "the patch is wrong".
+Every disagreement above 0.02 occurs on a best-effort solve. SOLVER_STATE §11 establishes
+that these are IPOPT cycling under an indeterminate dual rather than truncation, so a
+component of the disagreement is attributable to the iterate the cap lands on.
 
-`009_gelatin_box` is the known seed-starved object (SOLVER_STATE §9). Both its bad cells
-are geometric, not numerical: 62.4 deg and 87.7 deg splay, vs 175.4 deg on the one good
-seed. The audit agrees with the geometry (`beta_true = -0.0` on both).
+`009_gelatin_box` is the seed-starved object of SOLVER_STATE §9. Both of its failing cells
+are geometric rather than numerical: 62.4 deg and 87.7 deg splay, against 175.4 deg on its
+one good seed. `beta_true = -0.0` on both, in agreement with the geometry.
 
-### 8.4 Determinism: confirmed, after a false alarm
+### 8.4 Mechanism of the downward bias
 
-**The sweep IS deterministic.** Four full 18-cell runs: runs 1, 3 and 4 are byte-identical
-(md5 `29edc6c1ad41` over the table body). Run 2 differed in exactly 2 cells
-(`056_tennis_ball` sd0, `061_foam_brick` sd2) and was the outlier, not the rule.
+The bias is a property of the LP, not of the patch's particular errors. `beta` is the
+optimal value of a maximization whose feasible set is determined by `W alpha = 0`.
+Perturbing the normals rotates the primitive wrench columns; the optimum of the perturbed
+problem is generically below that of the unperturbed one, and the true-normal configuration
+is the reference point.
 
-Run 2 is explained by how it was launched, not by the solver: it was started while run 1
-was **still executing**, so two 18-cell sweeps shared the machine (and its BLAS thread
-pools) for run 2's entire duration. The two cells that moved are in the last two objects of
-the sweep order — the ones still solving under contention. Both are `best-effort` solves,
-i.e. exactly the IPOPT-cycling regime SOLVER_STATE §11 describes, where the iterate the cap
-lands on is the least stable thing about the solve.
+Measured on an antipodal pinch at mu=0.6, applying an equal-magnitude tilt in a uniformly
+random direction to both normals (400 trials per row):
 
-So SOLVER_STATE §12's determinism claim **holds**, including across a multi-object sweep in
-one process. The operational rule is narrower than "one object per process":
+| tilt (deg) | mean `beta` | median | max | fraction below `beta_true` |
+|---|---|---|---|---|
+| 0 (reference) | 0.10000 | 0.10000 | 0.10000 | — |
+| 1 | 0.09684 | 0.09677 | 0.09763 | 100.0% |
+| 2 | 0.09363 | 0.09348 | 0.09501 | 100.0% |
+| 5 | 0.08381 | 0.08335 | 0.08761 | 100.0% |
+| 9 | 0.06934 | 0.06859 | 0.07679 | 100.0% |
+| 15 | 0.04529 | 0.04396 | 0.05805 | 100.0% |
 
-> **Do not run two sweeps concurrently, and do not edit planner source while one is in
-> flight.** Under contention, `best-effort` cells can land on a different iterate. Treat
-> any run that overlapped another as void rather than as evidence.
+No perturbation in 2000 trials raised `beta`. The effect persists away from the arithmetic
+ceiling, so it is not solely a boundary artifact of the symmetric optimum (5 deg tilt):
 
-An earlier version of this section claimed order-dependent intra-process state, on the
-strength of `056_tennis_ball` sd0 reproducing `-0.05220` in isolation. That reproduction was
-real but the inference was wrong — isolation reproduced the value because isolation is the
-*uncontended* case, which is also what runs 1/3/4 were.
+| baseline splay | `beta_true` | ceiling `1/n_cols` | mean `beta` | fraction below |
+|---|---|---|---|---|
+| 180 deg | 0.10000 | 0.1000 | 0.08376 | 100.0% |
+| 160 deg | 0.07502 | 0.1000 | 0.05912 | 93.5% |
+| 140 deg | 0.04477 | 0.1000 | 0.02854 | 90.5% |
+| 125 deg | 0.01602 | 0.1000 | 0.00349 | 89.2% |
 
-### 8.5 The tripod's `beta` is far more trustworthy
+The mechanism accounts for the sign but not, on its own, the full magnitude. SOLVER_STATE
+§2 reports a median normal error against the true SDF of 2.02 deg on `017_orange` under
+analytic patch normals (9.22 deg frozen). Reconstructing that solve's geometry from its
+`span_margin` (169.5 deg splay at mu = 2.0) and applying a 2.02 deg random tilt predicts
+`delta = -0.0017` (mean over 600 trials), against a measured -0.0084. The rows above are at
+mu = 0.6 and do not transfer directly; friction coefficient changes the cone aperture and
+hence the sensitivity.
 
-`036_wood_block` seed 0, same object and seed, only the finger list changed:
+The residual factor of ~5 is unexplained. Candidate contributions, not yet separated: the
+normal error at a trust-region bound exceeding the patch median quoted above; the
+contribution of §8.3's best-effort iterate (`017_orange` is best-effort on all three
+seeds); and a systematic rather than random tilt direction, which the random-direction
+model above would understate. This should be resolved before `delta` is used
+quantitatively rather than as a direction.
+
+Two conditions concentrate the error at the solved contacts. First, the solution sits at a
+trust-region bound on 9/9 measured stages (SOLVER_STATE §2), which is where a paraboloid
+departs furthest from the fitted surface. Second, `beta` depends on the surrogate's
+gradient rather than its position, and the trust region is sized by a position tolerance
+(`sdf_err_tol`, 4 mm), which does not bound the normal error.
+
+The optimistic cases are not excluded by this account. The bias is generic in the
+perturbation direction, but a perturbation that happens to align the wrench columns more
+favourably than the true geometry can raise `beta`; `009_gelatin_box` sd0 is such a case,
+and it occurs where the true configuration is near-degenerate (62.4 deg splay,
+`beta_true = -0.0`), so the reference value is at the bottom of its range.
+
+### 8.5 Dependence on contact count
+
+`036_wood_block` seed 0, varying only the finger list:
 
 | fingers | n | `beta_rep` | `beta_true` | delta | `gamma_min` |
 |---|---|---|---|---|---|
 | `thumb,index` | 2 | +0.08970 | +0.09282 | -0.00312 | 28.387 (projected) |
-| `thumb,index,middle` | 3 | +0.03660 | +0.03665 | **-0.00005** | 38.855 (unprojected) |
+| `thumb,index,middle` | 3 | +0.03660 | +0.03665 | -0.00005 | 38.855 (unprojected) |
 
-**A 60x tighter agreement at n=3.** With only two contacts the wrench hull is rank-5-of-6,
-so the min-weight LP's optimum is soft in the unspanned direction and a small normal error
-moves `beta` a lot. A third off-axis contact spans the sixth direction and pins the hull, so
-the same normal error barely moves `beta`.
+Agreement is 60x tighter at n=3. With two contacts the wrench hull is rank-5-of-6, so the
+LP optimum is unconstrained in the unspanned direction and a small normal error displaces
+`beta` substantially. A third off-axis contact spans that direction, reducing the
+sensitivity.
 
-This matters for the FRoGGeR arm beyond faithfulness: it says `beta` is not uniformly
-untrustworthy — **it is untrustworthy mainly where the grasp is rank-deficient.** The
-formulation FRoGGeR actually proposes (>=3 contacts, hard `l_bar* >= k_l`) sits in the
-regime where `beta` behaves, while our measured 2-contact default sits in the regime where
-it does not. That is a point in the paper's favour that our own n=2 numbers would hide.
+This localizes the unreliability to rank-deficient configurations. The formulation FRoGGeR
+proposes (>= 3 contacts, hard `l_bar* >= k_l`) lies in the regime where `beta` is
+well-behaved; the 2-contact default does not.
 
-The absolute `beta` is LOWER at n=3 (+0.037 vs +0.090) purely because `beta`'s ceiling is
-`1/n_cols` and n_cols goes 10 -> 15; compare `beta_true_scaled` (`beta * n_cols`) across
-contact counts, not raw `beta`. Likewise `gamma_min` is not comparable here — see §7.2.
+Raw `beta` is lower at n=3 because its ceiling is `1/n_cols` and n_cols goes 10 -> 15.
+Compare `beta_true_scaled` (`beta * n_cols`) across contact counts. `gamma_min` is likewise
+not comparable across n — see §7.2.
+
+### 8.6 Determinism
+
+Four full 18-cell sweeps. Runs 1, 3 and 4 are byte-identical (md5 `29edc6c1ad41` over the
+table body). Run 2 differed in two cells (`056_tennis_ball` sd0, `061_foam_brick` sd2).
+
+Run 2 was started while run 1 was still executing, so two sweeps shared the machine for its
+duration. The two affected cells fall in the last two objects of the sweep order and are
+both best-effort solves, the regime of §8.3. Re-running both cells in isolation, and again
+in a different object grouping, reproduces the runs-1/3/4 values.
+
+SOLVER_STATE §12's determinism claim holds, including across a multi-object sweep in one
+process. The operational constraint is narrower: do not run two sweeps concurrently, and do
+not modify planner source while one is in flight. Treat any overlapped run as void.
