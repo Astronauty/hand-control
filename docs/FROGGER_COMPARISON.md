@@ -254,3 +254,56 @@ the shared object set, with the downstream trust-region consequence, rather than
 A hard `l_bar* >= k_l` is only meaningful once 5.1 lands. When it does, the choice between
 their task-agnostic floor and our task-specific `gamma` certificate (§3.3) becomes testable
 on the same grasps, and both can be reported.
+
+---
+
+## 6. Why their solve times are ~48x lower than this port's
+
+Measured: the frogger configuration takes ~36-40 s per solve here, against their
+reported median of 0.83 s total synthesis. That gap is an artifact of HOW the
+collision gradient is obtained, not of the formulation.
+
+### 6.1 Where the time goes
+
+Instrumented on `017_orange` seed 0, n=2, one seed, `max_iter=80`:
+
+| callback | count | total evaluations |
+|---|---|---|
+| exact geom-vs-object distance | 63 | **504,630** |
+| min-weight LP | 1 | 589 |
+
+63 callbacks is one per (arm geom, stage) pair; each was declared `enable_fd`, so
+CasADi finite-differences it over all 23 joints -- 24 evaluations per gradient
+request, ~334 requests each. `mj_geomDistance` itself is not the problem: measured
+sub-microsecond per hull pair. The problem is asking for it half a million times.
+
+### 6.2 What FRoGGeR does instead
+
+Their eq. (8) computes the collision gradient ANALYTICALLY from the witness points
+the distance query already returns:
+
+```
+sigma(o_A, o_B; q) = (-1)^(Ic+1) ||p_A - p_B||
+grad_q sigma       = (-1)^Ic (J_B^T - J_A^T) n_AB
+```
+
+with `J_A`, `J_B` the Jacobians at the two witness points and `n_AB` the unit vector
+between them. One distance query per constraint per iteration, then a Jacobian
+product -- a 24x reduction in queries and no finite differencing at all.
+
+They also cull distant pairs with Drake's broadphase and set those gradients to
+zero, and handle the `p_A == p_B` degeneracy (where the direction is undefined) by
+reusing the previous `n_AB`, initialized randomly.
+
+### 6.3 This is implementable here
+
+MuJoCo supplies both halves. `mj_geomDistance(..., fromto)` writes the witness
+SEGMENT, i.e. both witness points, and `mj_jac(model, data, jacp, jacr, point, body)`
+returns the Jacobian at an arbitrary point -- exactly `J_A` and `J_B`. So the
+analytic form is one distance call, two `mj_jac` calls and a dot product, replacing
+a 24-evaluation finite difference.
+
+Until that lands, **do not compare this port's solve times to the paper's**: the
+difference measures our gradient implementation, not their method. The `l_bar*`
+values are unaffected, since the finite-differenced gradient converges to the same
+place, only slower.
