@@ -223,26 +223,111 @@ def for_gws_recommender(obj_name: str, arm_geom_names: list,
         NLP either way. alpha/beta and gamma are separate computations over the
         same W: alpha is normalized (sum(alpha)=1, unitless closure witness),
         gamma is the task-specific squeeze force in newtons.
-      * gws_soft_finger stays FALSE (the dataclass default). The rank argument for
-        turning it ON is correct but MEASURED HARMFUL, so it is recorded here to
-        stop it being re-adopted: a 2-contact PCwF W is genuinely rank-5-of-6
-        (singular values 4.0/4.0/2.83/0.116/0.116/0) and the soft-finger columns do
-        restore rank 6 -- but only in a vestigial direction (the 6th singular value
-        is 0.1 against 4.0), because the authored torsional friction mu_t=0.05 is
-        40x smaller than mu=2.0.
-        Meanwhile beta PAYS FULL PRICE for them. beta is the MINIMUM weight of a
-        convex combination constrained to sum(alpha)=1 -- a FIXED budget -- so going
-        from 10 to 14 columns lowers the achievable minimum for purely arithmetic
-        reasons (10 columns share 1.0 -> <=0.100 each; 14 -> <=0.071). And the two
-        added columns per contact carry the IDENTICAL force vector, differing only
-        by the +/-mu_t*n spin term: measured 99.5% parallel (cos=0.995). So the
-        budget is diluted across near-duplicates that add almost no capability.
-        Measured on 014_lemon (seed 0, otherwise identical config):
-            gws_soft_finger=True   beta=-7e-06  WF=False  IK=(9.81, 8.02)mm
-            gws_soft_finger=False  beta=+0.056  WF=True   IK=(4.68, 0.29)mm  gamma=1.96
-        and beta=-0.487 on 036_wood_block with it on. If torque about the grasp axis
-        ever genuinely matters, the fix is a THIRD contact (a real moment arm), not a
-        near-degenerate column pair.
+      * gws_soft_finger stays FALSE (the dataclass default), but the reasoning
+        below has been PARTLY RETRACTED -- read the re-measurement before citing
+        it as a reason not to try the flag.
+
+        Structural facts (re-confirmed, these hold): a 2-contact PCwF W is
+        rank-5-of-6, singular values 4.0/4.0/2.83/0.144/0.144/0.0, and its
+        left-null direction is exactly TORQUE ABOUT THE GRASP AXIS. The
+        soft-finger columns do restore rank 6. The authored mu_t=0.05 puts the
+        6th singular value at 0.1 against 4.0, and the two added columns per
+        contact are 99.5% parallel in force (cos=0.995) -- so as CAPABILITY the
+        added direction is indeed vestigial.
+
+        RETRACTED -- "beta PAYS FULL PRICE ... the budget is diluted": the
+        arithmetic is right (10 cols -> beta <= 0.100, 14 -> <= 0.0714) but it
+        makes RAW beta incomparable across the flag, because the flag itself
+        moves the 1/n_cols ceiling. On an ideal antipodal pinch beta/ceiling ==
+        1.0000 for BOTH models (beta*n_cols == 1.0 identically), i.e. the entire
+        0.100 -> 0.0714 drop is the scale change with ZERO geometric
+        degradation. Compare beta*n_cols, or rescale w_gws, when judging this.
+
+        RETRACTED -- the measured numbers do not reproduce. The note cited
+        014_lemon soft=True as beta=-7e-06/WF=False and 036_wood_block as
+        beta=-0.487. Re-measured on the tabletop benchmark (seed 0, n_seeds=1,
+        n_relin=3), reporting beta*n_cols alongside raw beta:
+            014_lemon      off  beta=0.0797 (x n=0.797)  gamma=1.256  WF=T  LIFTED
+            014_lemon      ON   beta=0.0636 (x n=0.890)  gamma=1.049  WF=T  LIFTED
+            017_orange     off  beta=0.0968 (x n=0.968)  gamma=1.944  WF=T  LIFTED
+            017_orange     ON   beta=0.0702 (x n=0.983)  gamma=1.904  WF=T  LIFTED
+            036_wood_block off  beta=0.0992 (x n=0.992)  gamma=27.72  WF=T  squeeze aborted (gap)
+            036_wood_block ON   beta=0.0692 (x n=0.968)  gamma=None   WF=F  gamma-infeasible
+        No negative beta anywhere; on BOTH rounded objects the flag lifts the
+        object and IMPROVES beta*n_cols and gamma. Two likely reasons the old
+        numbers differ: they predate eaa622a (contact-patch SDF ray-intersection)
+        and 22a7b0a (solver preset), and pick_and_place.py did not report
+        gws_beta AT ALL until it was wired up, so whatever harness produced them
+        is not the one above.
+
+        WHAT DOES SURVIVE as a reason to leave it off: 036_wood_block goes
+        WRENCH-INFEASIBLE with the flag on. DIAGNOSED, and the cause is a
+        TRUST-REGION defect on flat faces that this flag merely EXPOSES -- not
+        a defect in the soft-finger model:
+
+          * It is NOT a frozen-frame problem. This preset already sets
+            quadratic_symbolic_normals=True with n_normal_relinearize=0, so the
+            GWS frame comes from _quadratic_inward_normal_ca in closed form and
+            tracks the contact within the stage (verified by call-count
+            instrumentation, 16 calls on the default config).
+          * NOT an oversized trust region either. The patches on
+            036_wood_block come back +/-42.3 x +/-95.3 mm and +/-43.1 x
+            +/-96.9 mm, which look bigger than the object only if the extents
+            are read off `--mode scene-only` (72 x 74 x 71 mm -- that is
+            TS.hull_vertices, a WORLD-frame bbox of the settled TILTED object).
+            True object-local extent is 101 x 102 x 206 mm, a tall post, so
+            95.3 < the 103.2 mm half-extent: the bound is INSIDE the face.
+            _sdf_axis_bound_np behaves correctly (SDF departure 0.00-0.02 mm
+            over the full 100 mm march vs a 4.0 mm tolerance, because the face
+            IS flat that far), and kappa=0 on every patch so they all already
+            route through the planar SDF-search bound.
+          * Resulting contact FACES (object-local), default config:
+                pcwf: c1 on -y, c2 on +y  -> opposed, n1.n2 = -0.996 (5.2 deg)
+                soft: c1 on -y, c2 on +z  -> PERPENDICULAR, n1.n2 = +0.164
+                                             (99.4 deg splay)
+            span_margin_final collapses 2.124 -> 0.479 rad. The orange, being
+            round, is untouched (2.117 -> 2.142) -- its patch bound is a real
+            curvature measurement, not a cap.
+          * beta is evaluated on the extrapolated paraboloid and reported
+            +0.0692, while the TRUE normals at those solved points give
+            beta = -0.0 (not force closure).
+          * solve_gamma_live then correctly REJECTS it: the 99 deg grasp is
+            feasible to ~5 m/s^2 (gamma 7.43) but INFEASIBLE at the 20 m/s^2
+            carry budget, where the 5 deg pinch gives gamma=25.5. The
+            certificate is doing its job; the NLP handed it a bad grasp.
+          * Note solve_gamma_live is PCwF and takes no mu_t, so the flag
+            changes WHERE contacts are placed and then has them certified by a
+            model with no spin capability. That asymmetry is intended (the
+            certificate should not assume torsion the executor cannot deliver)
+            but it means gws_soft_finger can only ever be a PLACEMENT prior.
+
+        beta is near-identical in splay sensitivity under both models (both
+        collapse to ~0 past 80 deg), so the flag does NOT make beta blind to
+        splay -- the oversized patch is what lets the contact reach a splay
+        that far out in the first place.
+
+        061_foam_brick is NOT evidence about this flag: it is wrench-infeasible
+        in BOTH arms (147 deg / 134 deg splay), and on the PCwF BASELINE both
+        of its contacts land on the SAME top face (n1.n2 = +0.84) with
+        span_margin = -0.359 (closure geometrically impossible) while beta
+        reports +0.0996 -- i.e. the same beta/geometry disagreement shows up on
+        the BASELINE, so it is not attributable to this flag.
+
+        Root cause of the flat-face regression is still OPEN (frozen frames and
+        oversized patch bounds are both ruled out above). The default stays
+        FALSE because on flat-faced objects the flag reliably lands on the bad
+        geometry, not because the mechanism is understood. The cheap guard,
+        independent of cause: reject any solve with span_margin_final < 0
+        before trusting beta -- see _embed_gws_ca's docstring.
+
+        For the DUAL indeterminacy specifically (non-unique KKT multipliers on
+        W@alpha==0, see _embed_gws_ca), this flag IS the direct 2-finger fix:
+        rank 5 -> 6 kills the left-null space, taking cond(W) from inf to 40 at
+        mu_t=0.05 (saturating at 27.8 for mu_t >= 0.1 -- past that the 0.144
+        tangential directions are the weak ones, so raising mu_t buys nothing).
+        A THIRD contact remains strictly better (a real moment arm rather than a
+        mu_t-scaled vestigial one), but it is not the ONLY fix.
+        Probe with PFF_GWS_SOFT_FINGER=1 on the tabletop benchmark.
       * quadratic contact parameterization is forced ON: the repo is migrating to
         YCB meshes permanently, and the quadratic path is both the on-surface-by-
         construction parameterization and the ONLY path that records the
@@ -323,3 +408,89 @@ def for_gws_recommender(obj_name: str, arm_geom_names: list,
         accel_budget_xyz=accel_budget_xyz,
         ang_accel_budget_xyz=ang_accel_budget_xyz,
         max_iter=max_iter, **cfg_kw)
+
+
+def for_frogger(obj_name: str, arm_geom_names: list,
+                obj_clearance_by_geom: dict,
+                accel_budget_xyz: tuple, ang_accel_budget_xyz: tuple,
+                max_iter: int = 80,
+                k_l: float = 0.3,
+                sdf_normals: bool = True,
+                fingers=None,
+                **overrides) -> GraspConfig3D:
+    """The FRoGGeR arm of the benchmark: beta as the SOLE objective.
+
+    FRoGGeR (arXiv 2302.13687) solves
+
+        max_q  l*(q)   s.t.  q_min <= q <= q_max,  l_bar*(q) >= k_l,
+                             s(FK_i(q)) = 0,  sigma(o_A, o_B; q) >= d_j
+
+    with l_bar* = m * beta, m = ncols(W), and k_l = 0.3 in their experiments. The
+    two structural differences from `for_gws_recommender` are that beta is the ONLY
+    objective (they have no IK/align/orient/reg terms competing for the contact
+    placement gradient) and that it carries a HARD robustness floor.
+
+    This preset reproduces both within our NLP, and deliberately does NOT attempt
+    to reproduce their bilevel LP -- see docs/GWS_IMPROVEMENTS.md items 1-3. The
+    benchmark is therefore a comparison of OBJECTIVE STRUCTURE at a shared
+    embedding, and the embedding's own convergence (lp_gap) is a known common-mode
+    limitation to report, not a difference between arms.
+
+    What is held in common with our arm, so the comparison is about the
+    formulation: scene, seeding pool, collision model, execution, and scoring.
+
+    k_l : the normalized floor. Applied as `beta >= k_l / m`, since our `beta` is
+        raw and `l_bar* = m * beta`. Passed through to `GraspConfig3D.gws_beta_min`
+        so the NLP carries it as a hard constraint. **0.0 disables the floor**,
+        which is the configuration to use when measuring how often the floor is
+        what rejects a grasp.
+
+    sdf_normals : take contact normals from the object's SDF gradient rather than
+        the quadratic patch, which is FRoGGeR's own formulation (n = -grad s(p))
+        and is the better-conditioned estimator here: measured 1.80/2.64 deg
+        against the patch's 4.80/4.92 deg on 056_tennis_ball/017_orange
+        (FROGGER_BENCH sec 8.5). The patch is retained for POSITION -- p(t) still
+        supplies the 2-DOF parameterization and the trust region -- so this
+        switches only the normal source. Set False to run the FRoGGeR objective on
+        patch normals, which isolates objective structure from normal source.
+
+    NOTE the contact count. A 2-contact pinch has rank(W) = 5 of 6 and cannot
+    satisfy l_bar* >= 0.3 meaningfully, so a faithful run needs `fingers` of
+    length >= 3. The preset does not force this -- a 2-contact run is legitimate
+    as a control -- but a k_l > 0 floor at n=2 will reject nearly everything, and
+    that is a property of the configuration, not a result.
+    """
+    cfg_kw = dict(overrides)
+
+    # beta alone. Every other cost weight is zeroed rather than merely reduced:
+    # the point of the comparison is that FRoGGeR has no competing placement
+    # objective, and w_ik dominates our gradient by ~3 orders (SOLVER_STATE sec 4).
+    cfg_kw.setdefault('w_gws', 1.0)
+    cfg_kw.setdefault('w_span', 0.0)     # not part of (7a); ours only
+    cfg_kw.setdefault('w_ik', 0.0)
+    cfg_kw.setdefault('w_align', 0.0)
+    cfg_kw.setdefault('orient_weight', 0.0)
+    cfg_kw.setdefault('w_edge_margin', 0.0)
+    cfg_kw.setdefault('w_contact_height', 0.0)
+    # Keep a small regularizer: with every other term at zero the arm's redundant
+    # DOFs are unconstrained by the cost, and FRoGGeR's own IK pre-solve plays that
+    # role in their pipeline. This is the one departure from "beta alone", and it is
+    # a posture prior, not a grasp-quality term.
+    cfg_kw.setdefault('w_reg', 0.03)
+
+    # beta*n_cols, so w_gws and k_l both keep one meaning across contact counts and
+    # cone models (m goes 10 -> 15 from n=2 to n=3). FRoGGeR's l_bar* IS the
+    # normalized quantity, so this is the faithful choice, not a convenience.
+    cfg_kw.setdefault('gws_beta_scale_ncols', True)
+
+    # The hard robustness floor (7c).
+    cfg_kw.setdefault('gws_beta_min_normalized', float(k_l))
+
+    if sdf_normals:
+        cfg_kw.setdefault('gws_sdf_normals', True)
+
+    return for_gws_recommender(
+        obj_name, arm_geom_names, obj_clearance_by_geom,
+        accel_budget_xyz=accel_budget_xyz,
+        ang_accel_budget_xyz=ang_accel_budget_xyz,
+        max_iter=max_iter, fingers=fingers, **cfg_kw)

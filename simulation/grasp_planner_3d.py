@@ -2854,6 +2854,46 @@ class GWSConfig:
     # a clean control on objects where stages are close in cost.
     gws_beta_scale_ncols: bool = False
 
+    # HARD robustness floor on the NORMALIZED min-weight metric, FRoGGeR's (7c):
+    #     l_bar* = n_cols * beta >= k_l,   i.e.   beta >= k_l / n_cols
+    # applied as an NLP constraint, not a cost. 0.0 (default) = OFF and
+    # byte-identical to prior behavior; FRoGGeR uses k_l = 0.3.
+    #
+    # The normalized form is what carries a fixed meaning: beta's ceiling is
+    # 1/n_cols, so a raw floor would mean different things at n_contacts 2 vs 3
+    # (n_cols 10 vs 15) and under gws_soft_finger (10 vs 14).
+    #
+    # THIS IS ONLY AS MEANINGFUL AS beta ITSELF. Two cautions, both measured:
+    #   * A 2-contact pinch is rank-5-of-6, so l_bar* >= 0.3 is not achievable
+    #     in the sense FRoGGeR intends; use n_contacts >= 3 for a faithful run.
+    #   * Our embedded LP does not reach its own optimum (lp_gap > 0 on 18/18
+    #     measured solves, median 0.0074 -- see docs/GWS_IMPROVEMENTS.md), so a
+    #     hard floor can reject a grasp whose CONVERGED beta would clear it.
+    #     Measured: 3 of 4 sign disagreements were repaired by re-solving the
+    #     same W. Report rejections alongside lp_gap, never alone.
+    gws_beta_min_normalized: float = 0.0
+
+    # Take the GWS contact normals from the object SDF's GRADIENT rather than the
+    # quadratic patch, which is FRoGGeR's own formulation (n = -grad s(p)). The
+    # patch still supplies POSITION -- p(t) keeps the 2-DOF parameterization and
+    # the trust region -- so this switches the normal SOURCE only.
+    #
+    # Rationale (FROGGER_BENCH sec 8.5): against the analytic normal of a sphere
+    # fitted to each object's own visual vertices, the SDF gradient lands at
+    # 1.80/2.64 deg versus the patch's 4.80/4.92 deg on 056_tennis_ball and
+    # 017_orange. The patch is smooth in t by construction but is a second-order
+    # fit evaluated AT a trust-region bound (pinned 9/9 measured stages), which is
+    # where it departs furthest from the surface it was fitted to.
+    #
+    # NOTE this does NOT contradict sec 2's case against the SDF: that argument is
+    # about the SDF HESSIAN (curvature is a global quantity -- measured -12.33 on
+    # a flat face, sourced from a corner 50 mm away) and does not transfer to the
+    # gradient. Curvature still comes from the mesh-vertex fit.
+    #
+    # Costs one spline evaluation per contact per NLP iteration. False (default)
+    # is byte-identical to prior behavior.
+    gws_sdf_normals: bool = False
+
     # Build the quadratic-contact frame's TANGENT basis from the paraboloid's
     # own dp0/dp1 (_quadratic_contact_frame_ca) instead of re-deriving it from
     # the bare normal via _symbolic_contact_frame_ca's tanh-blended world
@@ -3779,6 +3819,40 @@ class GraspPlanner3D:
         # Separate scratch MjData for _tip_support_along -- _dls_data's qpos is
         # live state for the DLS seeding path, not safe to stomp mid-solve.
         self._tip_data = mj.MjData(model)
+
+    def _sdf_contact_frames_ca(self, points, obj_center_np, obj_R_np):
+        """Contact frames [n_in | t1 | t2] built from the object SDF's GRADIENT.
+
+        FRoGGeR's normal source: the inward normal at a contact is -grad s(p), taken
+        from the baked SDF spline rather than from the quadratic patch. `points` are
+        WORLD-frame CasADi expressions (the patch's own p(t), so POSITION is unchanged
+        and the 2-DOF parameterization is kept); the SDF table is baked in the object
+        BODY frame, so each point is rotated in and the resulting normal rotated back.
+
+        Returns a list of 3x3 MX frames in the same convention build_W_ca expects
+        (column 0 = INWARD normal), or None when this object has no mesh SDF entry --
+        primitives keep their analytic frame and the caller warns.
+
+        The tangent basis comes from _symbolic_contact_frame_ca, i.e. the same
+        construction the non-quadratic path already uses. beta is provably invariant
+        to rotation of the tangent pair about n (measured 0.100000000000 across
+        0-90 deg), so this choice cannot change the metric, only the conditioning of
+        the Jacobian expressing it.
+        """
+        entry = self._mesh_entry
+        if entry is None or "normal_fn" not in entry:
+            return None
+        nfn = entry["normal_fn"]
+        R_wo = ca.DM(np.asarray(obj_R_np, float))          # object -> world
+        R_ow = ca.DM(np.asarray(obj_R_np, float).T)        # world -> object
+        c_dm = ca.DM(np.asarray(obj_center_np, float))
+        frames = []
+        for p in points:
+            p_l = R_ow @ (p - c_dm)                        # world -> object-local
+            n_out_l = nfn(p_l)                             # unit OUTWARD, object frame
+            n_in_w = R_wo @ (-n_out_l)                     # inward, world frame
+            frames.append(_symbolic_contact_frame_ca(n_in_w))
+        return frames
 
     def _tip_support_along(self, which: str, q: np.ndarray, n_out: np.ndarray,
                            r_fallback: float) -> float:
@@ -4727,16 +4801,32 @@ class GraspPlanner3D:
                     "frame (_R1_expr) available, GWS terms skipped this stage.")
             if (cfg.w_gws > 0.0 or cfg.w_span > 0.0) and _R1_expr is not None:
                 _gws_mu_t = _mu_t if cfg.gws_soft_finger else 0.0
+                # FRoGGeR's normal source: n = -grad s(p), evaluated at the PATCH
+                # point, so the 2-DOF parameterization and trust region are kept and
+                # only the normal changes. See GWSConfig.gws_sdf_normals.
+                _R1_gws, _R2_gws, _R3_gws = _R1_expr, _R2_expr, _R3_expr
+                if cfg.gws_sdf_normals:
+                    _sdf_frames = self._sdf_contact_frames_ca(
+                        [_p1, _p2] + ([_p3] if (_has_c3 and _p3 is not None) else []),
+                        obj_center_np, obj_R_np)
+                    if _sdf_frames is not None:
+                        _R1_gws, _R2_gws = _sdf_frames[0], _sdf_frames[1]
+                        if len(_sdf_frames) > 2:
+                            _R3_gws = _sdf_frames[2]
+                    else:
+                        self.log.warning(
+                            "[gws] gws_sdf_normals=True but no mesh SDF available for "
+                            "this object -- falling back to the patch/primitive frame.")
                 # EVERY load-bearing contact enters W. Omitting contact 3 made beta
                 # the min-weight of the PINCH ALONE: the tripod could not show the
                 # rank-6 improvement it exists for, and -w_gws*beta gave the solver
                 # no gradient pulling contact 3 anywhere useful -- which is half of
                 # why it collapsed onto contact 2. Reported three-finger betas from
                 # before this (-4.56, -4.87) were 2-contact numbers.
-                _gws_extra = ([(_p3, _R3_expr)]
-                              if (_has_c3 and _p3 is not None and _R3_expr is not None)
+                _gws_extra = ([(_p3, _R3_gws)]
+                              if (_has_c3 and _p3 is not None and _R3_gws is not None)
                               else None)
-                _gws_W = build_W_ca(_p1, _p2, _R1_expr, _R2_expr,
+                _gws_W = build_W_ca(_p1, _p2, _R1_gws, _R2_gws,
                                     obj_center_np, obj_R_np, _mu, mu_t=_gws_mu_t,
                                     extra_contacts=_gws_extra)
                 if _has_c3 and _gws_extra is None:
@@ -4750,6 +4840,19 @@ class GraspPlanner3D:
                 # convention just above (no LP pre-solve to warm-start from).
                 _opti.set_initial(_gws_alpha, np.ones(_gws_W.shape[1]) / _gws_W.shape[1])
                 _opti.set_initial(_gws_beta, -1e-3)
+                # FRoGGeR (7c): hard floor on the NORMALIZED metric,
+                # l_bar* = n_cols*beta >= k_l. Applied as a constraint, not a cost.
+                # See GWSConfig.gws_beta_min_normalized for the two cautions (rank
+                # deficiency at n=2, and lp_gap on our embedding).
+                if cfg.gws_beta_min_normalized > 0.0:
+                    _kl = float(cfg.gws_beta_min_normalized)
+                    _opti.subject_to(
+                        _gws_beta >= _kl / float(_gws_W.shape[1]))
+                    # Start inside the feasible set: the -1e-3 cold start above is
+                    # below any positive floor, and an initial point violating a
+                    # hard constraint is what turns a feasible problem into a
+                    # restoration-phase failure.
+                    _opti.set_initial(_gws_beta, _kl / float(_gws_W.shape[1]))
                 if cfg.w_gws > 0.0:
                     # beta's attainable ceiling is 1/n_cols (all alpha_j tied at
                     # beta under sum(alpha)==1), so RAW beta silently changes

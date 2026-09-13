@@ -1,8 +1,9 @@
 # FRoGGeR as a benchmark arm
 
-**Status: design note plus Phase 1 results.** The benchmark harness itself is not yet
-built. This file fixes the terms of the comparison before further code is written, and
-records what Phase 1 established.
+**Status: Phases 1-3 landed; results pending.** The benchmark harness is
+`benchmarks/ycb_grasp/frogger_bench.py`. This file fixes the terms of the comparison and
+records what the instrumentation established. Candidate improvements to our own `beta`
+machinery are in [`GWS_IMPROVEMENTS.md`](GWS_IMPROVEMENTS.md).
 
 Paper: [FRoGGeR: Fast Robust Grasp Generation via the Min-Weight Metric][paper]
 (Li, Culbertson, Ames, et al., IROS 2023). Reference implementation: [alberthli/frogger][code].
@@ -94,16 +95,30 @@ Varied: decision variables, objective, closure constraint, normal source.
 
 0. Design note.
 1. **`n >= 3` wiring** — see §7.
-2. **`frogger` planner mode** — sole `beta` objective, SDF surface equality on free
-   3-vectors in place of patch coordinates, `beta >= k_l / m` as a hard constraint, true
-   SDF normals. Plus the OBB palm sampler (noisy alignment to OBB axes weighted by side
-   length, palm 4 cm out, collision-free IK) as a seed generator alongside
-   `_fixed_antipodal_seed`.
-3. **`benchmarks/ycb_grasp/frogger_bench.py`** — `--planner {ours,frogger}`, N objects x M
-   seeds, logging `l_bar*`, epsilon, `gamma_min`, span margin, solve time, solve count, and
-   pick success. Includes the paper's shaky pickup: lift 10 cm in 1 s, hold 1.5 s, 3 mm
-   sinusoidal perturbation in all axes from t+0.25 s; failure on >30 deg rotation, >7.5 cm
-   deviation, or >60 s synthesis.
+2. **`frogger` planner mode** — DONE as a config preset, `grasp_config_builder.for_frogger`:
+   `beta` as the sole objective (every other cost weight zeroed except a `w_reg` posture
+   prior), `gws_beta_scale_ncols=True` so `w_gws` and `k_l` both mean one thing across
+   contact counts, the hard floor `gws_beta_min_normalized` (FRoGGeR's (7c)), and
+   `gws_sdf_normals` for their `n = -grad s(p)`.
+
+   Two deliberate departures from the paper, both recorded rather than hidden:
+   the patch is kept for POSITION (only the normal source changes, so the 2-DOF
+   parameterization is not a variable in the comparison), and the LP embedding stays
+   single-level (the bilevel rewrite needs `rank(W) = 6` first — see
+   [`GWS_IMPROVEMENTS.md`](GWS_IMPROVEMENTS.md) items 2-3). `lp_gap` is therefore a
+   COMMON-MODE limitation of both arms and is reported per solve.
+
+   The OBB palm sampler is not built; both arms share the existing seeding pool, which
+   keeps seeding out of the comparison.
+3. **`benchmarks/ycb_grasp/frogger_bench.py`** — DONE (plan-only). `--arms ours,frogger`,
+   N objects x M seeds, logging `l_bar*`, `l_bar_converged`, `lp_gap`, `delta`,
+   `span_margin`, `gamma_min` and solve time. `--k-l 0` isolates the objective change from
+   the floor; `--patch-normals` isolates objective structure from normal source.
+
+   Execution scoring is NOT yet wired: the paper's shaky pickup (lift 10 cm in 1 s, hold
+   1.5 s, 3 mm sinusoid in all axes from t+0.25 s; failure on >30 deg rotation, >7.5 cm
+   deviation, or >60 s synthesis) remains to be added on top of `pick_and_place`'s
+   execution path.
 4. **Teleop setpoint path** — FRoGGeR as an alternate producer of `obj['q_target']`,
    reusing the existing `_commit_recommended_pose` -> `rebranch` -> `plan` -> GRASP-hold
    contract.
