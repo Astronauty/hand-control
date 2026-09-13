@@ -37,9 +37,9 @@ DEFAULTS = {
     # Kept in sync with kinova_leap_pick_place.py's JOG_VEL / WRIST_TRACK_GAIN / JOG_QDOT_MAX
     # constants (the app passes those into WristTrackConfig, so they win at runtime; these are
     # the fallback + the GUI 'Reset to defaults' target).
-    "JOG_VEL":          0.35,  # m/s   peak wrist-tracking speed cap
-    "WRIST_TRACK_GAIN": 8.0,   # 1/s   P-gain on wrist position error
-    "JOG_QDOT_MAX":     2.5,   # rad/s final per-joint arm-rate cap
+    "JOG_VEL":          0.3,   # m/s   peak wrist-tracking speed cap
+    "WRIST_TRACK_GAIN": 7.0,   # 1/s   P-gain on wrist position error
+    "JOG_QDOT_MAX":     2.0,   # rad/s final per-joint arm-rate cap
     # The two knobs that trade SPEED vs OVERSHOOT (raising the gain alone makes the loop
     # faster but underdamped -> overshoot). Tune these together with the gain:
     "TRACK_ACCEL":      5.0,   # m/s^2  Cartesian accel-slew cap on the velocity command

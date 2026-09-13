@@ -672,11 +672,10 @@ if __name__ == "__main__":
 
     STEPS_PER_WP    = 5    # max sim steps before forcing waypoint advance (timeout, 1 step = 1ms)
     WP_REACH_TOL    = 0.02  # joint-space radius to consider a waypoint reached (rad)
-    JOG_VEL         = 0.35 # jog speed while arrow key held (m/s); ALSO the peak-speed cap on
+    JOG_VEL         = 0.3  # jog speed while arrow key held (m/s); ALSO the peak-speed cap on
                            # live wrist tracking (see _solve_wrist_qdot). Env-overridable below
-                           # via TELEOP_JOG_VEL. 0.35 = calmer midpoint between the conservative
-                           # 0.3 and the responsive 0.42 sweep-optimum (the 0.42/9/3 tuning felt
-                           # too responsive/hard to control).
+                           # via TELEOP_JOG_VEL. Original conservative value (the sweep-tuned
+                           # 0.4/0.35 felt harder to control — reverted).
     # Singularity-robust DLS jog damping (see the GRASP-branch resolved-rate solve):
     # JOG_SING_EPS is the smallest-singular-value threshold below which damping ramps
     # in; JOG_LAM_MAX caps the peak joint-rate gain at ~1/(2*JOG_LAM_MAX). With
@@ -693,9 +692,8 @@ if __name__ == "__main__":
     # rate at ~JOG_VEL/(2*sqrt(JOG_LAM_MIN)) regardless of conditioning; JOG_QDOT_MAX is a
     # final hard clamp so no single frame can ever integrate a runaway solve.
     JOG_LAM_MIN     = 0.02  # rad·m base DLS damping (peak arm rate ~0.2/(2*sqrt(0.02))≈0.7 rad/s)
-    JOG_QDOT_MAX    = 2.5   # rad/s hard cap on the mapped arm joint rate (safety backstop).
-                            # 2.5 = calmer midpoint between the conservative 2.0 and the sweep
-                            # value 3.0 (3.0 felt too responsive). Env: TELEOP_QDOT_MAX.
+    JOG_QDOT_MAX    = 2.0   # rad/s hard cap on the mapped arm joint rate (safety backstop).
+                            # Original conservative value (2.5/3.0 tuning reverted). Env: TELEOP_QDOT_MAX.
 
     # --- Live wrist-tracking RESPONSIVENESS env overrides (baseline dexpilot + CAT pre-lock-in) ---
     # The arm follows the operator's wrist via a resolved-rate velocity loop (_solve_wrist_qdot):
@@ -756,10 +754,9 @@ if __name__ == "__main__":
     # Cartesian velocity command (1/s). The command is then slew-limited to the NCF accel
     # budget and DLS-mapped to joint rates, so this only sets how briskly the wrist closes
     # a tracking gap; the budget still caps peak acceleration for the no-slip guarantee.
-    WRIST_TRACK_GAIN = _env_float(WRIST_TRACK_GAIN_ENV, 8.0)    # TELEOP_TRACK_GAIN override.
-    # 8 = calmer midpoint between the conservative 7 and the sweep value 9. The 9-gain tuning
-    # tracked tightly but felt too responsive/hard to control; 8 softens the response to error.
-    # Pair with TRACK_ACCEL/TRACK_DAMP to trade speed vs overshoot.
+    WRIST_TRACK_GAIN = _env_float(WRIST_TRACK_GAIN_ENV, 7.0)    # TELEOP_TRACK_GAIN override.
+    # Original conservative value (the sweep-tuned 9/8 felt harder to control — reverted).
+    # Pair with TRACK_ACCEL/TRACK_DAMP to trade speed vs overshoot if tuning further.
 
     # Object definitions: rigid objects only (obj_soft deferred — vertex-level contact,
     # not a rigid grasp-map problem). Each object maps every FINGER_SET finger to the
@@ -3638,7 +3635,7 @@ if __name__ == "__main__":
         print(f"[teleop] WRIST_ANG_GAIN_SCALE={WRIST_ANG_GAIN_SCALE:.3g} — "
               "angular tracking gain scaled independently of position.")
     # Responsiveness knobs — always print the active tracking config so a run is self-documenting
-    # (defaults JOG_VEL=0.35, WRIST_TRACK_GAIN=8, JOG_QDOT_MAX=2.5; from a live tuning sweep;
+    # (defaults JOG_VEL=0.3, WRIST_TRACK_GAIN=7, JOG_QDOT_MAX=2.0; from a live tuning sweep;
     #  override live via the TELEOP_* env vars).
     print(f"[teleop] wrist-tracking responsiveness: JOG_VEL={JOG_VEL:.3g} m/s "
           f"(TELEOP_JOG_VEL), WRIST_TRACK_GAIN={WRIST_TRACK_GAIN:.3g} (TELEOP_TRACK_GAIN), "
