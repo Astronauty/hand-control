@@ -334,8 +334,10 @@ disagreement on the same contacts via the same LP**. Because the budget changed 
 | angular accel | `cfg.ang_accel_budget_xyz` | `(1, 1, 1)` | `(0.1, 0.1, 0.1)` |
 | LP infeasible | flags `wrench_feasible=False` | **aborts the grasp** | `GAMMA_FALLBACK = 2.0` |
 
-**The remaining verify-side gap is the `0.8 * mu` derate**, and `verify()` is still
-hardcoded `n=2` (it does not see a third contact at all — §10).
+**The remaining verify-side gap is the `0.8 * mu` derate.** (`verify()`'s hardcoded `n=2`
+was the other half of this and is FIXED as of 2026-09-13 — it now certifies every contact
+present, with the grasp-axis projections gated to `n == 2`; see §10. Note that this makes a
+3-contact `gamma_min` incomparable to a 2-contact one — check `n_contacts_verified`.)
 
 **The tabletop fallback was REMOVED, deliberately.** An infeasible LP means the contact
 geometry cannot resist the disturbance box at ANY squeeze force; substituting a constant
@@ -506,13 +508,23 @@ works alone.
 
 What does **not** see it yet:
 
-- **The NLP's own GWS metric.** `build_W_ca` accepts an `extra_contacts` argument, but the
-  sole call site (the `w_gws`/`w_span` block) does not pass it — so `beta` is still computed
-  from a 2-contact `W`. This matters more than it looks: §4 argues that at n>2 opposition is
-  the wrong objective *because* `beta` measures the right thing, and that argument does not
-  hold until the third column is actually in `W`.
-- **`verify()`** — hardcoded `n=2`. It reports the middle finger's geom gap as a diagnostic
-  (it always did), but its wrench-feasibility LP does not include the third contact.
+- ~~**The NLP's own GWS metric.**~~ **DONE** (commit `5fabede`). The `w_gws` call site passes
+  `_gws_extra` into `build_W_ca` and warns when `n_contacts>=3` but contact 3 has no frame
+  this stage, so `beta` is the tripod's min-weight, not the pinch's. Reported three-finger
+  betas from before that commit (-4.56, -4.87) were 2-contact numbers.
+- ~~**`verify()`** — hardcoded `n=2`.~~ **DONE** (2026-09-13). Its wrench LP now covers every
+  contact present, with the moment reference generalized to the contact CENTROID (which
+  reduces to the midpoint at n=2) and the grasp-axis moment/torque projections gated to
+  `n == 2` — honest for a pinch, but conservative against the very capability a third
+  off-axis contact provides, so they self-disable at n>=3. Same convention as
+  `solve_gamma_live` (§5).
+  **`verify()` now returns `n_contacts_verified`, and you must read it before comparing
+  `gamma_min` across runs:** a 3-contact `gamma_min` is a DIFFERENT quantity from a
+  2-contact one, because the pinch's number had a disturbance component projected out.
+  Measured on `036_wood_block` seed 0: pinch 28.387 N (projected) vs tripod 38.855 N
+  (unprojected). The tripod is not worse — it is certified against more.
+  The n=2 path is bit-identical after the change (verified: `036_wood_block` seed 0,
+  `gamma_min = 28.387`, `beta` unchanged to all digits).
 - **Every executor.** Nothing in `pick_and_place.py`, `pick_from_floor.py` or
   `kinova_leap_pick_place.py` reads `p3`. `solve_gamma_live` is ready for `n >= 2` (§5), but
   the callers still build 2-contact lists from `FINGER_SET`.

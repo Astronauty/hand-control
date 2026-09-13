@@ -2,6 +2,8 @@
 the arm's home-pose XML. Extracted from kinova_leap_pick_place.py so benchmarks/other
 callers don't need to import the pick-and-place entry-point script for these.
 """
+from pathlib import Path
+
 import numpy as np
 
 # Fingertip contact sites added in models/build_kinova_leap.py (_add_fingertip_sites),
@@ -33,42 +35,65 @@ FINGER_CODE = {"index": "if", "middle": "mf", "ring": "rf", "thumb": "th"}
 #
 # _finger_set_from_config() falls back to the historical literal if the file is
 # missing or unreadable, so a fresh checkout behaves exactly as before.
-def _finger_set_from_config():
+_FINGER_CONFIG_PATH = (Path(__file__).resolve().parent.parent
+                       / "models" / "grasp_finger_config.json")
+_FINGER_FALLBACK = ["thumb", "index"]     # slot order; the dataclass default
+
+
+def _slot_roles_from_config(obj_id=None, path=None):
+    """The grasp's roles in PLANNER SLOT ORDER (slot 1 first = p1 = thumb).
+
+    Reads the SAME schema `grasp_config_builder.load_finger_config` reads: a flat
+    top-level `fingers` list, with `per_object[<ycb id>]` overriding it. A missing or
+    unreadable file falls back to thumb+index, so a fresh checkout behaves as before.
+
+    THIS USED TO READ A SCHEMA THE FILE NO LONGER HAS. It looked up
+    `pairings[default]`, and `grasp_finger_config.json` carries neither key -- so
+    every call silently hit the `["index","thumb"]` fallback. That went unnoticed
+    because the fallback happens to equal the file's current default, but it meant a
+    `per_object` entry (e.g. a tripod for one object) was read by the PLANNER, via
+    load_finger_config, and ignored by the EXECUTOR, via this function -- the exact
+    planner/executor disagreement the module comment below says this exists to prevent.
+
+    obj_id : YCB id to honour a `per_object` override for. None = the file default.
+    """
     import json
-    from pathlib import Path
-    p = Path(__file__).resolve().parent.parent / "models" / "grasp_finger_config.json"
+    p = Path(path) if path is not None else _FINGER_CONFIG_PATH
     try:
         raw = json.loads(p.read_text())
     except (OSError, ValueError):
-        return ["index", "thumb"]
-    pairings = {k: v for k, v in (raw.get("pairings") or {}).items()
-                if not k.startswith("_")}
-    roles = pairings.get(raw.get("default"))
+        return list(_FINGER_FALLBACK)
+    roles = (raw.get("per_object") or {}).get(obj_id) if obj_id else None
     if not roles:
-        return ["index", "thumb"]
-    # slot order (thumb-first) -> FINGER_SET order (opposing-finger-first)
-    return list(reversed(roles))
+        roles = raw.get("fingers")
+    roles = [r for r in (roles or []) if not str(r).startswith("_")]
+    return list(roles) if roles else list(_FINGER_FALLBACK)
 
 
-def _slot_roles_from_config(pairing=None):
-    """The pairing's roles in PLANNER SLOT order (slot 1 first = p1 = thumb).
+def _finger_set_from_config(obj_id=None, path=None):
+    """SLOT_ROLES reversed: opposing-finger-first. See the ordering note above."""
+    return list(reversed(_slot_roles_from_config(obj_id=obj_id, path=path)))
 
-    FINGER_SET is this list reversed; see the ordering note above. Exposed so the
-    controller can map an NLP slot to the finger that serves it WITHOUT keying on
-    the role name -- the two dicts at kinova_leap_pick_place.py:1644/:1822 used to
-    hardcode {'thumb': p1, 'index': p2}, which KeyErrors the moment a pairing does
-    not contain an 'index'."""
-    import json
-    from pathlib import Path
-    p = Path(__file__).resolve().parent.parent / "models" / "grasp_finger_config.json"
-    try:
-        raw = json.loads(p.read_text())
-    except (OSError, ValueError):
-        return ["thumb", "index"]
-    pairings = {k: v for k, v in (raw.get("pairings") or {}).items()
-                if not k.startswith("_")}
-    roles = pairings.get(pairing or raw.get("default"))
-    return list(roles) if roles else ["thumb", "index"]
+
+def resolve_fingers(fingers=None, obj_id=None):
+    """(SLOT_ROLES, FINGER_SET) for one grasp, resolved AT CALL TIME.
+
+    The module-level SLOT_ROLES/FINGER_SET below are import-time constants, which is
+    why `--pairing`/`--fingers` historically steered the PLANNER only: the executor
+    had already bound the default at import. A caller that knows the grasp it is
+    about to execute should call this instead and thread the result through, so a
+    non-default finger list reaches the controller too.
+
+    fingers : explicit ordered role list (or 'a,b' string) in SLOT order; wins over
+              the file. None = the file's per-object entry, else its default.
+    """
+    if fingers is not None:
+        if isinstance(fingers, str):
+            fingers = [t.strip() for t in fingers.split(",") if t.strip()]
+        slots = [str(f) for f in fingers]
+    else:
+        slots = _slot_roles_from_config(obj_id=obj_id)
+    return slots, list(reversed(slots))
 
 
 SLOT_ROLES = _slot_roles_from_config()
