@@ -172,29 +172,52 @@ def main():
     fig.canvas.mpl_connect("button_release_event", _on_release)
 
     errs = deque(maxlen=args.window)
-    state = {"offset": 0}
+    # Start reading at the END of any pre-existing log so a stale file's offset can't
+    # desync us; new rows the app appends after we launch are what we plot.
+    try:
+        state = {"offset": os.path.getsize(args.log)}
+    except OSError:
+        state = {"offset": 0}
+    state["total"] = 0
+
+    import numpy as _np
 
     def update(_frame):
         rows, state["offset"] = _tail_errors(args.log, state["offset"])
         for r in rows:
             if "err_mm" in r:
-                errs.append(r["err_mm"])
+                errs.append(r["err_mm"]); state["total"] += 1
         if errs:
             ys = list(errs)
             line_err.set_data(range(len(ys)), ys)
             ax_err.set_xlim(0, max(len(ys), 10))
             ax_err.set_ylim(0, max(5.0, 1.15 * max(ys)))
-            import numpy as _np
             mean_txt.set_text(f"mean {(_np.mean(ys)):.1f} mm   "
                               f"p95 {(_np.percentile(ys, 95)):.1f} mm   "
-                              f"n={len(ys)}")
+                              f"n={len(ys)} (total {state['total']})")
+        else:
+            # Nothing logged yet — tell the user WHY the plot is blank instead of
+            # leaving it silently empty (the usual cause: app not launched with
+            # --tune-wrist, or press-8 not done so tracking isn't producing a target).
+            _exists = os.path.exists(args.log)
+            mean_txt.set_text(
+                ("waiting for data… log file not created yet.\n"
+                 "Is the sim running with --tune-wrist, and have you pressed 8 to track?"
+                 if not _exists else
+                 "log file exists but no rows yet — press 8 and move your hand."))
+        fig.canvas.draw_idle()
         return line_err, mean_txt
 
-    anim = FuncAnimation(fig, update, interval=100, cache_frame_data=False)
+    # Keep a reference on the figure so the animation isn't garbage-collected (a GC'd
+    # FuncAnimation silently stops updating — the classic 'plot never moves' bug).
+    fig._wrist_anim = FuncAnimation(fig, update, interval=200, cache_frame_data=False,
+                                    save_count=1)
     print(f"[wrist-tune] writing {args.config}")
     print(f"[wrist-tune] reading {args.log}")
     print("[wrist-tune] launch the app with --tune-wrist, press 8 to track, then move the "
           "reference wrist and tune. Slider release (or Apply) writes the config.")
+    print("[wrist-tune] if the plot stays blank, check that the sim is running WITH "
+          "--tune-wrist and that you pressed 8 — the plot annotates the reason.")
     try:
         plt.show()
     except KeyboardInterrupt:
