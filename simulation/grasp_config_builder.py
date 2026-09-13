@@ -418,6 +418,7 @@ def for_frogger(obj_name: str, arm_geom_names: list,
                 sdf_normals: bool = True,
                 sdf_surface: bool = True,
                 fingers=None,
+                finger_obj_geoms=None,
                 **overrides) -> GraspConfig3D:
     """The FRoGGeR arm of the benchmark: beta as the SOLE objective.
 
@@ -461,6 +462,12 @@ def for_frogger(obj_name: str, arm_geom_names: list,
 
         Set False to run their objective inside our patch, which isolates objective
         structure from the parameterization.
+
+    finger_obj_geoms : geom names of the ACTIVE fingers' links, which (7e) allows
+        to interpenetrate the target object slightly. Their clearance is set to
+        `frogger_finger_obj_margin_m` (negative) unless the caller already gave
+        that geom an explicit value. None/empty leaves every clearance positive,
+        which is NOT the paper's (7e).
 
     sdf_normals : take contact normals from the object's SDF gradient rather than
         the quadratic patch, which is FRoGGeR's own formulation (n = -grad s(p))
@@ -516,6 +523,31 @@ def for_frogger(obj_name: str, arm_geom_names: list,
         # squeeze force and appears nowhere in (7a)-(7e). Off, so the frogger NLP
         # carries only the variables the paper's does.
         cfg_kw.setdefault('wrench_constraint', False)
+        # (7a) is `maximize l*(q)`, with l* a FUNCTION of q -- their inner LP is
+        # solved to optimality at every outer iterate. Our embedding only reaches
+        # the metric at NLP convergence, which the measured lp_gap shows it often
+        # does not. Bilevel is the paper's structure, so it is the default here.
+        cfg_kw.setdefault('frogger_bilevel_lp', True)
+
+    # (7e): a NEGATIVE margin d_j on FINGER-OBJECT pairs, which the paper states
+    # explicitly. Applied to the ACTIVE fingers' geoms against the target object
+    # only; every other pair keeps its positive clearance. Without it a point
+    # contact ON the surface and a finite pad sphere with non-negative clearance
+    # are mutually unsatisfiable, so this is what makes (7d) and (7e) consistent
+    # rather than a relaxation for convenience.
+    _fo = cfg_kw.get('frogger_finger_obj_margin_m', -0.002)
+    if _fo is not None and finger_obj_geoms:
+        # OVERWRITE, not setdefault. clearance_by_geom() pre-populates the active
+        # fingers' distal geoms with the DISABLE SENTINEL (-1.0), meaning "no object
+        # constraint at all" -- our contact tier, which lets a fingertip pass
+        # arbitrarily deep through the object. (7e) is a BOUNDED allowance
+        # (`d_j < 0`, "a small amount of interpenetration"), so leaving the sentinel
+        # in place would be strictly more permissive than the paper, not equal to
+        # it. An explicit caller value still wins via cfg_kw.
+        _clr = dict(obj_clearance_by_geom or {})
+        for _g in finger_obj_geoms:
+            _clr[_g] = float(_fo)
+        obj_clearance_by_geom = _clr
     if sdf_normals or sdf_surface:
         cfg_kw.setdefault('gws_sdf_normals', True)
 

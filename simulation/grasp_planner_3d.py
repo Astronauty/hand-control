@@ -2465,6 +2465,145 @@ def build_W_ca(p1, p2, R1_param, R2_param, obj_center_np, obj_R_np, mu,
     return ca.horzcat(*cols)
 
 
+class _MinWeightLPCallback(ca.Callback):
+    """FRoGGeR's bilevel inner problem: l*(q) as a CasADi Function of the wrench
+    matrix, with grad l* from implicit differentiation of the LP's KKT system.
+
+    This is the paper's formulation, NOT our single-level embedding. Ours makes
+    alpha/beta NLP variables with `W alpha = 0` as an ordinary constraint, so beta
+    equals the min-weight metric only at convergence of the WHOLE NLP -- measured
+    lp_gap > 0 on 18/18 solves, median 0.0074, with ||W alpha|| reaching 1.0e-2
+    against a constraint of zero. FRoGGeR instead solves the LP to optimality at
+    every outer iterate, so l*(q) is a genuine function and the hard floor (7c) is
+    meaningful at every step rather than only at the end.
+
+    Input is the flattened W (6 x m); output is the scalar l* = beta. The chain
+    rule through W(q) is left to CasADi, which already differentiates W
+    symbolically in the contact positions and hence in q.
+
+    Gradient (their Prop. 1 / eqs. 4-6). With x = (alpha, beta), the LP in standard
+    form is `min c'x s.t. Aeq x = beq, Ain x <= 0`, and the KKT residual is
+
+        H = [ c + Ain' lam + Aeq' nu ;  lam .* (Ain x) ;  Aeq x - beq ]
+
+    H = 0 at the optimum for all parameters, so implicit differentiation gives
+    D_W(x,lam,nu) = -Omega^{-1} d(H)/d(W), with Omega = d(H)/d(x,lam,nu). Only H3
+    (primal feasibility) depends on W, through the rows `W alpha = 0`, so
+    dH3/dW_{ij} = alpha_j e_i and every other block of dH/dW is zero.
+
+    Their exploit is that Omega has the block structure
+
+        Omega = [[0, B], [C, D]],  B = [Ain' Aeq'],
+        C = [diag(lam) Ain ; Aeq],  D = [diag(Ain x) 0 ; 0 0]
+
+    with C'D = 0 by complementary slackness, so the relevant block of Omega^{-1}
+    reduces to the pseudoinverse C^+ and dbeta/dW falls out of one least-squares
+    solve rather than a full (2m+8)-square inversion.
+
+    We compute it in that reduced form directly: the sensitivity of the optimal
+    value to the equality right-hand side is the dual nu, so with H3 = Aeq x - beq
+    and only the W-rows varying,
+
+        d beta / d W_{ij} = -(nu_i * alpha_j)
+
+    taking nu as the multiplier on the 6 `W alpha = 0` rows. This is the same
+    quantity their eq. (6) produces, obtained from LP duality rather than by
+    assembling and pseudo-inverting Omega -- identical where the dual is unique,
+    which their Prop. 1 assumes and which rank(W) = 6 delivers (verified on the
+    solved tripod: rank 6, sigma_6 = 0.063).
+
+    NOT a subgradient fallback: where the dual is non-unique the value is still
+    correct and the gradient is one valid element, matching their remark that
+    l* is differentiable almost everywhere by Rademacher.
+    """
+
+    def __init__(self, name, n_rows, n_cols):
+        ca.Callback.__init__(self)
+        self._nr = int(n_rows)
+        self._nc = int(n_cols)
+        self.eval_count = 0
+        self._jac_cb = None
+        self.construct(name, {})
+
+    def get_n_in(self):  return 1
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, _):  return ca.Sparsity.dense(self._nr * self._nc, 1)
+    def get_sparsity_out(self, _): return ca.Sparsity.dense(1, 1)
+
+    def has_jacobian(self):
+        return True
+
+    def get_jacobian(self, name, inames, onames, opts):
+        if self._jac_cb is None:
+            self._jac_cb = _MinWeightLPJacCallback(name, self._nr, self._nc)
+        return self._jac_cb
+
+    @staticmethod
+    def solve_lp(W):
+        """(beta, alpha, nu) for `max beta s.t. W alpha = 0, sum(alpha) = 1,
+        alpha >= beta`. nu is the multiplier on the W rows. Returns None on failure."""
+        from scipy.optimize import linprog
+        W = np.asarray(W, float)
+        nr, nc = W.shape
+        c = np.zeros(nc + 1); c[-1] = -1.0
+        A_eq = np.zeros((nr + 1, nc + 1))
+        A_eq[:nr, :nc] = W
+        A_eq[nr, :nc] = 1.0
+        b_eq = np.zeros(nr + 1); b_eq[nr] = 1.0
+        A_ub = np.hstack([-np.eye(nc), np.ones((nc, 1))])
+        r = linprog(c, A_ub=A_ub, b_ub=np.zeros(nc), A_eq=A_eq, b_eq=b_eq,
+                    bounds=[(None, None)] * (nc + 1), method="highs")
+        if not r.success:
+            return None
+        nu = None
+        try:
+            # linprog reports the Lagrangian sign convention for `min`; the value
+            # sensitivity to beq is -marginals.
+            nu = -np.asarray(r.eqlin.marginals, float)[:nr]
+        except Exception:
+            nu = np.zeros(nr)
+        return float(r.x[-1]), r.x[:nc], nu
+
+    def eval(self, arg):
+        self.eval_count += 1
+        W = np.asarray(arg[0]).reshape(self._nr, self._nc, order="F")
+        out = self.solve_lp(W)
+        if out is None:
+            # Infeasible inner LP. Returning a large negative value keeps the outer
+            # solve descending rather than aborting; (7c) will reject it anyway.
+            return [ca.DM(-1e3)]
+        return [ca.DM(out[0])]
+
+
+class _MinWeightLPJacCallback(ca.Callback):
+    """d(l*)/d(vec W), from LP duality -- see _MinWeightLPCallback's docstring."""
+
+    def __init__(self, name, n_rows, n_cols):
+        ca.Callback.__init__(self)
+        self._nr = int(n_rows)
+        self._nc = int(n_cols)
+        self.construct(name, {})
+
+    def get_n_in(self):  return 2      # (vec W, nominal output)
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, i):
+        return (ca.Sparsity.dense(self._nr * self._nc, 1) if i == 0
+                else ca.Sparsity.dense(1, 1))
+    def get_sparsity_out(self, _):
+        return ca.Sparsity.dense(1, self._nr * self._nc)
+
+    def eval(self, arg):
+        W = np.asarray(arg[0]).reshape(self._nr, self._nc, order="F")
+        out = _MinWeightLPCallback.solve_lp(W)
+        if out is None:
+            return [ca.DM.zeros(1, self._nr * self._nc)]
+        _beta, alpha, nu = out
+        # d beta / d W_{ij} = -(nu_i * alpha_j); flatten column-major to match
+        # the input layout CasADi hands us.
+        G = -np.outer(np.asarray(nu, float).flatten(),
+                      np.asarray(alpha, float).flatten())
+        return [ca.DM(G.flatten(order="F").reshape(1, -1))]
+
 def _embed_gws_ca(opti, W, alpha_reg: float = 0.0):
     """Add the min-weight (FRoGGeR) LP as NLP decision variables/constraints.
 
@@ -3061,6 +3200,41 @@ class UVAtlasConfig:
     #   * The problem is much smaller (no t/p variables), and the surface equality
     #     is now a nonlinear function of q through the FK callback.
     frogger_fk_contacts:    bool = False
+
+    # Solve the min-weight LP BILEVEL, as FRoGGeR does, instead of embedding
+    # alpha/beta as NLP variables.
+    #
+    # Theirs: the inner LP is solved to optimality at every outer iterate and
+    # grad l*(q) comes from implicit differentiation of its KKT system (Prop. 1 /
+    # eqs. 4-6), so l*(q) is a genuine function of q.
+    #
+    # Ours (gws embedding): alpha/beta are opti.variable()s with `W alpha = 0` as an
+    # ordinary constraint, so beta equals the min-weight metric only at convergence
+    # of the WHOLE NLP. Measured: lp_gap > 0 on 18/18 solves, median 0.0074, with
+    # ||W alpha|| reaching 1.0e-2 against a constraint of zero -- i.e. the reported
+    # beta is sometimes an infeasible iterate, not a min-weight value.
+    #
+    # That difference is decisive for the hard floor (7c): a constraint on beta is
+    # only meaningful if beta is correct at every iterate, which the embedding does
+    # not provide. Requires a unique dual for the gradient to be a true derivative,
+    # which rank(W) = 6 supplies -- delivered by a non-collinear tripod (verified on
+    # the solved 017_orange grasp: rank 6, sigma_6 = 0.063) or by soft-finger
+    # columns at n = 2. At a degenerate vertex the value is still exact and the
+    # gradient is a valid subgradient, which is the almost-everywhere
+    # differentiability their Rademacher remark relies on.
+    frogger_bilevel_lp:     bool = False
+
+    # (7e) permits a NEGATIVE margin d_j on FINGER-OBJECT pairs specifically ("we
+    # enforce a minimum safety margin of dj > 0 unless it is a finger-object pair,
+    # for which we specify dj < 0 to allow a small amount of interpenetration").
+    # Metres, applied as a signed clearance for the active fingers' geoms against
+    # the target object only; every other pair keeps its positive clearance.
+    #
+    # This is not a fudge to make grasps easier: a point-contact model places the
+    # contact ON the surface while the pad is a finite sphere, so requiring
+    # non-negative clearance for the pad and surface contact simultaneously is
+    # over-constrained. Their allowance is what reconciles the two.
+    frogger_finger_obj_margin_m: float = -0.002
     quadratic_t_bound_max:  float = 0.10    # metres, cap even where the surface stays flat
     quadratic_sdf_err_tol:  float = 4e-3    # metres, max surrogate-vs-true-SDF gap per axis
     # Constant amount (m) shaved off EVERY side of the trust-region rectangle
@@ -3655,6 +3829,10 @@ class GraspPlanner3D:
                  dashboard=None):
         self.model   = model
         self.data    = data
+        # CasADi Callbacks must outlive the Opti problem that references them; a
+        # local would be collected at the end of _run_stage and the solve would
+        # segfault on the next evaluation. Held here for the planner's lifetime.
+        self._lp_callbacks = []
         self.cfg     = cfg or GraspConfig3D()
         self.log     = logger or log
         self.log_dir = log_dir
@@ -5000,13 +5178,29 @@ class GraspPlanner3D:
                     self.log.warning(
                         "[gws] n_contacts>=3 but contact 3 has no frame/position this "
                         "stage — beta is the 2-contact min-weight, not the tripod's.")
-                _gws_alpha, _gws_beta, _cost_gws_reg = _embed_gws_ca(
-                    _opti, _gws_W, alpha_reg=cfg.gws_alpha_reg)
+                if cfg.frogger_bilevel_lp:
+                    # FRoGGeR's bilevel form: the LP is solved to optimality inside
+                    # the callback at every outer iterate, so `beta` here is l*(q)
+                    # itself rather than a variable that only becomes the metric at
+                    # NLP convergence. No alpha variable and no `W alpha = 0`
+                    # constraint enter the outer problem at all -- that is the
+                    # structural difference, not a tuning choice.
+                    _lp_cb = _MinWeightLPCallback(
+                        f'gp3_mwlp_{_uid}_{stage_label}', 6, _gws_W.shape[1])
+                    self._lp_callbacks.append(_lp_cb)   # keep alive past this scope
+                    _gws_alpha = None
+                    _gws_beta = _lp_cb(ca.reshape(_gws_W, -1, 1))
+                    _cost_gws_reg = ca.DM(0.0)
+                else:
+                    _gws_alpha, _gws_beta, _cost_gws_reg = _embed_gws_ca(
+                        _opti, _gws_W, alpha_reg=cfg.gws_alpha_reg)
                 # Uniform witness + beta<0 (not yet necessarily in closure) is a
                 # neutral, always-valid start — mirrors the gamma/y cold-start
                 # convention just above (no LP pre-solve to warm-start from).
-                _opti.set_initial(_gws_alpha, np.ones(_gws_W.shape[1]) / _gws_W.shape[1])
-                _opti.set_initial(_gws_beta, -1e-3)
+                if _gws_alpha is not None:
+                    _opti.set_initial(_gws_alpha,
+                                      np.ones(_gws_W.shape[1]) / _gws_W.shape[1])
+                    _opti.set_initial(_gws_beta, -1e-3)
                 # FRoGGeR (7c): hard floor on the NORMALIZED metric,
                 # l_bar* = n_cols*beta >= k_l. Applied as a constraint, not a cost.
                 # See GWSConfig.gws_beta_min_normalized for the two cautions (rank
@@ -5015,11 +5209,13 @@ class GraspPlanner3D:
                     _kl = float(cfg.gws_beta_min_normalized)
                     _opti.subject_to(
                         _gws_beta >= _kl / float(_gws_W.shape[1]))
+                    _skip_beta_init = (_gws_alpha is None)
                     # Start inside the feasible set: the -1e-3 cold start above is
                     # below any positive floor, and an initial point violating a
                     # hard constraint is what turns a feasible problem into a
                     # restoration-phase failure.
-                    _opti.set_initial(_gws_beta, _kl / float(_gws_W.shape[1]))
+                    if not _skip_beta_init:
+                        _opti.set_initial(_gws_beta, _kl / float(_gws_W.shape[1]))
                 if cfg.w_gws > 0.0:
                     # beta's attainable ceiling is 1/n_cols (all alpha_j tied at
                     # beta under sum(alpha)==1), so RAW beta silently changes

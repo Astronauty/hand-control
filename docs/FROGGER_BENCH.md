@@ -587,3 +587,64 @@ structure, the surface-equality arm tests the full formulation.
 - **Fairness of the gamma comparison.** Lower `gamma_min` is better, but the two arms
   place contacts differently, so this compares grasps, not solvers, and is not
   normalized for contact separation.
+
+---
+
+## 10. Faithfulness work (2026-09-13, in progress)
+
+The frogger arm reproduced FRoGGeR's algebra while retaining this repo's variable
+structure and conveniences. Each departure is now either removed or recorded.
+
+| (7a)-(7e) requires | was | now |
+|---|---|---|
+| `q` the only decision variable; contacts are `FK_i(q)` | free contact variables + IK cost | `frogger_fk_contacts` |
+| (7a) is `max l*(q)`, one term | `w_gws` weighted, plus `w_reg = 0.03` | `w_reg = 0.0`; `beta` sole term |
+| no `gamma`/`y`/slack variables | wrench-cone LP active | `wrench_constraint = False` |
+| (7d) `s(FK_i(q)) = 0` | patch/trust-region, or free vector | equality at `FK - r_tip*n` |
+| (7e) `d_j < 0` on finger-object pairs | positive clearance, or our disable sentinel | `frogger_finger_obj_margin_m = -0.002` |
+| bilevel LP, `grad l*` by implicit KKT | single-level embedding | `frogger_bilevel_lp` |
+
+### 10.1 The bilevel LP is implemented and its gradient verified
+
+`_MinWeightLPCallback` solves the min-weight LP to optimality at every outer iterate and
+supplies `d beta / d W_{ij} = -(nu_i * alpha_j)` from LP duality, `nu` being the multiplier
+on the `W alpha = 0` rows. This is the quantity their eq. (6) produces; it is obtained from
+duality rather than by assembling and pseudo-inverting `Omega`, which is identical wherever
+the dual is unique.
+
+Verified against central finite differences on the solved tripod geometry: 9 of 12 sampled
+entries agree to ~1e-11. The 3 that do not are exactly the degenerate ones — 9 of 15
+`alpha` components tie at `beta`, and there forward and backward differences themselves
+disagree (-0.0299 vs -0.0340) with the analytic value equal to one of them. That is the
+almost-everywhere differentiability the paper's Rademacher remark describes, not an error.
+
+**`rank(W) = 6` holds on a real tripod without soft fingers** (measured on the solved
+`017_orange` grasp: rank 6, `sigma_6 = 0.063`), so Prop. 1's unique-dual condition is met
+by contact count alone at `n >= 3`.
+
+### 10.2 Both faithfulness changes currently REGRESS the solve, and are not yet usable
+
+Isolated on `017_orange` seed 0, tripod:
+
+| configuration | `beta` |
+|---|---|
+| embedded LP, no (7e) — the previously reported working arm | +0.0405 |
+| embedded LP + (7e) | +0.0172 |
+| bilevel LP, no (7e) | +0.0503 |
+| **bilevel LP + (7e)** | **-0.0000** |
+
+The combination fails: the returned grasp puts all three contacts on the same side
+(pairwise normal dots +0.914 / +0.966 / +0.931), which is genuinely non-closure, and
+`verify()` rejects it. `Maximum_Iterations_Exceeded` persists at `max_iter = 400` and the
+outcome is unchanged with `k_l = 0`, so it is neither an iteration budget nor the floor.
+
+The callback itself is not at fault: CasADi differentiates it correctly (90/90 Jacobian
+entries nonzero, norm 1.98) and its value matches `beta_audit` to 1e-9.
+
+**Do not use `--arms frogger` for reported numbers until this is resolved.** The most
+likely cause is that (7e)'s bounded negative margin and the bilevel gradient interact
+through the seeding: with interpenetration permitted, a same-side seed is now feasible,
+and `beta` alone — with `w_ik = 0`, `w_align = 0` — supplies no term that prefers opposed
+contacts from a same-side start. FRoGGeR's own sampler addresses this by aligning the palm
+with the object's OBB axes and setting the fingertip span from the bounding box, which this
+benchmark has not implemented (§5, phase 2 note). That is the next thing to build.

@@ -84,8 +84,16 @@ def _build_cfg(arm, object_id, body_name, rgeoms, obj_geom0, *,
                   ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
                   fingers=fingers)
     if arm == "frogger":
+        # (7e): the ACTIVE fingers' geoms may interpenetrate the target object
+        # slightly. Derived from the same FINGER_CODE prefixes the RRT uses, so the
+        # set tracks the pairing rather than being a hardcoded list.
+        from kinova_common.constants import FINGER_CODE
+        codes = [FINGER_CODE[r] for r in (fingers or []) if r in FINGER_CODE]
+        fo = [g for g in rgeoms
+              if any(f"_{c}_" in g for c in codes) and ("ds" in g or "tip" in g)]
         return for_frogger(body_name, rgeoms, clearance_by_geom(rgeoms),
-                           k_l=k_l, sdf_normals=sdf_normals, **common, **cfg_kw)
+                           k_l=k_l, sdf_normals=sdf_normals,
+                           finger_obj_geoms=fo, **common, **cfg_kw)
     return for_gws_recommender(body_name, rgeoms, clearance_by_geom(rgeoms),
                                **common, **cfg_kw)
 
