@@ -3024,6 +3024,43 @@ class UVAtlasConfig:
     # those. The SDF gradient still gives the normal (see gws_sdf_normals), and
     # the 4mm-accurate quadratic_sdf_err_tol machinery simply does not apply.
     sdf_surface_contact:    bool = False
+
+    # FRoGGeR's FULL formulation (7a)-(7e), not an approximation of it.
+    #
+    #   maximize_q  l*(q)
+    #   s.t.  q_min <= q <= q_max                          (7b)
+    #         l_bar*(q) >= k_l                             (7c)
+    #         s(FK_i(q)) = 0,          i = 1..n_c          (7d)
+    #         sigma(o_A, o_B; q) >= d_j                    (7e)
+    #
+    # **q IS THE ONLY DECISION VARIABLE.** Contacts are not variables at all: they
+    # ARE the fingertip forward kinematics FK_i(q), and (7d) constrains THOSE to the
+    # object surface. The grasp map, and hence W(q), is built at those same points.
+    #
+    # This is the substantive difference from sdf_surface_contact above, which gives
+    # contacts their own free 3-vectors and pins them with the same equality. That
+    # arrangement reproduces (7d)'s ALGEBRA but not its MEANING: a free contact is
+    # coupled to the hand only through an IK COST, so with that cost down-weighted
+    # the optimizer places contacts the hand never reaches. Measured on 017_orange
+    # seed 0 at w_ik=0: fingertip-to-assigned-contact 1211/1315/1259 mm, while beta
+    # reported l_bar* = 0.9993 -- a perfect score for a grasp no hand performs.
+    #
+    # Under this flag that failure mode is structurally impossible: there is no
+    # separate contact to drift from, so reachability is not a cost to be traded
+    # against beta but a property of the variables. This is exactly why FRoGGeR
+    # needs no IK term in (7a), and why zeroing ours was not equivalent.
+    #
+    # Implies the contact-position variables are dropped entirely; takes precedence
+    # over use_quadratic_contact, the UV atlas, and sdf_surface_contact.
+    #
+    # Consequences to expect, all inherent to the formulation rather than defects:
+    #   * The pad OFFSET is real. FK gives the tip SITE; the contact is on the pad
+    #     SURFACE, so (7d) is applied at site + r_tip*n, which requires the normal
+    #     at the contact -- taken from the SDF gradient (their n = -grad s(p)).
+    #   * No trust region and no local surface model, so curvature is unavailable.
+    #   * The problem is much smaller (no t/p variables), and the surface equality
+    #     is now a nonlinear function of q through the FK callback.
+    frogger_fk_contacts:    bool = False
     quadratic_t_bound_max:  float = 0.10    # metres, cap even where the surface stays flat
     quadratic_sdf_err_tol:  float = 4e-3    # metres, max surrogate-vs-true-SDF gap per axis
     # Constant amount (m) shaved off EVERY side of the trust-region rectangle
@@ -4207,6 +4244,13 @@ class GraspPlanner3D:
             # ── Build Opti ────────────────────────────────────────────────
             _opti = ca.Opti()
             _q  = _opti.variable(n_act)
+            # Fingertip FK as MX expressions in q, built as soon as q exists.
+            # cfg.frogger_fk_contacts makes the CONTACTS these expressions, so the
+            # contact dispatch below needs them; the IK cost reuses them too rather
+            # than calling the callbacks a second time.
+            _tp1_fk = thumb_cb(_q)
+            _tp2_fk = index_cb(_q)
+            _tp3_fk = middle_cb(_q) if middle_cb is not None else None
             _is_mesh = (geom_type == _GEOM_TYPE_MESH and self._mesh_entry is not None)
             _t1_var = _t2_var = None   # set below iff a mesh 2-DOF contact var is built
             _t3_var = _p3 = _t3_bounds = _t3_frame = None   # third contact (n_contacts>=3)
@@ -4220,6 +4264,20 @@ class GraspPlanner3D:
                 # gating (see include_surface branch).
                 _p1 = ca.DM(np.asarray(p1_ws, float))
                 _p2 = ca.DM(np.asarray(p2_ws, float))
+            elif cfg.frogger_fk_contacts:
+                # FRoGGeR (7d): the contacts ARE the fingertip forward kinematics.
+                # No contact variables exist, so `q` is the only decision variable,
+                # exactly as in (7a)-(7e). The surface equality is applied below,
+                # after the pad offset is known -- it needs the contact normal, and
+                # the normal is a function of the contact point itself.
+                #
+                # The FK callbacks are the same ones the IK cost uses, so the
+                # fingertip position entering W is the position the hand actually
+                # reaches, by construction rather than by penalty.
+                _p1 = _tp1_fk
+                _p2 = _tp2_fk
+                if _has_c3 and _tp3_fk is not None:
+                    _p3 = _tp3_fk
             elif _is_mesh and cfg.sdf_surface_contact:
                 # FRoGGeR (7d): free 3-vectors pinned by s(p) = 0. No trust region
                 # and no local surface model, so contacts are free to traverse the
@@ -4425,8 +4483,8 @@ class GraspPlanner3D:
             _n1_al_s, _n2_al_s = _sym_pair(cfg.quad_sym_normals_align)
             _n1_or_s, _n2_or_s = _sym_pair(cfg.quad_sym_normals_orient)
 
-            _tp1   = thumb_cb(_q)
-            _tp2   = index_cb(_q)
+            _tp1   = _tp1_fk
+            _tp2   = _tp2_fk
             # IK cost: fingertip center should be at contact point + r_tip * outward_normal.
             # Without the offset the tip sphere embeds r_tip mm into the object surface.
             # r*_override (when set) is the DIRECTIONAL support distance along
@@ -4468,7 +4526,7 @@ class GraspPlanner3D:
             # CENTER targets contact + r_tip*outward_normal, not the bare contact.
             _d3_sq = None
             if _has_c3 and _p3 is not None and middle_cb is not None:
-                _tp3 = middle_cb(_q)
+                _tp3   = _tp3_fk
                 _r3_ik = float(cfg.r_middle if cfg.r_middle is not None else cfg.r_index)
                 _n3_out_ik = ca.DM(np.asarray(
                     d3_lp if d3_lp is not None else _n3_seed_out, float))
@@ -4679,7 +4737,37 @@ class GraspPlanner3D:
             # Mesh contacts are on-surface BY CONSTRUCTION (tangent-plane +
             # reprojection above) — no equality constraint needed or added.
             # fixed_contacts: p1/p2 are constants, nothing to constrain either.
-            if include_surface and not _is_mesh and not cfg.fixed_contacts:
+            if cfg.frogger_fk_contacts and include_surface:
+                # FRoGGeR (7d): s(FK_i(q)) = 0 for every contact.
+                #
+                # Applied at the PAD SURFACE, not the tip SITE. FK gives the site,
+                # which sits r_tip inside the pad, so constraining the site to the
+                # surface would bury the pad by that radius. The contact point is
+                # site - r_tip*n_out, and n_out is the SDF gradient AT that point --
+                # a fixed point in principle. One step from the site is sufficient
+                # here because r_tip is small against the local radius of curvature,
+                # and the residual is reported per solve (sdf_mm) rather than assumed.
+                _cons_pts = [(_tp1_fk, float(cfg.r_thumb)), (_tp2_fk, float(cfg.r_index))]
+                if _has_c3 and _tp3_fk is not None:
+                    _cons_pts.append((_tp3_fk, float(cfg.r_middle)))
+                if _is_mesh and self._mesh_entry is not None:
+                    _sfn = self._mesh_entry["fn"]
+                    _nfn = self._mesh_entry["normal_fn"]
+                    _Rt = ca.DM(obj_R_np.T); _Rw = ca.DM(obj_R_np)
+                    _cd = ca.DM(obj_center_np)
+                    for _tp, _r in _cons_pts:
+                        _tp_l = _Rt @ (_tp - _cd)
+                        _n_l  = _nfn(_tp_l)                 # unit outward, object frame
+                        _c_l  = _tp_l - _r * _n_l           # pad surface, object frame
+                        _opti.subject_to(_sfn(_c_l) == 0.0)
+                else:
+                    # Primitive: the analytic surface constraint already in the file.
+                    for (_tp, _r), _d_lp in zip(_cons_pts, (d1_lp, d2_lp, d3_lp)):
+                        _sym_geom_surface_con(
+                            _opti, _tp - _r * ca.DM(np.asarray(_d_lp, float)), _d_lp,
+                            geom_type, obj_center_np, obj_R_np, geom_size,
+                            edge_margin=cfg.edge_margin_m)
+            elif include_surface and not _is_mesh and not cfg.fixed_contacts:
                 _Rt_dm = ca.DM(obj_R_np.T)
                 _c_dm  = ca.DM(obj_center_np)
                 for _p, _d_lp in ((_p1, d1_lp), (_p2, d2_lp)):

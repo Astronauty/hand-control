@@ -505,9 +505,24 @@ independent variables and *couples* them to the hand through `w_ik`. Dropping `w
 mimic "beta as the sole objective" removed that coupling, which their formulation never
 had to state as a cost because it is built into their variables.
 
-**The fix** is to make the frogger arm's contacts be fingertip FK, as in (7d), rather
-than free variables plus a surface equality. Until then, treat every frogger-arm `l_bar*`
-in this document as an upper bound on an unreachable configuration.
+**FIXED** by `GraspConfig3D.frogger_fk_contacts`: contacts ARE the fingertip FK
+expressions, `q` is the only decision variable, and (7d) constrains `FK_i(q) - r_tip*n`
+to the surface. Drift is then structurally impossible rather than penalized.
+
+Measured after the fix, `017_orange` seed 0, tripod:
+
+| | tip->contact | `l_bar*` | `|s|` at the pad surface |
+|---|---|---|---|
+| before (free contacts, `w_ik = 0`) | 1211 / 1315 / 1259 mm | +0.9993 | — |
+| after (FK contacts) | **0.0 / 0.0 / 0.0 mm** | **+0.5800** | 0.006 / 0.027 / 0.076 mm |
+
+Zero by construction, and `l_bar*` falls to +0.5800 against ours at +0.5877 — the two are
+now comparable quantities. (7d) verified across three objects: pad surfaces land within
+~0.03 mm of the object, with one 1.3 mm outlier on `036_wood_block` where the single-step
+pad-offset approximation is weakest. The planned-pose render shows a real tripod on the
+object.
+
+Every `l_bar*` in §9.2 predates this and remains retracted.
 
 Unaffected by this: §8 in full (it concerns `beta` computed at contacts from a single
 solver configuration, with no cross-arm claim), and the `lp_gap`/`resid_Walpha`

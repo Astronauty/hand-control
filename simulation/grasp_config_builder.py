@@ -446,14 +446,21 @@ def for_frogger(obj_name: str, arm_geom_names: list,
         which is the configuration to use when measuring how often the floor is
         what rejects a grasp.
 
-    sdf_surface : use FRoGGeR's contact parameterization (7d) -- free world
-        3-vectors pinned by s(p) = 0 -- instead of our 2-DOF patch coordinates.
-        **This is the faithful setting and the default.** Holding position on the
-        patch would confine their objective to OUR trust region, and that bound is
-        active (the solution sits on it 9/9 measured stages, SOLVER_STATE sec 2),
-        so it would understate what their formulation reaches. Set False to run
-        their objective inside our patch, which isolates objective structure from
-        the parameterization.
+    sdf_surface : use FRoGGeR's formulation (7a)-(7e) in full -- q as the ONLY
+        decision variable, contacts as the fingertip forward kinematics FK_i(q),
+        and (7d) `s(FK_i(q)) = 0` constraining those to the surface.
+        **This is the faithful setting and the default.**
+
+        An earlier version gave contacts their own free 3-vectors pinned by the
+        same equality. That reproduces (7d)'s ALGEBRA but not its MEANING: a free
+        contact reaches the hand only through an IK COST, so zeroing that cost to
+        match "beta alone" let the optimizer place contacts the hand never reaches
+        (measured 1211/1315/1259 mm fingertip-to-contact at l_bar* = 0.9993). Under
+        FK contacts that is structurally impossible -- there is no separate contact
+        to drift from. It is also why FRoGGeR needs no IK term in (7a).
+
+        Set False to run their objective inside our patch, which isolates objective
+        structure from the parameterization.
 
     sdf_normals : take contact normals from the object's SDF gradient rather than
         the quadratic patch, which is FRoGGeR's own formulation (n = -grad s(p))
@@ -481,11 +488,12 @@ def for_frogger(obj_name: str, arm_geom_names: list,
     cfg_kw.setdefault('orient_weight', 0.0)
     cfg_kw.setdefault('w_edge_margin', 0.0)
     cfg_kw.setdefault('w_contact_height', 0.0)
-    # Keep a small regularizer: with every other term at zero the arm's redundant
-    # DOFs are unconstrained by the cost, and FRoGGeR's own IK pre-solve plays that
-    # role in their pipeline. This is the one departure from "beta alone", and it is
-    # a posture prior, not a grasp-quality term.
-    cfg_kw.setdefault('w_reg', 0.03)
+    # (7a) is `maximize l*(q)` -- ONE term. w_reg is zeroed with the rest rather
+    # than kept as a "harmless posture prior": under frogger_fk_contacts the arm's
+    # redundant DOFs are already constrained by (7d) (every fingertip must lie on
+    # the surface) and (7e), so a regularizer is not needed to keep q bounded, and
+    # including one would make the objective not theirs.
+    cfg_kw.setdefault('w_reg', 0.0)
 
     # beta*n_cols, so w_gws and k_l both keep one meaning across contact counts and
     # cone models (m goes 10 -> 15 from n=2 to n=3). FRoGGeR's l_bar* IS the
@@ -496,12 +504,18 @@ def for_frogger(obj_name: str, arm_geom_names: list,
     cfg_kw.setdefault('gws_beta_min_normalized', float(k_l))
 
     if sdf_surface:
-        # FRoGGeR (7d). Disables the patch, so the paraboloid-dependent machinery
-        # (symbolic normals, trust-region edge hinge) has nothing to act on --
-        # turn it off explicitly rather than relying on the branch not firing.
-        cfg_kw.setdefault('sdf_surface_contact', True)
+        # FRoGGeR (7a)-(7e) in full: q is the ONLY decision variable, contacts are
+        # the fingertip FK, and (7d) constrains those to the surface. Disables the
+        # patch, so the paraboloid-dependent machinery (symbolic normals,
+        # trust-region edge hinge) has nothing to act on -- turned off explicitly
+        # rather than relying on the branch not firing.
+        cfg_kw.setdefault('frogger_fk_contacts', True)
         cfg_kw.setdefault('use_quadratic_contact', False)
         cfg_kw.setdefault('quadratic_symbolic_normals', False)
+        # The wrench-cone LP (gamma/y/slack) is OUR machinery for a task-specific
+        # squeeze force and appears nowhere in (7a)-(7e). Off, so the frogger NLP
+        # carries only the variables the paper's does.
+        cfg_kw.setdefault('wrench_constraint', False)
     if sdf_normals or sdf_surface:
         cfg_kw.setdefault('gws_sdf_normals', True)
 
