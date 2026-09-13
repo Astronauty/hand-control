@@ -25,22 +25,21 @@ including the preshape (`solve_preshape`) and the measured hand frame
 between the thumb and index directions from the object centre, where negative means
 the two fingers are on opposite sides, which is what a force-closure seed needs.
 
-Measured over 40 draws per object, counting only draws the arm can actually reach:
+QUALITY METRIC. Use the distance from the object centre to the SEGMENT between the
+two fingertips, and require it to be inside the object. An earlier version used the
+cosine between the two tip directions from the object centre, which is WRONG and was
+misleading for several iterations: it measures direction only, so two fingers on
+opposite sides of a distant point score "perfectly opposed" (-0.96) while sitting
+253-280 mm away, grasping nothing.
 
-    object            reachable   opposed (dot<0)   best dot
-    017_orange          14/40           0            +0.67
-    036_wood_block      13/40           0            +0.00
-    011_banana           4/40           2            -0.18
+Measured on 017_orange with the corrected metric and standoff (see PALM_STANDOFF_M):
+8/8 reachable draws put the segment within 2-5 mm of the object centre, against
+0/10 at their +40 mm. The sampler now supplies the opposed start it exists for.
 
-Each fix moved this in the right direction (the block went from ~+0.45 to ~+0.05,
-and the banana now yields genuinely opposed seeds), but most draws still put both
-fingers on the same side, so the sampler does NOT yet reliably supply the opposed
-start that motivated it. Two candidates remain, in order: the LEAP thumb may simply
-not oppose the index across most of its span without also rotating the abduction
-DOFs this solver leaves fixed; and the 4 cm standoff may be too large for a hand
-whose fingers curl, so the tips pass the object rather than closing on it.
-
-Do not treat this as a finished replication of their sampler.
+Still open: reachability is ~20-40% of draws (the arm cannot achieve every sampled
+palm orientation), which is expected -- FRoGGeR samples repeatedly too -- but the
+acceptance rate has not been tuned, and the abduction DOFs remain fixed during the
+preshape.
 
 THEIR ALGORITHM (App. B-C), five steps:
   1. Choose an OBB axis to align the palm's finger-SEPARATION direction with,
@@ -96,7 +95,22 @@ import numpy as np
 #
 # `palm_frame_for_preshape` below MEASURES the frame from the preshape instead.
 
-PALM_STANDOFF_M = 0.04         # their "roughly 4cm from the surface"
+# Their "roughly 4cm from the surface", measured from the box face along the
+# approach direction, with the PINCH referenced rather than the palm (see step 4).
+#
+# NEGATIVE ON THIS HAND. FRoGGeR stands the Allegro off so its fingers can then
+# close; the LEAP fingers are already curled by the preshape, so the pinch must be
+# placed roughly AT the object rather than short of it. Measured on 017_orange
+# (mean half-extent 36 mm), distance from the object centre to the segment between
+# the two fingertips, over reachable draws:
+#
+#     standoff   +40mm   +20mm     0mm    -20mm    -40mm
+#     min dist    71mm    59mm    35mm     21mm      2mm
+#     through      0/10    0/9     1/7      8/8      8/8
+#
+# "through" counts draws whose tip-tip segment passes within the object. At their
+# +40 mm nothing straddles; at -40 mm every reachable draw does.
+PALM_STANDOFF_M = -0.04
 
 
 def object_obb(vertices, R_WO=None, p_WO=None):
