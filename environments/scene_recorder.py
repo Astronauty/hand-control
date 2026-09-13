@@ -2,7 +2,7 @@
 
 Records one MP4 per camera (e.g. a 3rd-person `overview` and the 1st-person `wrist`
 camera) into the trial-log run directory, alongside events.jsonl / the trace npz. Uses a
-single reused mj.Renderer + one cv2.VideoWriter per camera (mp4v). Frame capture is driven
+single reused mj.Renderer + one H264Writer per camera. Frame capture is driven
 by the caller (throttled to the recorder's fps) so it adds a bounded, off-the-hot-path cost.
 
 Construction is best-effort: if the GL context / renderer / video writer can't be created,
@@ -15,6 +15,8 @@ import os
 
 import numpy as np
 import mujoco as mj
+
+from kinova_common.video import H264Writer
 
 
 class SceneRecorder:
@@ -45,10 +47,9 @@ class SceneRecorder:
             self._cv2 = cv2
             self._renderer = mj.Renderer(model, height=self._h, width=self._w)
             os.makedirs(run_dir, exist_ok=True)
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             for name, cid in self._cams:
                 path = os.path.join(str(run_dir), f"{run_name}_{name}.mp4")
-                w = cv2.VideoWriter(path, fourcc, self._fps, (self._w, self._h))
+                w = H264Writer(path, self._fps, (self._w, self._h))
                 if not w.isOpened():
                     print(f"[record] could not open writer for {path} — skipping {name}.")
                     continue

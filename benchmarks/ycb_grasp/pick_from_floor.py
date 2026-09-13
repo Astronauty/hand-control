@@ -82,6 +82,7 @@ from grasp_control import GraspController                                       
 from grasp_control import object_uv_atlas as oua                                # noqa: E402
 from kinova_common.constants import FINGER_CODE, FINGER_SET, FINGER_TIP_SITES   # noqa: E402
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
+from kinova_common.video import H264Writer                                      # noqa: E402
 from simulation.grasp_config_builder import for_ablation_default                # noqa: E402
 from simulation.grasp_planner_3d import MultiStartGraspPlanner3D, _geom_normal_np  # noqa: E402
 from ycb_grasp import out_paths as OP                                           # noqa: E402
@@ -268,14 +269,14 @@ class VideoRecorder:
     same offscreen mj.Renderer + camera convention as ik_demo.render/
     plot_quadratic_path._render_hand_rgb (not the interactive viewer, which
     can't be captured this way), so the video's framing matches the repo's
-    existing static renders. cv2 encodes BGR; MuJoCo's Renderer returns RGB,
-    hence the channel-swap in capture()."""
+    existing static renders. The writer encodes BGR; MuJoCo's Renderer returns
+    RGB, hence the channel-swap in capture(). H264Writer emits H.264 rather than
+    cv2's mp4v so the clips preview in browsers and desktop viewers."""
     def __init__(self, path, lookat, dist=0.6, azim=135, elev=-55,
                 w=VIDEO_W, h=VIDEO_H, fps=VIDEO_FPS, groups=(0, 1, 2, 5)):
         self.path = str(path)
         self.w, self.h = w, h
-        self._writer = cv2.VideoWriter(self.path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                       fps, (w, h))
+        self._writer = H264Writer(self.path, fps, (w, h))
         self._opt = mj.MjvOption()
         mj.mjv_defaultOption(self._opt)
         for g in range(6):
