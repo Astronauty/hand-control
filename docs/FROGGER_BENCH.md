@@ -1187,3 +1187,35 @@ So alongside their rubric:
 
 The primary reported number stays their binary rate; the rest are diagnostics that
 make a failure legible rather than redefining success.
+
+## 17. Object set: `009_gelatin_box` excluded (our deviation, not theirs)
+
+`009_gelatin_box` is NOT on FRoGGeR's Table II exclusion list -- they kept it among
+their 43. Dropping it here is our choice, recorded as such.
+
+The reason: it exhausts all 20 synthesis attempts on every seed for the frogger
+config at `n = 2`. It is the flattest object in the set (OBB 107 x 96 x 34 mm), and a
+two-fingertip pinch has little depth to oppose across. FRoGGeR uses FOUR Allegro
+fingers, so the object is not flat relative to THEIR hand -- which means its failure
+here is plausibly an artifact of running their method at a contact count they never
+tested, rather than a property of the method.
+
+Effect on the mu = 0.7, resample-until-feasible results:
+
+| | with gelatin (18 cells) | without (15 cells) |
+|---|---|---|
+| ours median `l_bar*` | +0.6030 | +0.6030 |
+| ours wrench-feasible | 14/18 | 13/15 |
+| frogger median `l_bar*` | +0.3084 | +0.3167 |
+| frogger wrench-feasible | 14/18 | **14/15** |
+| frogger convergence | 78% | **93%** |
+
+93% against the paper's 99.4%, on a set of 5 objects against their 43. The frogger
+config now has MORE feasible cells than ours (14/15 against 13/15) while ours keeps
+the higher metric value.
+
+**This does not license reading the exclusion as a fix.** One object was removed
+because it failed, which moves a rate by construction; the honest statement is that
+the port converges at 93% on objects a two-finger pinch can physically grasp, and
+that the excluded object is the test case for the `n >= 3` path. It should return
+when that path works.

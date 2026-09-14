@@ -63,10 +63,23 @@ ARMS = ("ours", "frogger")
 # "A run converges if it yields a feasible grasp in under 1 minute" (their Sec. IV).
 SYNTH_BUDGET_S = 60.0
 
-# The five objects the tabletop solver work is characterized on, plus foam_brick
-# (the documented beta-vs-geometry disagreement case).
+# The tabletop set this solver is characterized on, plus foam_brick (the documented
+# beta-vs-geometry disagreement case).
+#
+# 009_gelatin_box IS EXCLUDED, and that is OUR deviation, not the paper's -- it is
+# absent from their Table II exclusion list, so FRoGGeR kept it among their 43. The
+# reason here is that it exhausts all 20 synthesis attempts on every seed for the
+# frogger config at n = 2: it is the flattest object in the set (OBB 107 x 96 x 34
+# mm), and a two-fingertip pinch has little depth to oppose across. FRoGGeR uses
+# FOUR Allegro fingers, so the object is not flat relative to THEIR hand.
+#
+# It should return once the n >= 3 path works -- whether its failure is an n = 2
+# geometric limit or a port defect is exactly what that path would settle. Pass it
+# explicitly via --objects to run it.
+EXCLUDED_OBJECTS = {"009_gelatin_box": "flat (34 mm); fails all 20 attempts at n=2"}
+
 DEFAULT_OBJECTS = ["036_wood_block", "017_orange", "014_lemon",
-                   "056_tennis_ball", "009_gelatin_box", "061_foam_brick"]
+                   "056_tennis_ball", "061_foam_brick"]
 
 
 def _build_cfg(arm, object_id, body_name, rgeoms, obj_geom0, *,
@@ -456,6 +469,10 @@ def main():
     args = ap.parse_args()
 
     objects = [o for o in args.objects.split(",") if o]
+    for _o in objects:
+        if _o in EXCLUDED_OBJECTS:
+            print(f"[note] {_o} is excluded by default ({EXCLUDED_OBJECTS[_o]}); "
+                  f"running it because it was named explicitly.")
     seeds = [int(s) for s in args.seeds.split(",") if s != ""]
     arms = [a for a in args.arms.split(",") if a]
     for a in arms:
