@@ -204,7 +204,7 @@ def for_gws_recommender(obj_name: str, arm_geom_names: list,
                         obj_clearance_by_geom: dict,
                         accel_budget_xyz: tuple, ang_accel_budget_xyz: tuple,
                         max_iter: int = 80,
-                        w_gws: float = 5.0, w_span: float = 1.0,
+                        w_gws: float | None = None, w_span: float = 1.0,
                         obj_id: str | None = None,
                         fingers=None,
                         **overrides) -> GraspConfig3D:
@@ -336,8 +336,12 @@ def for_gws_recommender(obj_name: str, arm_geom_names: list,
         reports curvature belonging to features up to 50mm away and collapses the
         trust region on flat faces).
     """
+    # w_gws=None means "use the preset's own value", which depends on whether
+    # beta is weighted raw or as beta*n_cols (set below). An explicit number
+    # from the caller is taken literally and never rescaled.
+    _w_gws_explicit = w_gws is not None
     cfg_kw = dict(
-        w_gws=w_gws, w_span=w_span, gws_soft_finger=False,
+        w_gws=(w_gws if _w_gws_explicit else 5.0), w_span=w_span,
         use_quadratic_contact=True, quadratic_mesh_fit=True,
     )
     # SEED GATES from models/grasp_seed_config.json, as DEFAULTS (setdefault, so any
@@ -385,6 +389,28 @@ def for_gws_recommender(obj_name: str, arm_geom_names: list,
     # The DLS rank pool is what makes n_seeds=3 safe -- seeds are ordered by arm
     # reachability first, so seeds 4-5 were the worst of the pool (dropping them was
     # bit-identical on 014_lemon and 056_tennis_ball).
+    # MULTI-START STAYS. n_seeds=1 was tried and REVERTED: it is a direct
+    # planning-time multiplier (one full NLP per accepted seed), but the extra
+    # solves are load-bearing. Measured on 7 objects x 2 seeds against this
+    # n_seeds=3 baseline, changing only the seed count (plus soft-finger):
+    #     n_seeds=3, PCwF   converged 21/21   lift 12/21   l_bar mean 0.907
+    #     n_seeds=1, soft    converged  7/14   lift  1/14   l_bar mean 0.135
+    # with l_bar going NEGATIVE on two objects (-1.837 on 056_tennis_ball,
+    # -1.013 on 065-a_cups) -- i.e. not force closure at all.
+    #
+    # WHY the seed-side ranking cannot replace the solves: seed min-weight
+    # l_bar predicted the NLP's own cost winner on 2/14 object-seed cells
+    # (14%, BELOW the 33% chance rate for 3 candidates), and the NLP compresses
+    # the candidates' l_bar spread from 0.130 to 0.062. The right reading is
+    # NOT "the extra solves select on nothing" but the opposite: the winner is
+    # UNPREDICTABLE from the seed, so all candidates must be solved to find it.
+    #
+    # Note also that the two seed tiers are ranked on DIFFERENT criteria -- the
+    # minor-axis seed is appended first and unranked, while the random pool is
+    # DLS-ranked among itself (seed_dls_rank_pool) -- so at n_seeds=1 the
+    # minor-axis seed wins unconditionally whenever it clears the gates, and
+    # the DLS-ranked candidates never run. Unifying that ranking is the open
+    # work; until then the multi-start is what covers for it.
     cfg_kw.setdefault('n_seeds', 3)
     # NO PICARD RELINEARIZATION. n_normal_relinearize=0 means the solve is a SINGLE
     # stage: the contact frame is never re-frozen from a re-read normal. This is only
@@ -402,6 +428,30 @@ def for_gws_recommender(obj_name: str, arm_geom_names: list,
     # attribute a regression. Expect to ablate those before trusting this default.
     cfg_kw.setdefault('n_normal_relinearize', 0)
     cfg_kw.setdefault('quadratic_symbolic_normals', True)
+    # RANK-6 W BY DEFAULT. A 2-contact PCwF W is rank-5-of-6 (measured singular
+    # values 4.0/4.0/2.83/0.144/0.144/0.0) whose left-null direction is exactly
+    # torque about the grasp axis, so the multiplier on W@alpha==0 is non-unique
+    # along that direction -- the dual indeterminacy no IPOPT setting can fix
+    # (0/21 across two solver sweeps). gws_soft_finger takes rank 5 -> 6 and
+    # cond(W) inf -> 40 at the authored mu_t=0.05. See GWS_IMPROVEMENTS.md item 2,
+    # which makes this a hard prerequisite for the bilevel-LP work (item 3).
+    #
+    # PAIRED WITH gws_beta_scale_ncols, which is not optional alongside it: the
+    # flag takes m from 10 to 14, and beta's attainable ceiling is 1/m, so RAW
+    # beta silently rescales 0.100 -> 0.0714. Weighting beta*n_cols is exactly
+    # FRoGGeR's normalized l_bar = m*beta, which keeps w_gws meaning one thing
+    # across m and makes our numbers comparable to the paper's (including its
+    # l_bar >= 0.3 floor). Judging soft-finger on raw beta is what produced the
+    # earlier "measured harmful" verdict that did not reproduce.
+    #
+    # w_gws is rescaled to keep the EFFECTIVE weight put: beta*n_cols is ~14x
+    # raw beta at m=14, so 5.0/14 = 0.357 leaves the GWS term's gradient
+    # contribution where it was rather than multiplying it by 14.
+    cfg_kw.setdefault('gws_soft_finger', True)
+    cfg_kw.setdefault('gws_beta_scale_ncols', True)
+    # Rescale only the DEFAULT w_gws -- an explicit value is taken literally.
+    if cfg_kw.get('gws_beta_scale_ncols') and not _w_gws_explicit:
+        cfg_kw['w_gws'] = 5.0 / 14.0
     cfg_kw.update(overrides)
     return for_teleop_recommender(
         obj_name, arm_geom_names, obj_clearance_by_geom,
@@ -528,6 +578,25 @@ def for_frogger(obj_name: str, arm_geom_names: list,
         # the metric at NLP convergence, which the measured lp_gap shows it often
         # does not. Bilevel is the paper's structure, so it is the default here.
         cfg_kw.setdefault('frogger_bilevel_lp', True)
+        # Exact collision distance, as FRoGGeR uses. Required, not optional: with FK
+        # contacts the bounding-sphere proxy's 4.4 mm over-report of the pad makes
+        # the surface and collision constraints jointly infeasible.
+        cfg_kw.setdefault('frogger_exact_collision', True)
+        # THEIR SOLVER IS SLSQP, NOT IPOPT. "To solve (7), we use the NLopt
+        # implementation of SLSQP" (their Sec. IV). use_slsqp selects CasADi's
+        # sqpmethod + OSQP, the same sequential-quadratic-programming family;
+        # it is not NLopt's implementation, but it is the right class of solver
+        # and the closest this repo offers.
+        #
+        # This matters beyond fidelity. Every frogger cell in the n=2 sweep exited
+        # Maximum_Iterations_Exceeded under IPOPT, never once reaching `converged`,
+        # against 8/18 for our own configuration -- so the backend was a live
+        # suspect for the convergence failure, not just a faithfulness detail.
+        cfg_kw.setdefault('use_slsqp', True)
+        # NOT applied: their constraint tolerances (App. B-F, Table III -- joint
+        # 1e-2, surface contact 5e-4, collision 1e-3, force closure 1e-5). This
+        # solver exposes one tolerance rather than per-constraint ones, so matching
+        # them would need a per-constraint scaling pass. Recorded as a known gap.
 
     # (7e): a NEGATIVE margin d_j on FINGER-OBJECT pairs, which the paper states
     # explicitly. Applied to the ACTIVE fingers' geoms against the target object
@@ -535,7 +604,10 @@ def for_frogger(obj_name: str, arm_geom_names: list,
     # contact ON the surface and a finite pad sphere with non-negative clearance
     # are mutually unsatisfiable, so this is what makes (7d) and (7e) consistent
     # rather than a relaxation for convenience.
-    _fo = cfg_kw.get('frogger_finger_obj_margin_m', -0.002)
+    # Their App. B-F: 1 mm minimum safety margin on every collision pair that is not
+    # a fingertip/object pair, and 3 mm of permitted interpenetration on those.
+    cfg_kw.setdefault('col_clearance_m', 0.001)
+    _fo = cfg_kw.get('frogger_finger_obj_margin_m', -0.003)
     if _fo is not None and finger_obj_geoms:
         # OVERWRITE, not setdefault. clearance_by_geom() pre-populates the active
         # fingers' distal geoms with the DISABLE SENTINEL (-1.0), meaning "no object

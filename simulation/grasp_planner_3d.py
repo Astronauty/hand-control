@@ -2465,6 +2465,94 @@ def build_W_ca(p1, p2, R1_param, R2_param, obj_center_np, obj_R_np, mu,
     return ca.horzcat(*cols)
 
 
+class _ExactGeomDistanceJacCallback(ca.Callback):
+    """d(exact distance)/dq by FRoGGeR's eq. (8), from the witness points.
+
+        sigma(o_A, o_B; q) = (-1)^(Ic+1) ||p_A - p_B||
+        grad_q sigma       = (-1)^Ic (J_B^T - J_A^T) n_AB
+
+    with J_A, J_B the translational Jacobians AT THE TWO WITNESS POINTS and n_AB the
+    unit vector from p_A to p_B. One distance query per evaluation, then two
+    `mj_jac` calls -- against 24 distance evaluations for a finite difference over
+    23 joints.
+
+    MuJoCo supplies both halves directly: `mj_geomDistance(..., fromto)` writes the
+    witness SEGMENT (p_A in fromto[:3], p_B in fromto[3:]), and `mj_jac` returns the
+    Jacobian at an arbitrary world point on a given body, which is exactly what
+    eq. (8) needs.
+
+    Degeneracies, both handled the way the paper describes:
+      * p_A == p_B (exactly touching) leaves n_AB undefined. FRoGGeR reuses the
+        PREVIOUS n_AB, initialized randomly; this does the same, per callback.
+      * A pair culled as distant gets a zero gradient, matching their broadphase
+        treatment -- beyond the cutoff the constraint is inactive and its gradient
+        carries no information.
+    """
+
+    def __init__(self, name, model, geom_id, obj_gids, n_robot, obj_qpos=None,
+                 cutoff=0.2):
+        ca.Callback.__init__(self)
+        self._model = model
+        self._data = mj.MjData(model)
+        self._gid = int(geom_id)
+        self._obj_gids = [int(g) for g in obj_gids]
+        self._n = int(n_robot)
+        self._cutoff = float(cutoff)
+        self._fromto = np.zeros(6)
+        self._jacp_a = np.zeros((3, model.nv))
+        self._jacp_b = np.zeros((3, model.nv))
+        # Previous witness direction, for the p_A == p_B degeneracy. Random init,
+        # as the paper specifies.
+        self._n_prev = np.array([1.0, 0.0, 0.0])
+        self.eval_count = 0
+        if obj_qpos is not None:
+            self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
+        self.construct(name, {})
+
+    def get_n_in(self):  return 2      # (q, nominal output)
+    def get_n_out(self): return 1
+    def get_sparsity_in(self, i):
+        return (ca.Sparsity.dense(self._n, 1) if i == 0
+                else ca.Sparsity.dense(1, 1))
+    def get_sparsity_out(self, _): return ca.Sparsity.dense(1, self._n)
+
+    def eval(self, arg):
+        self.eval_count += 1
+        m, d = self._model, self._data
+        d.qpos[:self._n] = np.array(arg[0]).flatten()
+        mj.mj_kinematics(m, d)
+        mj.mj_comPos(m, d)
+
+        # The binding pair is the nearest hull; only it constrains the solution, so
+        # only its gradient is nonzero (the min over hulls is what the value returns).
+        best_d, best_og = float("inf"), None
+        for og in self._obj_gids:
+            dist = mj.mj_geomDistance(m, d, self._gid, og, self._cutoff, self._fromto)
+            if dist < best_d:
+                best_d, best_og = dist, og
+                best_ft = self._fromto.copy()
+        if best_og is None or best_d >= self._cutoff:
+            return [ca.DM.zeros(1, self._n)]        # culled: zero gradient
+
+        pA, pB = best_ft[:3], best_ft[3:]
+        v = pB - pA
+        nv = float(np.linalg.norm(v))
+        if nv < 1e-12:
+            n_ab = self._n_prev                      # degenerate: reuse previous
+        else:
+            n_ab = v / nv
+            self._n_prev = n_ab.copy()
+
+        bodyA = int(m.geom_bodyid[self._gid])
+        bodyB = int(m.geom_bodyid[best_og])
+        mj.mj_jac(m, d, self._jacp_a, None, pA, bodyA)
+        mj.mj_jac(m, d, self._jacp_b, None, pB, bodyB)
+        # (-1)^Ic with Ic = 1 when colliding (distance < 0).
+        sign = -1.0 if best_d < 0.0 else 1.0
+        g = sign * ((self._jacp_b - self._jacp_a).T @ n_ab)
+        return [ca.DM(np.asarray(g[:self._n], float).reshape(1, -1))]
+
+
 class _ExactGeomDistanceCallback(ca.Callback):
     """Exact signed distance from one robot geom to the target object, as a function
     of q -- FRoGGeR's collision model rather than our bounding-sphere proxy.
@@ -2500,8 +2588,9 @@ class _ExactGeomDistanceCallback(ca.Callback):
     """
 
     def __init__(self, name, model, geom_id, obj_gids, n_robot, obj_qpos=None,
-                 cutoff=0.2):
+                 cutoff=0.2, analytic=True):
         ca.Callback.__init__(self)
+        self._obj_qpos = obj_qpos
         self._model = model
         self._data = mj.MjData(model)
         self._gid = int(geom_id)
@@ -2512,12 +2601,29 @@ class _ExactGeomDistanceCallback(ca.Callback):
         self.eval_count = 0
         if obj_qpos is not None:
             self._data.qpos[n_robot:n_robot + len(obj_qpos)] = obj_qpos
-        self.construct(name, {"enable_fd": True})
+        self._jac_cb = None
+        self._analytic = bool(analytic)
+        # enable_fd only when there is no analytic Jacobian to offer. Finite
+        # differencing this constraint is what made the port 14x slower than our
+        # own solver: measured 504,630 distance evaluations on one 017_orange
+        # solve (63 callbacks x 23 joints x ~334 gradient requests), against 589
+        # for the min-weight LP. See _ExactGeomDistanceJacCallback.
+        self.construct(name, {} if analytic else {"enable_fd": True})
 
     def get_n_in(self):  return 1
     def get_n_out(self): return 1
     def get_sparsity_in(self, _):  return ca.Sparsity.dense(self._n, 1)
     def get_sparsity_out(self, _): return ca.Sparsity.dense(1, 1)
+
+    def has_jacobian(self):
+        return self._analytic
+
+    def get_jacobian(self, name, inames, onames, opts):
+        if self._jac_cb is None:
+            self._jac_cb = _ExactGeomDistanceJacCallback(
+                name, self._model, self._gid, self._obj_gids, self._n,
+                self._obj_qpos, self._cutoff)
+        return self._jac_cb
 
     def eval(self, arg):
         self.eval_count += 1
@@ -4216,6 +4322,12 @@ class GraspPlanner3D:
             _dls_kw["step"] = float(os.environ["PFF_DLS_STEP"])
         if os.environ.get("PFF_DLS_ADAPTIVE"):
             _dls_kw["adaptive_damping"] = True
+        if os.environ.get("PFF_DLS_SELECTIVE"):
+            # Per-direction damping (see IKSolver.selective_damping): damps only
+            # the near-singular directions, so the healthy ones keep full accuracy
+            # and I - J^+ J stays a near-true projector for the posture bias.
+            _dls_kw["selective_damping"] = True
+            _dls_kw["sigma0"] = float(os.environ.get("PFF_DLS_SIGMA0", 0.05))
         self._dls_ik   = SpatialIKSolver(n_robot=n_act, **_dls_kw)
         self._dls_data = mj.MjData(model)
         # Separate scratch MjData for _tip_support_along -- _dls_data's qpos is
@@ -4450,18 +4562,50 @@ class GraspPlanner3D:
                                        mesh_entry=self._mesh_entry))
         _dls_tgt1 = p1_seed + cfg.r_thumb * _d1_ws
         _dls_tgt2 = p2_seed + cfg.r_index * _d2_ws
+        # THIRD contact joins the warm start when the seed carries one. Without it
+        # the solve constrains only the thumb and index SITES, and since neither
+        # site's Jacobian has any leap_mf_* column -- and q_bias == q_ref leaves the
+        # null-space term identically zero there -- the middle finger's four joints
+        # come back BIT-IDENTICAL to q_ref (measured: sum|dq| = 0.000000 rad over
+        # [11:15] while the arm moved 3.53 rad). IPOPT then starts a 3-contact solve
+        # from a pose where two fingers are placed for their seeds and the third sits
+        # in an object-independent home curl, even though _d3_sq is costing it.
+        #
+        # The seeder already runs 3-site DLS solves when ranking c3 candidates, but
+        # discards their q and keeps only the residual as a score -- this is the one
+        # solve whose q survives into the NLP, so it is the one that has to carry the
+        # third contact.
+        _dls_sids = [self._thumb_sid, self._index_sid]
+        _dls_tgts = [_dls_tgt1, _dls_tgt2]
+        _mf_in_ws = False
+        if (int(getattr(cfg, 'n_contacts', 2)) >= 3 and p3_seed is not None
+                and self._middle_sid is not None):
+            _d3_ws = (np.asarray(d3, float) if d3 is not None
+                      else _geom_normal_np(p3_seed, geom_type, obj_center_np, obj_R_np,
+                                           geom_size, mesh_entry=self._mesh_entry))
+            _r3_ws = float(cfg.r_middle if cfg.r_middle is not None else cfg.r_index)
+            if cfg.directional_r_tip:
+                _r3_ws = self._tip_support_along(
+                    'middle', q_ref, np.asarray(_d3_ws, float),
+                    _r3_ws) + float(cfg.directional_r_tip_margin_m)
+            _dls_sids.append(self._middle_sid)
+            _dls_tgts.append(p3_seed + _r3_ws * _d3_ws)
+            _mf_in_ws = True
         q_dls = self._dls_ik.solve(
             self.model, self._dls_data,
-            [self._thumb_sid, self._index_sid],
-            [_dls_tgt1, _dls_tgt2],
+            _dls_sids, _dls_tgts,
             q_bias=q_ref, null_gain=0.3)
         mj.mj_kinematics(self.model, self._dls_data)
 
         _err_th = float(np.linalg.norm(self._dls_data.site_xpos[self._thumb_sid] - _dls_tgt1))
         _err_if = float(np.linalg.norm(self._dls_data.site_xpos[self._index_sid] - _dls_tgt2))
+        _err_mf = (float(np.linalg.norm(
+                       self._dls_data.site_xpos[self._middle_sid] - _dls_tgts[2]))
+                   if _mf_in_ws else None)
         self.log.info(
-            f"[dls_ws] th={_err_th*1e3:.1f}mm  idx={_err_if*1e3:.1f}mm  "
-            f"dt={1e3*(time.perf_counter()-_t_ws):.0f}ms")
+            f"[dls_ws] th={_err_th*1e3:.1f}mm  idx={_err_if*1e3:.1f}mm"
+            + (f"  mid={_err_mf*1e3:.1f}mm" if _err_mf is not None else "  (2-site)")
+            + f"  dt={1e3*(time.perf_counter()-_t_ws):.0f}ms")
 
         # ── Proximity pruning: arm geoms vs object for q_dls arm config ──────────────────────────
         _active_arm = []
@@ -6105,6 +6249,13 @@ class GraspPlanner3D:
         _d2_lp = (np.asarray(d2, float) if d2 is not None
                   else _geom_normal_np(p2_seed, geom_type, obj_center_np, obj_R_np, geom_size,
                                        mesh_entry=self._mesh_entry))
+        if os.environ.get("PFF_WS_TRACE"):
+            _dqm = np.abs(np.asarray(q_dls, float)[11:15]
+                          - np.asarray(q_ref, float)[11:15]).sum()
+            _dqa = np.abs(np.asarray(q_dls, float)[0:7]
+                          - np.asarray(q_ref, float)[0:7]).sum()
+            print(f"[ws] middle joints sum|dq| = {_dqm:.6f} rad   arm = {_dqa:.4f} rad   "
+                  f"mf_in_warmstart={_mf_in_ws}")
         _p1_ws, _p2_ws, _q_ws = p1_seed, p2_seed, q_dls
         # THIRD contact (cfg.n_contacts >= 3). Bound from the seed dict that
         # _seed_third_contact produced; None at n=2 so _run_stage's _has_c3 gate stays
