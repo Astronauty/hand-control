@@ -2374,19 +2374,43 @@ def _quadratic_contact_frame_ca(t_var, frame: dict, mat_np):
     return ca.horzcat(R_w @ n_in, R_w @ t1, R_w @ t2)
 
 
-def _friction_cone_verts(mu: float) -> np.ndarray:
-    """5-vertex linearized Coulomb cone in the LOCAL contact frame [n_in|t1|t2]
-    (origin + 4 unit-normal-force edges at ±mu tangential). Shared by the
-    embedded wrench-cone LP and the GWS primitive-wrench matrix so both use
-    the exact same cone geometry. Point-contact-with-friction (PCwF): pure
-    force generators, no torsional/spin component about the contact normal —
-    see _soft_finger_torque_ca / build_W_ca's mu_t argument for the
-    soft-finger extension (scripts/3D_minimum_NCF_soft.py)."""
-    return np.array([[0.0, 0.0, 0.0],
-                     [1.0, 0.0, -mu],
-                     [1.0, -mu, 0.0],
-                     [1.0,  mu, 0.0],
-                     [1.0, 0.0,  mu]])
+def _friction_cone_verts(mu: float, include_origin: bool = True) -> np.ndarray:
+    """Linearized Coulomb cone in the LOCAL contact frame [n_in|t1|t2].
+
+    include_origin=True (default) returns 5 rows: the ORIGIN plus 4 unit-normal-force
+    edges at ±mu tangential. That is the form the wrench-cone LP wants, where the
+    origin represents "this contact carries no force" and is a legitimate mode.
+
+    include_origin=False returns the 4 edges alone -- FRoGGeR's "4-sided pyramidal
+    approximation of the friction cone" (their App. B-F), and the ONLY correct form
+    for the min-weight metric.
+
+    *** THE ORIGIN ROW BREAKS beta. *** Its wrench column is identically zero, so it
+    is unconstrained by `W alpha = 0` -- alpha_j may take any value without affecting
+    the equality. The LP then has a degenerate optimum available: put the entire
+    sum(alpha) = 1 budget on a zero column and every other weight at 0, giving
+    beta = 0 with no gradient. Measured on a 110-degree-splay pinch at mu = 0.6,
+    where the grasp is genuinely NOT force closure:
+
+        with origin   : alpha = [1, 0, 0, ...],  beta = -0.000000
+        4-sided       :                          beta = -0.020880
+
+    The second is the true value. The first destroys exactly the property FRoGGeR's
+    relaxation exists for -- that l* stays smoothly climbable when the grasp is not
+    yet in closure (their Sec. II-A) -- and is consistent with the frogger
+    configuration returning exactly 0 on 20 of 36 benchmark cells.
+
+    Verified harmless where the grasp IS in closure: at 180 degrees both forms give
+    the normalized l_bar* = 1.0000 (beta 0.100 at m=10 vs 0.125 at m=8), since the
+    ceiling 1/m absorbs the column-count change.
+    """
+    edges = np.array([[1.0, 0.0, -mu],
+                      [1.0, -mu, 0.0],
+                      [1.0,  mu, 0.0],
+                      [1.0, 0.0,  mu]])
+    if not include_origin:
+        return edges
+    return np.vstack([np.zeros((1, 3)), edges])
 
 
 def _soft_finger_torque_ca(n_O, mu_t: float):
@@ -2437,7 +2461,12 @@ def build_W_ca(p1, p2, R1_param, R2_param, obj_center_np, obj_R_np, mu,
     positions (and in the R_params if those are themselves expressions, e.g.
     under symbolic_normals).
     """
-    verts_c = _friction_cone_verts(mu)
+    # 4-SIDED, no origin row: a zero wrench column is unconstrained by
+    # `W alpha = 0` and lets the min-weight LP park the whole alpha budget there,
+    # reporting beta = 0 with no gradient on grasps that are not force closure.
+    # See _friction_cone_verts's docstring for the measurement. This matches
+    # FRoGGeR's "4-sided pyramidal approximation" exactly.
+    verts_c = _friction_cone_verts(mu, include_origin=False)
     obj_c   = ca.DM(obj_center_np)
     R_ow    = ca.DM(obj_R_np.T)   # world → object body-frame rotation
 

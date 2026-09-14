@@ -51,7 +51,9 @@ def build_W_np(points, normals_out, obj_center, obj_R, mu, mu_t: float = 0.0):
     mu_t        : soft-finger torsional coefficient; > 0 adds 2 columns per contact.
                   Left at 0.0 (PCwF, s=5) to match the standardized GWS preset.
     """
-    verts_c = _friction_cone_verts(mu)
+    # 4-sided (no origin row), matching build_W_ca -- the audit must build the SAME
+    # W the NLP does, and a zero column would let the LP report beta = 0 spuriously.
+    verts_c = _friction_cone_verts(mu, include_origin=False)
     R_ow = np.asarray(obj_R, float).T          # world -> object body frame
     c = np.asarray(obj_center, float)
     cols = []
