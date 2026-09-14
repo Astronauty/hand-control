@@ -85,12 +85,23 @@ class DexPilotController:
         if str(retargeter).lower() == "dexpilot":
             self._retarg = DexPilotRetargeter(model, n_arm=n_arm, debug=debug, eps=eps,
                                               pinch_debounce=pinch_debounce)
+        elif str(retargeter).lower() in ("vwj", "vwj_upstream"):
+            # Whole-arm-hand VWJ optimizer (arXiv:2506.09384): solves the FULL 23-DOF
+            # q (arm+hand) itself, so it doesn't take the finger-only dexpilot kwargs.
+            # 'vwj' = clean-room reimplementation; 'vwj_upstream' = the authors' optimizer
+            # run verbatim from a local clone (the A/B partner). Both are whole-robot.
+            from anyteleop.factory import make_retargeter
+            self._retarg = make_retargeter(str(retargeter).lower(), model,
+                                           n_arm=n_arm, debug=debug)
         else:
             from anyteleop.factory import make_retargeter
             self._retarg = make_retargeter(retargeter, model, n_arm=n_arm,
                                            debug=debug, eps=eps,
                                            pinch_debounce=pinch_debounce,
                                            type_override=anyteleop_type)
+        # Whole-robot retargeters (VWJ) own the arm: they return a 23-DOF q and need the
+        # wrist TARGET pose fed in. Detected via .whole_robot; drives the VWJ path below.
+        self._whole_robot = bool(getattr(self._retarg, "whole_robot", False))
         self._arm    = DexPilotArmController(
             model,
             n_arm=n_arm,
@@ -187,7 +198,13 @@ class DexPilotController:
         # Auto-calibrate orientation: the hand pose held at press-8 maps to the
         # robot's home wrist. Fixes the circular "match the moving wrist" problem.
         self._arm.request_orientation_calib()
-        self._retarg.reset()
+        # Whole-robot (VWJ) retargeter: re-home its warm-start to the robot's CURRENT
+        # 23-DOF pose (the bias/home), so the first solve doesn't jump the arm from
+        # zeros. Finger-only retargeters take no seed (reset() is a no-arg clear).
+        if self._whole_robot:
+            self._retarg.reset(data.qpos[:self._n_robot].copy())
+        else:
+            self._retarg.reset()
         self._q_hand_prev = None
         # Drop any stale pre-reset finger solve so tracking re-zeros cleanly (the
         # worker re-solves from the next posted landmarks).
@@ -249,7 +266,12 @@ class DexPilotController:
                     if len(raw) >= 183 else None)
 
         # --- Hand retargeting (16 DOF) — world landmarks (see note above) ---
-        if self._hand_tracking:
+        # Whole-robot retargeters (VWJ) solve the arm AND hand in ONE optimize; they
+        # need the wrist TARGET pose, which the arm controller computes below. So skip
+        # the finger-only solve here and take the VWJ path after self._arm.step().
+        if self._whole_robot:
+            q_hand = None                        # produced by the whole-robot solve below
+        elif self._hand_tracking:
             # Post the latest landmarks to the finger worker (owns the SLSQP) and
             # take the most recently solved q_hand WITHOUT blocking — the ~40 ms solve
             # runs off-thread so step() stays cheap. One-frame latency; until the
@@ -313,6 +335,31 @@ class DexPilotController:
             palm_R, _     = self._retarg.human_palm_frame_robot_aligned(world_lm)
         q_arm          = self._arm.step(cam_wrist, data, palm_R=palm_R)
 
+        # --- Whole-robot (VWJ) path: the optimizer owns the arm too --------------
+        # self._arm.step() above computed the wrist TARGET pose (target_frame()) and
+        # keeps home tracking, but its DLS-IK q_arm is DISCARDED here: VWJ solves the
+        # full 23-DOF q itself against that same wrist target. We post (world_lm,
+        # wrist_pos, wrist_R) to the async worker and return its latest full q (holding
+        # the home/bias pose until the first solve, like the finger path does).
+        if self._whole_robot:
+            tf = self._arm.target_frame()
+            if tf is None or tf[1] is None:
+                # No wrist target yet (or axis-only orientation): can't drive VWJ; hold.
+                return None
+            wrist_pos, wrist_R = tf
+            with self._hand_lock:
+                self._hand_pending = (world_lm, np.asarray(wrist_pos, float),
+                                      np.asarray(wrist_R, float))
+                q_full = None if self._hand_result is None else self._hand_result.copy()
+            self._hand_evt.set()
+            if q_full is None:
+                # No solve yet — hold the last full q, or the bias/home pose.
+                if self._q_hand_prev is not None:
+                    return self._q_hand_prev.copy()
+                return None
+            self._q_hand_prev = q_full.copy()    # reuse as the "last full q" holder
+            return q_full
+
         # The arm IK now solves on a BACKGROUND thread (see DexPilotArmController)
         # and returns None until the worker has produced its first solution (the
         # first frame or two after press-8 / reset). Propagate that None — the
@@ -337,14 +384,20 @@ class DexPilotController:
                 continue
             self._hand_evt.clear()
             with self._hand_lock:
-                world_lm = self._hand_pending
+                pending = self._hand_pending
                 self._hand_pending = None
-            if world_lm is None:
+            if pending is None:
                 continue
             try:
                 import time as _time
                 _t0 = _time.perf_counter()
-                q = self._retarg.retarget(world_lm)
+                if self._whole_robot:
+                    # VWJ: pending is (world_lm, wrist_pos, wrist_R); one solve returns
+                    # the full 23-DOF q (arm+hand) — see VWJRetargeter.retarget().
+                    world_lm, wrist_pos, wrist_R = pending
+                    q = self._retarg.retarget(world_lm, wrist_pos, wrist_R)
+                else:
+                    q = self._retarg.retarget(pending)
                 _ms = (_time.perf_counter() - _t0) * 1e3
             except Exception as e:   # noqa: BLE001 — a bad solve must not kill the worker
                 print(f"[hand] finger retarget worker error (skipping): {e!r}")
@@ -411,6 +464,8 @@ class DexPilotController:
 
     def reset(self) -> None:
         """Reset all transient state (call when hand tracking is lost)."""
+        # VWJ: reset() reverts its warm-start to _q_home (the robot home captured at
+        # start()), a safe recovery posture. Finger-only: clears transient input state.
         self._retarg.reset()
         self._arm.reset()
         self._q_hand_prev = None

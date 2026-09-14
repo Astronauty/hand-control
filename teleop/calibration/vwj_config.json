@@ -1,0 +1,23 @@
+{
+  "_note": "VWJ (Vector-Wrist-Joint) retargeting weights, clean-room reimplementation of arXiv:2506.09384 (Mingrui-Yu/retargeting), LEAP profile. Hot-reloadable: edit + save while the sim runs.",
+  "human_hand_scale": 1.8,
+  "huber_delta": 0.02,
+  "pinch_transition_threshold": 0.1,
+  "pinch_contact_threshold": 0.01,
+  "pinch_sigmoid_slope": 10.0,
+  "weights": {
+    "world_thumb": 10.0,
+    "wrist_fingertip": 1.0,
+    "thumb_primary": 10.0,
+    "fingertip_orientation": 10.0,
+    "wrist_rotation": 0.1
+  },
+  "joint_position_weights": [0, 0, 1.0, 0, 0.5, 0, 0, 0.5, 0, 0, 0, 0.5, 0, 0, 0, 0.5, 0, 0, 0.5, 0, 0.1, 0, 0],
+  "joint_velocity_weights": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01],
+  "max_joint_speed": [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+  "_joint_limit_overrides_note": "Upstream clamps the PIP+DIP of index/middle/ring fingers to >=0 (no hyperextension). Opt-vector indices 9,10=if_pip,if_dip; 13,14=mf_pip,mf_dip; 17,18=rf_pip,rf_dip. Same numeric indices as the upstream LEAP profile (arm[0:7]+LEAP[7:23] order matches).",
+  "joint_limit_overrides": [
+    {"indices": [9, 10, 13, 14, 17, 18], "lower": 0.0}
+  ],
+  "max_iter": 50
+}

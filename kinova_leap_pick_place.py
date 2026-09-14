@@ -125,8 +125,9 @@ if __name__ == "__main__":
     _arg_parser.add_argument(
         '--mode',
         choices=['contact_aware_autonomous', 'contact_aware_teleop', 'dexpilot',
-                 'anyteleop', 'contact_aware_w_dexpilot', 'contact_aware_w_anyteleop',
-                 'rrt'],
+                 'anyteleop', 'vwj', 'vwj_upstream', 'contact_aware_w_dexpilot',
+                 'contact_aware_w_anyteleop', 'contact_aware_w_vwj',
+                 'contact_aware_w_vwj_upstream', 'rrt'],
         default='contact_aware_teleop',
         help="contact_aware_teleop (default): teleop the wrist (DexPilot mapping) with "
              "MediaPipe fingers while an NLP continuously recommends grasp contacts for "
@@ -137,9 +138,13 @@ if __name__ == "__main__":
              "teleop via ROS 2.  |  ---- Baseline comparison (2x2 of pipeline x finger "
              "retargeter) ----  | dexpilot: plain teleop + our DexPilot retargeter.  | "
              "anyteleop: plain teleop + the AnyTeleop (dex-retargeting) backend.  | "
+             "vwj: plain teleop + the whole-arm-hand Vector-Wrist-Joint optimizer "
+             "(arXiv:2506.09384) — it owns the ARM too (one 23-DOF solve/frame), unlike "
+             "the finger-only baselines.  | "
              "contact_aware_w_dexpilot: OUR contact-aware pipeline + our DexPilot "
              "(== contact_aware_teleop).  | contact_aware_w_anyteleop: OUR pipeline + the "
-             "AnyTeleop backend. The *_anyteleop modes need the optional dep: "
+             "AnyTeleop backend.  | contact_aware_w_vwj: OUR pipeline + the VWJ optimizer. "
+             "The *_anyteleop modes need the optional dep: "
              "`uv sync --extra anyteleop` (see anyteleop/README.md).")
     _arg_parser.add_argument(
         '--recommender-grasp', action='store_true',
@@ -386,10 +391,22 @@ if __name__ == "__main__":
     _RETARGETER = 'dexpilot'
     if args.mode == 'anyteleop':
         args.mode, _RETARGETER = 'dexpilot', 'anyteleop'
+    elif args.mode == 'vwj':
+        args.mode, _RETARGETER = 'dexpilot', 'vwj'
+    elif args.mode == 'vwj_upstream':
+        args.mode, _RETARGETER = 'dexpilot', 'vwj_upstream'
     elif args.mode == 'contact_aware_w_dexpilot':
         args.mode = 'contact_aware_teleop'
     elif args.mode == 'contact_aware_w_anyteleop':
         args.mode, _RETARGETER = 'contact_aware_teleop', 'anyteleop'
+    elif args.mode == 'contact_aware_w_vwj':
+        args.mode, _RETARGETER = 'contact_aware_teleop', 'vwj'
+    elif args.mode == 'contact_aware_w_vwj_upstream':
+        args.mode, _RETARGETER = 'contact_aware_teleop', 'vwj_upstream'
+    # VWJ is a WHOLE-ROBOT retargeter (owns the arm): the drive loop tracks its solved
+    # 7 arm joints as a position target instead of the shared resolved-rate wrist IK.
+    # Both the clean-room 'vwj' and the verbatim-upstream 'vwj_upstream' take this path.
+    _VWJ = (_RETARGETER in ('vwj', 'vwj_upstream'))
     # For the AnyTeleop baseline, --anyteleop-type distinguishes the two optimizer conditions
     # (vector vs dexpilot). Append it to the run label so logs/<...>_<type>/ stays distinct;
     # ignored for non-anyteleop runs.
@@ -2746,6 +2763,14 @@ if __name__ == "__main__":
         elif _RETARGETER == 'anyteleop':
             print("[AnyTeleop] finger retargeting via dex-retargeting "
                   "(edit calibration/anyteleop_config.json; hot-reloaded each frame).")
+        elif _RETARGETER == 'vwj':
+            print("[VWJ] whole-arm-hand retargeting (Vector-Wrist-Joint, arXiv:2506.09384) "
+                  "— one 23-DOF solve/frame; the optimizer OWNS the arm (wrist relaxes for "
+                  "fingertip accuracy). Edit calibration/vwj_config.json; hot-reloaded each frame.")
+        elif _RETARGETER == 'vwj_upstream':
+            print("[VWJ-upstream] whole-arm-hand retargeting via the AUTHORS' optimizer run "
+                  "VERBATIM (Mingrui-Yu/retargeting, local clone under third_party/) on MuJoCo "
+                  "FK — the A/B partner to --mode vwj. Shares calibration/vwj_config.json.")
 
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")
         print("[DexPilot] Press 8 to start tracking (captures your current wrist "
@@ -4475,9 +4500,10 @@ if __name__ == "__main__":
                     _draw_camera_views()   # per-camera feed grid (no-op unless --camera-views)
                     _teleop_cam_t = _now
                 _check_pipeline_alive()  # warn if the multicam child died
-                if _tune_retarget or _RETARGETER == 'anyteleop':
-                    # DexPilot: hot-reload retarget_config.json; AnyTeleop: hot-reload
-                    # anyteleop_config.json (both via the backend's poll_config()).
+                if _tune_retarget or _RETARGETER in ('anyteleop', 'vwj', 'vwj_upstream'):
+                    # DexPilot: hot-reload retarget_config.json; AnyTeleop:
+                    # anyteleop_config.json; VWJ: vwj_config.json (all via the backend's
+                    # poll_config()).
                     _dexpilot_ctrl.poll_retarget_config()
                 if TELEOP_PROFILE:
                     _t = time.perf_counter(); _tp_acc['camviews'] += _t - _tp_s; _tp_s = _t
@@ -4723,6 +4749,21 @@ if __name__ == "__main__":
                         _teleop_arm_hold = data.qpos[:7].copy()   # seed at the live arm pose
                     _qdot_arm, _teleop_jog_v, _teleop_jog_w, _sigma_min = _solve_wrist_qdot(
                         _teleop_wrist_tgt, _teleop_jog_v, _teleop_jog_w)
+
+                    # --- VWJ (whole-arm-hand optimizer) arm drive -----------------
+                    # Unlike dexpilot/anyteleop (finger-only + shared resolved-rate arm
+                    # IK), VWJ (arXiv:2506.09384) SOLVED the 7 arm joints itself as part
+                    # of its one 23-DOF optimize — that IS the method (it relaxes the
+                    # wrist for fingertip accuracy). So for VWJ we DISCARD the resolved-
+                    # rate _qdot_arm and instead drive the arm as a POSITION target to
+                    # _teleop_q[:7] (VWJ already speed-clamps per frame). The finger
+                    # drive, physics/damping, singularity gate, and substep loop below
+                    # are all UNCHANGED — only the arm target source differs. _sigma_min
+                    # from _solve_wrist_qdot is still used for the singularity gate.
+                    if _VWJ and _teleop_q is not None:
+                        _teleop_arm_hold = _teleop_q[:7].copy()   # VWJ-solved arm joints
+                        _clamp_arm_hold(_teleop_arm_hold)
+                        _qdot_arm = np.zeros(7)                    # position target, no vel-inject
 
                     # SINGULAR-STATE GATE (root-cause fix for the qacc explosion). An
                     # out-of-band mj_resetData (viewer Backspace / BADQACC, both on other
@@ -5005,9 +5046,10 @@ if __name__ == "__main__":
                 if DP_PROFILE:
                     _t = time.perf_counter(); _dpp_acc['camviews'] += _t - _dpp_s
                 _check_pipeline_alive()  # warn if the multicam child died
-                if _tune_retarget or _RETARGETER == 'anyteleop':
-                    # DexPilot: hot-reload retarget_config.json; AnyTeleop: hot-reload
-                    # anyteleop_config.json (both via the backend's poll_config()).
+                if _tune_retarget or _RETARGETER in ('anyteleop', 'vwj', 'vwj_upstream'):
+                    # DexPilot: hot-reload retarget_config.json; AnyTeleop:
+                    # anyteleop_config.json; VWJ: vwj_config.json (all via the backend's
+                    # poll_config()).
                     _dexpilot_ctrl.poll_retarget_config()
                 if DP_PROFILE:
                     _dpp_acc['spin_draw'] += time.perf_counter() - _dpp_iter0
