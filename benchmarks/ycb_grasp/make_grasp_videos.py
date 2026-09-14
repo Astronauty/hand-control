@@ -73,7 +73,7 @@ def main():
                              (f'seed{s}_planned.png',    f'{arm}_planned.png'),
                              (f'seed{s}.png',            f'{arm}_final.png'),
                              (f'seed{s}_grasp_contacts.pdf', f'{arm}_contacts.pdf'),
-                             (f'seed{s}_seeds.pdf',      f'{arm}_seeds.pdf')):
+                             (f'seed{s}_contact_seeds.pdf', f'{arm}_contact_seeds.pdf')):
                 p = stage / src
                 if p.exists():
                     shutil.move(str(p), str(odir / dst))

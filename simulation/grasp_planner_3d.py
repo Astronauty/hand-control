@@ -194,7 +194,33 @@ _SQP_SOLVER_OPTS = {
 
 _IPOPT_SOLVER_OPTS = {
     'hessian_approximation':      'limited-memory',
-    'limited_memory_max_history': 20,       # more curvature pairs for near-singular reduced space
+    # FEWER curvature pairs, not more. The old value was 20, on the theory that
+    # a near-singular reduced space wants more history -- but the pairs here are
+    # INCONSISTENT, so more of them is actively harmful: cfg.symbolic_normals'
+    # own note records that grad f changes both from x movement AND from frame
+    # rotation, which is precisely the condition under which stale L-BFGS pairs
+    # corrupt the approximation.
+    #
+    # The symptom was a stalled barrier. On 017_orange seed 1 at history=20,
+    # lg(mu) sat at -2.7..-3.7 (mu ~ 1e-3) for 750 iterations instead of
+    # descending toward 1e-9, and under mu_strategy=adaptive it ROSE again
+    # (-3.4 -> -2.8). alpha_pr was chronically 0.09-0.25 against ||d|| of 1-1.8,
+    # i.e. the line search cutting nearly every step because the direction was
+    # poor. Since inf_du scales with mu, the stalled barrier mechanically FLOORS
+    # the dual residual -- which is why loosening acceptable_obj_change_tol
+    # changed nothing (measured: 10/12 convergence either way).
+    #
+    # Measured over 4 objects x 2 seeds, varying only this:
+    #     history=20   conv 7/8  med_it 652  max_it 800  total  107.5s  l_bar 0.840
+    #     history=5    conv 8/8  med_it 280  max_it 346  total   32.0s  l_bar 0.834
+    # 3.4x faster, no solve reaching the cap, l_bar preserved.
+    #
+    # mu_strategy was tested at the same time and REJECTED: monotone and
+    # monotone+mu_init=1e-2 both converge faster but drive l_bar to -7.08 and
+    # -1.67 respectively (negative min-weight == not force closure), i.e. they
+    # buy convergence by accepting bad grasps. nlp_scaling_method='none' was
+    # neutral-to-worse (total 115.6s, l_bar 0.720).
+    'limited_memory_max_history': 5,
     'max_iter':                   500,
     'sb':                         'no',
     'print_level':                0,
@@ -205,7 +231,51 @@ _IPOPT_SOLVER_OPTS = {
     'acceptable_constr_viol_tol': 1e-6,    # the real feasibility test
     'acceptable_compl_inf_tol':   1e2,
     'acceptable_dual_inf_tol':    1e3,
-    'acceptable_obj_change_tol':  1e-2,    # ← the criterion that matters
+    # ← the criterion that matters, and the one that was blocking.
+    #
+    # MEASURED on 017_orange seed 1 (print_level=5, full 800-iterate trace):
+    #     iter    objective    inf_pr     inf_du
+    #        0   5.921e+01   4.05e-01   2.64e+01
+    #       25   7.628e+00   6.20e-05   1.36e+01
+    #       50   4.560e+00   1.53e-03   5.90e+00   <- objective essentially final
+    #      200   4.587e+00   3.10e-04   7.96e+00
+    #      400   4.500e+00   3.43e-04   3.14e+00
+    #      600   4.913e+00   2.23e-04   8.45e+00
+    #      800   3.878e+00   3.98e-05   1.74e+00
+    # From iteration 50 to 800 -- 750 iterations -- the objective WANDERS in
+    # 4.47..4.91, a +/-5% band with no trend, and inf_du oscillates 1.7 <-> 13.6
+    # with no descent direction either. The final residuals say which condition
+    # is actually binding:
+    #     constraint violation  3.0e-5   converged
+    #     complementarity       6.2e-5   converged
+    #     DUAL infeasibility    1.02     the sole blocker
+    # i.e. the solve is FEASIBLE and COMPLEMENTARY -- the grasp satisfies every
+    # constraint -- and only the dual residual stalls.
+    #
+    # acceptable_dual_inf_tol (1e3) is already permissive enough to let that
+    # pass, so the reason "acceptable" never fired is THIS tolerance: a +/-5%
+    # inter-iterate objective swing exceeds a 1% relative-change threshold, so
+    # the acceptable_iter counter kept resetting. 5e-2 is sized to the MEASURED
+    # oscillation band rather than picked round, and should accept near
+    # iteration 50-100 instead of grinding to the cap.
+    #
+    # MEASURED AND IT DID NOT WORK -- kept at 5e-2 only because it is harmless.
+    # 4 objects x 3 seeds, 1e-2 vs 5e-2: convergence 10/12 BOTH ways, lift_ok
+    # 7/12 both ways, median iterations 612 both ways. The reason is the barrier
+    # stall documented on limited_memory_max_history above: inf_du is floored by
+    # a mu that never descends, so no acceptance tolerance on the OBJECTIVE can
+    # release a solve that is being held by the DUAL. The fix that did work was
+    # the L-BFGS history, which removes the stall itself.
+    #
+    # NOT a claim that the KKT system is now well conditioned. rank(W) 5->6
+    # removed the structural null space in the min-weight block, but the
+    # oscillating inf_du says a degeneracy remains elsewhere -- the NLP carries
+    # 138 one-sided plus 33 two-sided inequality constraints and quad_pinned is
+    # True on essentially every solve, so the trust-region bounds are active and
+    # a near-parallel active set produces exactly this signature. This setting
+    # is an acknowledgement that the dual residual is not informative about
+    # grasp quality here, not a claim that it would converge given more time.
+    'acceptable_obj_change_tol':  5e-2,
     'acceptable_iter':            4,
     'nlp_scaling_method':         'gradient-based',
 }   
@@ -3766,6 +3836,27 @@ class MultiStartConfig:
     # safe side while still closing the bulk of the 5-6mm isotropic overshoot.
     directional_r_tip_margin_m: float = 0.001
 
+    # Recompute the directional radius at the SOLVED q and re-run the DLS IK
+    # against the corrected targets, after the NLP returns.
+    #
+    # Needed because directional_r_tip alone is a no-op under the production
+    # preset. It evaluates the support function at a FIXED q (correctly -- the
+    # support is non-smooth and must not enter the NLP symbolically), but with
+    # n_normal_relinearize=0 there is no previous Picard stage, so the only q
+    # available is the WARM START, where the finger has not yet turned to face
+    # the object. Measured on 061_foam_brick: warm-start q leaves the pad
+    # 103.4 deg off pad-on and the support returns 18.78mm against an isotropic
+    # 19.47mm -- a 0.7mm correction, and the tip gaps came back bit-identical
+    # with the flag on. At the SOLVED q the pad is 2.2 deg off and the correct
+    # support is ~9.95mm.
+    #
+    # The refined q is GATED, not trusted: SpatialIKSolver clips to jnt_range
+    # but is collision-BLIND, unlike the NLP it runs after. The refinement is
+    # accepted only if the worst object-vs-anything contact distance does not
+    # get more negative; otherwise the NLP's q stands and res['q'] is
+    # unchanged. res['q_pre_refine'] keeps the original either way.
+    directional_r_tip_refine: bool = False
+
     # Antipodal-march jitter (deg): _seed_pair marches from contact 1 along its inward
     # normal rotated by up to +/- this angle to find contact 2. Large values (the old 45)
     # let the march exit through an ADJACENT box face ~half the time; since each contact
@@ -6010,6 +6101,13 @@ class GraspPlanner3D:
                             _rec['q']  = np.asarray(_opti.debug.value(_q),  float).flatten()
                             _rec['p1'] = np.asarray(_opti.debug.value(_p1), float).flatten()
                             _rec['p2'] = np.asarray(_opti.debug.value(_p2), float).flatten()
+                            # Contact 3 (n_contacts >= 3) is recorded on the SAME
+                            # per-iteration cadence as p1/p2 so the trace carries a
+                            # complete tripod; absent at n=2, where _p3 is None and
+                            # every downstream reader keys off its absence.
+                            if _p3 is not None:
+                                _rec['p3'] = np.asarray(
+                                    _opti.debug.value(_p3), float).flatten()
                             # Raw (u,v) decision-variable trajectory — mesh contacts only
                             # (_mesh_tangent_contact_ca / _mesh_uv_local_contact_ca both name
                             # their 2-DOF variable _t1_var/_t2_var; ground truth, cheaper and
@@ -6215,6 +6313,18 @@ class GraspPlanner3D:
                     if _t2_frame is not None:
                         for _k, _v in _t2_frame.items():
                             _out[f'quad2_{_k}'] = np.asarray(_v, float)
+                    # Contact 3's frame, so the trace describes the tripod the NLP
+                    # actually solved. At c3_own_patch=False _t3_frame IS _t2_frame
+                    # (contact 3 lives on contact 2's paraboloid), so quad3_* is then
+                    # a deliberate DUPLICATE of quad2_* -- that is the shared-patch
+                    # configuration being faithfully recorded, not a bug, and it is
+                    # exactly what makes the two contacts' patches plot on top of
+                    # each other. p3 is the trajectory; it is absent at n=2.
+                    if _t3_frame is not None:
+                        for _k, _v in _t3_frame.items():
+                            _out[f'quad3_{_k}'] = np.asarray(_v, float)
+                    if 'p3' in _iter_rec[0]:
+                        _out['p3'] = np.stack([r['p3'] for r in _iter_rec])
                     np.savez(npz_path, **_out)
                     self.log.info(f"[{stage_label}] iter trace saved -> {npz_path}")
                 except Exception as _e_npz:
@@ -6585,6 +6695,92 @@ class GraspPlanner3D:
             self.log.info(
                 f"[solve|final] n1={np.round(_n1f, 3).tolist()}  n2={np.round(_n2f, 3).tolist()}  "
                 f"dot={_dot12:+.3f}  span_margin={_sm:+.4f}rad")
+            # ── POST-SOLVE directional-radius refinement ──────────────────
+            # WHY THIS EXISTS. The IK target is contact + r_tip*n_out, and the
+            # isotropic r_tip is max||V - site|| over ALL directions -- a
+            # bounding sphere around an elongated pad -- so the pad is parked
+            # several mm short of the surface. cfg.directional_r_tip fixes that
+            # by using the support distance along the contact normal, but it is
+            # evaluated at a FIXED q (the support function is non-smooth, so it
+            # must not enter the NLP symbolically) -- and with the preset's
+            # n_normal_relinearize=0 the only q available is the WARM START,
+            # where the finger is not yet pointing at the object. Measured on
+            # 061_foam_brick: at the warm-start q the pad is 103.4 deg off
+            # pad-on and the support comes back 18.78mm (vs isotropic 19.47mm,
+            # a useless 0.7mm correction); at the SOLVED q it is 2.2 deg off
+            # and the correct support is ~9.95mm. So the flag silently did
+            # nothing -- the gaps were bit-identical with it on.
+            #
+            # This pass recomputes the radius at the SOLVED q, where the pad is
+            # actually aligned, and re-runs the DLS IK against the corrected
+            # targets.
+            #
+            # COLLISION CAVEAT, and why the result is GATED rather than trusted:
+            # SpatialIKSolver clips to jnt_range but is otherwise collision-
+            # BLIND (unlike the NLP, which carries the full softplus arm-vs-
+            # object constraint set). A refinement that closes the tip gap by
+            # driving a knuckle into the object would be strictly worse. So the
+            # refined q is accepted ONLY if it does not introduce a new
+            # penetration against the object: any contact involving an arm/hand
+            # geom and the object whose dist is more negative than the
+            # pre-refinement worst is a reject, and the original q stands.
+            if cfg.directional_r_tip_refine and res.get('q') is not None:
+                try:
+                    _q0 = np.asarray(res['q'], float)
+                    _rd = mj.MjData(model)
+                    _rd.qpos[:] = self.data.qpos[:]
+                    _rd.qpos[:len(_q0)] = _q0
+                    mj.mj_forward(model, _rd)
+
+                    def _worst_obj_pen(_d):
+                        """Most-negative contact distance between the object and
+                        any other geom. None when nothing touches it.
+
+                        Deliberately includes the FINGERTIPS: the refinement's
+                        whole purpose is to bring the pads to the surface, so a
+                        tip contact appearing is expected and healthy -- but a
+                        tip DRIVEN THROUGH the surface is the failure this gate
+                        catches, and it is the same test either way (did the
+                        worst penetration get worse)."""
+                        _w = None
+                        for _i in range(_d.ncon):
+                            _c = _d.contact[_i]
+                            if self._obj_gid in (int(_c.geom1), int(_c.geom2)):
+                                _w = _c.dist if _w is None else min(_w, _c.dist)
+                        return _w
+
+                    _pen_before = _worst_obj_pen(_rd)
+                    # Directional radii at the SOLVED pose, along the TRUE
+                    # outward normals just computed above.
+                    _r1_ref = self._tip_support_along(
+                        'thumb', _q0, _n1f, cfg.r_thumb) + float(cfg.directional_r_tip_margin_m)
+                    _r2_ref = self._tip_support_along(
+                        'index', _q0, _n2f, cfg.r_index) + float(cfg.directional_r_tip_margin_m)
+                    _t1_ref = _p1f + _r1_ref * _n1f
+                    _t2_ref = _p2f + _r2_ref * _n2f
+                    _rd2 = mj.MjData(model)
+                    _rd2.qpos[:] = self.data.qpos[:]
+                    _rd2.qpos[:len(_q0)] = _q0
+                    _q_ref_new = self._dls_ik.solve(
+                        model, _rd2, [self._thumb_sid, self._index_sid],
+                        [_t1_ref, _t2_ref], q_bias=_q0, null_gain=0.3)
+                    _rd2.qpos[:len(_q_ref_new)] = _q_ref_new
+                    mj.mj_forward(model, _rd2)
+                    _pen_after = _worst_obj_pen(_rd2)
+                    _ok = (_pen_after is None or _pen_before is None
+                           or _pen_after >= _pen_before - 1e-6)
+                    self.log.info(
+                        f"[r_tip_refine] r_iso=({cfg.r_thumb*1e3:.1f},{cfg.r_index*1e3:.1f})mm "
+                        f"-> r_dir=({_r1_ref*1e3:.1f},{_r2_ref*1e3:.1f})mm  "
+                        f"pen {(_pen_before or 0)*1e3:+.2f} -> {(_pen_after or 0)*1e3:+.2f}mm  "
+                        f"{'ACCEPTED' if _ok else 'REJECTED (new penetration)'}")
+                    if _ok:
+                        res['q_pre_refine'] = _q0.tolist()
+                        res['q'] = np.asarray(_q_ref_new, float)
+                        res['r_tip_refined_mm'] = [_r1_ref * 1e3, _r2_ref * 1e3]
+                except Exception as _e:
+                    self.log.warning(f"[r_tip_refine] skipped: {_e}")
+
             res['n1_final'] = _n1f.tolist()
             res['n2_final'] = _n2f.tolist()
             res['span_margin_final'] = _sm

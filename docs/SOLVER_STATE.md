@@ -525,9 +525,23 @@ What does **not** see it yet:
   (unprojected). The tripod is not worse — it is certified against more.
   The n=2 path is bit-identical after the change (verified: `036_wood_block` seed 0,
   `gamma_min = 28.387`, `beta` unchanged to all digits).
-- **Every executor.** Nothing in `pick_and_place.py`, `pick_from_floor.py` or
-  `kinova_leap_pick_place.py` reads `p3`. `solve_gamma_live` is ready for `n >= 2` (§5), but
-  the callers still build 2-contact lists from `FINGER_SET`.
+- ~~**Every executor.**~~ **PARTLY DONE (2026-09-14).** `pick_and_place.py` DOES read `p3`
+  now: it binds contact 3, derives its inward normal from `_geom_normal_np`, and zips
+  `_SLOTS` against the contact list so slots map to fingers positionally at n=2 or n=3.
+  `pick_from_floor.py` and `kinova_leap_pick_place.py` are still 2-contact.
+  **But three-finger execution does not WORK yet.** Measured 5 objects x 3 seeds, full
+  execution: 2-finger 8/15 true grasps, 3-finger **1/15** (8/15 abort before squeeze).
+  Every 3-finger plan certifies `wrench_feasible=True`, so this is not a metric failure.
+  Two causes, both measured:
+  (a) contact 3 COLLAPSES onto contact 2 — `014_lemon` seed 1 index/middle land 6.2 mm
+      apart in the object frame, supplying no off-axis moment arm;
+  (b) every fingertip misses its target by 13-21 mm, giving 19-33 mm squeeze gaps against
+      the 8 mm gate.
+  This happens under BOTH patch branches: `c3_own_patch=True` still collapses (6.4 mm) and
+  still aborts, so the shared trust region is NOT the cause — look at the seeding/objective.
+  Note 3-finger solves are ~2x FASTER (5.7 s vs 11.3 s mean) and converge 15/15 — they
+  converge quickly to an unexecutable configuration. Full table:
+  `benchmarks/ycb_grasp/out/tabletop/default/RESULTS_2v3_finger.md` (dirty tree).
 - **`FINGER_SET` is import-time**, derived from the pairing file's `default`. So `--pairing`
   steers the PLANNER only; **plan-only sweeps are meaningful, execution runs with a
   non-default pairing are not.** `SLOT_ROLES` was added so the controller maps an NLP slot to

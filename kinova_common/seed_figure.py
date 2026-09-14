@@ -100,49 +100,97 @@ def _contacts_of(rec):
 
 _MIDDLE_COLOR = "#238b45"   # green -- distinct from thumb orange / index blue
 
+# One colour per finger, used for BOTH ends of that contact's story: the o at
+# the seed and the ^ at the NLP's converged position. Rejected seeds keep the
+# finger colours too -- the panel header already says the seed was rejected, so
+# recolouring everything red only destroys the finger encoding.
+_FINGER_COLORS = dict(SQ.FINGER_COLORS, middle=_MIDDLE_COLOR)
 
-def _draw_block(fig, gs, col0, recs, sc, header, ok):
-    """One column block (all accepted, or all rejected), two rows deep."""
+
+def _FCOL(key):
+    return _FINGER_COLORS.get(key, "0.3")
+
+
+def _overlay_solved(ax, solved, normals=None):
+    """Draw the SOLVED contacts over a seed panel as a triangle per finger.
+
+    Same colour as that finger's seed marker: the pair (o -> ^) is the NLP's
+    travel for that contact, and colour is what ties the two ends together.
+    No connecting axis is drawn -- the only line on this panel is the dashed
+    chord the antipodal seed scan ran along.
+    """
+    p1 = solved.get("p1")
+    p2 = solved.get("p2")
+    if p1 is None or p2 is None:
+        return
+    for key in ("thumb", "index", "middle"):
+        p = solved.get({"thumb": "p1", "index": "p2", "middle": "p3"}[key])
+        if p is None:
+            continue
+        # Lifted off the surface for the same reason the seed o is -- the NLP
+        # converges ONTO the patch, so the solved contact is co-planar with it.
+        # The normal is taken from this finger's SEED: the solved point has no
+        # recorded normal here, and over a patch-sized move the surface normal
+        # turns little enough that it serves only to pick a side.
+        _n = (normals or {}).get(key)
+        _q = _lift(p, _n) if _n is not None else np.asarray(p, float).reshape(3)
+        _mark(ax, _q, "^", _FCOL(key), 8.0, 21)
+
+
+def _mark(ax, p, marker, color, size, z):
+    """One contact marker, drawn with ax.plot rather than ax.scatter.
+
+    This is not cosmetic. A scatter on a 3D axes is a Path3DCollection, which
+    matplotlib folds into its depth sort REGARDLESS of zorder, so a marker
+    lying on a patch is composited behind that patch and disappears -- measured
+    against an alpha=0.92 surface, the marker is invisible at any lift and at
+    any zorder. A marker drawn through ax.plot is a Line3D, which does honour
+    zorder, so it stays on top of the patch it belongs to. The patches keep
+    their depth sort against EACH OTHER; only the markers opt out.
+    """
+    p = np.asarray(p, float).reshape(3)
+    ax.plot([p[0]], [p[1]], [p[2]], marker=marker, ms=size, mfc=color,
+            mec="k", mew=0.4, ls="none", zorder=z)
+
+
+def _lift(p, n_in, mm=1.2):
+    """A contact point pushed `mm` OUT of the surface (against the inward
+    normal). Markers are drawn here rather than at the contact so they never
+    land co-planar with an opaque patch -- see the note at the seed scatter."""
+    p = np.asarray(p, float).reshape(3)
+    n = np.asarray(n_in, float).reshape(3)
+    d = float(np.linalg.norm(n))
+    return p - (n / d) * (mm * 1e-3) if d > 1e-12 else p
+
+
+def _draw_block(fig, gs, col0, recs, sc, header, ok, solved=None):
+    """One column block (all accepted, or all rejected), one panel per seed.
+
+    solved: optional dict(p1=..., p2=..., p3=...) of the contacts the NLP
+        actually converged to. Overlaid on ACCEPTED panels only (a rejected
+        seed never reached the NLP, so it has no solved counterpart). This is
+        what makes the figure legible next to the grasp-contacts figure: the
+        seed is only a STARTING POINT, and the NLP moves it -- measured 23mm of
+        travel and 45.6 deg of grasp-axis rotation on 014_lemon seed 0 -- so a
+        seed figure with no solved marker looks like it is showing a different
+        grasp than the one that executed. It was; both were correct.
+    """
     for j, rec in enumerate(recs):
-        c = col0 + j
-        axr = fig.add_subplot(gs[0, c], projection="3d")
-        SQ.draw_mesh(axr, sc)
-        try:
-            SQ.draw_seed_rays(axr, sc, rec)
-        except Exception:
-            for key, p, _n in _contacts_of(rec):
-                col = (_MIDDLE_COLOR if key == "middle"
-                       else SQ.FINGER_COLORS[key]) if ok else "#cb181d"
-                axr.scatter(*p, s=34, color=col, depthshade=False, zorder=10)
-            axr.plot(*np.array([rec["seed"]["p1s"], rec["seed"]["p2s"]]).T,
-                     color="0.35" if ok else "#cb181d", lw=1.1, ls="--", zorder=9)
-        if rec["seed"].get("p3s") is not None:
-            # Middle-finger seed, drawn on the ray panel too so its position
-            # relative to the pinch axis is legible at a glance.
-            axr.scatter(*rec["seed"]["p3s"], s=42, marker="^",
-                        color=_MIDDLE_COLOR if ok else "#cb181d",
-                        edgecolor="k", linewidths=0.4, depthshade=False, zorder=11)
-        axr.set_title(f"{rec['kind']} — {'accepted' if ok else rec['why']}",
-                      fontsize=8.5, color="0.15" if ok else "#cb181d")
-        # WORLD frame. draw_mesh/draw_seed_rays both draw in world, so the limits
-        # must be set from the world vertex cloud -- passing the BODY-LOCAL Vvis
-        # (its y spans [-0.055,0.019] while the world mesh sits at [0.243,0.317])
-        # leaves limits and content disjoint and the panel renders EMPTY.
-        SQ._equal_axes(axr, sc["center"] + sc["Vvis"] @ sc["R"].T)
-        axr.set_axis_off()
+        ax = fig.add_subplot(gs[0, col0 + j], projection="3d")
+        # ONE PANEL PER SEED. The patch row used to be a separate, patch-zoomed
+        # axes below this one, on the assumption that a patch is small next to
+        # its object and needs its own framing. Measured, it is not: patch
+        # half-extent vs object half-extent is 0.96-1.02 on 056_tennis_ball and
+        # 1.17-2.15 on 036_wood_block (the largest object in the set), so the
+        # two rows were drawing nearly the same framing twice. Merging them puts
+        # the seed, the solved contact and the patch each contact is confined to
+        # in ONE picture, which is the comparison the figure is actually for.
+        SQ.draw_mesh(ax, sc, alpha=0.16)
 
-        axp = fig.add_subplot(gs[1, c], projection="3d")
-        # MESH UNDER THE PATCH. This call is what the sweep figures were missing:
-        # without it the paraboloids float with no surface beneath them. Safe to
-        # add because _equal_axes turns autoscale OFF before setting limits, so
-        # the full-object shell cannot re-expand a patch-local zoom (the same
-        # reason plot_grasp_contacts draws the mesh in every zoomed panel).
-        SQ.draw_mesh(axp, sc, alpha=0.16)
         pts = []
-        _patch_by_key = {}
         for key, p, nin in _contacts_of(rec):
             if key == "middle":
-                continue          # shares slot 2's patch; drawn as a marker below
+                continue          # shares slot 2's patch; marked, not re-drawn
             try:
                 frame = SQ.quad_frame(sc, np.asarray(p, float),
                                       np.asarray(nin, float), sc["cfg"])
@@ -150,50 +198,65 @@ def _draw_block(fig, gs, col0, recs, sc, header, ok):
                 frame = None
             if frame is None:
                 continue
-            _patch_by_key[key] = frame
-            SQ.draw_quadratic(axp, sc, frame, key)
+            # OPAQUE + DEPTH SORTED, so a nearer patch actually hides the part
+            # of the farther one behind it. Both were previously drawn at
+            # alpha=0.55 with a hard zorder=8; an explicit zorder overrides
+            # matplotlib's 3D depth sort entirely, so the two patches were
+            # composited in CALL order regardless of which faced the camera,
+            # and a pair on opposite sides of the object read as
+            # interpenetrating rather than front-and-back.
+            # alpha just under 1: opaque enough that the nearer patch clearly
+            # occludes the farther one, sheer enough that a contact marker
+            # lying ON the surface still reads through it. At alpha=1.0 the
+            # seed markers vanished entirely -- they sit on the patch, so an
+            # opaque patch swallows them, which costs the panel its subject.
+            SQ.draw_quadratic(ax, sc, frame, key, alpha=0.92, depth_sort=True)
             pts.append(SQ.patch_points(frame, sc["center"], sc["R"],
                                        (frame["t_lo_0"], frame["t_hi_0"]),
                                        (frame["t_lo_1"], frame["t_hi_1"]),
                                        n=7).reshape(-1, 3))
-        # Both slot-2 fingers marked ON the shared patch, which is the thing worth
-        # seeing: whether index and middle are far enough apart to contribute
-        # independent wrench columns, or collapsed onto each other.
-        for key, p, _n in _contacts_of(rec):
-            if key == "thumb":
-                continue
-            col = _MIDDLE_COLOR if key == "middle" else SQ.FINGER_COLORS["index"]
-            axp.scatter(*p, s=46, marker="^" if key == "middle" else "o",
-                        color=col, edgecolor="k", linewidths=0.4,
-                        depthshade=False, zorder=12)
+
+        # The chord the antipodal scan ran along -- the only line on the panel.
+        ax.plot(*np.array([rec["seed"]["p1s"], rec["seed"]["p2s"]]).T,
+                color="0.45", lw=1.1, ls="--", zorder=9)
+        # SEED positions: one o per finger, in that finger's colour, nudged
+        # OUTWARD off the surface. A contact point is by construction ON the
+        # patch, so drawn at its true position it is exactly co-planar with an
+        # opaque surface and the depth sort may place it either side; a ~1mm
+        # lift along the outward normal makes it unambiguously in front
+        # without moving it anywhere the reader can measure.
+        for key, p, nin in _contacts_of(rec):
+            _mark(ax, _lift(p, nin), "o", _FCOL(key), 7.0, 20)
             pts.append(np.asarray(p, float)[None, :])
-        _s3 = rec["seed"].get("p3s")
-        if _s3 is not None:
-            _d23 = float(np.linalg.norm(np.asarray(_s3) - rec["seed"]["p2s"])) * 1e3
-            # Is the middle SEED actually inside the slot-2 patch it will be
-            # confined to? Compare against that patch's own measured half-extent
-            # rather than asserting "shared": when it is outside, the seed and the
-            # NLP's parameterization disagree, and the solve can only resolve that
-            # by dragging the contact -- which is worth seeing on the figure.
-            _fr2 = _patch_by_key.get("index")
-            if _fr2 is not None:
-                _half = max(abs(_fr2["t_hi_0"]), abs(_fr2["t_lo_0"]),
-                            abs(_fr2["t_hi_1"]), abs(_fr2["t_lo_1"])) * 1e3
-                _in = _d23 <= _half
-                axp.set_title(
-                    f"index↔middle seed {_d23:.0f}mm  vs slot-2 patch ±{_half:.0f}mm\n"
-                    f"{'INSIDE' if _in else 'OUTSIDE patch'}",
-                    fontsize=8, color="0.15" if _in else "#cb181d")
-            else:
-                axp.set_title(f"index↔middle seed {_d23:.0f}mm", fontsize=8)
-        if pts:
-            SQ._equal_axes(axp, np.vstack(pts), min_r=0.012)
-        axp.set_axis_off()
+        # SOLVED positions: same colour, as a triangle.
+        if ok and solved is not None:
+            _overlay_solved(ax, solved,
+                            normals={k: n for k, _p, n in _contacts_of(rec)})
+
+        ax.set_title("accepted" if ok else rec["why"], fontsize=8.5,
+                     color="0.15" if ok else "#cb181d", pad=1.0)
+        # WORLD frame, framed on the whole object: draw_mesh draws the full
+        # shell in world, and with the patches this large there is nothing to
+        # gain by cropping to them.
+        SQ._equal_axes(ax, sc["center"] + sc["Vvis"] @ sc["R"].T)
+        ax.set_axis_off()
 
 
-def write_seed_figure(planner, model, data, out_path, title_extra=""):
+def write_seed_figure(planner, model, data, out_path, title_extra="", res=None):
     """Draw every seed this solve considered. Returns the written path, or None
-    when the planner recorded no seeds (e.g. a solve that never reached seeding)."""
+    when the planner recorded no seeds (e.g. a solve that never reached seeding).
+
+    res: the solve result dict. When given, the contacts the NLP CONVERGED TO
+        (res['p1']/['p2']/['p3']) are overlaid on the accepted panels as a
+        triangle in each finger's colour, against that finger's o at its seed.
+
+        This exists because the seed figure and the grasp-contacts figure
+        legitimately disagree: a seed is a STARTING POINT and the NLP moves it
+        (measured 23.5/22.7mm of travel and 45.6 deg of grasp-axis rotation on
+        014_lemon seed 0, seed width 53.7mm -> solved 62.9mm). Without the
+        overlay the two figures look like they describe different grasps, and
+        the only way to tell they don't is to diff the coordinates by hand.
+    """
     pl = planner._planner if hasattr(planner, "_planner") else planner
     acc = list(getattr(planner, "last_seed_accept_table", None)
                or getattr(pl, "last_seed_accept_table", None) or [])
@@ -203,6 +266,13 @@ def write_seed_figure(planner, model, data, out_path, title_extra=""):
         return None
     sc = _scene_from_planner(planner, model, data)
     recs = [_as_rec(e, True) for e in acc] + [_as_rec(e, False) for e in rej]
+    # Solved contacts, when the caller handed us the result. Only p1/p2 are
+    # required; p3 rides along at n_contacts>=3.
+    _solved = None
+    if res is not None and res.get("p1") is not None and res.get("p2") is not None:
+        _solved = {"p1": res["p1"], "p2": res["p2"]}
+        if res.get("p3") is not None:
+            _solved["p3"] = res["p3"]
 
     n = len(recs)
     n_acc = len(acc)
@@ -216,16 +286,13 @@ def write_seed_figure(planner, model, data, out_path, title_extra=""):
     n_acc, n_rej = _acc_n, _rej_n
     widths = ([1.0] * n_acc) + ([_SPACER] if (n_acc and n_rej) else []) + ([1.0] * n_rej)
     n_cols = len(widths)
-    fig = plt.figure(figsize=(max(3.3 * (n_acc + n_rej) + 1.0, 10.0), 7.2))
-    gs = fig.add_gridspec(2, n_cols, height_ratios=[1.05, 1.0], width_ratios=widths)
-    fig.suptitle(
-        f"{sc['obj']}  —  contact seeds considered by THIS solve{title_extra}\n"
-        f"{n_acc} accepted (left)   |   {len(rej)} rejected (right, showing {n_rej})   "
-        f"(kappa gate {sc['cfg'].seed_kappa_max_reject:.0f}, "
-        f"DLS pool x{sc['cfg'].seed_dls_rank_pool})\n"
-        "top: seed ray → surface   bottom: paraboloid patches "
-        "(▲ = middle-finger seed; the NLP confines it to the slot-2 patch)",
-        fontsize=10.5)
+    fig = plt.figure(figsize=(max(3.3 * (n_acc + n_rej) + 1.0, 10.0), 4.2))
+    gs = fig.add_gridspec(1, n_cols, width_ratios=widths)
+    # COMPACT TITLE: object, and how the seeds split. The gate thresholds
+    # (kappa, DLS pool) are config, not a property of this picture -- they
+    # belong in the run's log, and on the figure they only compete with it.
+    fig.suptitle(f"{sc['obj']}{title_extra}  —  "
+                 f"{n_acc} accepted, {len(rej)} rejected", fontsize=11)
 
     acc_recs = [r for r in recs if r["ok"]]
     rej_recs = [r for r in recs if not r["ok"]]
@@ -241,15 +308,30 @@ def write_seed_figure(planner, model, data, out_path, title_extra=""):
         # gate that only fires late is still represented.
         _idx = np.linspace(0, _n_rej_total - 1, _REJ_CAP).astype(int)
         rej_recs = [rej_recs[i] for i in _idx]
-    _draw_block(fig, gs, 0, acc_recs, sc, "accepted", True)
+    _draw_block(fig, gs, 0, acc_recs, sc, "accepted", True, solved=_solved)
     _draw_block(fig, gs, n_acc + (1 if (n_acc and n_rej) else 0),
                 rej_recs, sc, "rejected", False)
 
-    # Tight vertical packing. The default 3D-axes bbox leaves most of a panel
-    # empty around the rendered sphere, which at two rows read as a large band of
-    # whitespace between them; hspace is negative to pull the rows back together.
-    fig.subplots_adjust(left=0.015, right=0.985, top=0.88, bottom=0.02,
-                        wspace=0.02, hspace=-0.22)
+    # ONE SHARED LEGEND. Finger role is carried by colour in every panel, and
+    # marker shape separates the two ends of a contact's story (seed vs the
+    # NLP's converged position), so a single key replaces every per-panel tag.
+    _has_mid = (bool(_solved) and _solved.get("p3") is not None) or any(
+        r["seed"].get("p3s") is not None for r in recs)
+    _keys = ["thumb", "index"] + (["middle"] if _has_mid else [])
+    _h = [plt.Line2D([], [], color=_FCOL(k), marker="o", ls="none", ms=7,
+                     mec="k", mew=0.4, label=k) for k in _keys]
+    _h += [plt.Line2D([], [], color="0.35", marker="o", ls="none", ms=7,
+                      mec="k", mew=0.4, label="seed"),
+           plt.Line2D([], [], color="0.35", marker="^", ls="none", ms=7,
+                      mec="k", mew=0.4, label="NLP solution")]
+    fig.legend(handles=_h, loc="lower center", ncol=len(_h), frameon=False,
+               fontsize=9, handletextpad=0.35, columnspacing=1.4,
+               bbox_to_anchor=(0.5, 0.005))
+
+    # Tight packing. The default 3D-axes bbox leaves most of a panel empty
+    # around the rendered object, so the margins are pulled in hard.
+    fig.subplots_adjust(left=0.015, right=0.985, top=0.90, bottom=0.10,
+                        wspace=0.02)
     out = OP.savefig(fig, Path(out_path), dpi=115)
     plt.close(fig)
     return out

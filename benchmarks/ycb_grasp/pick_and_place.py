@@ -94,6 +94,38 @@ LIFT_SPEED_MPS = 0.06           # was 0.02 -- see JOG_RAMP_S on why this is safe
 TRANSPORT_SPEED_MPS = 0.15      # lateral carry to the bin, faster than the lift
 RELEASE_SETTLE_STEPS = 400
 
+# ── What counts as a successful LIFT ─────────────────────────────────────────
+# result["lift_ok"] is the single boolean to aggregate over. It exists because
+# the fields it replaces each answer only half the question, and reading either
+# alone counts real failures as successes:
+#
+#   lift_obj_dz_mm      the object's z-displacement, and NOTHING about whether
+#                       the hand still has it. Measured on 061_foam_brick:
+#                       +119mm with lift_contact_lost={'thumb': True} -- the
+#                       object was carried on ONE finger and scored as a lift.
+#                       It also goes NEGATIVE when the object is knocked off the
+#                       table (-103.4mm on 036_wood_block) while still logging
+#                       phase "lift_done".
+#   lift_contact_lost   sticky per-finger flag, set the first time a tip's
+#                       measured force touches <=1e-6 N at ANY sampled step and
+#                       never cleared. A tip can momentarily unload mid-jog and
+#                       re-seat, which is not a failed grasp, so this alone is
+#                       too strict to gate on.
+#   phase_log           "lift_done" is appended unconditionally after the jog
+#                       returns. It records that the jog RAN, not that it
+#                       worked, so it is not a success signal at all (the same
+#                       class as the known release_done != grasped issue).
+#
+# lift_ok therefore requires BOTH: the object actually went up, and the hand is
+# still holding it WHEN THE LIFT ENDS. Transient mid-jog unloading is tolerated
+# (the sticky flag is reported separately as lift_contact_lost for anyone who
+# wants the strict reading); a one-finger carry at the end is not.
+LIFT_OK_MIN_FRAC = 0.80         # of LIFT_DISTANCE_M -- "reached most of the
+                                # commanded travel", not merely "moved at all"
+LIFT_OK_MIN_FORCE_N = 1e-3      # per fingertip at the final step. Above the
+                                # 1e-6 noise floor _jog_to trips on, so a tip
+                                # that is merely grazing does not pass.
+
 # Cartesian ACCELERATION slew limit on the commanded palm twist, adopted from
 # the teleop stack (kinova_leap_pick_place.NCF_ACCEL_BUDGET_XYZ). This is not
 # merely a smoothing nicety -- it is what makes the no-slip guarantee true.
@@ -216,12 +248,18 @@ def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
     return q_cmd, contact_lost
 
 
-def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
+def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=None,
                    w_span=1.0, view=False, out_dir=None, do_transport=True,
-                   max_iter=int(os.environ.get("PFF_MAXITER", 200)),
+                   # None DEFERS to the preset (which measures 800 as the cap
+                   # that converges 7/7; 80 gave 4/7). Passing a number here
+                   # overrides it, and passing the old hardcoded 200 silently
+                   # defeated the preset entirely -- solves reported iters=200
+                   # while the preset asked for 800.
+                   max_iter=(int(os.environ["PFF_MAXITER"])
+                             if os.environ.get("PFF_MAXITER") else None),
                    w_edge_margin=0.0, directional_r_tip=True,
                    mesh_fit=True, sdf_err_tol=None, bound_inset=None,
-                   bound_inset_kappa_ref=None,
+                   bound_keep_frac=None,
                    quad_sym_normals=False, seed_rank_pool=1, backend=None,
                    impratio=None, gamma_override=None,
                    squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05,
@@ -262,7 +300,10 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
     obj_geom0 = TS.hull_geoms(model, body_name)[0]
     obj_gids = _obj_hull_geom_ids(model, body_name)
 
-    cfg_kw = dict(n_seeds=n_seeds, max_iter=max_iter, arm_geom_names=rgeoms,
+    # n_seeds=None defers to the preset (which sets 1 -- one seed reaches the
+    # NLP, the DLS rank pool does the selecting). Only pass it as an override
+    # when the caller asked for a specific count.
+    cfg_kw = dict(arm_geom_names=rgeoms,
                   obj_clearance_by_geom=clearance_by_geom(rgeoms),
                   col_clearance_m=DEFAULT_COL_CLEARANCE_M,
                   use_quadratic_contact=True,
@@ -276,6 +317,10 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                   # permit contacts driven straight through the table surface.
                   ground_z=TS.TABLE_TOP_Z,
                   ground_clearance_m=0.006)
+    if max_iter is not None:
+        cfg_kw["max_iter"] = max_iter
+    if n_seeds is not None:
+        cfg_kw["n_seeds"] = n_seeds
     if n_relin is not None:
         cfg_kw["n_normal_relinearize"] = n_relin
     if seed_rank_pool and seed_rank_pool > 1:
@@ -319,15 +364,20 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
         # cannot keep a contact off a sharp edge. See
         # GraspConfig3D.quadratic_bound_inset.
         cfg_kw["quadratic_bound_inset"] = bound_inset
-    if bound_inset_kappa_ref is not None:
-        # Curvature gate on the inset above -- see
-        # GraspConfig3D.quadratic_bound_inset_kappa_ref. 0 = ungated.
-        cfg_kw["quadratic_bound_inset_kappa_ref"] = bound_inset_kappa_ref
+    if bound_keep_frac is not None:
+        # Floor on what the inset may leave -- see
+        # GraspConfig3D.quadratic_bound_keep_frac.
+        cfg_kw["quadratic_bound_keep_frac"] = bound_keep_frac
     # --gws is now the DEFAULT architecture (see for_gws_recommender below), so
     # the flag only overrides the term WEIGHTS; wrench_constraint=False comes
     # from the shared preset either way.
     if gws:
-        cfg_kw["w_gws"] = w_gws
+        # w_gws=None (the default) DEFERS to the preset, which picks the value
+        # matching its own beta normalization (beta*n_cols vs raw beta). Forcing
+        # 5.0 here would silently re-apply the raw-beta weight on top of the
+        # scaled term, a ~14x over-weighting. Pass a number to mean it literally.
+        if w_gws is not None:
+            cfg_kw["w_gws"] = w_gws
         cfg_kw["w_span"] = w_span
         # PFF_GWS_ALPHA_REG: proximal (Tikhonov) regularization on the
         # embedded min-weight LP's alpha (see GWSConfig.gws_alpha_reg) --
@@ -362,6 +412,14 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
         _w_gws_env = os.environ.get("PFF_GWS_W")
         if _w_gws_env is not None:
             cfg_kw["w_gws"] = float(_w_gws_env)
+    # PFF_QUAD_TANGENT_FRAME=0 reverts the quadratic contact frame's TANGENT
+    # basis to the pre-change _symbolic_contact_frame_ca reconstruction (the
+    # tanh(|n0|-0.9)/0.01 blend). Default is the paraboloid's own dp0/dp1 --
+    # see GraspConfig3D.quad_tangent_frame. Outside the `if gws` block because
+    # the frame is used by the wrench cone too, not just the GWS terms.
+    _qtf = os.environ.get("PFF_QUAD_TANGENT_FRAME")
+    if _qtf is not None:
+        cfg_kw["quad_tangent_frame"] = (_qtf not in ("0", "false", "False", ""))
     # Seed/surrogate settings from models/grasp_seed_config.json, applied as
     # DEFAULTS (setdefault, not update) so every explicit CLI flag and PFF_* env
     # override set above still wins. Precedence: file -> per-object -> CLI/env.
@@ -411,12 +469,16 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
     # sample repeated three times.
     planner = MultiStartGraspPlanner3D(model, data, cfg, log_dir=log_dir, seed=seed)
     t0 = time.time()
-    res = planner.solve(q_home, np.asarray(pos, float), max_seeds=n_seeds)
+    res = planner.solve(q_home, np.asarray(pos, float), max_seeds=cfg.n_seeds)
     t_solve = time.time() - t0
     print(f"[plan] status={res.get('status')} rs={res.get('return_status')} "
           f"iterations={res.get('iterations')}  ({t_solve * 1e3:.0f}ms)")
+    # lift_ok defaults FALSE so every abort path (plan failure, wrench-infeasible
+    # contacts, squeeze aborted) reports the same field as a run that lifted and
+    # dropped. An aggregate over lift_ok then needs no .get() fallback and cannot
+    # silently count a missing key as anything.
     result = dict(object=object_id, seed=seed, t_solve_s=t_solve,
-                  status=res.get("status"), phase_log=[])
+                  status=res.get("status"), phase_log=[], lift_ok=False)
     if res.get("q") is None or res.get("p1") is None:
         print("[plan] FAILED — no feasible grasp found.")
         result["phase_log"].append("plan_failed")
@@ -449,6 +511,8 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
 
     data.qpos[:N_ROBOT] = q_target
     mj.mj_forward(model, data)
+    p_WoO_pre = data.xpos[obj_bid].copy()
+    R_WO_pre  = data.xmat[obj_bid].reshape(3, 3).copy()
 
     if out_dir is not None:
         # planner= also writes the PAIRED seed figure from the tables this very
@@ -457,6 +521,35 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
                      body_name, obj_bid, pos, out_dir, n_relin=n_relin,
                      planner=planner)
     shutil.rmtree(log_dir, ignore_errors=True)
+
+    if os.environ.get("PFF_GEOM_TRACE"):
+        # WHERE the NLP put the contacts vs WHERE the fingertips ended up. The
+        # n=3 failure mode is one contact thrown far off, so the question is
+        # whether the NLP moved the CONTACT POINT somewhere unreachable (a
+        # placement problem) or placed it sensibly and the IK failed to track it
+        # (a kinematics problem). Printing both, plus the per-contact IK residual,
+        # separates those.
+        _pts = [res.get("p1"), res.get("p2"), res.get("p3")]
+        for _slot, _p in zip(_SLOTS, _pts):
+            if _p is None:
+                continue
+            _p = np.asarray(_p, float).reshape(3)
+            _sid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, FINGER_TIP_SITES[_slot])
+            _tip = data.site_xpos[_sid]
+            # contact in the OBJECT frame too: tells us if it even lies on the object
+            _pO = R_WO_pre.T @ (_p - p_WoO_pre) if R_WO_pre is not None else _p
+            print(f"[geom] {_slot:6s} contact_W={np.round(_p, 4).tolist()} "
+                  f"tip_W={np.round(_tip, 4).tolist()} "
+                  f"|tip-contact|={np.linalg.norm(_tip - _p) * 1000:7.2f}mm "
+                  f"contact_objframe={np.round(_pO, 4).tolist()}")
+
+    if os.environ.get("PFF_ALIGN_TRACE"):
+        # Angle between each fingerpad normal (site -x, see pad_axis) and the contact
+        # INWARD normal at the solved pose: how flush orient_weight actually got the pad.
+        for _f, _sid in zip(_FSET, tip_site_ids):
+            _R = data.site_xmat[_sid].reshape(3, 3)
+            _pad_W = _R @ np.array([-1.0, 0.0, 0.0])
+            print(f"[align] {_f}: pad_normal_W={np.round(_pad_W, 3).tolist()}")
 
     p_WoO = data.xpos[obj_bid].copy()
     R_WO = data.xmat[obj_bid].reshape(3, 3).copy()
@@ -642,6 +735,21 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
         # SQUEEZE: ramp the internal force in.
         ctrl.set_squeeze(True)
         n_ramp = max(int(SQUEEZE_RAMP_S / model.opt.timestep), 1)
+        # PFF_DRIFT_TRACE=1 decomposes the squeeze: how big the internal-force
+        # torque is against the PD torque that is supposed to hold the planned
+        # posture, and how far each fingertip actually travels from where the
+        # planner put it -- measured in the PALM frame, so arm motion does not
+        # contaminate it. This is the diagnostic for "the tips do not stay near
+        # the planned grasp": a large tau_int/tau_pd ratio means the PD has no
+        # authority to resist the squeeze, and the drift is the consequence.
+        _drift = os.environ.get("PFF_DRIFT_TRACE")
+        if _drift:
+            _R_pw0 = data.xmat[palm_bid].reshape(3, 3).T
+            _p_w0  = data.xpos[palm_bid].copy()
+            _tip_P0 = np.array([_R_pw0 @ (data.site_xpos[s] - _p_w0)
+                                for s in tip_site_ids])
+            print(f"[drift] planned tips (palm frame, mm):\n"
+                  f"        {dict(zip(_FSET, np.round(_tip_P0 * 1000, 1).tolist()))}")
         for i in range(n_ramp * 4):
             scale = min(1.0, i / n_ramp)
             data.qvel[:N_ROBOT] = 0.0
@@ -660,6 +768,27 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
             # CONTACT_GAP_TOL_M comment) is that the squeeze CLOSES the gap the
             # IK deliberately leaves; this is how you check that it actually does
             # on a given object rather than assuming it.
+            if _drift and i % 100 == 0:
+                _kp, _kd = ctrl.effective_gains()
+                _t_pd  = _kp * (q_target - data.qpos[:N_ROBOT])
+                _t_int = ctrl.internal_force_torques(data, scale=min(1.0, i / n_ramp))
+                _R_pw = data.xmat[palm_bid].reshape(3, 3).T
+                _p_w  = data.xpos[palm_bid]
+                _tip_P = np.array([_R_pw @ (data.site_xpos[s] - _p_w)
+                                   for s in tip_site_ids])
+                _dr = np.linalg.norm(_tip_P - _tip_P0, axis=1) * 1000
+                _rows = []
+                for _k, (_lo, _hi) in enumerate(ctrl.active_joint_slices):
+                    _rows.append(f"{_FSET[_k]}: |pd|={np.abs(_t_pd[_lo:_hi]).max():.3f} "
+                                 f"|int|={np.abs(_t_int[_lo:_hi]).max():.3f} "
+                                 f"drift={_dr[_k]:.1f}mm")
+                _f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+                _op = data.xpos[obj_bid]
+                _fc = ctrl.last_f_c_W
+                print(f"[drift] i={i:4d} scale={min(1.0, i / n_ramp):.2f}  "
+                      + "  ".join(_rows) + f"  fn={np.round(_f, 2).tolist()}"
+                      + f"  obj={np.round(_op, 3).tolist()}"
+                      + f"  |f_c|={np.round(np.linalg.norm(_fc, axis=1), 2).tolist()}")
             if os.environ.get("PFF_SQUEEZE_TRACE") and i % 100 == 0:
                 _g = _tip_gaps_mm(model, data, tip_geom_ids, obj_gid, obj_gids)
                 _f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
@@ -685,8 +814,27 @@ def run_pick_place(object_id, seed, n_seeds=3, n_relin=3, gws=True, w_gws=5.0,
             n_lift, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="lift", finger_set=_FSET)
         result["lift_obj_dz_mm"] = (float(data.xpos[obj_bid][2]) - obj_z0) * 1000
         result["lift_contact_lost"] = lost_lift
+        # SUCCESS TEST (see LIFT_OK_MIN_FRAC above). Both halves are required:
+        #   rose   -- travelled at least LIFT_OK_MIN_FRAC of the COMMANDED lift.
+        #             Also excludes the negative-dz case (object knocked off the
+        #             table), which the phase log alone reports as "lift_done".
+        #   held   -- every fingertip still carrying load AT THE FINAL STEP.
+        #             Sampled fresh here rather than read from lost_lift, which
+        #             is sticky: it latches on the first momentary unload and so
+        #             cannot say whether the grasp RECOVERED. Both numbers are
+        #             kept in the result so either reading stays available.
+        _f_end = (_measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+                  if (tip_geom_ids is not None and obj_gid is not None) else [])
+        result["lift_final_forces_N"] = dict(zip(_FSET, np.round(_f_end, 4).tolist()))
+        _rose = result["lift_obj_dz_mm"] >= LIFT_OK_MIN_FRAC * LIFT_DISTANCE_M * 1000
+        _held = bool(_f_end) and all(f > LIFT_OK_MIN_FORCE_N for f in _f_end)
+        result["lift_ok"] = bool(_rose and _held)
         result["phase_log"].append("lift_done")
-        print(f"[lift] object rose {result['lift_obj_dz_mm']:.1f}mm  lost={lost_lift}")
+        print(f"[lift] object rose {result['lift_obj_dz_mm']:.1f}mm  lost={lost_lift}  "
+              f"final_forces={result['lift_final_forces_N']}  "
+              f"lift_ok={result['lift_ok']}"
+              + ("" if result["lift_ok"] else
+                 f"  ({'did not rise' if not _rose else 'not held at end'})"))
 
         if do_transport:
             # TRANSPORT: lateral toward the bin centre, holding height.
@@ -857,12 +1005,10 @@ def main():
                          "rectangle after the SDF search sizes it. Keeps contacts off "
                          "sharp edges, which the SDF-error criterion cannot see (a "
                          "planar surrogate matches a box face right up to the crease). "
-                         "(default: GraspConfig3D.quadratic_bound_inset, 0.0 = off)")
-    ap.add_argument("--bound-inset-kappa-ref", type=float, default=None,
-                    help="1/m; curvature at which --bound-inset is halved on that axis. "
-                         "The inset guards a FACE EDGE, which only a planar patch has, so "
-                         "this keeps it off smooth objects; 0 disables the gate "
-                         "(default: GraspConfig3D's 5.0)")
+                         "(default: GraspConfig3D.quadratic_bound_inset, 10mm)")
+    ap.add_argument("--bound-keep-frac", type=float, default=None,
+                    help="fraction of each side the inset may never consume, guaranteeing "
+                         "a usable patch (default: GraspConfig3D's 0.5)")
     ap.add_argument("--impratio", type=float, default=None,
                     help="override the scene's contact impratio (scene XML sets 100; "
                          "the floor-pick benchmark measured 20 as best)")
@@ -891,6 +1037,14 @@ def main():
                          "with gamma=10.0 and squeeze_pd_scale=1.0 -- pass those "
                          "via --gamma/--squeeze-pd-scale; noslip alone removes the "
                          "tangential compliance a heavy object leans on.")
+    ap.add_argument("--no-directional-r-tip", dest="directional_r_tip",
+                    action="store_false",
+                    help="use the ISOTROPIC fingertip radius for the IK target "
+                         "(max||V-site||, ~19.5mm) instead of the support distance "
+                         "along the contact normal (~9.95mm + margin). The isotropic "
+                         "value is a bounding sphere around an elongated pad, so it "
+                         "parks the tip ~9.5mm proud of the surface; this flag exists "
+                         "to A/B that slack against the directional default.")
     ap.add_argument("--finger-kp", type=float, default=0.8)
     ap.add_argument("--finger-kd", type=float, default=0.05)
     ap.add_argument("--lift-speed", type=float, default=LIFT_SPEED_MPS,
@@ -936,8 +1090,9 @@ def main():
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
         fingers=args.fingers, force_execute=args.force_execute,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
+        directional_r_tip=args.directional_r_tip,
         sdf_err_tol=args.sdf_err_tol, bound_inset=args.bound_inset,
-        bound_inset_kappa_ref=args.bound_inset_kappa_ref,
+        bound_keep_frac=args.bound_keep_frac,
         backend=args.backend,
         quad_sym_normals=args.quad_sym_normals,
         seed_rank_pool=args.seed_rank_pool,

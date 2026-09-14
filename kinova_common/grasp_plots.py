@@ -59,7 +59,7 @@ def write_grasp_plots(model, data, res, verify_info, log_dir, object_id, seed,
     trajectory left to draw. plot_quadratic_path is still imported for
     _iter_trace_quadratic_stages, its shared trace reader.
 
-    planner: when given, ALSO writes the paired seed figure (seed<N>_seeds.pdf)
+    planner: when given, ALSO writes the paired seed figure (seed<N>_contact_seeds.pdf)
     from that planner's last_seed_accept_table / last_seed_reject_table -- every
     contact seed THIS solve considered, accepted and rejected, in the same grammar
     as plot_seed_quadratic. Paired by construction: same seeds, same gates, same
@@ -78,9 +78,13 @@ def write_grasp_plots(model, data, res, verify_info, log_dir, object_id, seed,
             return None
         V, F = oua.body_visual_mesh(model, obj_bid)
         # NOTE: the Picard-TRAJECTORY figure (seed<N>_quadratic_path) was removed --
-        # it answered "how did the contact MOVE across Picard stages", which no longer
-        # applies now that the solver runs a SINGLE stage (n_normal_relinearize=0 with
-        # quadratic_symbolic_normals; see grasp_config_builder.for_gws_recommender).
+        # it answered "how did the contact MOVE across Picard stages", which the
+        # BUILDER DEFAULT makes vacuous: for_gws_recommender setdefaults
+        # n_normal_relinearize=0 (a single stage) alongside
+        # quadratic_symbolic_normals. But that is only a setdefault -- a caller
+        # passing n_normal_relinearize explicitly still gets a multi-stage solve
+        # (benchmarks/ycb_grasp/pick_and_place.py's --n-relin did exactly that),
+        # so do NOT read this as "the solver cannot run multiple stages".
         # plot_quadratic_path is still imported for _iter_trace_quadratic_stages, the
         # shared trace reader that narrows a log_dir to the WINNING attempt.
         # LAST stage carrying contact frames = the returned solve's contacts
@@ -95,27 +99,44 @@ def write_grasp_plots(model, data, res, verify_info, log_dir, object_id, seed,
         except Exception:
             pass
         out = OP.fig_path(Path(out_dir) / f"seed{seed}_grasp_contacts.png")
+        # The stage COUNT is no longer reported in the figure. The builder
+        # default is a single stage (n_normal_relinearize=0), and len(stages)
+        # counted stage records found in the log dir rather than stages this
+        # solve ran -- it read "3 Picard stages" for a one-stage, 173-iteration
+        # solve. n_relin stays in THIS function's signature because callers pass
+        # it and plot_quadratic_path.py still uses the multi-stage trace.
         got = PGC.plot_grasp_contacts(
             V, F, last, object_id, out,
-            sdf_fn=sdf_fn, verify_info=verify_info, n_relin=n_relin)
+            sdf_fn=sdf_fn, verify_info=verify_info)
         if got is not None:
             print(f"[plan] grasp contacts -> {out.name}")
-        _write_seed_fig(planner, model, data, out_dir, seed)
+        _write_seed_fig(planner, model, data, out_dir, seed, res=res)
         return out if got is not None else None
     except Exception as e:
         print(f"[plan] contact plot failed: {e}")
         return None
 
 
-def _write_seed_fig(planner, model, data, out_dir, seed):
+def _write_seed_fig(planner, model, data, out_dir, seed, res=None):
     """Paired seed figure, best-effort: a failure here must never lose the grasp
-    figure that was already written."""
+    figure that was already written.
+
+    res is forwarded so the accepted panel can overlay the SOLVED contacts --
+    without it the seed figure and the grasp-contacts figure read as different
+    grasps, because the NLP moves the contact well off its seed."""
     if planner is None:
         return None
     try:
         from kinova_common.seed_figure import write_seed_figure
         got = write_seed_figure(planner, model, data,
-                                Path(out_dir) / f"seed{seed}_seeds.png")
+                                # "contact_seeds", not "seeds". The seed<N>
+                                # prefix is the RNG seed -- ONE planning run --
+                                # while the seeds this figure draws are CONTACT
+                                # seeds, the candidate grasps tried within that
+                                # run (cfg.n_seeds of them). "seed0_seeds.pdf"
+                                # collided those two senses in one filename.
+                                Path(out_dir) / f"seed{seed}_contact_seeds.png",
+                                res=res)
         if got is not None:
             print(f"[plan] contact seeds -> {got.name}")
         return got

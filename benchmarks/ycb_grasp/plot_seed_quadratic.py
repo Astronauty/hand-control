@@ -267,7 +267,9 @@ def quad_frame(sc, p_world, n_in, cfg):
         sdf_err_tol=cfg.quadratic_sdf_err_tol,
         mesh_fit=cfg.quadratic_mesh_fit,
         mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
-        mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min)
+        mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
+        bound_inset=cfg.quadratic_bound_inset,
+        bound_keep_frac=cfg.quadratic_bound_keep_frac)
     return frame
 
 
@@ -410,7 +412,7 @@ def s_pts(rec):
     return np.array([rec["seed"]["p1s"], rec["seed"]["p2s"]], float)
 
 
-def draw_quadratic(ax, sc, frame, key):
+def draw_quadratic(ax, sc, frame, key, color=None, alpha=0.55, depth_sort=False):
     """Part 2: the paraboloid over its measured trust region.
 
     Only the trust region is drawn. An earlier version added a pale wireframe
@@ -418,19 +420,35 @@ def draw_quadratic(ax, sc, frame, key):
     panel's whole subject IS the trust region -- the bounds are what
     _sdf_axis_bound_np measured -- and a second, larger surface around it reads
     as part of the patch and works against that.
+
+    depth_sort: leave zorder UNSET so matplotlib's 3D painter sorts this
+        surface against the others by depth. An explicit zorder overrides that
+        sort entirely, so two patches sharing zorder=8 are drawn in call order
+        and the nearer one does not occlude the farther one -- they read as
+        interpenetrating. Off by default because a single-patch panel wants the
+        deterministic stacking, and matplotlib's per-collection sort is exact
+        only for non-intersecting surfaces.
+    color: override the finger colour (a shared patch drawn once for two
+        fingers has no single finger colour to take).
     """
-    c_in = FINGER_COLORS[key]
+    c_in = FINGER_COLORS[key] if color is None else color
     center, R = sc["center"], sc["R"]
     lo0, hi0 = frame["t_lo_0"], frame["t_hi_0"]
     lo1, hi1 = frame["t_lo_1"], frame["t_hi_1"]
 
+    _z = {} if depth_sort else dict(zorder=8)
+    _ze = {} if depth_sort else dict(zorder=9)
     P_in = patch_points(frame, center, R, (lo0, hi0), (lo1, hi1), n=13)
+    # edgecolor="none" as well as linewidth=0: at alpha<1 the default face
+    # edges stay faintly visible and the patch reads as a wire grid rather
+    # than a surface, which at the old alpha=0.55 was hidden by the
+    # transparency and only showed up once the patches went near-opaque.
     ax.plot_surface(P_in[..., 0], P_in[..., 1], P_in[..., 2],
-                    color=c_in, alpha=0.55, linewidth=0, antialiased=True,
-                    shade=True, zorder=8)
+                    color=c_in, alpha=alpha, linewidth=0, edgecolor="none",
+                    antialiased=True, shade=True, **_z)
     # Trust-region boundary, drawn solid so the asymmetry (t_lo != t_hi) reads.
     for edge in (P_in[0], P_in[-1], P_in[:, 0], P_in[:, -1]):
-        ax.plot(edge[:, 0], edge[:, 1], edge[:, 2], color=c_in, lw=1.4, zorder=9)
+        ax.plot(edge[:, 0], edge[:, 1], edge[:, 2], color=c_in, lw=1.4, **_ze)
 
 
 def _equal_axes(ax, pts, pad=0.005, min_r=None):
@@ -459,7 +477,9 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
                 out_dir: Path, elev: float, azim: float,
                 show_rejected: bool = False, show_geom_origin: bool = False,
                 sdf_err_tol: float | None = None,
-                t_bound_max: float | None = None):
+                t_bound_max: float | None = None,
+                bound_inset: float | None = None,
+                bound_keep_frac: float | None = None):
     sc = build_object(obj)
     cfg = sc["cfg"]
     cfg.quadratic_mesh_fit = mesh_fit
@@ -473,6 +493,16 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
         cfg.quadratic_sdf_err_tol = float(sdf_err_tol)
     if t_bound_max is not None:
         cfg.quadratic_t_bound_max = float(t_bound_max)
+    # Third knob, and the only one that is NOT a model-accuracy statement: a
+    # constant keep-back from every side, so a contact cannot sit on a sharp
+    # edge that the sdf_err_tol criterion is blind to. Drawn patches shrink by
+    # exactly this on all four sides, which is what the solver sees.
+    if bound_inset is not None:
+        cfg.quadratic_bound_inset = float(bound_inset)
+    # Floor on what the inset may leave: each side keeps at least this fraction
+    # of itself, so a near-edge seed is never frozen outright.
+    if bound_keep_frac is not None:
+        cfg.quadratic_bound_keep_frac = float(bound_keep_frac)
     recs = generate_seeds(sc, n_random=n_random, rng_seed=rng_seed)
 
     accepted = [r for r in recs if r["ok"]]
@@ -619,6 +649,15 @@ def plot_object(obj: str, n_random: int, mesh_fit: bool, rng_seed: int,
     _tag = "" if sdf_err_tol is None else f"_tol{cfg.quadratic_sdf_err_tol*1e3:g}mm"
     if t_bound_max is not None:
         _tag += f"_cap{cfg.quadratic_t_bound_max*1e3:g}mm"
+    # Same reason as the two above: an inset sweep writes one figure per setting
+    # rather than clobbering a single file. kappa-ref only enters the name when
+    # an inset is actually in effect (it does nothing at inset 0), and 'ungated'
+    # is spelled out rather than written as 0 so the two arms of the
+    # planar-vs-curved comparison are legible in a directory listing.
+    if bound_inset is not None:
+        _tag += f"_inset{cfg.quadratic_bound_inset*1e3:g}mm"
+        if cfg.quadratic_bound_inset > 0.0:
+            _tag += f"_keep{cfg.quadratic_bound_keep_frac:g}"
     out = obj_dir / f"seedquad_{obj}{'' if mesh_fit else '_sdfhess'}{_tag}.png"
     fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.07,
                         wspace=0.14, hspace=0.24)
@@ -807,6 +846,13 @@ def main():
     ap.add_argument("--t-bound-max", type=float, default=None,
                     help="metres; hard cap on each patch half-width even where "
                          "the surface never trips --sdf-err-tol (default 0.05)")
+    ap.add_argument("--bound-inset", type=float, default=None,
+                    help="metres; constant shaved off every side of each patch after "
+                         "the SDF search sizes it, so a contact cannot sit on a sharp "
+                         "edge --sdf-err-tol is blind to (default: GraspConfig3D's 10mm)")
+    ap.add_argument("--bound-keep-frac", type=float, default=None,
+                    help="fraction of each side the inset may never consume, so a patch "
+                         "always keeps usable room (default: GraspConfig3D's 0.5)")
     ap.add_argument("--rng-seed", type=int, default=0)
     ap.add_argument("--elev", type=float, default=18.0)
     ap.add_argument("--azim", type=float, default=-60.0)
@@ -825,7 +871,8 @@ def main():
     for obj in objs:
         plot_object(obj, a.n_random, not a.no_mesh_fit, a.rng_seed,
                     a.out_dir, a.elev, a.azim, a.show_rejected, a.ray_origins,
-                    a.sdf_err_tol, a.t_bound_max)
+                    a.sdf_err_tol, a.t_bound_max, a.bound_inset,
+                    a.bound_keep_frac)
 
 
 if __name__ == "__main__":

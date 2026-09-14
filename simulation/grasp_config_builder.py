@@ -203,7 +203,27 @@ def for_teleop_recommender(obj_name: str, arm_geom_names: list,
 def for_gws_recommender(obj_name: str, arm_geom_names: list,
                         obj_clearance_by_geom: dict,
                         accel_budget_xyz: tuple, ang_accel_budget_xyz: tuple,
-                        max_iter: int = 80,
+                        # 80 NEVER CONVERGED. Measured across 7 objects, varying
+                        # only this cap:
+                        #      80  converged 4/7   total solve  16.4s
+                        #     200  converged 4/7                28.5s
+                        #     400  converged 6/7                50.0s
+                        #     800  converged 7/7                87.3s
+                        #    1600  converged 7/7               102.8s
+                        # It SATURATES at 800 -- 1600 buys nothing, and per
+                        # object the iteration count is identical at 800 and
+                        # 1600 for 5 of 7 (017_orange converges at exactly 328
+                        # under caps of 400/800/1600). So a high cap costs
+                        # nothing on objects that do not need it; the total is
+                        # driven by the three that genuinely run long
+                        # (056_tennis_ball 620, 015_peach 718, 065-a_cups 721).
+                        #
+                        # Caveat when comparing iteration counts across caps:
+                        # acceptable_obj_change_tol is a RELATIVE test and
+                        # acceptable_iter=4, so the accept point depends on the
+                        # run's own progress history -- the same solve reports
+                        # different iteration counts under different caps.
+                        max_iter: int = 800,
                         w_gws: float | None = None, w_span: float = 1.0,
                         obj_id: str | None = None,
                         fingers=None,
@@ -479,11 +499,51 @@ def for_gws_recommender(obj_name: str, arm_geom_names: list,
     # on the GAP side of zero, since penetration is unrecoverable for the
     # squeeze while a small gap is what the squeeze exists to close.
     cfg_kw.setdefault('directional_r_tip', True)
+    # ...and REFINE it at the solved pose. directional_r_tip alone is a NO-OP
+    # here: it evaluates the support function at a fixed q (correct -- the
+    # support is non-smooth and must not enter the NLP symbolically), but with
+    # n_normal_relinearize=0 there is no previous Picard stage, so the only q
+    # available is the WARM START, where the finger has not yet turned to face
+    # the object. Measured on 061_foam_brick: at the warm-start q the pad is
+    # 103.4 deg off pad-on and the support returns 18.78mm against an isotropic
+    # 19.47mm (a 0.7mm correction); at the SOLVED q it is 2.2 deg off and the
+    # support is ~9.95mm. With the flag alone the tip gaps came back
+    # BIT-IDENTICAL.
+    #
+    # Measured against the alternatives on 7 objects x 2 seeds:
+    #     none         lift_ok  2/14  med_gap 8.97mm  solve 144.6s total
+    #     dls_refine   lift_ok  9/14  med_gap 4.12mm  solve 148.0s total
+    #     relin1       lift_ok  8/14  med_gap 3.23mm  solve 273.2s total
+    #     relin2       lift_ok  9/14  med_gap 4.00mm  solve 303.0s total
+    # Relinearization produces tighter gaps but costs ~1.9x the solve time for
+    # no lift_ok gain, and relin2 drove 056_tennis_ball to a NEGATIVE gap
+    # (-0.08mm, i.e. penetration) despite the 1mm margin -- the asymmetric
+    # failure the margin exists to prevent. The refinement is ~0.2s and gated:
+    # it is discarded if the worst object contact distance gets more negative,
+    # since SpatialIKSolver is collision-blind unlike the NLP it runs after.
+    # Zero rejections over the 14 solves measured.
+    cfg_kw.setdefault('directional_r_tip_refine', True)
     cfg_kw.setdefault('gws_soft_finger', True)
     cfg_kw.setdefault('gws_beta_scale_ncols', True)
     # Rescale only the DEFAULT w_gws -- an explicit value is taken literally.
+    #
+    # The divisor is n_cols(W), which is 12 for the live 2-contact config and
+    # NOT 14: build_W_ca takes the min-weight cone from
+    # _friction_cone_verts(include_origin=False) -- 4 pyramid edges per contact,
+    # not 5 -- plus 2 soft-finger spin columns, so 2*(4+2) = 12. The origin row
+    # is excluded because its wrench column is identically ZERO: it is
+    # unconstrained by W@alpha==0, so the LP can put the entire sum(alpha)=1
+    # budget on it and report beta=0 with no gradient, destroying the very
+    # property the FRoGGeR relaxation exists for (that beta stays smoothly
+    # climbable when the grasp is not yet in closure). See
+    # _friction_cone_verts' own docstring for the measurement.
+    #
+    # beta's ceiling is 1/n_cols, so weighting beta*n_cols (gws_beta_scale_ncols
+    # == FRoGGeR's normalized l_bar) makes the term O(1) regardless of m; 5.0/12
+    # then leaves the GWS gradient contribution where the old raw-beta w_gws=5.0
+    # put it. Verified m=12 by intercepting the live W.
     if cfg_kw.get('gws_beta_scale_ncols') and not _w_gws_explicit:
-        cfg_kw['w_gws'] = 5.0 / 14.0
+        cfg_kw['w_gws'] = 5.0 / 12.0
     cfg_kw.update(overrides)
     return for_teleop_recommender(
         obj_name, arm_geom_names, obj_clearance_by_geom,
