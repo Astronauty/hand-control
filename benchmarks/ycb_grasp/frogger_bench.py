@@ -60,6 +60,9 @@ from simulation.obb_sampler import (                          # noqa: E402
 
 ARMS = ("ours", "frogger")
 
+# "A run converges if it yields a feasible grasp in under 1 minute" (their Sec. IV).
+SYNTH_BUDGET_S = 60.0
+
 # The five objects the tabletop solver work is characterized on, plus foam_brick
 # (the documented beta-vs-geometry disagreement case).
 DEFAULT_OBJECTS = ["036_wood_block", "017_orange", "014_lemon",
@@ -102,7 +105,7 @@ def _build_cfg(arm, object_id, body_name, rgeoms, obj_geom0, *,
 
 
 def _frogger_seed(model, data, info, body_name, q_home, roles, seed,
-                  n_draws=40, palm_tol_mm=20.0):
+                  n_draws=40, palm_tol_mm=20.0, attempt=0):
     """q0 from FRoGGeR's heuristic sampler (their steps 1-5).
 
     Draws palm poses until one is REACHABLE -- the arm cannot achieve every sampled
@@ -149,7 +152,9 @@ def _frogger_seed(model, data, info, body_name, q_home, roles, seed,
     best = (float("inf"), None, None)
     d_chk = mj.MjData(model)
     for k in range(int(n_draws)):
-        rng = np.random.default_rng(int(seed) * 10007 + k)
+        # `attempt` shifts the stream so a resample draws NEW candidates rather
+        # than replaying the same ones -- see _frogger_synthesize.
+        rng = np.random.default_rng(int(seed) * 10007 + int(attempt) * 104729 + k)
         try:
             if tri:
                 # THREE contacts: preshape to cradle a sphere of the object's own
@@ -170,7 +175,9 @@ def _frogger_seed(model, data, info, body_name, q_home, roles, seed,
                                           model, q_home, roles=pair))
                 qp = solve_preshape(model, q_home, s0["width"], roles=pair)
                 _hf = palm_frame_for_preshape(model, qp, roles=pair)
-            s = sample_palm_pose(V, np.random.default_rng(int(seed) * 10007 + k),
+            s = sample_palm_pose(V,
+                                 np.random.default_rng(int(seed) * 10007
+                                                       + int(attempt) * 104729 + k),
                                  obb=obb, min_height_axis=(0, 0, 1),
                                  hand_frame=_hf)
             q = solve_palm_ik(model, data, pb, s["R_WP"], s["p_WP"], qp,
@@ -204,8 +211,48 @@ def _frogger_seed(model, data, info, body_name, q_home, roles, seed,
                 "seed_straddles": bool(sd < R_obj)}
 
 
+def _frogger_synthesize(planner, model, data, info, body_name, q_home, roles,
+                        seed, pos, n_seeds, *, k_l=0.3, max_attempts=20,
+                        budget_s=SYNTH_BUDGET_S):
+    """FRoGGeR's synthesis loop: resample and re-solve until a grasp is FEASIBLE.
+
+    Their protocol (Sec. IV / Table I): a run converges when it yields a feasible
+    grasp within 60 s, and FRoGGeR needs a median of 3 solves to get one (IQR 1-6).
+    Feasible here means `l_bar* >= k_l`, their (7c), which is the constraint the
+    solve is already carrying -- so this accepts the first attempt whose RETURNED
+    grasp actually clears the floor, rather than assuming the constraint held.
+
+    Returns (best_result, info) where info records `n_attempts`, whether the loop
+    succeeded, and the seed diagnostics of the ACCEPTED attempt. On exhaustion it
+    returns the best attempt by `l_bar*`, so a failed run still reports its closest
+    approach rather than an arbitrary one.
+    """
+    t_start = time.time()
+    best, best_info, best_lbar = None, {}, -np.inf
+    for k in range(int(max_attempts)):
+        if time.time() - t_start > budget_s:
+            break
+        q0, sinfo = _frogger_seed(model, data, info, body_name, q_home, roles,
+                                  seed, attempt=k)
+        res = planner.solve(q0, np.asarray(pos, float), max_seeds=n_seeds)
+        b = res.get("gws_beta")
+        W = res.get("gws_W")
+        m = (np.asarray(W, float).shape[1] if W is not None else None)
+        lbar = (float(b) * m) if (b is not None and m) else -np.inf
+        if lbar > best_lbar:
+            best, best_info, best_lbar = res, dict(sinfo), lbar
+        if lbar >= k_l:                      # their (7c): feasible, stop
+            best_info.update(n_attempts=k + 1, synth_ok=True,
+                             synth_time_s=time.time() - t_start)
+            return res, best_info
+    best_info.update(n_attempts=int(max_attempts), synth_ok=False,
+                     synth_time_s=time.time() - t_start)
+    return best, best_info
+
+
 def plan_one(arm, object_id, seed, *, n_seeds=3, max_iter=80, fingers=None,
-             k_l=0.3, sdf_normals=True, mu=None):
+             k_l=0.3, sdf_normals=True, mu=None, max_attempts=1,
+             budget_s=SYNTH_BUDGET_S):
     """Plan (not execute) one grasp with one arm, and score it.
 
     mu : object-geom sliding friction. None keeps table_scene's default (2.0),
@@ -229,6 +276,18 @@ def plan_one(arm, object_id, seed, *, n_seeds=3, max_iter=80, fingers=None,
                      n_seeds=n_seeds, max_iter=max_iter, fingers=fingers,
                      k_l=k_l, sdf_normals=sdf_normals)
 
+    # SYNTHESIS. FRoGGeR RESAMPLES until a feasible grasp is found, within a
+    # 60-second budget: "For each of 43 objects, we try to generate 20 feasible
+    # grasps", "A run converges if it yields a feasible grasp in under 1 minute",
+    # and their Table I reports a MEDIAN of 3 solves per feasible grasp (IQR 1-6,
+    # against 50 for the baseline). Their headline convergence rate of 99.4% is a
+    # property of that loop, not of a single solve.
+    #
+    # This harness previously drew seeds, picked one and solved ONCE, reporting
+    # whatever came out -- which is not their protocol and understates it by
+    # construction, since a single attempt cannot benefit from the resampling their
+    # numbers assume.
+    #
     # SEED. The frogger arm starts from FRoGGeR's own heuristic sampler (their
     # App. B-C), not from HOME. This is not a convenience: (7a) is `max l*(q)` with
     # no alignment or IK term, so nothing in their objective prefers opposed
@@ -240,13 +299,19 @@ def plan_one(arm, object_id, seed, *, n_seeds=3, max_iter=80, fingers=None,
     # characterized and what its numbers are comparable to.
     q0 = np.asarray(q_home, float)
     seed_info = {}
-    if arm == "frogger":
-        q0, seed_info = _frogger_seed(model, data, info, body_name, q0,
-                                      fingers or ["thumb", "index"], seed)
-
     planner = MultiStartGraspPlanner3D(model, data, cfg, seed=seed)
     t0 = time.time()
-    res = planner.solve(q0, np.asarray(pos, float), max_seeds=n_seeds)
+
+    if arm == "frogger" and max_attempts > 1:
+        res, seed_info = _frogger_synthesize(
+            planner, model, data, info, body_name, q0,
+            fingers or ["thumb", "index"], seed, pos, n_seeds,
+            k_l=k_l, max_attempts=max_attempts, budget_s=budget_s)
+    else:
+        if arm == "frogger":
+            q0, seed_info = _frogger_seed(model, data, info, body_name, q0,
+                                          fingers or ["thumb", "index"], seed)
+        res = planner.solve(q0, np.asarray(pos, float), max_seeds=n_seeds)
     t_solve = time.time() - t0
 
     row = dict(arm=arm, object=object_id, seed=seed, t_solve_s=t_solve,
@@ -372,6 +437,12 @@ def main():
     ap.add_argument("--patch-normals", action="store_true",
                     help="run the frogger arm on PATCH normals instead of the SDF "
                          "gradient, isolating objective structure from normal source.")
+    ap.add_argument("--max-attempts", type=int, default=1,
+                    help="FRoGGeR resamples until a grasp is feasible, a median of "
+                         "3 solves (IQR 1-6) in their Table I, within a 60 s budget. "
+                         "Default 1 is a SINGLE solve, which is not their protocol "
+                         "and understates the method. Applies to the frogger config "
+                         "only; `ours` always solves once from HOME.")
     ap.add_argument("--mu", type=float, default=None,
                     help="object-geom sliding friction. Default None keeps "
                          "table_scene's 2.0, which every existing tabletop result "
@@ -401,6 +472,7 @@ def main():
                     r, ctx = plan_one(arm, obj, sd, n_seeds=args.n_seeds,
                                       max_iter=args.max_iter, fingers=fingers,
                                       k_l=args.k_l, mu=args.mu,
+                                      max_attempts=args.max_attempts,
                                       sdf_normals=not args.patch_normals)
                     if args.artifacts:
                         # out/tabletop/<tag>/<arm>/<object>/ -- the arm level keeps
