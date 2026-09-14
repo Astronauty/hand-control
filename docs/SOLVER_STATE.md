@@ -530,18 +530,22 @@ What does **not** see it yet:
   `_SLOTS` against the contact list so slots map to fingers positionally at n=2 or n=3.
   `pick_from_floor.py` and `kinova_leap_pick_place.py` are still 2-contact.
   **But three-finger execution does not WORK yet.** Measured 5 objects x 3 seeds, full
-  execution: 2-finger 8/15 true grasps, 3-finger **1/15** (8/15 abort before squeeze).
+  execution, CLEAN TREE at `7827ec3`: 2-finger 9/14 true grasps (one cell excluded as a
+  physics blow-up), 3-finger **1/15** (8/15 abort before squeeze). The n=3 arm is
+  BIT-IDENTICAL between the dirty and clean trees (all 15 cells, beta and gamma_min).
   Every 3-finger plan certifies `wrench_feasible=True`, so this is not a metric failure.
   Two causes, both measured:
-  (a) contact 3 COLLAPSES onto contact 2 — `014_lemon` seed 1 index/middle land 6.2 mm
-      apart in the object frame, supplying no off-axis moment arm;
+  (a) contact 3 COLLAPSES onto contact 2 — EXACTLY coincident, not merely close: the n=3
+      contacts figure's pairwise separations read `1-2 69mm  1-3 69mm  2-3 0mm` on
+      `017_orange` seed 0, supplying no off-axis moment arm;
   (b) every fingertip misses its target by 13-21 mm, giving 19-33 mm squeeze gaps against
       the 8 mm gate.
   This happens under BOTH patch branches: `c3_own_patch=True` still collapses (6.4 mm) and
   still aborts, so the shared trust region is NOT the cause — look at the seeding/objective.
-  Note 3-finger solves are ~2x FASTER (5.7 s vs 11.3 s mean) and converge 15/15 — they
-  converge quickly to an unexecutable configuration. Full table:
-  `benchmarks/ycb_grasp/out/tabletop/default/RESULTS_2v3_finger.md` (dirty tree).
+  On the CLEAN tree the two arms solve at comparable speed (2-finger 4.87 s, 3-finger
+  5.58 s mean); the dirty tree's apparent "n=3 is 2x faster" was a property of that tree,
+  not the formulation. Full table:
+  `benchmarks/ycb_grasp/out/tabletop/clean_7827ec3/RESULTS_2v3_finger.md`.
 - **`FINGER_SET` is import-time**, derived from the pairing file's `default`. So `--pairing`
   steers the PLANNER only; **plan-only sweeps are meaningful, execution runs with a
   non-default pairing are not.** `SLOT_ROLES` was added so the controller maps an NLP slot to
