@@ -53,7 +53,7 @@ from grasp_planner_3d import (GraspConfig3D, MultiStartGraspPlanner3D,  # noqa: 
 import simulation.grasp_config_builder as _grasp_config_builder  # noqa: E402
 
 from kinova_common.constants import (FINGER_TIP_SITES, FINGER_CODE, FINGER_SET,
-                                     SLOT_ROLES,
+                                     SLOT_ROLES, finger_joint_slices,
                                      GEN3_XML, FINGERTIP_POINTING_AXIS)
 from kinova_common.grasp_plots import write_grasp_plots
 from kinova_common.wrench import solve_gamma_live, composite_wrench_cone, hull3d
@@ -5850,6 +5850,20 @@ if __name__ == "__main__":
                         squeeze_pd_scale=SQUEEZE_PD_SCALE,
                         support_weight=True,
                         pad_offsets=[_PAD_OFFSET[f] for f in FINGER_SET],
+                        # Cone-constrained gamma: solve null-space weights so EVERY
+                        # contact is compressive and in-cone, not just the sign-anchor
+                        # contact. mu comes from the live model (the grasped object's
+                        # own geom) rather than the 0.7 default, which understates the
+                        # scene's objects (mu 1.2-2.0) and makes the cone solve
+                        # demand more normal force than physics requires.
+                        cone_mu=float(model.geom_friction[obj_grasp['id_geom'], 0]),
+                        cone_margin=0.2, cone_f_min=0.5,
+                        # Finger-gain slices for THIS run's fingers, derived from the
+                        # model. The default is hardcoded to index+thumb, so any
+                        # third/fourth finger kept full stiff gains while the others
+                        # softened to close, and never took part in the
+                        # CLOSING/HOLDING switch.
+                        active_joint_slices=finger_joint_slices(model, FINGER_SET),
                         obj_contact_provider=_grasp_provider)
                     # Grasp controller is now executing: clear the approach visualizations —
                     # the RRT path trace (ghost capsules) and the achieved-contact markers

@@ -80,7 +80,8 @@ sys.path.insert(0, str(REPO / "benchmarks"))
 
 from grasp_control import GraspController                                       # noqa: E402
 from grasp_control import object_uv_atlas as oua                                # noqa: E402
-from kinova_common.constants import FINGER_CODE, FINGER_SET, FINGER_TIP_SITES   # noqa: E402
+from kinova_common.constants import (FINGER_CODE, FINGER_SET,                    # noqa: E402
+                                     FINGER_TIP_SITES, finger_joint_slices)
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
 from kinova_common.video import (H264Writer, VideoRecorder,                     # noqa: E402,F401
                                  VIDEO_FPS, VIDEO_H, VIDEO_W)
@@ -684,6 +685,18 @@ def run_pick(object_id, seed, n_seeds=1, n_relin=None, gws=False, w_gws=5.0,
         obj_body_id=obj_bid, kp=Kp, kd=Kd,
         gamma=gamma_live, squeeze_pd_scale=0.25, support_weight=True,
         pad_offsets=[pad_offset[f] for f in FINGER_SET],
+        # Cone-constrained gamma: solve null-space weights so EVERY contact is
+        # compressive and in-cone, not just the sign-anchor contact. mu is the
+        # SAME live-model value solve_gamma_live was sized against above -- the
+        # controller default (0.7) understates the scene's objects (mu 1.2-2.0),
+        # so gamma and the cone constraint disagreed about friction.
+        cone_mu=mu_c[0],
+        cone_margin=0.2, cone_f_min=0.5,
+        # Finger-gain slices for THIS run's fingers, derived from the model.
+        # The default is hardcoded to index+thumb, so any third/fourth finger
+        # kept full stiff gains while the others softened to close, and never
+        # took part in the CLOSING/HOLDING switch.
+        active_joint_slices=finger_joint_slices(model, FINGER_SET),
         obj_contact_provider=make_object_contact_provider(rec_local, obj_bid))
 
     # Reset to the RANDOM start config (q0), not q_target -- the whole point is
