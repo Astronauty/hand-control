@@ -85,6 +85,24 @@ fingertip's isotropic bounding-sphere radius otherwise) and `_seed_kappa_ok`
 (`seed_kappa_max_reject`, evaluated on the MESH-FIT curvature when
 `quadratic_mesh_fit` is on, so the gate and the surrogate judge the same surface).
 
+### Reading the seed figure (`seed<N>_contact_seeds.pdf`)
+
+Changed in `d9d2a16`, and the old behaviour invited a specific misreading:
+
+- **Only the WINNING accepted panel is titled `accepted -- SELECTED`** (bold, blue).
+  `solve()` runs a full NLP per accepted seed and keeps the cost-ranked best, so without
+  this every accepted panel looked equally chosen.
+- **Solution triangles are drawn ONLY on that winning panel.** `res['p1']/['p2']` are the
+  winner's contacts; drawing them on a losing accepted panel paired one seed's patch with a
+  different seed's solution, which reads as "the solution is off its patch" and is an
+  artifact. A pre-`d9d2a16` figure showing triangles far from the circles on several panels
+  is showing that artifact, not seed-to-solution drift.
+- **The drawn rectangle is the frame the solve actually used** (`res['quad_frames']`), not a
+  rebuild at that panel's own seed. The rebuild measured 24 mm off in y on `036_wood_block`
+  seed 1, which made a solution strictly inside its bounds (t1 = +86.87 against +86.88)
+  appear to sit outside its own trust region. The rebuild remains the fallback for records
+  with no stage frame (rejected seeds never reached a stage).
+
 **Consequence worth knowing:** because the deterministic seed goes in first and usually
 wins the ranking, varying the planner's `seed` produces NO variation on rigid symmetric
 objects (measured: wood block identical across seeds 0/1/2), and only mild variation on
@@ -158,6 +176,28 @@ An axis that reaches `t_bound_max` is flat/uncapped; one that stops short is
 divergence-limited (an edge is near). `w_edge_margin`'s hinge fires only on
 divergence-limited axes, so a genuinely flat face is not penalized.
 
+**`quadratic_extent_clip` (default True, added `d9d2a16`) — a bound the SDF search
+structurally cannot provide.** On a FLAT face a plane tracks the surface perfectly, so
+nothing ever diverges: the search runs the full range and returns `t_bound_max`, which
+reports the CAP, not the face. Measured on `036_wood_block`, the raw long-axis bounds came
+back at exactly 100.0/100.0/99.6/99.2 mm against a 100 mm cap — saturated, not measured.
+The NLP then legitimately walked contacts ~87-89 mm up the face to the block's top edge
+(inside their bounds, `quad_pinned=True`), where the fingers cannot oppose each other.
+The observed failure was the thumb contacting ALONE at 33 N and shoving the block off the
+table; the same cell in a later sweep applied 68 N and launched it 1356 mm through the
+floor, carrying the only negative `gws_beta` measured (-0.1937).
+
+The clip additionally bounds each axis by how far the object's own face reaches along it,
+using only vertices lying IN the patch plane (`|(v-seed).n| <= 2mm`) — projecting the whole
+hull measures the object's bounding extent (+/-103 mm on that block), which is looser than
+the 89 mm already present and clips nothing. It runs BETWEEN the corner shrink and
+`bound_inset`, and only ever moves a side INWARD, so the inset takes its crease reserve out
+of the already-clipped room rather than double-subtracting the same margin.
+
+Measured effect on `036_wood_block` seed 2 (2-finger): `gws_beta` -0.1937 -> +0.0615,
+lift dz -1356 mm -> ~0 mm. The grasp still fails, but as an ordinary failed grasp rather
+than a physics blow-up.
+
 Those four searches bound the rectangle's **centre-lines** only, and say nothing about
 its corners — which is where a paraboloid departs worst. `_shrink_patch_to_tol` therefore
 treats them as an upper bracket and scales all four down uniformly (bisection on a 5x5
@@ -187,6 +227,14 @@ because an independent patch can land on a face the hand would have to re-approa
 Sharing guarantees the two contacts are adjacent and mutually reachable; a standalone test
 confirmed the optimizer then slides BOTH to reachable spots inside the bounds (index/middle
 10-24 mm apart, every finger converging to its pad radius).
+
+**That 10-24 mm separation does NOT hold in the benchmark.** Measured 2026-09-14 over
+5 objects x 3 seeds through full execution, contact 3 converges ONTO contact 2: the n=3
+contacts figure's pairwise separations read `1-2 69mm  1-3 69mm  2-3 0mm` on `017_orange`
+seed 0 — exactly coincident, with the index and middle panels rendering identically (same
+curvature, same bounds, same SDF error). The half-bound initialization above prevents a
+coincident START, not a coincident SOLUTION. Consequence: no off-axis moment arm, which is
+the only reason a third contact exists. See §10 for the execution numbers.
 
 The rest-pose fingertip separation (178-219 mm) that originally motivated separate patches
 was the wrong measurement: what matters is whether both fingers can curl onto NEARBY
