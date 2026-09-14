@@ -859,3 +859,38 @@ backend change argues the remaining defect is in the problem as posed -- the
 constraint set or its scaling -- rather than in the optimizer, which is where the
 per-constraint tolerances we have NOT applied (Table III: joint 1e-2, surface 5e-4,
 collision 1e-3, force closure 1e-5) become the obvious next suspect.
+
+### 13.4 After the cone fix: best result so far, and the zeros are gone
+
+Same sweep, after removing the origin vertex from the min-weight cone
+(FROGGER_COMPARISON §7.1).
+
+| | ours | frogger (v2: SQP + analytic) | frogger (v3: + cone fix) |
+|---|---|---|---|
+| median `l_bar*` | +0.8873 | +0.0000 | **+0.4047** |
+| wrench-feasible | 16/18 | 6/18 | **11/18** |
+| median solve time | 2.3 s | 5.3 s | **5.0 s** |
+
+**Exact-zero cells: 11 -> 0.** That is the cone diagnosis confirmed on the sweep
+rather than on one contrived pinch. Every cell that previously reported `beta = 0`
+with no gradient now reports a real value.
+
+Per cell, 12 improved and 3 regressed. `036_wood_block` recovered on all three seeds
+(0.0 -> 0.30/0.45/0.37) and `017_orange` now sits at 0.97-1.00.
+
+### 13.5 The remaining failures are now legible
+
+7 cells report `l_bar*` well below -1 (to -31.8). That is not a new fault: these are
+the same failing grasps, with `beta` finally reporting HOW FAR from closure they are
+instead of clamping at zero. A large negative value is exactly the smoothly climbable
+signal the relaxation is for -- the solver now has a gradient to descend, and did not
+before.
+
+All 7 have straddling seeds (2.3-23.3 mm), so the seed is again not the discriminator.
+`009_gelatin_box` fails all three seeds; it is the flattest object in the set
+(OBB 107 x 96 x 34 mm), where a fingertip pair has little depth to oppose across.
+
+Still: the frogger configuration reaches `converged` on 0 of 18 cells, against 12/18
+for ours. That has now survived a solver change, a gradient change and a cone fix,
+which continues to point at the constraint set rather than the optimizer -- the
+per-constraint tolerances (§7.4) remain the untested candidate.
