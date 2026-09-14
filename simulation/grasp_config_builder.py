@@ -593,10 +593,10 @@ def for_frogger(obj_name: str, arm_geom_names: list,
         # against 8/18 for our own configuration -- so the backend was a live
         # suspect for the convergence failure, not just a faithfulness detail.
         cfg_kw.setdefault('use_slsqp', True)
-        # NOT applied: their constraint tolerances (App. B-F, Table III -- joint
-        # 1e-2, surface contact 5e-4, collision 1e-3, force closure 1e-5). This
-        # solver exposes one tolerance rather than per-constraint ones, so matching
-        # them would need a per-constraint scaling pass. Recorded as a known gap.
+        # Their constraint tolerances (Table III), realized by scaling each
+        # constraint against a single tol_pr -- see
+        # GraspConfig3D.frogger_tol_scaling.
+        cfg_kw.setdefault('frogger_tol_scaling', True)
 
     # (7e): a NEGATIVE margin d_j on FINGER-OBJECT pairs, which the paper states
     # explicitly. Applied to the ACTIVE fingers' geoms against the target object

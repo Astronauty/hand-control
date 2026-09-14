@@ -894,3 +894,34 @@ Still: the frogger configuration reaches `converged` on 0 of 18 cells, against 1
 for ours. That has now survived a solver change, a gradient change and a cone fix,
 which continues to point at the constraint set rather than the optimizer -- the
 per-constraint tolerances (§7.4) remain the untested candidate.
+
+### 13.6 Tolerance scaling: implemented, and the convergence label is a red herring
+
+`frogger_tol_scaling` realizes Table III's per-constraint tolerances. CasADi's
+`sqpmethod` exposes ONE primal tolerance, so each constraint is instead SCALED:
+writing `g(x)/s = 0` under a single `tol_pr = T` gives it an effective tolerance
+`T*s`. With `T = 1e-5` (the tightest, force closure) that is joint /1000,
+collision /100, surface /50, force closure /1.
+
+**The `converged` count was the wrong thing to chase.** Four measurements:
+
+| probe | result |
+|---|---|
+| `max_iter` 20 / 80 / 200 / 800 | `l_bar*` 0.106 / 0.593 / 0.608 / **0.608** |
+| `tol_pr` 1e-5 vs 1e-3 | 0.593 vs 0.587 |
+| `tol_du` 1e-2 / 1e-1 / 1.0 | 0.608 / 0.608 / **0.608** |
+| surface residual at the solution | **5.1e-12** against `tol_pr = 1e-5` |
+
+`l_bar*` plateaus from 200 to 800 iterations, neither tolerance moves it, and the
+constraints are satisfied seven orders of magnitude inside tolerance. **The solve
+converges numerically; only the status label is wrong** -- CasADi's `sqpmethod`
+keeps iterating without crediting a step, most plausibly a line-search artifact.
+
+So `converged 0/18` was never evidence of a defect, and three of this session's
+changes were pursued partly on the strength of it. The quantity that matters is
+`l_bar*` and the wrench certificate, both of which are reported.
+
+The scaling itself is a modest, mixed change on a 3-object probe:
+`009_gelatin_box` -4.33 -> +0.34 and now wrench-feasible, `017_orange`
+1.00 -> 0.94, `036_wood_block` +0.30 -> -1.47. Kept because it implements a stated
+part of their method, not because it is a measured win.

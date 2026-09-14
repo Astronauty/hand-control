@@ -2813,7 +2813,7 @@ class _MinWeightLPJacCallback(ca.Callback):
                       np.asarray(alpha, float).flatten())
         return [ca.DM(G.flatten(order="F").reshape(1, -1))]
 
-def _embed_gws_ca(opti, W, alpha_reg: float = 0.0):
+def _embed_gws_ca(opti, W, alpha_reg: float = 0.0, row_scale=None):
     """Add the min-weight (FRoGGeR) LP as NLP decision variables/constraints.
 
         max_{alpha,beta}  beta - alpha_reg * ||alpha||^2
@@ -2925,7 +2925,36 @@ def _embed_gws_ca(opti, W, alpha_reg: float = 0.0):
     n_cols = int(W.shape[1])
     alpha  = opti.variable(n_cols)
     beta   = opti.variable()
-    opti.subject_to(W @ alpha == ca.DM.zeros(6, 1))
+    # ROW SCALING on the wrench-balance equality. W's six rows are not
+    # commensurate: rows 0-2 are TORQUE (each entry carries a moment arm, so
+    # their magnitude scales with the grasp span) and rows 3-5 are FORCE.
+    # Measured on a 36mm half-span pinch the row norms are
+    # [0.10, 0.144, 0.144, 3.46, 4.0, 4.0] -- a 28x spread that GROWS with the
+    # object. IPOPT enforces constr_viol_tol as an ABSOLUTE number per row, so
+    # one tolerance means ~28x looser satisfaction on the force rows than the
+    # torque rows, and the mismatch is object-dependent. This is the suspected
+    # source of ||W alpha|| reaching 1e-2 against a constraint that says 0
+    # (GWS_IMPROVEMENTS.md item 1); _embed_wrench_cone_ca already applies the
+    # same per-row normalization to its own corner equalities.
+    #
+    # SAFE FOR alpha BY CONSTRUCTION. This is a LEFT multiplication by an
+    # invertible diagonal: (D W) alpha = 0  <=>  W alpha = 0, an identical
+    # feasible set, so the alpha we reason about cannot move. (COLUMN scaling
+    # would rescale each alpha_j individually and change what sum(alpha)=1
+    # distributes -- that would be a reformulation. This is not that.) Verified
+    # numerically over random splay/span geometry: max|d alpha| ~ 5e-17 and
+    # |d beta| ~ 1e-17, i.e. machine precision, while cond(W) drops from 42-48
+    # to 1.0-1.2. Only the multiplier changes, nu -> D^-1 nu, which is the
+    # point: it is a preconditioning of the KKT system.
+    #
+    # row_scale is a CONSTANT 6-vector (computed once per stage from the seed
+    # geometry), never a function of the decision variables -- making it depend
+    # on the live W would add derivative terms and couple the rows back into
+    # the problem. None leaves the equality exactly as it was.
+    _Wa = W @ alpha
+    if row_scale is not None:
+        _Wa = _Wa / ca.DM(np.asarray(row_scale, float).reshape(6, 1))
+    opti.subject_to(_Wa == ca.DM.zeros(6, 1))
     opti.subject_to(ca.sum1(alpha) == 1.0)
     opti.subject_to(alpha - beta * ca.DM.ones(n_cols, 1) >= 0)
     cost_alpha_reg = (alpha_reg * ca.sumsqr(alpha)) if alpha_reg > 0.0 else ca.DM(0.0)
@@ -3235,6 +3264,25 @@ class GWSConfig:
     # a clean control on objects where stages are close in cost.
     gws_beta_scale_ncols: bool = False
 
+    # Divide each row of the embedded min-weight equality W@alpha==0 by that
+    # row's own norm (evaluated ONCE per stage at the seed, so the scale is a
+    # constant, not a function of the decision variables).
+    #
+    # W's rows are not commensurate -- 0-2 are torque and carry a moment arm,
+    # 3-5 are force -- measuring [0.10, 0.144, 0.144, 3.46, 4.0, 4.0] on a 36mm
+    # half-span pinch, a 28x spread that grows with the object. IPOPT applies
+    # constr_viol_tol as an ABSOLUTE per-row number, so without scaling one
+    # tolerance means very different things per row, object-dependently. This is
+    # GWS_IMPROVEMENTS.md item 1, and _embed_wrench_cone_ca already does the
+    # same thing for its corner equalities.
+    #
+    # Cannot change the alpha/beta being reasoned about: left-multiplying by an
+    # invertible diagonal leaves the feasible set identical. Verified over
+    # random splay/span geometry -- max|d alpha| ~5e-17, |d beta| ~1e-17, while
+    # cond(W) drops 42-48 -> 1.0-1.2. Only the multiplier changes (nu -> D^-1
+    # nu), which is the intended preconditioning.
+    gws_row_scale: bool = True
+
     # HARD robustness floor on the NORMALIZED min-weight metric, FRoGGeR's (7c):
     #     l_bar* = n_cols * beta >= k_l,   i.e.   beta >= k_l / n_cols
     # applied as an NLP constraint, not a cost. 0.0 (default) = OFF and
@@ -3471,6 +3519,27 @@ class UVAtlasConfig:
     # it is a fixed body-frame quantity, which is the property their sentence
     # requires, unlike an offset along the object's own surface normal.
     frogger_pad_offset_m:   float = 0.011
+
+    # Per-constraint tolerances, FRoGGeR's Table III (App. B-F):
+    #     joint 1e-2, surface contact 5e-4, collision 1e-3, force closure 1e-5.
+    #
+    # CasADi's sqpmethod exposes ONE primal tolerance (`tol_pr`), so the tolerances
+    # are realized by SCALING each constraint instead: writing `g(x)/s = 0` under a
+    # single `tol_pr = T` gives that constraint an effective tolerance of `T*s`.
+    # Setting T to the tightest of the four (1e-5, force closure) gives
+    #     joint /1000, collision /100, surface /50, force closure /1.
+    #
+    # This is not cosmetic. The constraints here differ in natural scale by orders
+    # of magnitude -- a surface residual in metres against a normalized `beta` in
+    # [-1,1] -- so one unscaled tolerance is simultaneously far too loose for one
+    # and far too tight for another, which is the standing suspect for the frogger
+    # configuration reaching `converged` on 0 of 18 cells after a solver change, a
+    # gradient change and a cone fix.
+    #
+    # 0.0 disables the scaling (every constraint at scale 1), which is the prior
+    # behavior and what every non-frogger config keeps.
+    frogger_tol_scaling:    bool = False
+    frogger_tol_pr:         float = 1e-5
     quadratic_t_bound_max:  float = 0.10    # metres, cap even where the surface stays flat
     quadratic_sdf_err_tol:  float = 4e-3    # metres, max surrogate-vs-true-SDF gap per axis
     # Constant amount (m) shaved off EVERY side of the trust-region rectangle
@@ -5287,8 +5356,12 @@ class GraspPlanner3D:
                     _sfn = self._mesh_entry["fn"]
                     _Rt = ca.DM(obj_R_np.T)
                     _cd = ca.DM(obj_center_np)
+                    # Table III: surface contact 5e-4 against a tol_pr of 1e-5 -> /50.
+                    _s_surf = (5e-4 / float(cfg.frogger_tol_pr)
+                               if cfg.frogger_tol_scaling else 1.0)
                     for _cp in _cons_pts:
-                        _opti.subject_to(_sfn(_Rt @ (_cp - _cd)) == 0.0)
+                        _opti.subject_to(
+                            _sfn(_Rt @ (_cp - _cd)) / _s_surf == 0.0)
                 else:
                     # Primitive: the analytic surface constraint already in the file.
                     for _cp, _d_lp in zip(_cons_pts, (d1_lp, d2_lp, d3_lp)):
@@ -5543,8 +5616,30 @@ class GraspPlanner3D:
                     _gws_beta = _lp_cb(ca.reshape(_gws_W, -1, 1))
                     _cost_gws_reg = ca.DM(0.0)
                 else:
+                    # Constant per-row scale from the SEED geometry: evaluate W
+                    # once at the initial iterate and take each row's norm. Rows
+                    # that come back ~0 (a structurally empty row) are left at
+                    # 1.0 so the division cannot blow up.
+                    _rs = None
+                    if cfg.gws_row_scale:
+                        try:
+                            # Evaluate W at the CURRENT initial guess. opti.debug
+                            # .value(expr) resolves an expression against the
+                            # stored initial values -- do NOT hand it a manual
+                            # substitute(), which detaches the expression from
+                            # the Opti stack and raises [OptiNode].
+                            _W0 = np.array(_opti.debug.value(
+                                _gws_W, _opti.initial()), dtype=float)
+                            _rn = np.linalg.norm(_W0, axis=1)
+                            _rs = np.where(_rn > 1e-9, _rn, 1.0)
+                            self.log.info(
+                                f"[gws] row_scale {np.round(_rs, 4).tolist()} "
+                                f"(spread {_rs.max() / max(_rs.min(), 1e-12):.1f}x)")
+                        except Exception as _e:
+                            self.log.warning(f"[gws] row_scale unavailable: {_e}")
+                            _rs = None
                     _gws_alpha, _gws_beta, _cost_gws_reg = _embed_gws_ca(
-                        _opti, _gws_W, alpha_reg=cfg.gws_alpha_reg)
+                        _opti, _gws_W, alpha_reg=cfg.gws_alpha_reg, row_scale=_rs)
                 # Uniform witness + beta<0 (not yet necessarily in closure) is a
                 # neutral, always-valid start — mirrors the gamma/y cold-start
                 # convention just above (no LP pre-solve to warm-start from).
@@ -5759,7 +5854,10 @@ class GraspPlanner3D:
                             self._arm_gids[_ai], self._obj_all_gids, n_act,
                             obj_qpos_snap)
                         self._lp_callbacks.append(_ex_cb)   # keepalive
-                        _opti.subject_to(_ex_cb(_q) >= _clr_obj)
+                        # Table III: collision 1e-3 against a tol_pr of 1e-5 -> /100.
+                        _s_col = (1e-3 / float(cfg.frogger_tol_pr)
+                                  if cfg.frogger_tol_scaling else 1.0)
+                        _opti.subject_to(_ex_cb(_q) / _s_col >= _clr_obj / _s_col)
                     elif _clr_obj > _COL_DISABLE_SENTINEL:
                         if geom_type == 6:   # BOX
                             _d_obj = _softplus_sphere_box_distance(
@@ -5802,6 +5900,10 @@ class GraspPlanner3D:
             if cfg.use_slsqp:
                 _sqp_opts = dict(_SQP_SOLVER_OPTS)
                 _sqp_opts['max_iter'] = _n_iter
+                if cfg.frogger_tol_scaling:
+                    # The single primal tolerance the per-constraint scaling above
+                    # is expressed against (GraspConfig3D.frogger_tol_scaling).
+                    _sqp_opts['tol_pr'] = float(cfg.frogger_tol_pr)
                 self.log.info(f"[{stage_label}|solver_opts] sqpmethod  {_sqp_opts}")
                 _opti.solver('sqpmethod', _sqp_opts)
             else:
