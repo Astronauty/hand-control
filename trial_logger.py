@@ -26,9 +26,11 @@ State machine (settled spec — see conversation record, not re-derived here):
              holds LIFT_HEIGHT_M above its rest height continuously for DWELL_S. A dip
              below threshold before DWELL_S elapses resets the dwell timer WITHOUT
              ending the attempt, as long as the trigger condition is still active.
-  Transport: entered at pick_confirmed. Arrival is a SET-IN-PLACE check: object XY within
-             the place-site marker footprint AND |v| < ARRIVAL_SPEED_M_S (settled), whether
-             held clear over the target or set down into it -> trial success. Falling below
+  Transport: entered at pick_confirmed. Arrival is a SET-IN-PLACE check, and all three of
+             its conditions must hold continuously for ARRIVAL_DWELL_S: the object RESTS on
+             the place target (contact with the bin base, or the flat place-site footprint
+             for the legacy task), it is SETTLED (|v| < ARRIVAL_SPEED_M_S), and the robot has
+             RELEASED it (no hand<->object contact) -> trial success. Falling below
              LIFT_HEIGHT_M *outside* the footprint counts a drop (phase reverts to Pick,
              awaiting the next trigger edge); falling below it *inside* the footprint is a
              placement in progress (stay in Transport until it settles), not a drop.
@@ -58,6 +60,18 @@ CONTACT_EPISODE_COOLDOWN_S = 0.5  # min sim-time gap between counted episodes �
                                    # episode, exploding one real touch into hundreds
                                    # (observed in a live dexpilot log).
 ARRIVAL_SPEED_M_S  = 0.05   # object linear speed below which it's considered "settled"
+ARRIVAL_DWELL_S     = 0.5    # sim-time the object must stay in-place, settled and RELEASED
+                             # before arrival is counted. Mirrors DWELL_S/DROP_DWELL_S: an
+                             # instantaneous frame where the fingers lose contact mid-carry
+                             # (or a one-frame contact flicker) is not a placement.
+ARRIVAL_LAPSE_S     = 0.15   # how long the arrival conditions may momentarily lapse WITHOUT
+                             # restarting the dwell. A settled object still shows brief
+                             # contact-jitter spikes: in a real placement 96.4% of the final
+                             # 0.5s window was under ARRIVAL_SPEED_M_S, but the 3-frame
+                             # (0.018s) spike in it reset a strict timer every time, so the
+                             # dwell could NEVER complete and the placement never scored.
+                             # A lapse longer than this (a genuine re-grasp or a carry
+                             # resuming) does restart the dwell.
 TRIAL_TIMEOUT_S     = 120.0  # trial force-ends (outcome='timeout') past this WALL-clock time
 PINCH_EPS_M         = 0.03   # DexPilot: min(d_s1) below this = operator fingers pinched
                               # (matches DexPilotRetargeter.EPS; kept here as the
@@ -415,6 +429,11 @@ class TrialState:
     drop_t0: float | None = None   # sim-time the current continuous sub-threshold descent began
                                     # (outside the footprint) — gates a drop by DROP_DWELL_S, mirror
                                     # of dwell_t0. Reset whenever height rises back above LIFT_HEIGHT_M.
+    arrive_t0: float | None = None # sim-time the current in-place + settled + released stretch
+                                    # began — gates arrival by ARRIVAL_DWELL_S.
+    arrive_lapse_t0: float | None = None  # sim-time the current momentary lapse of those
+                                    # conditions began. Only a lapse lasting ARRIVAL_LAPSE_S
+                                    # clears arrive_t0, so contact jitter doesn't starve the dwell.
     pick_confirmed: bool = False
     pick_logged: bool = False   # forward phase_enter PICK emitted for the current PICK entry
                                  # (reset on a drop so a re-pick logs PICK again)
@@ -574,7 +593,8 @@ class TrialRunner:
                                 place_xy_offset: float | None = None,
                                 object_speed: float | None = None,
                                 place_marker_half_extent: float = 0.15,
-                                inside_container: bool | None = None):
+                                inside_container: bool | None = None,
+                                hand_touching: bool | None = None):
         """Call every step once REACH has ended (GRASP begins). Drives the attempt /
         dwell / confirm / transport / drop / arrival state machine.
 
@@ -588,6 +608,12 @@ class TrialRunner:
         place_xy_offset: |xy_object - xy_place_site| (metres), or None if not yet
                          relevant (e.g. still in GRASP, not TRANSPORT).
         object_speed:    object linear speed (m/s), for the arrival settle check.
+
+        hand_touching:   True while any robot geom contacts the target object. Gates the
+                         RELEASE half of arrival: a placement means the operator let go, so
+                         an object held motionless inside the bin does not score. Pass None
+                         only where no contact signal is available — the runner then falls
+                         back to `trigger_active` (engaged while the object is grasped).
 
         inside_container: optional 3D-containment predicate for a BOWL/container target
                          (object XY within the rim AND z between the bowl floor and rim).
@@ -651,16 +677,22 @@ class TrialRunner:
                     state.dwell_t0 = None   # reset dwell, SAME attempt continues
 
         elif state.phase == TrialPhase.TRANSPORT:
-            # SET-IN-PLACE arrival. Two success paths, both requiring the object be inside
-            # the place footprint and settled (speed < ARRIVAL_SPEED_M_S):
-            #   (a) held-clear hover: settled while still lifted (height > LIFT_HEIGHT_M) —
-            #       the operator hovers the object over the target and holds it still.
-            #   (b) set down in target: the object is lowered/released INTO the target and
-            #       comes to rest there (height <= LIFT_HEIGHT_M). This is how a human
-            #       actually places — carry over, set down, let go — and is why teleop runs
-            #       that clearly placed the box never scored under the old held-clear-only
-            #       rule (the object was still moving whenever it was above the threshold,
-            #       and the moment it descended it was counted as a drop instead).
+            # SET-IN-PLACE arrival — THREE conditions, all held continuously for
+            # ARRIVAL_DWELL_S:
+            #   (1) IN PLACE: the object is resting on the container (a CONTACT fact — see
+            #       _object_in_bowl: it must touch the bin base, directly or through a stack).
+            #       An object leaning against a wall but with part of it down on the bin floor
+            #       DOES count; one merely wedged against a wall, or hovering inside the rim,
+            #       does not.
+            #   (2) SETTLED: speed < ARRIVAL_SPEED_M_S.
+            #   (3) RELEASED: the robot is no longer touching it. Placement means the operator
+            #       let go — holding an object still inside the bin is not yet a placement.
+            # Height is deliberately NOT part of this test. rest_half_height is referenced to
+            # the TABLE top, while the bin floor sits above it (10mm on the robocasa counter),
+            # so an object fully at rest IN the bin still reads height_above_rest >= LIFT_
+            # HEIGHT_M; and a toppled/leaning object's geom-centre height varies with its
+            # orientation (a wood block on its side vs upright). Contact + release is
+            # orientation- and shape-independent, which position thresholds are not.
             # A descent to/below the threshold OUTSIDE the footprint is still a drop.
             # "in place" = inside the 3D container when given (bowl task), else inside the
             # flat XY footprint (legacy place-site task).
@@ -670,14 +702,35 @@ class TrialRunner:
                 in_place = (place_xy_offset is not None
                             and place_xy_offset <= place_marker_half_extent)
             settled = (object_speed is not None and object_speed < ARRIVAL_SPEED_M_S)
-            if in_place and settled:
-                self.set_phase(state, t_now, TrialPhase.PLACE)   # object placed → finish
-                self.events.log(state.trial_id, t_now, 'arrival',
-                                 attempt=state.attempt_id,
-                                 xy_offset_m=round(place_xy_offset, 4),
-                                 set_down=bool(height_above_rest <= LIFT_HEIGHT_M))
-                state.outcome = TrialOutcome.SUCCESS
-                return True
+            # hand_touching None = caller supplies no contact signal (legacy call site):
+            # fall back to the grasp trigger, which is engaged while the object is held.
+            released = (not bool(trigger_active) if hand_touching is None
+                        else not bool(hand_touching))
+            if in_place and settled and released:
+                state.arrive_lapse_t0 = None      # conditions hold again
+                if state.arrive_t0 is None:
+                    state.arrive_t0 = t_now
+                if t_now - state.arrive_t0 >= ARRIVAL_DWELL_S:
+                    self.set_phase(state, t_now, TrialPhase.PLACE)   # placed → finish
+                    self.events.log(state.trial_id, t_now, 'arrival',
+                                     attempt=state.attempt_id,
+                                     xy_offset_m=(None if place_xy_offset is None
+                                                  else round(place_xy_offset, 4)),
+                                     dwell_s=round(t_now - state.arrive_t0, 3),
+                                     set_down=bool(height_above_rest <= LIFT_HEIGHT_M))
+                    state.outcome = TrialOutcome.SUCCESS
+                    return True
+            elif state.arrive_t0 is not None:
+                # A condition lapsed. Do NOT restart the dwell on the spot: a settled object
+                # still produces brief contact jitter (a 3-frame, 0.018s speed spike was
+                # enough to starve a strict timer forever, so a correct placement never
+                # scored). Tolerate a lapse shorter than ARRIVAL_LAPSE_S; only a sustained
+                # one — the object picked back up, or genuinely moving again — resets it.
+                if state.arrive_lapse_t0 is None:
+                    state.arrive_lapse_t0 = t_now
+                elif t_now - state.arrive_lapse_t0 >= ARRIVAL_LAPSE_S:
+                    state.arrive_t0 = None
+                    state.arrive_lapse_t0 = None
 
             if height_above_rest <= LIFT_HEIGHT_M:
                 # Descended out of the carry. If it came down INSIDE the footprint we do

@@ -6,8 +6,12 @@
 #   ./start_teleop.sh logs      terminal 2: headset app output
 #   ./start_teleop.sh hands     terminal 3: hand publisher  (uplink,  9870)
 #   ./start_teleop.sh sim [MODE] [flags...]   terminal 4: MuJoCo teleop
-#        MODE (default dexpilot): dexpilot | anyteleop |
-#             contact_aware_w_dexpilot | contact_aware_w_anyteleop  (the 2x2 baseline)
+#        MODE (default dexpilot): dexpilot | anyteleop | vwj | vwj_upstream |
+#             contact_aware_w_dexpilot | contact_aware_w_anyteleop | contact_aware_w_vwj
+#             (the baseline conditions; vwj = clean-room whole-arm-hand optimizer,
+#              arXiv:2506.09384; vwj_upstream = the authors' optimizer verbatim, A/B partner)
+#        MODE is optional — anything starting with '-' is treated as a flag, so
+#        `sim --order 3` and `sim anyteleop --order 3` both work.
 #        flags... are forwarded (e.g. --trial-log --object obj_red_box)
 #        anyteleop modes need:  uv sync --extra anyteleop
 #   ./start_teleop.sh viz       optional:   skeleton view
@@ -78,12 +82,21 @@ hands)
 
 sim)
 	ros_env
-	# $2 = --mode value (default dexpilot); $3+ = extra flags (e.g. --trial-log --object).
+	# $2 = MODE (optional, default dexpilot); the rest = extra flags (e.g. --trial-log).
+	# MODE is POSITIONAL and OPTIONAL, so it is only consumed when it is actually a mode
+	# name — i.e. when it does NOT start with '-'. Without that test a leading flag was
+	# swallowed as the mode: `sim --order 3` became `--mode --order ... 3`, which argparse
+	# rejects (or worse, misreads the bare value). Both forms now work:
+	#     ./start_teleop.sh sim --order 3                 (default mode + flags)
+	#     ./start_teleop.sh sim anyteleop --order 3       (explicit mode + flags)
 	# --no-mediapipe is always on: the VR headset (./start_teleop.sh hands) is the sole
 	# /hand/joint_angles publisher, so the app must never spawn a camera publisher.
 	# anyteleop / contact_aware_w_anyteleop need:  uv sync --extra anyteleop
-	MODE="${2:-dexpilot}"
-	if [ "$#" -ge 2 ]; then shift 2; else shift "$#"; fi   # drop 'sim' + mode; rest = extra flags
+	shift                                  # drop 'sim'; $1 is now MODE-or-first-flag
+	case "${1:-}" in
+		-*|"") MODE="dexpilot" ;;          # a flag (or nothing): keep the default mode
+		*)     MODE="$1"; shift ;;         # a real mode name: consume it
+	esac
 	# DP_PROFILE=1 prints the per-iteration wall-time breakdown (retarget / step / draw /
 	# record) so a "sim gets stuck" stall shows which bucket spiked. An env assignment must
 	# precede the command (or the shell tries to exec a program literally named DP_PROFILE=1);
