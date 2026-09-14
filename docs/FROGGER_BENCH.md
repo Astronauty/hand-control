@@ -1049,3 +1049,43 @@ three seeds, `056_tennis_ball` two, `061_foam_brick` one, `014_lemon` one. It fa
 every `036_wood_block` and `009_gelatin_box` seed -- the two non-round objects, which
 is consistent with the mu = 2.0 pattern where the roundest object was also the most
 reliable.
+
+### 14.3 The collapse is geometric, and (7a) has no term to prevent it
+
+FRoGGeR's objective is `maximize l*(q)` -- ONE term, confirmed against (7a)-(7e).
+There is no alignment cost anywhere in their program, so the frogger configuration
+correctly has none, and adding one would not be FRoGGeR.
+
+Measuring what actually changes at mu = 0.7, the contact normals' dot product at the
+solved grasp (-1 = perfectly opposed, +1 = same side), same seeds both runs:
+
+| | median normal dot |
+|---|---|
+| mu = 2.0 | **-0.024** |
+| mu = 0.7 | **+0.858** |
+
+The contacts genuinely migrate to the SAME SIDE of the object. `036_wood_block` is
+the clearest: -0.991 (well opposed) at mu = 2.0 against +0.874 at 0.7, with `l_bar*`
+going +0.453 -> -8.167. So this is not the metric reporting the same grasp more
+harshly; the solve converges somewhere geometrically worse.
+
+**Why the seed does not save it.** Their sampler supplies opposition -- palm aligned
+to an OBB axis, fingers pre-separated by that edge -- and it does straddle the object
+on 60-100% of reachable draws (§11.1). But nothing in (7a) HOLDS the solve there. At
+mu = 2.0 a wide friction cone means many contact pairs are in closure, so `beta`'s
+landscape is broad and the solve stays near its opposed seed. At 0.7 the cone
+narrows, that basin shrinks, and `beta` alone does not pull the contacts back.
+
+Our own configuration does not have this problem because `w_ik` and `w_align` anchor
+the contacts independently of `beta` -- which is exactly the multi-term structure
+FRoGGeR dispenses with.
+
+**This is a real property of the formulation under our conditions, not a port
+defect,** but it is NOT yet a finding about the paper: they pair the minimal objective
+with an Allegro hand, their own IK, and 20 sampler draws per object, any of which
+could keep the solve in the opposed basin where ours drifts out. Reporting it as
+"FRoGGeR fails at realistic friction" would overclaim.
+
+The honest next test is sampler draws: we accept the FIRST straddling draw, while
+they generate many candidates per object. If more draws recover the mu = 0.7 numbers,
+the cause is our thin sampling rather than their objective.
