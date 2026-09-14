@@ -177,6 +177,13 @@ def _draw_block(fig, gs, col0, recs, sc, header, ok, solved=None):
     """
     for j, rec in enumerate(recs):
         ax = fig.add_subplot(gs[0, col0 + j], projection="3d")
+        # WHICH ACCEPTED SEED WON. solve() runs a full NLP per accepted seed and
+        # keeps the cost-ranked best, so without this every accepted panel looks
+        # equally chosen and the reader cannot tell which one produced the grasp
+        # that actually executed. rec['winner'] is set by the caller from
+        # res['seed_index'].
+        is_winner = bool(ok and rec.get("winner"))
+        _stage_frames = rec.get("stage_frames") if is_winner else None
         # ONE PANEL PER SEED. The patch row used to be a separate, patch-zoomed
         # axes below this one, on the assumption that a patch is small next to
         # its object and needs its own framing. Measured, it is not: patch
@@ -191,11 +198,22 @@ def _draw_block(fig, gs, col0, recs, sc, header, ok, solved=None):
         for key, p, nin in _contacts_of(rec):
             if key == "middle":
                 continue          # shares slot 2's patch; marked, not re-drawn
-            try:
-                frame = SQ.quad_frame(sc, np.asarray(p, float),
-                                      np.asarray(nin, float), sc["cfg"])
-            except Exception:
-                frame = None
+            # PREFER THE FRAME THE SOLVE ACTUALLY USED. Rebuilding it here with
+            # quad_frame() re-runs _mesh_quadratic_contact_ca at THIS record's
+            # seed, which is not the point the winning stage was built on --
+            # measured 24mm apart in y on 036_wood_block seed 1 -- so the drawn
+            # rectangle did not correspond to the solved t_var, and a solution
+            # strictly inside its bounds (t1 = +86.87 against +86.88) appeared
+            # to sit outside its own trust region. res['quad_frames'] carries
+            # the real thing; the rebuild stays as the fallback for records
+            # that have none (rejected seeds never reached a stage).
+            frame = (_stage_frames or {}).get(key) if is_winner else None
+            if frame is None:
+                try:
+                    frame = SQ.quad_frame(sc, np.asarray(p, float),
+                                          np.asarray(nin, float), sc["cfg"])
+                except Exception:
+                    frame = None
             if frame is None:
                 continue
             # OPAQUE + DEPTH SORTED, so a nearer patch actually hides the part
@@ -228,13 +246,20 @@ def _draw_block(fig, gs, col0, recs, sc, header, ok, solved=None):
         for key, p, nin in _contacts_of(rec):
             _mark(ax, _lift(p, nin), "o", _FCOL(key), 7.0, 20)
             pts.append(np.asarray(p, float)[None, :])
-        # SOLVED positions: same colour, as a triangle.
-        if ok and solved is not None:
+        # SOLVED positions: same colour, as a triangle. ONLY on the winning
+        # panel -- res['p1']/['p2'] are the contacts of the seed that WON, so
+        # drawing them on a losing accepted panel would show that panel's seed
+        # next to a different seed's solution and invite exactly the
+        # "solution is off its patch" misreading this figure exists to settle.
+        if is_winner and solved is not None:
             _overlay_solved(ax, solved,
                             normals={k: n for k, _p, n in _contacts_of(rec)})
 
-        ax.set_title("accepted" if ok else rec["why"], fontsize=8.5,
-                     color="0.15" if ok else "#cb181d", pad=1.0)
+        _title = ("accepted -- SELECTED" if is_winner
+                  else "accepted" if ok else rec["why"])
+        ax.set_title(_title, fontsize=8.5,
+                     color=("#08519c" if is_winner else "0.15") if ok else "#cb181d",
+                     fontweight=("bold" if is_winner else "normal"), pad=1.0)
         # WORLD frame, framed on the whole object: draw_mesh draws the full
         # shell in world, and with the patches this large there is nothing to
         # gain by cropping to them.
@@ -273,6 +298,16 @@ def write_seed_figure(planner, model, data, out_path, title_extra="", res=None):
         _solved = {"p1": res["p1"], "p2": res["p2"]}
         if res.get("p3") is not None:
             _solved["p3"] = res["p3"]
+    # WINNER + ITS REAL PATCH FRAMES. solve() runs one NLP per accepted seed and
+    # keeps the cost-ranked best; res['seed_index'] says which accepted seed
+    # that was, and res['quad_frames'] carries the paraboloid frames that stage
+    # actually built. Tagging the record lets the panel both mark itself as the
+    # selected one and draw the patch the contact was genuinely confined to
+    # rather than a plot-time reconstruction at a different seed point.
+    _win = res.get("seed_index") if res is not None else None
+    if _win is not None and 0 <= int(_win) < len(acc):
+        recs[int(_win)]["winner"] = True
+        recs[int(_win)]["stage_frames"] = (res.get("quad_frames") or {})
 
     n = len(recs)
     n_acc = len(acc)

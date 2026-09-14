@@ -1966,6 +1966,7 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
                                mesh_fit: bool = False, mesh_fit_radius: float = 0.04,
                                mesh_fit_quad_gain_min: float = 0.5,
                                bound_inset: float = 0.0,
+                               extent_clip: bool = True,
                                bound_keep_frac: float = 0.5):
     """Mesh contact as a 2-DOF offset along the two PRINCIPAL CURVATURE AXES at
     the seed, placed on a LOCAL QUADRATIC (paraboloid) surrogate of the
@@ -2129,6 +2130,62 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
         mesh_entry, seed_l, axis0_l, axis1_l, n_l_unit,
         kappa0, kappa1, grad_norm, (t_lo_0, t_hi_0, t_lo_1, t_hi_1),
         tol=sdf_err_tol)
+
+    # EXTENT CLIP: bound each axis by how far the OBJECT actually reaches along
+    # it, not only by how far the surrogate stays accurate.
+    #
+    # WHY THE SDF SEARCH IS NOT ENOUGH. _sdf_axis_bound_np stops where the
+    # paraboloid departs from the true SDF. On a FLAT face a plane tracks the
+    # surface perfectly, so nothing departs and the search runs the whole way
+    # and returns t_bound_max -- it reports the CAP, not the face. Measured on
+    # 036_wood_block (a 206mm-tall post): the raw long-axis bounds came back at
+    # exactly 100.0mm, 100.0mm, 99.6mm, 99.2mm against a 100mm cap, i.e.
+    # saturated rather than measured, and raising the cap to 300mm changed
+    # nothing because the file value in models/grasp_seed_config.json wins. The
+    # NLP then legitimately walked the contacts ~87-89mm up the face to the
+    # block's top edge (inside their bounds, quad_pinned=True), where the
+    # fingers cannot oppose each other -- the thumb contacted alone at 33N and
+    # shoved the block off the table.
+    #
+    # The honest bound on a flat face is the face's own reach. Project the hull
+    # vertices onto each patch axis (about the seed) and take the extent in each
+    # direction; that is where the surface ends regardless of how well the
+    # surrogate fits up to it.
+    #
+    # NO DOUBLE-COUNTING WITH bound_inset. This clip runs BEFORE the inset and
+    # only ever MOVES A SIDE INWARD (min/max against the existing value), so the
+    # inset that follows measures its reserve against the already-clipped room:
+    # _inset_for reads `_room = min(|lo|,|hi|)` from these post-clip values, and
+    # its bound_keep_frac cap therefore applies to the real remaining room. The
+    # two are sequential shrinks of the same interval, not two independent
+    # subtractions of the same margin -- an axis clipped to the face edge then
+    # gets the crease reserve taken out of what is left, which is exactly once.
+    # Only vertices ON THIS FACE count. Projecting the whole hull measures the
+    # object's bounding extent, which on 036_wood_block is +/-103mm along the
+    # long axis -- LOOSER than the 89mm already there, so it clipped nothing
+    # (verified: bounds unchanged). A contact on one side face must be bounded
+    # by where THAT face ends, so the vertex set is first restricted to those
+    # lying in the patch plane: |(v - seed) . n| <= _FACE_BAND, with n the
+    # patch's own outward normal. A vertex on an adjacent face fails that test
+    # because it departs the plane, which is exactly the boundary being sought.
+    if (extent_clip and mesh_entry is not None
+            and mesh_entry.get("verts") is not None):
+        _V = np.asarray(mesh_entry["verts"], float)
+        _d = _V - np.asarray(seed_l, float).reshape(1, 3)
+        _FACE_BAND = 2.0e-3      # m; a vertex further off the plane is another face
+        _on_face = np.abs(_d @ np.asarray(n_l_unit, float).reshape(3)) <= _FACE_BAND
+        if int(_on_face.sum()) >= 3:
+            _df = _d[_on_face]
+            for _ax, _nm in ((axis0_l, 0), (axis1_l, 1)):
+                _proj = _df @ np.asarray(_ax, float).reshape(3)
+                _hi_ext = float(_proj.max())
+                _lo_ext = float(_proj.min())
+                if _nm == 0:
+                    t_hi_0 = min(t_hi_0, max(_hi_ext, 0.0))
+                    t_lo_0 = max(t_lo_0, min(_lo_ext, 0.0))
+                else:
+                    t_hi_1 = min(t_hi_1, max(_hi_ext, 0.0))
+                    t_lo_1 = max(t_lo_1, min(_lo_ext, 0.0))
 
     # CONSTANT INSET on every side, applied LAST.
     #
@@ -3676,6 +3733,25 @@ class UVAtlasConfig:
     # least where a contact is nearly on the crease. Constant target, fractional
     # cap: conservative at both ends.
     quadratic_bound_keep_frac: float = 0.5
+
+    # Clip each patch axis by how far the OBJECT's own face reaches along it,
+    # in addition to how far the SURROGATE stays accurate.
+    #
+    # _sdf_axis_bound_np stops where the paraboloid departs from the true SDF.
+    # On a FLAT face a plane tracks the surface perfectly, nothing departs, and
+    # the search runs the whole range and returns quadratic_t_bound_max -- it
+    # reports the CAP, not the face. Measured on 036_wood_block: raw long-axis
+    # bounds came back at exactly 100.0/100.0/99.6/99.2mm against a 100mm cap.
+    #
+    # Restricted to vertices lying IN the patch plane (|(v-seed).n| <= 2mm),
+    # because projecting the whole hull measures the object's bounding extent,
+    # which on that block is +/-103mm along the long axis -- looser than the
+    # 89mm already present, so it clipped nothing.
+    #
+    # Runs BETWEEN the corner shrink and bound_inset, and only ever moves a side
+    # INWARD, so the inset that follows takes its crease reserve out of the
+    # already-clipped room rather than double-subtracting the same margin.
+    quadratic_extent_clip: bool = True
     # Fit the local patch's curvature to the VISUAL MESH vertices around the
     # seed instead of to the SDF Hessian. The SDF's second derivative is a
     # global quantity and reports curvature belonging to nearby features rather
@@ -5032,6 +5108,7 @@ class GraspPlanner3D:
                     mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
                     mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
                     bound_inset=cfg.quadratic_bound_inset,
+                    extent_clip=cfg.quadratic_extent_clip,
                     bound_keep_frac=cfg.quadratic_bound_keep_frac)
                 _t2_var, _p2, _t2_bounds, _t2_frame = _mesh_quadratic_contact_ca(
                     _opti, p2_ws, _n2_seed_out, obj_center_np, obj_R_np, self._mesh_entry,
@@ -5041,6 +5118,7 @@ class GraspPlanner3D:
                     mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
                     mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
                     bound_inset=cfg.quadratic_bound_inset,
+                    extent_clip=cfg.quadratic_extent_clip,
                     bound_keep_frac=cfg.quadratic_bound_keep_frac)
                 # THIRD contact SHARES contact 2's patch (index + middle on one
                 # paraboloid, each with its own 2-DOF coordinate inside the SAME trust
@@ -5096,6 +5174,7 @@ class GraspPlanner3D:
                         mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
                         mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
                     bound_inset=cfg.quadratic_bound_inset,
+                    extent_clip=cfg.quadratic_extent_clip,
                     bound_keep_frac=cfg.quadratic_bound_keep_frac)
                 elif _has_c3:
                     # SHARED patch (ablation baseline). Contact 3 is reconstructed
@@ -6455,6 +6534,22 @@ class GraspPlanner3D:
                     'gws_alpha':     (np.asarray(_sol.value(_gws_alpha), float).flatten().tolist()
                                        if _gws_alpha is not None else None),
                     'quad_pinned':   _quad_pinned(_sol.value),
+                    # The paraboloid frames THIS stage actually built, so a
+                    # figure can draw the patch the contact was really confined
+                    # to instead of reconstructing one. seed_figure.py used to
+                    # call quad_frame() at plot time, which re-runs
+                    # _mesh_quadratic_contact_ca on a throwaway Opti at the
+                    # accept-table's seed -- a DIFFERENT point from the one the
+                    # winning stage was built on (measured 24mm apart in y on
+                    # 036_wood_block seed 1), so the drawn rectangle did not
+                    # correspond to the solved t_var and the solution appeared
+                    # to sit outside its own trust region when it was strictly
+                    # inside it (t1 solved +86.87 against a +86.88 bound).
+                    # Frames are numpy-only, so they serialize cleanly.
+                    'quad_frames':   {
+                        'thumb': _t1_frame, 'index': _t2_frame,
+                        'middle': _t3_frame,
+                    },
                     'grad_z':        _eval_grad_z(_sol.value),
                 }
             except Exception as _e:
@@ -7784,7 +7879,8 @@ class MultiStartGraspPlanner3D:
                                 mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
                                 mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
                                 bound_inset=cfg.quadratic_bound_inset,
-                    bound_keep_frac=cfg.quadratic_bound_keep_frac)
+                                extent_clip=cfg.quadratic_extent_clip,
+                                bound_keep_frac=cfg.quadratic_bound_keep_frac)
                         except Exception as _pe:
                             log.debug(f"[seed {i+1}] patch fit for c3 seeding failed: {_pe}")
                             _c3_patch_frame = None
@@ -7961,6 +8057,11 @@ class MultiStartGraspPlanner3D:
             r['p1_seed']  = seed['p1s'].copy()
             r['p2_seed']  = seed['p2s'].copy()
             r['seed_meta'] = seed
+            # Which accepted seed this result came from, so the paired seed
+            # figure can mark the WINNER rather than leaving all accepted
+            # panels visually identical. Index into the accept table, which is
+            # built from `seeds` in the same order.
+            r['seed_index'] = i
             results.append(r)
 
         if not results:
