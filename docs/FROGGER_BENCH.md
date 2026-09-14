@@ -1140,3 +1140,50 @@ test for that.
 Note the cost: a failing cell now burns the full 60-second budget, which is why the
 median solve time rose 5.5 s -> 17.5 s. That is the protocol working as specified,
 not a regression.
+
+## 16. Execution scoring: what is measured
+
+### 16.1 Their rubric (Sec. IV), reproduced exactly
+
+A binary PICK SUCCESS per trial. A pick fails if any of:
+
+| criterion | threshold |
+|---|---|
+| object rotation from its pre-lift orientation | > 30 deg |
+| object deviation from the pick trajectory, at any point | > 7.5 cm |
+| total grasp synthesis time | > 60 s |
+
+on a fixed trajectory: lift 10 cm in 1 s, hold 1.5 s, 3 mm sinusoidal perturbation
+in all spatial axes from 0.25 s onward. They run 20 trials per object and report the
+success RATE -- 78.8% overall (spheroid 95.3%, box/cylinder 81.6%, adversarial
+63.0%). That is their whole execution rubric; everything else in Table I is
+planning-side.
+
+### 16.2 Trial count: one execution per planned grasp
+
+Their 20 trials per object sample STOCHASTIC SYNTHESIS -- each trial re-runs the
+sampler and solver. Our benchmark already varies that through its seeds, and our
+execution is deterministic (same plan, same physics, same result), so repeating one
+plan adds nothing. Each of the 18 object-seed cells is executed ONCE and the rate is
+taken across cells. Comparable to their per-category rates once the object sets are
+matched, which they are not yet (§15.1).
+
+### 16.3 What is recorded beyond the binary
+
+Their criteria are pass/fail and trajectory-relative, which admits a false pass: an
+object that never moves BECAUSE IT WAS NEVER PICKED UP has zero deviation and zero
+rotation. This repo has already produced exactly that failure mode -- a run reported
+`release_done` with 0.0 N on both fingers, the object riding inside the hand.
+
+So alongside their rubric:
+
+| quantity | why |
+|---|---|
+| `success`, `fail_reason` | theirs, verbatim |
+| peak rotation (deg), peak deviation (m) | continuous, not just pass/fail -- failing at 31 deg and at 120 deg are different results, and at 18 cells the continuous form carries far more than a binary |
+| min squeeze force during the hold | the guard against the false pass above. A grasp with no force is not a grasp, whatever the trajectory says |
+| contact lost during the jog | whether any fingertip force reached zero mid-motion |
+| achieved lift height | separates "held but did not rise" from "rose and held" |
+
+The primary reported number stays their binary rate; the rest are diagnostics that
+make a failure legible rather than redefining success.
