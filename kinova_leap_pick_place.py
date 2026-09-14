@@ -1222,9 +1222,16 @@ if __name__ == "__main__":
     if args.trial_log:
         for _oi, _o in enumerate(objects):
             _bid = _o['id_body']
+            # Use the COMPILED contype snapshot (_geom_contype0, taken before any stow),
+            # NOT the live contype/conaffinity. Under --sequential-spawn, objects 2..N are
+            # STOWED at startup (contype/conaffinity zeroed) BEFORE this runs, so filtering
+            # on the live flags would find NO hulls for a stowed multi-hull mesh (e.g. the
+            # 43-hull 025_mug) and fall back to just <name>_geom — then its placement /
+            # grasp on a different _col_N hull silently never registers (observed: the mug
+            # placed in the bin was never detected). The compiled snapshot captures every
+            # real collision hull regardless of the current stow state.
             _gl = [g for g in range(model.ngeom)
-                   if model.geom_bodyid[g] == _bid
-                   and (model.geom_contype[g] or model.geom_conaffinity[g])]
+                   if model.geom_bodyid[g] == _bid and _geom_contype0[g] != 0]
             # Fall back to the named geom if somehow no collision hull was found.
             _OBJ_COL_GIDS[_oi] = _gl or [_o['id_geom']]
             _OBJ_COL_GID_SET[_oi] = set(_OBJ_COL_GIDS[_oi])
