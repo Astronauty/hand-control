@@ -205,9 +205,18 @@ def _frogger_seed(model, data, info, body_name, q_home, roles, seed,
 
 
 def plan_one(arm, object_id, seed, *, n_seeds=3, max_iter=80, fingers=None,
-             k_l=0.3, sdf_normals=True):
-    """Plan (not execute) one grasp with one arm, and score it."""
-    model, data, info = TS.build([object_id])
+             k_l=0.3, sdf_normals=True, mu=None):
+    """Plan (not execute) one grasp with one arm, and score it.
+
+    mu : object-geom sliding friction. None keeps table_scene's default (2.0),
+        which every existing tabletop result was measured at. FRoGGeR simulates at
+        0.7, and the metric is strongly friction-dependent -- l_bar* on an antipodal
+        pinch at 100-degree splay is +0.58 at 2.0 and -0.20 at 0.7 -- so a
+        cross-paper comparison needs this set to 0.7.
+    """
+    _fric = None if mu is None else (float(mu), 0.05, 0.005)
+    model, data, info = (TS.build([object_id]) if _fric is None
+                         else TS.build([object_id], friction=_fric))
     body_name = next(iter(info))
     TS.settle(model, data)
     pos, _ = TS.object_pose(model, data, body_name, info)
@@ -363,6 +372,12 @@ def main():
     ap.add_argument("--patch-normals", action="store_true",
                     help="run the frogger arm on PATCH normals instead of the SDF "
                          "gradient, isolating objective structure from normal source.")
+    ap.add_argument("--mu", type=float, default=None,
+                    help="object-geom sliding friction. Default None keeps "
+                         "table_scene's 2.0, which every existing tabletop result "
+                         "was measured at. Pass 0.7 for the paper's regime -- the "
+                         "metric is strongly friction-dependent and l_bar* is NOT "
+                         "comparable across different values.")
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--no-artifacts", dest="artifacts", action="store_false",
                     help="skip per-solve renders (the scored table is unaffected)")
@@ -385,7 +400,7 @@ def main():
                 try:
                     r, ctx = plan_one(arm, obj, sd, n_seeds=args.n_seeds,
                                       max_iter=args.max_iter, fingers=fingers,
-                                      k_l=args.k_l,
+                                      k_l=args.k_l, mu=args.mu,
                                       sdf_normals=not args.patch_normals)
                     if args.artifacts:
                         # out/tabletop/<tag>/<arm>/<object>/ -- the arm level keeps
