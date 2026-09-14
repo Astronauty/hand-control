@@ -597,6 +597,9 @@ def for_frogger(obj_name: str, arm_geom_names: list,
         # constraint against a single tol_pr -- see
         # GraspConfig3D.frogger_tol_scaling.
         cfg_kw.setdefault('frogger_tol_scaling', True)
+        # Optimize and certify against MuJoCo's combined contact friction, not a
+        # derate of it -- see GraspConfig3D.frogger_raw_friction.
+        cfg_kw.setdefault('frogger_raw_friction', True)
 
     # (7e): a NEGATIVE margin d_j on FINGER-OBJECT pairs, which the paper states
     # explicitly. Applied to the ACTIVE fingers' geoms against the target object

@@ -3540,6 +3540,33 @@ class UVAtlasConfig:
     # behavior and what every non-frogger config keeps.
     frogger_tol_scaling:    bool = False
     frogger_tol_pr:         float = 1e-5
+
+    # Use MuJoCo's COMBINED contact friction directly, with no safety derate.
+    #
+    # The planner normally optimizes and certifies against `0.8 * mu` -- a margin
+    # for the gap between the rigid-contact model and reality. FRoGGeR instead
+    # simulates at mu = 0.7 and optimizes at 0.5, i.e. it derates too, so the derate
+    # itself is not the mismatch. The mismatch is the VALUE: MuJoCo combines
+    # friction as the elementwise MAX of the two geoms, and our object geom is 2.0
+    # against fingertips already at 0.5, so the contact sees 2.0 and the planner
+    # optimizes at 1.6 -- more than 3x the paper's regime.
+    #
+    # That matters because the metric is strongly friction-dependent. Normalized
+    # l_bar* on an antipodal pinch at 100-degree splay is +0.5805 at mu = 2.0 and
+    # -0.1987 at 0.7: a grasp that closes in our scene does not close in theirs.
+    #
+    # WHAT THIS ACTUALLY CHANGES, measured: the NLP's own wrench matrix ALREADY uses
+    # raw friction (`_mu = round(1 * _mu_raw, 3)`), so the objective was never
+    # derated. Only `verify()` and the post-solve gamma LP applied the 0.8x. The two
+    # therefore described DIFFERENT friction -- the objective optimizing at mu = 2.0
+    # while its own certificate judged it at 1.6 -- which is a pre-existing
+    # inconsistency rather than a deliberate safety margin on the metric.
+    #
+    # Setting this makes the certificate agree with the objective. It does NOT make
+    # l_bar* comparable to the paper's numbers: that needs the SCENE's friction
+    # changed from 2.0 to their 0.7, which would invalidate every existing tabletop
+    # result and is deliberately not done here.
+    frogger_raw_friction:   bool = False
     quadratic_t_bound_max:  float = 0.10    # metres, cap even where the surface stays flat
     quadratic_sdf_err_tol:  float = 4e-3    # metres, max surrogate-vs-true-SDF gap per axis
     # Constant amount (m) shaved off EVERY side of the trust-region rectangle
@@ -6665,7 +6692,10 @@ class GraspPlanner3D:
                 _inert_v = model.body_inertia[_bid_v]
                 _aab_v   = cfg.ang_accel_budget_xyz
                 _mu_v_raw, _ = _contact_friction(model, self._obj_gid, self._thumb_gid, self._index_gid)
-                _mu_v    = round(0.8 * _mu_v_raw, 3)
+                # Same derate gate as the NLP's W, so the certificate and the
+                # objective describe one friction rather than two.
+                _mu_v    = (round(_mu_v_raw, 3) if cfg.frogger_raw_friction
+                            else round(0.8 * _mu_v_raw, 3))
                 R_WO_v   = data_v.xmat[_bid_v].reshape(3, 3)
                 _g_O_v   = R_WO_v.T @ model.opt.gravity
                 _ab_v    = cfg.accel_budget_xyz
@@ -6938,7 +6968,10 @@ class MultiStartGraspPlanner3D:
         _ab    = cfg.accel_budget_xyz
         _aab   = cfg.ang_accel_budget_xyz
         _mu_raw2, _ = _contact_friction(model, obj_gid, self._planner._thumb_gid, self._planner._index_gid)
-        _mu    = round(0.8 * _mu_raw2, 3)
+        # frogger_raw_friction: no 0.8 derate -- optimize against the friction
+        # MuJoCo will actually apply. See GraspConfig3D.frogger_raw_friction.
+        _mu    = (round(_mu_raw2, 3) if cfg.frogger_raw_friction
+                  else round(0.8 * _mu_raw2, 3))
         _nlp_fx = _mass * (_ab[0] + abs(_g_O[0]))
         _nlp_fy = _mass * (_ab[1] + abs(_g_O[1]))
         _nlp_fz = _mass * (_ab[2] + abs(_g_O[2]))
