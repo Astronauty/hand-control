@@ -103,12 +103,15 @@ Changed in `d9d2a16`, and the old behaviour invited a specific misreading:
   appear to sit outside its own trust region. The rebuild remains the fallback for records
   with no stage frame (rejected seeds never reached a stage).
 
-**Consequence worth knowing:** because the deterministic seed goes in first and usually
-wins the ranking, varying the planner's `seed` produces NO variation on rigid symmetric
-objects (measured: wood block identical across seeds 0/1/2), and only mild variation on
-spheres/cups. `seed` is plumbed through `MultiStartGraspPlanner3D(..., seed=)`; the
-per-seed `q_ref` jitter (`qref_restart_sigma_arm/hand`) is 0.0 by default, so the RNG's
-only live effect is `_seed_pair`'s march directions.
+**Consequence worth knowing:** `seed` is plumbed through
+`MultiStartGraspPlanner3D(..., seed=)`; the per-seed `q_ref` jitter
+(`qref_restart_sigma_arm/hand`) is 0.0 by default, so the RNG's only live effect is
+`_seed_pair`'s march directions. That is still enough to move the result: **the earlier
+claim that varying `seed` produces NO variation on rigid symmetric objects is FALSE** and
+is corrected here. Measured at `2bcfae3`, `036_wood_block` tripod across seeds 0/1/2 gives
+`gamma_min` 34.06 / 44.75 / 59.73 and `014_lemon` 4.94 / 1.28 / 1.70. The deterministic
+minor-axis seed goes in first and often wins, but the random candidates that fill the rest
+of the `n_seeds` budget do change the pool it is ranked against.
 
 ### The third contact (`n_contacts >= 3`)
 
@@ -720,9 +723,36 @@ Hessian — 0/21; `hessian_approximation=exact` fails outright, 0 Lagrangian Hes
 evaluations, the constraints are not twice-differentiable here), and `max_iter=300` still
 hits `Maximum_Iterations_Exceeded` every time.
 
-`n_seeds` 5->3 is safe because of `seed_dls_rank_pool=3`: candidates are already ordered by
-DLS-IK arm reachability, so seeds 4-5 were the worst of the pool. Dropping them was
-bit-identical on `014_lemon` and `056_tennis_ball` at 40% less time.
+`n_seeds` 5->3 was justified by `seed_dls_rank_pool=3` ordering candidates by DLS-IK arm
+reachability, so seeds 4-5 were "the worst of the pool". Dropping them was bit-identical on
+`014_lemon` and `056_tennis_ball` at 40% less time, which stands as an empirical result.
+**But the stated reason does not hold: DLS residual does NOT predict grasp quality.**
+Measured at `f173ee0`, 5 objects, 3 DLS-ranked candidates each, all solved so realised NLP
+cost is known:
+
+| object | DLS residuals (mm) | rank of the DLS-BEST candidate by cost |
+|---|---|---|
+| `017_orange` | 45.3 / 55.2 / 56.1 | 2 of 3 |
+| `014_lemon` | 24.9 / 26.3 / 29.4 | 2 of 3 |
+| `056_tennis_ball` | 25.7 / 29.5 / 30.6 | **3 of 3** |
+| `036_wood_block` | 23.8 / 25.1 / 25.3 | **3 of 3** |
+| `009_gelatin_box` | 26.6 / 26.8 / 26.9 | **3 of 3** |
+
+The DLS-best candidate was cost-best in **0 of 5** objects and was WORST in 3 of 5. On
+`056_tennis_ball` it did not even converge (`best-effort`, `wrench_ok=False`) while the
+DLS-worst candidate converged at cost 4.45. If anything the correlation is mildly negative.
+
+This is structural, not noise: `_dls_residual` scores whether the ARM CAN REACH a contact
+pair; `cost`/`gamma_min` score whether the CONTACTS RESIST WRENCHES. Reachability does not
+imply force quality, and the residuals barely separate anyway (`009_gelatin_box` spans
+0.3 mm across its three candidates). It is the same mistake the "one seed per object"
+caveat below already records twice.
+
+**Consequence: DLS pre-ranking cannot replace multi-start.** Ranking N candidates and
+solving only the top one would have picked a non-converging grasp on `056_tennis_ball`.
+The DLS screen earns its place as a reachability FILTER (it rejected 7 of 10 candidates
+here) but cannot ORDER the survivors by quality -- only the NLP does that, and ranking by
+realised cost means paying for one NLP per candidate.
 
 **Backend: IPOPT kept.** SQP+OSQP was compared under an identical NLP (`use_slsqp` touches
 only which plugin `Opti` gets, plus a log label; every cost term, constraint, bound and seed
