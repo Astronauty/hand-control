@@ -2599,7 +2599,7 @@ if __name__ == "__main__":
             # Higher = less reach needed but coarser precision + more tremor amplification. This
             # is the VR path's value (the config's abs_scale is for the MediaPipe path). Re-run
             # dropout_analyze to verify / retune.
-            "abs_scale": 3.0,
+            "abs_scale": 2.0,
             "scale_x": 1.0,                # already metres
             "scale_z": 1.0,
             "identity_orientation": True,  # direct hand->wrist, no press-8 offset
