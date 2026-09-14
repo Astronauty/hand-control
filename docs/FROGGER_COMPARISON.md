@@ -307,3 +307,69 @@ Until that lands, **do not compare this port's solve times to the paper's**: the
 difference measures our gradient implementation, not their method. The `l_bar*`
 values are unaffected, since the finite-differenced gradient converges to the same
 place, only slower.
+
+---
+
+## 7. Careful re-read: where the port still differs (2026-09-14)
+
+### 7.1 FIXED: the friction cone had an extra vertex, and it broke `beta`
+
+FRoGGeR: "a 4-sided pyramidal approximation of the friction cone" (App. B-F). Ours
+returned 5 rows -- the ORIGIN plus 4 edges.
+
+The origin's wrench column is identically zero, so it is unconstrained by
+`W alpha = 0`: alpha_j may take any value without touching the equality. The LP then
+has a degenerate optimum available -- put the entire `sum(alpha) = 1` budget on a
+zero column, every other weight at 0, `beta = 0`, no gradient. Measured on a
+110-degree-splay pinch at mu = 0.6, genuinely not force closure:
+
+| cone | alpha at the optimum | `beta` |
+|---|---|---|
+| 5-vertex (ours) | `[1, 0, 0, ...]` | **-0.000000** |
+| 4-sided (theirs) | non-degenerate | **-0.020880** |
+
+This destroys the exact property the min-weight relaxation exists for: that `l*`
+stays smoothly climbable when the grasp is NOT yet in closure (their Sec. II-A). It
+is consistent with the frogger configuration returning exactly 0 on 20 of 36
+benchmark cells. After the fix `beta` descends properly (-0.167 at 110 degrees,
+-0.667 at 90).
+
+Scoped to the min-weight path; the wrench-cone LP keeps its origin, where "this
+contact carries no force" is a legitimate mode.
+
+### 7.2 OPEN: our friction coefficient is ~3x theirs
+
+| | FRoGGeR | this benchmark |
+|---|---|---|
+| simulation `mu` | 0.7 | **2.0** (`table_scene.build` default) |
+| optimizer `mu` | 0.5 (a deliberate derate) | `0.8 * mu` = 1.6 |
+
+The metric is highly sensitive to this. Normalized `l_bar*` on an antipodal pinch:
+
+| splay | mu = 2.0 | mu = 0.7 |
+|---|---|---|
+| 180 deg | 1.0000 | 1.0000 |
+| 150 deg | 0.8660 | 0.6172 |
+| 120 deg | 0.7113 | 0.1752 |
+| 100 deg | 0.5805 | **-0.1987** |
+
+At mu = 2.0 a 120-degree splay still closes; at 0.7 it does not. **Our `l_bar*`
+values are therefore not comparable to the paper's**, and the `k_l = 0.3` floor is
+far easier to clear here than in their regime. Changing the scene friction would
+also invalidate every existing tabletop result, so this is recorded rather than
+changed unilaterally.
+
+### 7.3 Confirmed matching
+
+Audited against the paper: `k_l = 0.3`; 3 mm fingertip/object interpenetration and
+1 mm elsewhere; SLSQP solver family; bilevel LP with analytic KKT gradients; exact
+collision distance with the eq. (8) analytic gradient; FK contacts with a fixed
+contact point; `beta` normalized by `n_cols`; and no objective term besides `beta`.
+
+### 7.4 Still not applied
+
+Their per-constraint tolerances (Table III: joint 1e-2, surface contact 5e-4,
+collision 1e-3, force closure 1e-5). This solver exposes a single constraint
+tolerance, so matching them requires scaling each constraint so that one tolerance
+means the right thing for each -- e.g. dividing the surface residual by 5e-4 and the
+collision residual by 1e-3. Not yet done.
