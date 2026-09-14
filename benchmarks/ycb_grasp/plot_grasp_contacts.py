@@ -14,6 +14,8 @@ the same way:
     pale wireframe beyond it (where the surrogate is extrapolating)
   * per-contact zoom, because a pair's two contacts sit on opposite sides of
     the object and framing both at once makes a ~10mm patch unreadable
+  * one panel per contact, at n=2 OR n=3 -- the tripod's third contact is
+    drawn from the trace's quad3_* frame exactly like the other two
   * max |true SDF| over the drawn patch reported per contact, so the picture
     carries its own error bar
 
@@ -22,8 +24,6 @@ Differences from the seed version, all because these are SOLVED contacts:
   * the solved (t0,t1) is marked inside the trust region, so a contact pinned
     against its own bound (the thing quadratic_pin_frac tests, see
     GraspConfig3D) is visible as a dot on the patch edge
-  * an overview panel shows both contacts on the whole object with the grasp
-    axis between them
 
 Used by pick_and_place.py in place of the quadratic-path figure. Reads the
 same per-stage npz trace and the same attempt-matching logic
@@ -47,8 +47,14 @@ except ImportError:
 FINGER_COLORS = {
     1: ("#d94801", "#fdd0a2"),   # thumb  — orange
     2: ("#2171b5", "#c6dbef"),   # index  — blue
+    3: ("#238b45", "#c7e9c0"),   # middle — green
 }
-FINGER_NAMES = {1: "thumb", 2: "index"}
+# SLOT labels, not finger identities. Slot 3 is whatever --fingers names third;
+# 'middle' is only the default pairing's third entry. kinova_common.constants
+# owns the real slot->finger mapping (SLOT_ROLES) and the executor binds them
+# positionally -- this table exists so a panel has a caption, and deliberately
+# does not try to re-derive that mapping from a trace that never recorded it.
+FINGER_NAMES = {1: "thumb", 2: "index", 3: "middle"}
 
 
 def _patch_points(frame, t0_range, t1_range, n=13):
@@ -112,19 +118,20 @@ def _to_world(P_l, center, R):
 
 
 def build_grasp_contacts_figure(V, F, stage, object_id, sdf_fn=None,
-                                verify_info=None, elev=18.0, azim=-60.0, n_relin=None,
+                                verify_info=None, elev=18.0, azim=-60.0,
                                 max_tris=3000):
-    """Build (but do not save) the solved-grasp-contacts figure. Returns the
-    matplotlib Figure, or None when the stage carries no contacts. Shared by
-    plot_grasp_contacts (-> file) and, via kinova_common.seed_figure, the live
-    dashboard (-> PNG bytes). `max_tris` caps the mesh scatter per subplot so a
-    live render stays cheap.
+    """Build (but do not save) the solved-grasp-contacts figure: one zoomed
+    panel per solved contact. Returns the matplotlib Figure, or None when the
+    stage carries no contacts. Shared by plot_grasp_contacts (-> file) and, via
+    kinova_common.seed_figure, the live dashboard (-> PNG bytes). `max_tris`
+    caps the mesh scatter per subplot so a live render stays cheap.
 
     V, F     : object visual mesh, BODY frame (object_uv_atlas.body_visual_mesh)
     stage    : ONE per-stage dict from
                plot_quadratic_path._iter_trace_quadratic_stages -- normally the
                LAST (the returned solve); carries obj_center/obj_mat and a
-               `contact` map {1: frame, 2: frame} of quad_* params.
+               `contact` map {1: frame, 2: frame[, 3: frame]} of quad_*
+               params -- key 3 only at n_contacts >= 3.
     sdf_fn   : optional f(p_local)->signed distance. When given, each panel
                reports max |true SDF| over its drawn patch, the same error bar
                plot_seed_quadratic.py shows.
@@ -132,15 +139,48 @@ def build_grasp_contacts_figure(V, F, stage, object_id, sdf_fn=None,
     center = np.asarray(stage["obj_center"], float)
     R = np.asarray(stage["obj_mat"], float).reshape(3, 3)
     Vw = _to_world(V, center, R)
-    contacts = [(ci, stage["contact"][ci]) for ci in (1, 2) if ci in stage["contact"]]
+    contacts = [(ci, stage["contact"][ci]) for ci in (1, 2, 3)
+                if ci in stage["contact"]]
     if not contacts:
         return None
 
-    n_cols = 1 + len(contacts)
-    fig = plt.figure(figsize=(max(5.4 * n_cols, 11.0), 6.4))
-    sub = f"  ({n_relin} Picard stage{'s' if (n_relin or 0) != 1 else ''})" \
-        if n_relin is not None else ""
-    head = f"{object_id} — solved grasp contacts{sub}"
+    n_cols = len(contacts)
+    fig = plt.figure(figsize=(max(5.4 * n_cols, 8.0), 6.4))
+    # NO PICARD STAGE COUNT IN THE TITLE, and no n_relin parameter to pass one.
+    # The builder default is a SINGLE stage (for_gws_recommender setdefaults
+    # n_normal_relinearize=0 alongside quadratic_symbolic_normals -- the
+    # paraboloid supplies the normal in closed form, so there is nothing to
+    # relinearize), which made the annotation either vacuous or actively wrong:
+    # it read "3 Picard stages" on a solve a fresh trace showed to be ONE stage
+    # of 173 iterations, because the count came from stage RECORDS present in
+    # the log directory rather than from stages this solve ran.
+    # plot_quadratic_path.py remains the figure that legitimately draws a
+    # multi-stage trajectory, for the callers that still request one.
+    head = f"{object_id} — solved grasp contacts"
+    # Grasp width, previously the overview panel's title. Measured between the
+    # two SOLVED contacts (t_sol when the trace carries it), not between the
+    # stage anchors, so it is the span the hand actually closed to.
+    _pw = []
+    for _ci, _fr in contacts:
+        _ts = _fr.get("t_sol")
+        if _ts is not None:
+            _ts = np.asarray(_ts, float).reshape(-1)
+            _pl = _patch_points(_fr, (_ts[0], _ts[0]), (_ts[1], _ts[1]), n=1)[0, 0]
+        else:
+            _pl = np.asarray(_fr["seed_l"], float)
+        _pw.append(_to_world(_pl[None, :], center, R)[0])
+    if len(_pw) == 2:
+        head += f"   |   grasp width {np.linalg.norm(_pw[0] - _pw[1]) * 1e3:.0f}mm"
+    elif len(_pw) >= 3:
+        # "Grasp width" is a PAIR's quantity -- the span the two fingers close
+        # to -- and has no single-number analogue for a tripod. Report every
+        # pairwise separation instead, which is also the number that makes a
+        # COLLAPSED third contact visible: contact 3 sliding onto contact 2
+        # shows up here as a near-zero 2-3 gap while 1-2 stays wide.
+        _seps = "  ".join(
+            f"{_i+1}-{_j+1} {np.linalg.norm(_pw[_i] - _pw[_j]) * 1e3:.0f}mm"
+            for _i in range(len(_pw)) for _j in range(_i + 1, len(_pw)))
+        head += f"   |   contact separations {_seps}"
     if verify_info:
         _wf = verify_info.get("wrench_feasible")
         _gm = verify_info.get("gamma_min")
@@ -151,30 +191,17 @@ def build_grasp_contacts_figure(V, F, stage, object_id, sdf_fn=None,
     fig.suptitle(head + "\nsaturated = measured trust region, pale wireframe = "
                  "extrapolation, ✕ = solved contact", fontsize=10.5)
 
-    # ── overview: both contacts on the whole object ────────────────────────
-    ax = fig.add_subplot(1, n_cols, 1, projection="3d")
-    _draw_mesh(ax, Vw, F, alpha=0.10, max_tris=max_tris)
-    pts_w = []
-    for ci, fr in contacts:
-        p_w = _to_world(np.asarray(fr["seed_l"], float)[None, :], center, R)[0]
-        pts_w.append(p_w)
-        ax.scatter(*p_w, color=FINGER_COLORS[ci][0], s=60, edgecolor="k", lw=0.5,
-                   zorder=8)
-        ax.text(*p_w, f"  {FINGER_NAMES[ci]}", fontsize=7.5, fontweight="bold",
-                color=FINGER_COLORS[ci][0], zorder=9)
-    if len(pts_w) == 2:
-        # Grasp axis -- the line the two fingers squeeze along.
-        ax.plot(*np.array(pts_w).T, color="0.3", ls="-.", lw=1.3, zorder=7)
-        _d = np.linalg.norm(pts_w[0] - pts_w[1]) * 1e3
-        ax.set_title(f"both contacts  (grasp width {_d:.0f}mm)", fontsize=9)
-    _equal_axes(ax, np.vstack([Vw] + [np.asarray(pts_w)]), pad=0.01)
-    ax.view_init(elev=elev, azim=azim)
-    ax.set_xlabel("x (m)", fontsize=7); ax.set_ylabel("y (m)", fontsize=7)
-    ax.set_zlabel("z (m)", fontsize=7); ax.tick_params(labelsize=6)
+    # NO OVERVIEW PANEL. It drew both contacts as two dots on the whole object
+    # with a grasp axis between them -- superseded by seed<N>_contact_seeds.pdf, whose
+    # accepted panels show the same contacts ON their patches, with the seed
+    # they started from and the rejects that lost. This figure is now purely
+    # the QUANTITATIVE half: curvature, measured trust-region bounds, surrogate
+    # error and bound saturation for the grasp that was committed. Its one
+    # number worth keeping, the grasp width, moved into the suptitle.
 
     # ── one zoomed panel per contact ───────────────────────────────────────
     for k, (ci, fr) in enumerate(contacts):
-        axq = fig.add_subplot(1, n_cols, 2 + k, projection="3d")
+        axq = fig.add_subplot(1, n_cols, 1 + k, projection="3d")
         _draw_mesh(axq, Vw, F, alpha=0.12, max_tris=max_tris)
         c_in, c_out = FINGER_COLORS[ci]
         (lo0, hi0), (lo1, hi1) = _bounds(fr)
@@ -234,13 +261,20 @@ def build_grasp_contacts_figure(V, F, stage, object_id, sdf_fn=None,
 
 
 def plot_grasp_contacts(V, F, stage, object_id, out_path, sdf_fn=None,
-                        verify_info=None, elev=18.0, azim=-60.0, n_relin=None):
+                        verify_info=None, elev=18.0, azim=-60.0, n_relin=None,
+                        max_tris=3000):
     """Draw the solved-grasp-contacts figure to a PNG file (dpi 115). Returns the
     written path, or None when the stage carries no contacts. Thin saving wrapper
-    around build_grasp_contacts_figure."""
+    around build_grasp_contacts_figure.
+
+    n_relin is ACCEPTED AND IGNORED, kept only so existing callers do not break.
+    The stage count is no longer annotated on this figure -- see the note in the
+    builder: it counted stage records in the log directory rather than stages
+    this solve ran, and read "3 Picard stages" on a one-stage solve.
+    """
     fig = build_grasp_contacts_figure(V, F, stage, object_id, sdf_fn=sdf_fn,
                                       verify_info=verify_info, elev=elev, azim=azim,
-                                      n_relin=n_relin)
+                                      max_tris=max_tris)
     if fig is None:
         return None
     out_path = OP.savefig(fig, out_path, dpi=115)

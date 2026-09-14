@@ -33,10 +33,11 @@ sudo apt-get install libxcb-cursor0
 - `teleop/` — hand-input publishers and teleop UI: `vive_hand_publisher.py` (Vive/VR), the DexPilot retargeter/controller/arm-controller, MediaPipe/multicam pipeline, `hand_tune.py`/`hand_quality.py` (pinch tuning + input-quality tools), and `teleop/calibration/` (ChArUco + config files).
 - `anyteleop/` — the AnyTeleop (`dex-retargeting`) finger-retargeting backend + `compare_retargeting.py`; see [`anyteleop/README.md`](anyteleop/README.md).
 - `simulation/` — the NLP grasp planner (`grasp_planner_3d.py`, `grasp_config_builder.py`).
-  `SOLVER_STATE.md` is the living reference for what the solver currently does and how the
-  floor / tabletop / teleop environments each drive it — keep it current when you change a
-  default, cost term, constraint, or an environment's call into the planner. (The
-  `*_FINDINGS.md` files beside it are closed investigation records; don't rewrite those.)
+  [`docs/SOLVER_STATE.md`](docs/SOLVER_STATE.md) is the living reference for what the solver
+  currently does and how the floor / tabletop / teleop environments each drive it — keep it
+  current when you change a default, cost term, constraint, or an environment's call into the
+  planner. (The `simulation/*_FINDINGS.md` files are closed investigation records; don't
+  rewrite those.)
 - `kinova_common/` — shared constants/wrench/geometry/keyboard helpers. `environments/` — object randomization + task-env scaffolding.
 - `benchmarks/ycb_grasp/` — YCB grasp benchmark scripts (see [YCB object assets](#ycb-object-assets)).
 - `godot_scene/` — exported headset scene (see [Godot headset scene](#godot-headset-scene)).
@@ -251,7 +252,7 @@ The grasp planner's seed-generation and local-quadratic-surrogate settings live 
 
 **Precedence:** file → `per_object` → explicit CLI flag / `PFF_*` env var. The file supplies *defaults*, so `--sdf-err-tol 0.002` still wins. A missing or unreadable file falls back to the dataclass defaults, so a fresh checkout runs without it.
 
-The curvature gate is evaluated on the **mesh-fit** curvature whenever `quadratic_mesh_fit` is on, i.e. the same surface model the surrogate fits — gating on the SDF Hessian instead rejected 73% of a smooth sphere. See `simulation/SOLVER_STATE.md` §1-2 for the measurements behind each default.
+The curvature gate is evaluated on the **mesh-fit** curvature whenever `quadratic_mesh_fit` is on, i.e. the same surface model the surrogate fits — gating on the SDF Hessian instead rejected 73% of a smooth sphere. See [`docs/SOLVER_STATE.md`](docs/SOLVER_STATE.md) §1-2 for the measurements behind each default.
 
 The committed/vendored surface assets: the counter's marble texture (`models/furniture/textures/robocasa_marble.png`, from RoboCasa, CC-BY-4.0) and the wood-table assets (`models/furniture/`, from reachy2_mujoco_assets / Vikash Kumar's furniture_sim, Apache-2.0).
 

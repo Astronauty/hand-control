@@ -25,7 +25,8 @@ class GraspController:
                  active_joint_slices=((7, 11), (19, 23)),
                  support_weight=False, pad_offsets=None,
                  grasp_map_computer=None, allocator=None,
-                 obj_contact_provider=None):
+                 obj_contact_provider=None, cone_gamma=True,
+                 cone_mu=0.7, cone_f_min=0.5, cone_margin=0.2):
         """
         Args:
             model: MjModel.
@@ -88,6 +89,18 @@ class GraspController:
                             else [0.0] * len(self.tip_site_ids))
         self.grasp_map_computer = grasp_map_computer or SpatialGraspMapComputer()
         self.allocator = allocator or GraspForceAllocator(gamma)
+        # CONE-CONSTRAINED gamma. The sign-anchor path only orients each
+        # null-space basis vector using the FIRST non-None inward_dirs entry, so
+        # with 2 antipodal contacts (null(G) 1-D) one sign is the whole answer,
+        # but with 3 contacts the null space is 3-D and nothing holds the
+        # non-anchor contacts compressive. Measured on an asymmetric tripod:
+        # sign-anchor normal forces [1.213, 0.047, 0.325] N vs cone-solve
+        # [1.0, 1.0, 1.0] N. See tests/test_force_allocator_cone.py.
+        self.cone_gamma  = bool(cone_gamma)
+        self.cone_mu     = float(cone_mu)
+        self.cone_f_min  = float(cone_f_min)
+        self.cone_margin = float(cone_margin)
+        self.last_cone_info = None
 
         self.q_target = None
         self.squeeze = False
@@ -272,8 +285,32 @@ class GraspController:
             r_W   = data.xipos[self.obj_body_id] - p_WoO     # origin -> COM, world frame
             w_des[:3] = R_WO.T @ f_W
             w_des[3:] = R_WO.T @ np.cross(r_W, f_W)
-        f_c = scale * self.allocator.allocate(G, w_des, contact_dof=3,
-                                              inward_dirs=inward_dirs)
+        # Cone-constrained gamma when enabled: solves for null-space weights that
+        # keep EVERY contact compressive and inside its friction cone, rather than
+        # sign-flipping an arbitrary SVD basis off one anchor contact. Contact
+        # frames put the inward normal in col0, and G's columns are built in those
+        # same frames, so the per-contact normal is [1,0,0] by construction.
+        #
+        # gamma_scale carries the caller's commanded squeeze magnitude: the LP
+        # returns the MINIMUM in-cone force (peak normal = cone_f_min), and the
+        # configured gamma scales it up to the force actually wanted.
+        f_c = None
+        if self.cone_gamma:
+            _g_cmd = float(np.max(np.atleast_1d(self.allocator.gamma)))
+            _gam, _info = self.allocator.solve_gamma_cone(
+                G, w_des, contact_dof=3,
+                normals=[np.array([1.0, 0.0, 0.0])] * len(contacts),
+                mu=self.cone_mu, f_min=self.cone_f_min, margin=self.cone_margin)
+            self.last_cone_info = _info
+            if _gam is not None:
+                _f_min_used = max(self.cone_f_min, 1e-9)
+                f_c = scale * (_g_cmd / _f_min_used) * np.asarray(_info['f_c'], float)
+        if f_c is None:
+            # Fall back to the sign-anchor path: either cone_gamma is off, or the
+            # LP found no compressive in-cone force for this geometry (which is a
+            # real property of the contacts, not a solver failure).
+            f_c = scale * self.allocator.allocate(G, w_des, contact_dof=3,
+                                                  inward_dirs=inward_dirs)
         self.last_f_c = f_c
 
         n_f = len(J_list)

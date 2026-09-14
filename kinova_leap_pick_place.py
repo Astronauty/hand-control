@@ -53,6 +53,7 @@ from grasp_planner_3d import (GraspConfig3D, MultiStartGraspPlanner3D,  # noqa: 
 import simulation.grasp_config_builder as _grasp_config_builder  # noqa: E402
 
 from kinova_common.constants import (FINGER_TIP_SITES, FINGER_CODE, FINGER_SET,
+                                     SLOT_ROLES,
                                      GEN3_XML, FINGERTIP_POINTING_AXIS)
 from kinova_common.grasp_plots import write_grasp_plots
 from kinova_common.wrench import solve_gamma_live, composite_wrench_cone, hull3d
@@ -424,6 +425,12 @@ if __name__ == "__main__":
         help="Recorded video resolution for --record, as WxH (default 1280x960). Must be "
              "<= the scene's <global offwidth/offheight> (1280x960) or the render errors; "
              "raise those in models/scene_kinova_leap*.xml to go higher.")
+    _arg_parser.add_argument(
+        '--fingers', default=None,
+        help="comma-separated fingers to grasp with, IN SLOT ORDER, e.g. 'thumb,middle' "
+             "or 'thumb,index,middle'. Slot 1 anchors the grasp (the antipodal seed "
+             "marches from it) and w_align gates on slot-1<->slot-2 opposition, so the "
+             "order is not interchangeable. Default: models/grasp_finger_config.json.")
     args = _arg_parser.parse_args()
     # In-code defaults for behaviours that used to be always-True CLI flags. These
     # never had a way to turn them OFF from the command line, so they only cluttered
@@ -434,6 +441,25 @@ if __name__ == "__main__":
     args.multicam_max_res = True   # open each multicam camera at its highest resolution
     args.skeleton_view = False     # orbitable fused-hand skeleton window (teleop modes);
                                    # OFF by default — flip to True to re-enable
+    # WHICH FINGERS GRASP -- resolved ONCE here, before any consumer below.
+    # SLOT_ROLES/FINGER_SET are imported as module constants (resolved from the
+    # config file's default at IMPORT time, which cannot see --fingers). Rebinding
+    # them HERE shadows the imports for the whole __main__ block, which is where
+    # every consumer lives: id_C, _TIP_GEOM_IDS, _PAD_OFFSET, _active_finger_geoms
+    # and the ~dozen zips downstream all read these names from this namespace.
+    #
+    # ORDER: SLOT_ROLES is slot order (slot 1 = p1 = the anchor contact);
+    # FINGER_SET is its REVERSE, because id_C is built in FINGER_SET order and
+    # zipped against forces/contacts/IK targets that document the pairing as
+    # "[index, thumb]: index<-p2, thumb<-p1". See kinova_common/constants.py.
+    SLOT_ROLES = (_grasp_config_builder.parse_fingers(args.fingers)
+                  or list(SLOT_ROLES))
+    _cfg_fingers = _grasp_config_builder.load_finger_config(fingers=SLOT_ROLES)
+    if not _cfg_fingers:
+        _arg_parser.error(f"--fingers {args.fingers!r}: no usable finger list")
+    FINGER_SET = list(reversed(SLOT_ROLES))
+    print(f"[fingers] slots={SLOT_ROLES}  FINGER_SET={FINGER_SET}  "
+          f"n_contacts={_cfg_fingers['n_contacts']}")
     if args.mode == 'rrt':          # deprecated alias
         args.mode = 'contact_aware_autonomous'
     # Baseline-comparison modes normalize to a CANONICAL pipeline mode + a finger
@@ -2025,12 +2051,17 @@ if __name__ == "__main__":
         _ik_data.qpos[N_ROBOT:] = obj_qpos_snap
         mj.mj_forward(model, _ik_data)
 
-        # World contacts in FINGER_SET order ([index, thumb]): index<-p2, thumb<-p1.
-        _by_finger = {'thumb': rec['p1'], 'index': rec['p2']}
+        # Map NLP SLOT -> finger by POSITION, not by role name. SLOT_ROLES is the
+        # pairing's slot order (slot 1 = p1 = thumb), so zipping it against
+        # (p1, p2) binds each contact to whichever finger that pairing assigns --
+        # thumb_middle included. The old form hardcoded {'thumb': p1, 'index': p2}
+        # and KeyError'd on any pairing without an 'index'.
+        _slot_pts = [rec['p1'], rec['p2']]
+        _by_finger = {r: p for r, p in zip(SLOT_ROLES, _slot_pts)}
         p_S_W = [np.asarray(_by_finger[f], float).copy() for f in FINGER_SET]
         # Inward surface normals at those contacts (object's live geom pose).
         n1_in, n2_in = _recommended_inward_normals(obj_idx, rec['p1'], rec['p2'])
-        _n_by_finger = {'thumb': n1_in, 'index': n2_in}
+        _n_by_finger = {r: n for r, n in zip(SLOT_ROLES, [n1_in, n2_in])}
         inward_S_W = [np.asarray(_n_by_finger[f], float).copy() for f in FINGER_SET]
 
         obj['p_S_W']       = p_S_W
@@ -2204,8 +2235,12 @@ if __name__ == "__main__":
             # from its planner config so the number is true convergence error (sub-mm when
             # the NLP solves well). FINGER_SET order = [index, thumb] -> [r_index, r_thumb].
             _rec_cfg = _get_cat_planner(obj_idx)._planner.cfg
-            _r_tip_by_finger = {'index': float(_rec_cfg.r_index),
-                                'thumb': float(_rec_cfg.r_thumb)}
+            # Slot-indexed, same reason as _setup_recommended_contact_frames:
+            # cfg.r_thumb/r_index are SLOT radii (slot 1 / slot 2), not finger
+            # names, so bind them through SLOT_ROLES rather than by role literal.
+            _r_tip_by_finger = {r: v for r, v in
+                                zip(SLOT_ROLES, [float(_rec_cfg.r_thumb),
+                                                 float(_rec_cfg.r_index)])}
             _nlp_tgts = [p - _r_tip_by_finger[f] * n
                          for f, p, n in zip(FINGER_SET, p_S_W, inward_S_W)]
             obj['rec_nlp_err_mm'] = [
@@ -3200,9 +3235,16 @@ if __name__ == "__main__":
             # links far from the box, so a curled finger pointing away adds no constraint — it
             # only binds when mf/rf actually approach the object.
             _REC_NONACTIVE_OBJ_CLR = 0.001   # m, on the bounding-sphere surface
+            # NON-ACTIVE = every finger NOT in this run's grasping set. Previously
+            # hardcoded to mf/rf, which is correct ONLY for a thumb+index grasp: under
+            # --fingers thumb,middle the middle finger GRASPS, and a positive object
+            # clearance on it would push away the very fingertip the IK term is pulling
+            # onto the surface -- two constraints fighting, surfacing as a phantom
+            # unreachable-contact failure.
+            _nonactive_roles = [f for f in FINGER_CODE if f not in SLOT_ROLES]
             _rec_nonactive_geoms = sorted(
                 g for g in _robot_geom_names
-                if g.startswith('leap_mf_') or g.startswith('leap_rf_'))
+                if any(g.startswith(f'leap_{FINGER_CODE[f]}_') for f in _nonactive_roles))
             _rec_arm_geoms = list(_REC_ARM_GEOMS) + _rec_finger_geoms + _rec_nonactive_geoms
             _rec_obj_clearance = {g: _active_obj_clearance(g) for g in _rec_finger_geoms}
             _rec_obj_clearance.update(
@@ -3224,6 +3266,11 @@ if __name__ == "__main__":
                 o['name'], _rec_arm_geoms, _rec_obj_clearance,
                 accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
                 ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
+                # Same list the executor squeezes with (SLOT_ROLES above). Passing it
+                # here is what keeps plan and execution on the SAME fingers -- omitting
+                # it would leave the recommender on the config default while the
+                # controller followed --fingers, i.e. the inverse of the old bug.
+                fingers=list(SLOT_ROLES),
                 # w_ik 0.70 -> 5.0 (wrench_feasibility tuning, preserved via the builder's
                 # overrides): the keyframe convergence sweep showed the baseline
                 # alignment:reachability ratio (~14:1) starved the IK term; w_ik=5.0 lifts
@@ -3407,10 +3454,11 @@ if __name__ == "__main__":
                     'n_converged':     _nconv,
                     'n_seeds':         len(_all),
                 })
-            # --seed-viz: render the SOLVED grasp's contacts (overview + per-contact
+            # --seed-viz: render the SOLVED grasp's contacts (one per-contact
             # paraboloid patch with the ✕ the solver landed on — the CHOSEN contact
-            # location) from THIS solve's in-memory result (res carries quad{1,2}_frame /
-            # t{1,2}_sol) and ship it. On THIS recommender daemon thread (serialized with
+            # location; the overview panel is gone, superseded by the seed figure)
+            # from THIS solve's in-memory result (res carries quad{1,2,3}_frame /
+            # t{1,2,3}_sol, contact 3 only at n>=3) and ship it. On THIS recommender daemon thread (serialized with
             # the solve by the _rec_idle gate), so it never touches the render/physics
             # thread. Best-effort.
             if _SEED_VIZ_DASH or _SEED_VIZ_FILE:

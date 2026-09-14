@@ -76,9 +76,13 @@ def _stage_color(ci: int, si: int) -> str:
 
 def _load_stage_npz(path):
     """One grasp3d_iter_*.npz -> the same per-stage dict shape used
-    throughout this module (raw arrays + 'contact' sub-dicts keyed 1/2 with
+    throughout this module (raw arrays + 'contact' sub-dicts keyed 1/2/3 with
     that contact's quad_* frame params, present only under
-    use_quadratic_contact)."""
+    use_quadratic_contact).
+
+    Contact 3 and the 'p3' trajectory appear only in traces written at
+    n_contacts >= 3; a 2-contact stage has neither key, so its dict is
+    byte-for-byte what it was before contact 3 existed."""
     trace = np.load(path, allow_pickle=True)
     stage = dict(
         p1=trace["p1"], p2=trace["p2"],
@@ -88,7 +92,12 @@ def _load_stage_npz(path):
         n_iter=len(trace["iter"]),
         contact={},
     )
-    for ci in (1, 2):
+    # p3 only exists in traces written at n_contacts >= 3. Keyed in rather than
+    # defaulted so a 2-contact stage carries NO p3 key at all and readers can
+    # test presence instead of comparing against a sentinel.
+    if "p3" in trace.files:
+        stage["p3"] = trace["p3"]
+    for ci in (1, 2, 3):
         prefix = f"quad{ci}_"
         keys = [k for k in trace.files if k.startswith(prefix)]
         if not keys:
@@ -681,6 +690,12 @@ def main():
                          "re-fits to show). Default: GraspConfig3D's own default (1).")
     ap.add_argument("--n-seeds", type=int, default=1,
                     help="MultiStartGraspPlanner3D's own contact-seed budget per solve")
+    ap.add_argument("--bound-inset", type=float, default=None,
+                    help="metres; constant shaved off every side of each trust region, "
+                         "keeping contacts off sharp edges the SDF-error bound cannot see "
+                         "(default: GraspConfig3D's 10mm)")
+    ap.add_argument("--bound-keep-frac", type=float, default=None,
+                    help="fraction of each side the inset may never consume (default: 0.5)")
     ap.add_argument("--render", action="store_true",
                     help="also save a SEPARATE standalone PNG of the final arm+hand pose "
                          "(the hand pose is already embedded in the main figure by default)")
@@ -703,6 +718,13 @@ def main():
                  use_quadratic_contact=True)
     if args.n_relin is not None:
         cfg_kw["n_normal_relinearize"] = args.n_relin
+    # Trust-region inset + its curvature gate, so the PATH view can be produced
+    # under the same bounds the seed-quadratic figures show. Both default to
+    # None = leave GraspConfig3D's own value alone.
+    if args.bound_inset is not None:
+        cfg_kw["quadratic_bound_inset"] = args.bound_inset
+    if args.bound_keep_frac is not None:
+        cfg_kw["quadratic_bound_keep_frac"] = args.bound_keep_frac
     if args.gws:
         cfg_kw["wrench_constraint"] = False
         cfg_kw["w_gws"] = args.w_gws

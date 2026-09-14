@@ -9,7 +9,8 @@ import numpy as np
 
 class IKSolver:
     def __init__(self, pos_dim, n_robot, damping=0.01, max_iter=500, step=0.5, tol=1e-3,
-                 adaptive_damping=False, lambda_max=0.1, w0=1e-3):
+                 adaptive_damping=False, lambda_max=0.1, w0=1e-3,
+                 selective_damping=False, sigma0=0.05):
         self.pos_dim = pos_dim
         self.n_robot = n_robot
         self.damping = damping
@@ -25,6 +26,47 @@ class IKSolver:
         self.adaptive_damping = adaptive_damping
         self.lambda_max = lambda_max
         self.w0 = w0
+        # PER-DIRECTION (selective) damping. Damps ONLY the near-singular singular
+        # directions instead of every direction equally, via the SVD form
+        #     J^+ = sum_i sigma_i / (sigma_i^2 + lambda_i^2) v_i u_i^T
+        #     lambda_i = 0                                  if sigma_i > sigma0
+        #                lambda_max * (1 - sigma_i/sigma0)^2 otherwise
+        #
+        # Why this exists. A SCALAR lambda has to be large enough for the WORST
+        # direction, so it over-damps every healthy one. Measured on the 3-site
+        # seeding Jacobian (9x23) at the wood-block home pose:
+        #     sigma = [2.25, .315, .147, .104, .0896, .0847, .0241, .0132, 7.0e-4]
+        # eight directions are fine and one is weak, yet lambda=0.01 suppresses all
+        # nine (a direction is suppressed when sigma^2 << lambda; here the weakest
+        # has sigma^2 = 4.9e-7, four orders below lambda).
+        #
+        # Two measured consequences of the scalar form, both fixed by damping only
+        # the offending axis:
+        #   1. Task error on REACHABLE targets: a 20mm move converges to 8.29mm
+        #      with damping=0.01/null_gain=0.3, and to 0.06mm at damping=1e-4.
+        #      It is a FIXED POINT, not slow convergence -- 10x the iterations
+        #      leaves it at 8.29mm.
+        #   2. The null-space projector leaks. dq += null_gain*(I - J^+ J)(q_bias-q)
+        #      is only orthogonal to the task when J^+ is the TRUE pseudo-inverse;
+        #      the damped one makes I - J^+ J a non-projector, so the posture bias
+        #      pulls the fingertips off target. Damping only the weak direction
+        #      keeps I - J^+ J close to a true projector.
+        #
+        # sigma0 gates on the SMALLEST SINGULAR VALUE, deliberately not the
+        # Yoshikawa w=sqrt(det(J J^T)) that adaptive_damping uses: w is the PRODUCT
+        # of the singular values, so (a) it shrinks geometrically with the task
+        # dimension -- measured 4.84e-3 / 1.22e-6 / 1.83e-11 for 1/2/3 sites at the
+        # same pose, so a single w0 cannot serve different site counts (w0=1e-3
+        # fires ALWAYS at 3 sites, making adaptive_damping a flat 11x damping
+        # increase rather than an adaptive one) -- and (b) a volume masks a
+        # collapsing axis: scaling sigma_min up 100x and sigma_max down 100x leaves
+        # w bit-identical while the conditioning that actually matters improves
+        # 100-fold. sigma_min has task-space units and does not move with the row
+        # count, so one threshold serves 2 and 3 contacts alike.
+        #
+        # Off by default: selective_damping=False reproduces the scalar path exactly.
+        self.selective_damping = selective_damping
+        self.sigma0 = sigma0
 
     def solve(self, model, data, site_ids: list[int], targets: list[np.ndarray],
               orientations: list[np.ndarray] = None, q_bias=None, null_gain=0.1) -> np.ndarray:
@@ -106,7 +148,21 @@ class IKSolver:
                 if w < self.w0:
                     ratio = 1.0 - w / self.w0
                     lam = self.damping + self.lambda_max * ratio * ratio
-            J_pinv_damped = J.T @ np.linalg.inv(JJt + lam * np.eye(J.shape[0]))
+            if self.selective_damping:
+                # Per-direction damping: build the inverse from the SVD so each
+                # singular direction gets its OWN lambda_i, zero for the healthy
+                # ones. Equivalent to the scalar form when every sigma_i <= sigma0.
+                U, sv, Vt = np.linalg.svd(J, full_matrices=False)
+                lam_i = np.where(
+                    sv > self.sigma0, 0.0,
+                    self.lambda_max * (1.0 - sv / self.sigma0) ** 2)
+                # sigma/(sigma^2 + lambda^2); guard the exactly-zero-sigma case,
+                # where the gain is 0 (that direction is unreachable, not infinite).
+                denom = sv ** 2 + lam_i ** 2
+                gain = np.divide(sv, denom, out=np.zeros_like(sv), where=denom > 0)
+                J_pinv_damped = (Vt.T * gain) @ U.T
+            else:
+                J_pinv_damped = J.T @ np.linalg.inv(JJt + lam * np.eye(J.shape[0]))
             dq = J_pinv_damped @ err
             if q_bias is not None:
                 null_proj = np.eye(self.n_robot) - J_pinv_damped @ J

@@ -62,17 +62,35 @@ def solve_gamma_live(p_O, R_O_inward, mu, mass, accel_box_xyz, ang_accel_box_xyz
     pos = [np.asarray(p, float).reshape(3, 1) for p in p_O]
     fx, fy, fz = (mass * a for a in accel_box_xyz)        # force box = m * a
     tx, ty, tz = (I * al for I, al in zip(inertia_diag, ang_accel_box_xyz))  # torque = I*alpha
-    if grav_O is not None and n == 2:
-        # Datum / Task-B formulation: reference the disturbance about the grasp midpoint,
-        # add gravity as an explicit re-datumed wrench, and project its grasp-axis moment.
-        _mref = (0.5 * (pos[0] + pos[1])).reshape(3)
+    if grav_O is not None and n >= 2:
+        # Datum / Task-B formulation: reference the disturbance about the grasp
+        # CENTROID, and add gravity as an explicit re-datumed wrench.
+        #
+        # n == 2: also project the grasp-axis moment/torque. A two-contact pinch
+        # cannot resist ANY torque about the line through its contacts -- the
+        # friction cones have zero moment arm there -- so that component is
+        # strictly unresistable and projecting it out is honest, not a relaxation.
+        #
+        # n >= 3: projections OFF. The premise above is exactly what a third
+        # contact OFF the grasp axis removes: three non-collinear contacts have a
+        # real moment arm about every axis, so zeroing one would make the
+        # certificate CONSERVATIVE against a capability the tripod actually has --
+        # wrong rather than merely unnecessary. The LP's own gates
+        # (project_grasp_axis_{moment,torque} in 3D_minimum_NCF.py) are likewise
+        # `and n == 2`, so they self-disable; passing False here keeps the intent
+        # explicit at the call site rather than relying on that.
+        #
+        # The moment reference generalizes as the contact CENTROID, which reduces
+        # to the midpoint at n == 2 (so the measured 2-contact path is unchanged).
+        _mref = (sum(np.asarray(p, float).reshape(3) for p in pos) / float(n))
         _grav = mass * np.asarray(grav_O, float)          # gravity force, object frame
+        _proj = (n == 2)
         return _ncf.min_gamma_for_accel_lp(
             fx, fy, fz, tx, ty, tz, n, pos, R_out, [1.0] * n,
             [0.0] * n, [0.0] * n, list(mu),
             moment_ref=_mref, grav_force=_grav,
-            project_grasp_axis_moment=True,
-            project_grasp_axis_torque=True)
+            project_grasp_axis_moment=_proj,
+            project_grasp_axis_torque=_proj)
     return _ncf.min_gamma_for_accel_lp(
         fx, fy, fz, tx, ty, tz, n, pos, R_out, [1.0] * n,
         [0.0] * n, [0.0] * n, list(mu))

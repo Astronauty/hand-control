@@ -82,6 +82,8 @@ from grasp_control import GraspController                                       
 from grasp_control import object_uv_atlas as oua                                # noqa: E402
 from kinova_common.constants import FINGER_CODE, FINGER_SET, FINGER_TIP_SITES   # noqa: E402
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
+from kinova_common.video import (H264Writer, VideoRecorder,                     # noqa: E402,F401
+                                 VIDEO_FPS, VIDEO_H, VIDEO_W)
 from simulation.grasp_config_builder import for_ablation_default                # noqa: E402
 from simulation.grasp_planner_3d import MultiStartGraspPlanner3D, _geom_normal_np  # noqa: E402
 from ycb_grasp import out_paths as OP                                           # noqa: E402
@@ -115,8 +117,7 @@ LIFT_SPEED_MPS = 0.02      # slow jog -- "validate stability," not a fast lift
 JOG_SING_EPS = 0.02        # rad*m onset of DLS damping near a Jacobian singularity
 JOG_LAM_MAX = 0.05         # peak damping at the singularity
 
-VIDEO_FPS = 30
-VIDEO_W, VIDEO_H = 960, 720
+# VIDEO_FPS / VIDEO_W / VIDEO_H now come from kinova_common.video (imported above).
 PRINT_EVERY = 250
 
 
@@ -263,43 +264,10 @@ def make_object_contact_provider(rec_local, obj_body_id):
     return _provider
 
 
-class VideoRecorder:
-    """Fixed external camera -> MP4, one frame per call to capture(). Uses the
-    same offscreen mj.Renderer + camera convention as ik_demo.render/
-    plot_quadratic_path._render_hand_rgb (not the interactive viewer, which
-    can't be captured this way), so the video's framing matches the repo's
-    existing static renders. cv2 encodes BGR; MuJoCo's Renderer returns RGB,
-    hence the channel-swap in capture()."""
-    def __init__(self, path, lookat, dist=0.6, azim=135, elev=-55,
-                w=VIDEO_W, h=VIDEO_H, fps=VIDEO_FPS, groups=(0, 1, 2, 5)):
-        self.path = str(path)
-        self.w, self.h = w, h
-        self._writer = cv2.VideoWriter(self.path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                       fps, (w, h))
-        self._opt = mj.MjvOption()
-        mj.mjv_defaultOption(self._opt)
-        for g in range(6):
-            self._opt.geomgroup[g] = 1 if g in groups else 0
-        self._cam = mj.MjvCamera()
-        mj.mjv_defaultCamera(self._cam)
-        self._cam.lookat[:] = lookat
-        self._cam.distance, self._cam.azimuth, self._cam.elevation = dist, azim, elev
-        self._renderer = None
-        self._model = None
-
-    def capture(self, model, data):
-        if self._renderer is None or self._model is not model:
-            self._renderer = mj.Renderer(model, self.h, self.w)
-            self._model = model
-        self._renderer.update_scene(data, camera=self._cam, scene_option=self._opt)
-        rgb = self._renderer.render()
-        self._writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-
-    def close(self):
-        self._writer.release()
-        if self._renderer is not None:
-            del self._renderer
-            self._renderer = None
+# VideoRecorder moved to kinova_common/video.py (a general offscreen recorder,
+# beside the H264Writer it wraps, in the module the benchmarks and live teleop
+# already share). Re-exported so existing `from ycb_grasp.pick_from_floor import
+# VideoRecorder` call sites keep working.
 
 
 def _measured_tip_forces(model, data, tip_geom_ids, obj_geom_id):
