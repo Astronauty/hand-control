@@ -24,6 +24,7 @@ class ROSInterface:
         self._raw_msg: list | None = None
         self._current_wrist: np.ndarray | None = None
         self._ros_node = None
+        self._last_msg_wall: float | None = None   # wall time the last message ARRIVED
 
     def init(self) -> None:
         """Initialize ROS 2 and create the hand-angles subscription."""
@@ -46,7 +47,9 @@ class ROSInterface:
             lambda msg: self._on_hand_message(list(msg.data)), sensor_qos())
 
     def _on_hand_message(self, data_list: list) -> None:
+        import time
         self._raw_msg = data_list
+        self._last_msg_wall = time.time()   # arrival time — for staleness/dropout detection
         if len(data_list) >= 3:
             self._current_wrist = np.array(data_list[0:3], float)
 
@@ -70,3 +73,13 @@ class ROSInterface:
     @property
     def current_wrist(self) -> np.ndarray | None:
         return self._current_wrist
+
+    def msg_age(self) -> float:
+        """Seconds (wall-clock) since the last /hand/joint_angles message arrived, or
+        inf if none yet. The publisher stops publishing when the tracked hand has
+        tracked=0 (headset lost the pose), so a growing age == a live tracking DROPOUT.
+        Lets the trajectory recorder mark which rows the hand input was stale for."""
+        import time, math
+        if self._last_msg_wall is None:
+            return math.inf
+        return time.time() - self._last_msg_wall

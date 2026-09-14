@@ -165,6 +165,13 @@ class DexPilotController:
         visualise the world landmarks (raw[57:120]) without reaching into ._ros."""
         return self._ros.raw_msg
 
+    def input_msg_age(self) -> float:
+        """Seconds since the last hand message arrived (inf if none). A large/growing
+        value == the tracked hand's input is STALE (a headset tracking dropout), since
+        the publisher stops publishing on tracked=0. Recorded in the trajectory trace so
+        dropouts can be correlated with the hand pose / wrist-vs-head geometry offline."""
+        return self._ros.msg_age()
+
     def start(self, data: mj.MjData) -> None:
         """(Re)zero tracking to the robot's current pose and enable tracking.
 

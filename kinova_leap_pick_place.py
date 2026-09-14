@@ -4374,7 +4374,33 @@ if __name__ == "__main__":
                 else:
                     _pt_phase, _pt_sub = TrialPhase.from_control(
                         control_phase, _CAT_MODE and _teleop_active)
+                # --- HEADSET HAND INPUT (for dropout diagnosis) ---------------------------
+                # Record the raw hand pose the headset sent alongside the robot trajectory,
+                # so a tracking dropout can be correlated with WHAT the hand was doing:
+                #   hand_wrist  = wrist position (raw[0:3])
+                #   hand_head   = headset pose pos+quat (raw[3:10]) -> wrist-vs-head geometry
+                #                 tells you if the hand was OUT OF RANGE / at an FOV edge
+                #   hand_lm     = 21 wrist-relative landmarks (raw[57:120]) -> hand SHAPE/pose
+                #   hand_age    = seconds since the last message arrived; > ~0.05 == the input
+                #                 is STALE (a live tracking dropout, publisher stopped on
+                #                 tracked=0). Rows with a large hand_age are the dropout frames;
+                #                 the hand_wrist/hand_head just BEFORE that shows the trigger.
+                # NaN-filled when there is no dexpilot controller (autonomous modes).
+                _hand_wrist = np.full(3, np.nan); _hand_head = np.full(7, np.nan)
+                _hand_lm = np.full((21, 3), np.nan); _hand_age = float('inf')
+                if _dexpilot_ctrl is not None:
+                    _hand_age = float(_dexpilot_ctrl.input_msg_age())
+                    _raw = _dexpilot_ctrl.raw_msg
+                    if _raw is not None and len(_raw) >= 120:
+                        _raw = np.asarray(_raw, float)
+                        _hand_wrist = _raw[0:3].copy()
+                        _hand_head = _raw[3:10].copy()
+                        _hand_lm = _raw[57:120].reshape(21, 3).copy()
                 _pose_trace.sample(
+                    hand_wrist=_hand_wrist,      # headset wrist pos (raw[0:3])
+                    hand_head=_hand_head,        # headset pose pos+quat (raw[3:10])
+                    hand_lm=_hand_lm,            # 21 wrist-relative landmarks (raw[57:120])
+                    hand_age_s=float(_hand_age), # secs since last hand msg (>~0.05 = dropout)
                     norm_force=np.array([_pt_norm[f] for f in FINGER_SET]),
                     tan_force=np.array([_pt_tan[f] for f in FINGER_SET]),
                     f_net=np.asarray(_pt_fnet).copy(),      # net contact force on object (world, N)
