@@ -2572,13 +2572,17 @@ if __name__ == "__main__":
         _cam_kwargs = {
             "R_cam_robot": np.diag([1.0, -1.0, -1.0]),
             "position_mode": "relative",   # press-8 rezeroable; see note below
-            # abs_scale amplifies hand travel -> robot travel. Raised 1.5 -> 2.0 so a SMALLER
-            # physical hand movement covers the sim workspace: the operator's hand stays in a
-            # tighter volume close to the headset, less likely to leave the OpenXR hand-tracking
-            # FOV (the tracked=0 dropouts that froze the robot when reaching far). Higher = less
-            # reach needed but coarser precision; 2.0 is a moderate step. This is the VR path's
-            # value (the config's abs_scale is for the MediaPipe path).
-            "abs_scale": 2.0,
+            # abs_scale amplifies hand travel -> robot travel. Raised 1.5 -> 2.0 -> 2.7 so a
+            # SMALLER physical hand movement covers the sim workspace: the operator's hand stays
+            # in a tighter volume close to the headset, less likely to leave the Vive's NARROW
+            # hand-tracking cone (the tracked=0 dropouts that froze the robot when reaching far).
+            # 2.7 is data-driven: dropout_analyze on run 125656 showed hand reach p90=24cm with
+            # dropouts starting ~21cm (past the cone edge); the robot workspace spanned ~0.48m at
+            # scale 2.0, so 2.7 pulls the p90 hand reach to ~18cm — inside the reliable cone.
+            # Higher = less reach needed but coarser precision + more tremor amplification, so
+            # 2.7 is a moderate step, not a max. This is the VR path's value (the config's
+            # abs_scale is for the MediaPipe path). Re-run dropout_analyze to verify / retune.
+            "abs_scale": 2.7,
             "scale_x": 1.0,                # already metres
             "scale_z": 1.0,
             "identity_orientation": True,  # direct hand->wrist, no press-8 offset
