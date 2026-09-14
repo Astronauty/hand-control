@@ -1004,3 +1004,48 @@ normals.
 So the two configurations differ in the NORMALS entering the cone, which is a
 deliberate and documented axis of the comparison (§2.2), not in the friction
 coefficient.
+
+## 14. At the paper's friction (mu = 0.7)
+
+`--mu 0.7` sets the object geom's sliding friction to the paper's simulation value.
+`table_scene.build` already took `friction` as a parameter, so this is a CLI flag,
+not a default change: every existing result at mu = 2.0 stands. Verified the value
+reaches the contact -- MuJoCo combines by elementwise max and the LEAP fingertips are
+0.5, so anything below 0.5 would be floored by the fingertip instead of the object.
+
+| | ours mu=2.0 | ours mu=0.7 | frogger mu=2.0 | frogger mu=0.7 |
+|---|---|---|---|---|
+| median `l_bar*` | +0.8265 | +0.6606 | +0.3370 | **-7.4655** |
+| `l_bar* > 0` | 17/18 | **18/18** | 10/18 | 7/18 |
+| wrench-feasible | 16/18 | 15/18 | 10/18 | 7/18 |
+
+**This is the first measurement in the paper's own regime**, and it does not flatter
+the port: the frogger configuration's median falls off a cliff while ours degrades
+gracefully.
+
+### 14.1 The asymmetry is the interesting part
+
+Lower friction should make force closure HARDER for both. Ours instead gains a
+positive cell (17/18 -> 18/18) while its median drops modestly; the frogger
+configuration loses three and its median goes deeply negative.
+
+A plausible reading, not yet tested: our configuration carries `w_ik`, `w_align` and
+the patch trust region, which keep contacts opposed and reachable regardless of what
+`beta` is doing, so a harder friction regime degrades the METRIC without moving the
+contacts much. The frogger configuration has only `beta` -- by construction, since
+(7a) is a single term -- so when the friction regime makes `beta`'s landscape harder,
+there is nothing else holding the solve in a good basin. If that is right, it is a
+genuine finding about the two formulations rather than a port defect: FRoGGeR's
+minimal objective is more exposed to the friction regime than a multi-term one.
+
+Testing it means re-running the frogger configuration with `w_align` restored at
+mu = 0.7 and seeing whether the cliff disappears. That deviates from (7a) on purpose,
+as a diagnostic rather than a benchmark arm.
+
+### 14.2 Which objects survive
+
+At mu = 0.7 the frogger configuration stays positive on 7 cells: `017_orange` all
+three seeds, `056_tennis_ball` two, `061_foam_brick` one, `014_lemon` one. It fails
+every `036_wood_block` and `009_gelatin_box` seed -- the two non-round objects, which
+is consistent with the mu = 2.0 pattern where the roundest object was also the most
+reliable.
