@@ -359,6 +359,14 @@ def run_ros(args):
             self.published = 0
             self.last_rx = 0.0
             self.warned_stale = False
+            # Edge-triggered tracking-loss diagnostics: log the MOMENT the tracked hand is
+            # lost / regained and how long each gap lasted, so a dropout can be correlated
+            # with what the hand was doing (rotation for a grasp, reaching a FOV edge, etc.).
+            # tracked=0 in the packet header means OpenXR could not resolve the hand pose —
+            # a headset-side tracking loss, NOT an app/stream failure (the stream keeps
+            # flowing; other-hand packets still arrive). This just surfaces it clearly.
+            self._tracked_ok = None          # last known tracked state (None=unknown yet)
+            self._loss_start = 0.0           # wall time the current dropout began
 
             self.get_logger().info(
                 f"listening on {args.host}:{args.port} for the {args.hand} "
@@ -381,6 +389,25 @@ def run_ros(args):
             self.last_rx = time.monotonic()
 
             d = decode(pkt, self.want_hand)
+            # Edge-log tracking loss/recovery for the TRACKED hand only. `latest()` already
+            # returned our-hand packets in preference to the other hand, so a decode()==None
+            # here means our hand's packet had tracked=0 (headset lost the pose).
+            _this_hand_tracked = d is not None
+            if self._tracked_ok is True and not _this_hand_tracked:
+                self._tracked_ok = False
+                self._loss_start = time.monotonic()
+                self.get_logger().warn(
+                    f"[{args.hand} hand] tracking LOST (OpenXR tracked=0) — hand out of "
+                    f"view or in a pose/region the headset can't resolve (edge-on palm, "
+                    f"occlusion, FOV edge, motion blur). Robot holds its last pose until "
+                    f"tracking returns.")
+            elif self._tracked_ok is not True and _this_hand_tracked:
+                if self._tracked_ok is False:
+                    self.get_logger().info(
+                        f"[{args.hand} hand] tracking REGAINED after "
+                        f"{time.monotonic() - self._loss_start:.1f}s.")
+                self._tracked_ok = True
+
             if d is None:
                 self.untracked += 1      # hand present in stream, not in view
                 return
