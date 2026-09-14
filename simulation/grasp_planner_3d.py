@@ -2178,7 +2178,39 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
         _V = np.asarray(mesh_entry["verts"], float)
         _d = _V - np.asarray(seed_l, float).reshape(1, 3)
         _FACE_BAND = 2.0e-3      # m; a vertex further off the plane is another face
-        _on_face = np.abs(_d @ np.asarray(n_l_unit, float).reshape(3)) <= _FACE_BAND
+        _off = _d @ np.asarray(n_l_unit, float).reshape(3)
+        _on_face = np.abs(_off) <= _FACE_BAND
+        # IS IT ACTUALLY A FACE? The band test alone cannot tell a flat face from
+        # the tangent CAP of a ROUNDED surface: every smooth object has vertices
+        # within 2mm of its own tangent plane, and clipping to those measures
+        # CURVATURE while reporting it as face extent. Measured on 017_orange
+        # (a sphere, no face anywhere): 119 of 5528 vertices land in the band with
+        # an in-plane radius of 12.7mm, which clipped the patch to 32.7mm -- and
+        # that clip, not sdf_err_tol, was the sole binding constraint (loosening
+        # the tolerance 8x past saturation changed nothing, toggling this changed
+        # 32.7 -> 103.4mm). It is why the tripod could never reach its 45.4mm
+        # index-middle pitch: the cap forbade the spacing before the NLP started.
+        #
+        # A band of depth b on a sphere of radius R has in-plane radius
+        # r = sqrt(2Rb - b^2), so R_implied = r^2/(2b) recovers the radius --
+        # bounded and small for a curved patch, enormous for a planar one
+        # (a plane's band is limited only by where the face ends). MEASURED
+        # separation, seed 0, three contacts per object:
+        #     017_orange 40-45mm | 014_lemon 43mm | 056_tennis_ball 37-46mm
+        #     009_gelatin_box 367-568mm | 036_wood_block 6616-10913mm
+        # Rounded objects report their own radius; faces are 8x-240x larger. The
+        # threshold sits in that empty gap and is deliberately nearer the curved
+        # end, so an ambiguous patch keeps the clip (the conservative direction --
+        # it preserves d9d2a16's crease guard, whose whole purpose is to stop a
+        # contact parking on an edge).
+        _FACE_MIN_R = 0.15       # m; R_implied below this is curvature, not a face
+        if int(_on_face.sum()) >= 3:
+            _dfb = _d[_on_face]
+            _rip = float(np.linalg.norm(
+                _dfb - np.outer(_off[_on_face], np.asarray(n_l_unit, float).reshape(3)),
+                axis=1).max())
+            if (_rip * _rip) / (2.0 * _FACE_BAND) < _FACE_MIN_R:
+                _on_face = np.zeros_like(_on_face)
         if int(_on_face.sum()) >= 3:
             _df = _d[_on_face]
             for _ax, _nm in ((axis0_l, 0), (axis1_l, 1)):
