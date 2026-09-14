@@ -447,6 +447,38 @@ def for_gws_recommender(obj_name: str, arm_geom_names: list,
     # w_gws is rescaled to keep the EFFECTIVE weight put: beta*n_cols is ~14x
     # raw beta at m=14, so 5.0/14 = 0.357 leaves the GWS term's gradient
     # contribution where it was rather than multiplying it by 14.
+    # DIRECTIONAL TIP RADIUS. The IK target is contact + r_tip*n_out, so r_tip
+    # decides how far the fingertip SITE is parked back from the surface. The
+    # isotropic default is max||V - site|| over ALL directions -- a bounding
+    # sphere around an elongated pad -- which leaves the pad short of the object
+    # by the difference between that and the support distance along the actual
+    # contact normal.
+    #
+    # Measured this session as the DOMINANT term in the pre-squeeze gap, by
+    # decomposing every candidate source on the same solve (061_foam_brick
+    # seed 0, gaps thumb 5.58mm / index 9.00mm):
+    #     plan vs true surface (|SDF| at contact)   0.07 / 0.10 mm   negligible
+    #     IK residual                               3.86 / 0.37 mm   secondary
+    #     r_tip slack (iso 19.4 - directional 10.3) 9.19 / 9.12 mm   DOMINANT
+    #     hold drift over the 200-step settle       0.000 mm         zero
+    #     arm/hand collision constraint             not in contact   none
+    # The index is the clean read: with IK residual 0.37mm its 9.00mm gap is
+    # almost exactly the 9.12mm slack. The thumb's larger IK error happens to
+    # pull it toward the object, masking part of its own slack.
+    #
+    # This matters because 10 of 14 benchmark solves abort on the 8mm
+    # CONTACT_GAP_TOL_M gate BEFORE squeezing, and the aborts are near-misses
+    # (six between 8.69 and 9.21mm). Gap cleanly separated outcome in that
+    # sweep: every lift_ok=True had max gap <= 6.03mm, every failure >= 7.47mm.
+    #
+    # Safe to evaluate: _tip_support_along runs in NUMPY at a FIXED q (the
+    # stage's warm start), never symbolically inside the NLP -- a support
+    # function is non-smooth because the argmax vertex switches, so it is
+    # refrozen per stage exactly like the contact normal and the paraboloid
+    # curvature already are. directional_r_tip_margin_m (1mm) keeps the target
+    # on the GAP side of zero, since penetration is unrecoverable for the
+    # squeeze while a small gap is what the squeeze exists to close.
+    cfg_kw.setdefault('directional_r_tip', True)
     cfg_kw.setdefault('gws_soft_finger', True)
     cfg_kw.setdefault('gws_beta_scale_ncols', True)
     # Rescale only the DEFAULT w_gws -- an explicit value is taken literally.
@@ -593,10 +625,25 @@ def for_frogger(obj_name: str, arm_geom_names: list,
         # against 8/18 for our own configuration -- so the backend was a live
         # suspect for the convergence failure, not just a faithfulness detail.
         cfg_kw.setdefault('use_slsqp', True)
-        # Their constraint tolerances (Table III), realized by scaling each
-        # constraint against a single tol_pr -- see
-        # GraspConfig3D.frogger_tol_scaling.
-        cfg_kw.setdefault('frogger_tol_scaling', True)
+        # Their constraint tolerances (Table III) are implemented
+        # (GraspConfig3D.frogger_tol_scaling) but DEFAULT OFF: measured harmful.
+        #
+        # Ablated on 4 objects, seed 0, n=2, reporting l_bar*:
+        #
+        #     object           scaling ON   scaling OFF
+        #     017_orange           0.5929        0.6664
+        #     036_wood_block    -265.0947        0.2000
+        #     014_lemon          -17.2318      -31.5240
+        #     061_foam_brick      -0.0087        0.2900
+        #     median              -8.6202       +0.2450
+        #
+        # The -265 on 036_wood_block is the tell: dividing a constraint by 50-1000
+        # to fake a per-constraint tolerance also divides its GRADIENT by the same
+        # factor, so the scaled constraints stop steering the solve relative to the
+        # unscaled ones. It is not a tolerance change; it is a silent reweighting of
+        # the constraint Jacobian. Matching Table III properly needs a solver that
+        # accepts per-constraint tolerances, not this trick.
+        cfg_kw.setdefault('frogger_tol_scaling', False)
         # Optimize and certify against MuJoCo's combined contact friction, not a
         # derate of it -- see GraspConfig3D.frogger_raw_friction.
         cfg_kw.setdefault('frogger_raw_friction', True)

@@ -925,3 +925,54 @@ The scaling itself is a modest, mixed change on a 3-object probe:
 `009_gelatin_box` -4.33 -> +0.34 and now wrench-feasible, `017_orange`
 1.00 -> 0.94, `036_wood_block` +0.30 -> -1.47. Kept because it implements a stated
 part of their method, not because it is a measured win.
+
+### 13.7 Final n=2 state, and the tolerance scaling reverted
+
+Full sweep with the cone fix and friction consistency, tolerance scaling OFF.
+
+| | ours | frogger |
+|---|---|---|
+| median `l_bar*` | +0.8265 | +0.3370 |
+| `l_bar* > 0` | 17/18 | 10/18 |
+| wrench-feasible | 16/18 | 10/18 |
+| median `\|lp_gap\|` | ~0.001 | **0.00000** |
+| median solve time | 2.4 s | 5.1 s |
+
+**Tolerance scaling (§13.6) was measured harmful and is now default OFF.** Ablated on
+4 objects at seed 0:
+
+| object | scaling ON | scaling OFF |
+|---|---|---|
+| `017_orange` | 0.5929 | 0.6664 |
+| `036_wood_block` | **-265.09** | 0.2000 |
+| `014_lemon` | -17.23 | -31.52 |
+| `061_foam_brick` | -0.0087 | 0.2900 |
+| median | **-8.6202** | **+0.2450** |
+
+`tol OFF` and `both OFF` are identical, and `both ON` and `fric OFF` are identical, so
+the friction change contributes nothing to the objective (expected -- it touches only
+`verify()` and the gamma LP) and the scaling caused the whole regression.
+
+**Why the approach was wrong.** Dividing a constraint by 50-1000 to emulate a
+per-constraint tolerance also divides its GRADIENT by the same factor, so the scaled
+constraints stop steering the solve relative to the unscaled ones. It is not a
+tolerance change, it is a silent reweighting of the constraint Jacobian. Matching
+Table III needs a solver that accepts per-constraint tolerances; CasADi's `sqpmethod`
+exposes one, and this trick does not substitute for it.
+
+### 13.8 Where the port stands
+
+Working, verified, and faithful to the paper: the min-weight metric with a bilevel LP
+and analytic KKT gradients (`lp_gap` exactly 0 on every cell); the 4-sided friction
+cone; FK contacts with a fixed contact point; exact collision distance with their
+eq. (8) analytic gradient; SLSQP; the OBB sampler; both collision margins; `k_l`.
+
+The frogger configuration reaches `l_bar* > 0` on 10/18 cells and a median of +0.337,
+against ours at 17/18 and +0.827. **That is not a method comparison**, for three
+recorded reasons: our scene friction is mu = 2.0 against the paper's 0.7 (§7.2), which
+changes which grasps close at all; solve times are not comparable until the remaining
+FD paths are analytic (FROGGER_COMPARISON §6); and every number here was measured on a
+dirty tree (§0a).
+
+The 8 failing cells all have straddling seeds, so the seed is not the discriminator.
+`009_gelatin_box` fails all three seeds and is the flattest object in the set.
