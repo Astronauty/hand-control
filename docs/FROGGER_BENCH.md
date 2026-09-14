@@ -818,3 +818,44 @@ non-faithful gradient implementation (FROGGER_COMPARISON §6), never converges, 
 was measured on a dirty tree. What it licenses is: **the port is not yet good enough
 to benchmark against**, and the next step is the analytic collision gradient, which
 addresses both the time and, plausibly, the convergence.
+
+### 13.3 Re-run with SLSQP + analytic collision gradient: no net gain
+
+The n=2 sweep repeated after switching the frogger configuration to the paper's
+solver family (SQP, not IPOPT) and implementing their analytic collision gradient
+(eq. 8). Same objects, seeds and sampler.
+
+| | ours | frogger (IPOPT + FD) | frogger (SQP + analytic) |
+|---|---|---|---|
+| median `l_bar*` | +0.8879 | +0.2968 | **+0.0000** |
+| wrench-feasible | 16/18 | 10/18 | **6/18** |
+| median solve time | 2.4 s | 34.5 s | **5.3 s** |
+
+**The single cell I tested improved; the sweep did not.** `017_orange` seed 0 went
+0.7056 -> 0.9544, which is what prompted the re-run, but per cell: 6 improved, 8
+regressed, 4 unchanged. Testing one cell before launching a 36-cell sweep was not
+enough to justify the change.
+
+The split is object-dependent rather than random:
+
+| object | OBB edges (mm) | outcome |
+|---|---|---|
+| `017_orange` | 74 / 72 / 72 | improved 3/3 (0.95, 0.76, 0.84) |
+| `056_tennis_ball` | 67 / 67 / 67 | improved 1/3, unchanged 2/3 |
+| `014_lemon` | 65 / 55 / 54 | improved 2/3, regressed 1/3 |
+| `036_wood_block` | 210 / 127 / 122 | regressed 3/3, all to zero |
+| `009_gelatin_box` | 107 / 96 / 34 | regressed 2/3 |
+| `061_foam_brick` | 80 / 66 / 66 | regressed 2/3, unchanged 1/3 |
+
+The two elongated objects regress on every seed, and the roundest object improves on
+every seed -- but `061_foam_brick` is round and regresses, so shape does not fully
+explain it. Both speed results hold regardless: 5.3 s against 34.5 s, a 6.5x
+reduction from the analytic gradient, and `lp_gap` stays exactly 0 from the bilevel
+LP.
+
+**Still not reportable.** The frogger configuration never reaches `converged` on any
+of the 36 cells across both runs, under either solver. That invariance across a
+backend change argues the remaining defect is in the problem as posed -- the
+constraint set or its scaling -- rather than in the optimizer, which is where the
+per-constraint tolerances we have NOT applied (Table III: joint 1e-2, surface 5e-4,
+collision 1e-3, force closure 1e-5) become the obvious next suspect.
