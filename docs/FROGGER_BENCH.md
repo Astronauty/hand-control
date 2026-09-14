@@ -1089,3 +1089,54 @@ could keep the solve in the opposed basin where ours drifts out. Reporting it as
 The honest next test is sampler draws: we accept the FIRST straddling draw, while
 they generate many candidates per object. If more draws recover the mu = 0.7 numbers,
 the cause is our thin sampling rather than their objective.
+
+## 15. At the paper's full protocol: mu = 0.7 with resampling
+
+The harness previously drew seeds, picked one, solved ONCE and reported the result.
+That is not FRoGGeR's protocol. They RESAMPLE until a grasp is feasible within a
+60-second budget -- "we try to generate 20 feasible grasps", "a run converges if it
+yields a feasible grasp in under 1 minute" -- and Table I reports a MEDIAN OF 3
+SOLVES per feasible grasp (IQR 1-6). Their 99.4% convergence rate is a property of
+that loop, so a single-attempt harness understates the method by construction.
+
+`--max-attempts 20` implements it (`_frogger_synthesize`), accepting the first
+attempt whose RETURNED grasp clears `l_bar* >= k_l`.
+
+| frogger, mu = 0.7 | 1 attempt | up to 20 attempts |
+|---|---|---|
+| median `l_bar*` | **-7.4655** | **+0.3084** |
+| wrench-feasible | 7/18 | **14/18** |
+| median solve time | 5.5 s | 17.5 s |
+
+Fourteen of eighteen cells converge, against ours at 14/18 wrench-feasible and a
+median `l_bar*` of +0.6030. Individual recoveries are large: `036_wood_block` seed 2
+went -63.44 to +0.3000 on attempt 4, `014_lemon` seed 0 -25.00 to +0.3341 on
+attempt 6, `056_tennis_ball` seed 1 -15.62 to +0.7226 on attempt 2.
+
+### 15.1 The attempt distribution matches the paper
+
+| | this port | FRoGGeR (Table I) |
+|---|---|---|
+| attempts on success | median **2**, IQR 1-6 | median **3**, IQR 1-6 |
+| convergence rate | 77.8% (14/18) | 99.4% |
+| `l_bar*` over converged | 0.325 | 0.58 |
+
+The attempt distribution is independent evidence that the port behaves like the
+method: it is not a quantity that was tuned, and it lands on theirs.
+
+Convergence and metric value are both below the paper's. Candidate causes, none
+tested: their 43-object set is pruned to watertight meshes and excludes objects "too
+large, small, or thin to reasonably grasp"; they use 4 Allegro fingers against our 2;
+and our sampler accepts the first straddling draw rather than ranking many.
+
+### 15.2 What still fails
+
+`009_gelatin_box` exhausts all 20 attempts on every seed, and `036_wood_block` seed 0
+does too. The gelatin box is the flattest object in the set (OBB 107 x 96 x 34 mm),
+where a two-fingertip pinch has little depth to oppose across -- a plausible
+geometric limit for `n = 2` rather than a port defect, and the n >= 3 path is the
+test for that.
+
+Note the cost: a failing cell now burns the full 60-second budget, which is why the
+median solve time rose 5.5 s -> 17.5 s. That is the protocol working as specified,
+not a regression.
