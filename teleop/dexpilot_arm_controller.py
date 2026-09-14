@@ -233,17 +233,19 @@ class DexPilotArmController:
         # Load a saved orientation correction if present (from a prior multi-pose
         # calibration), else identity — or an explicit R_align override.
         #
-        # identity_orientation: force R_correct = I and disable ALL calibration
-        # (press-8 auto-calib AND the saved orientation_correction.json). This is
-        # the DIRECT mapping R_des = R_mp_to_robot @ palm_R — the world->wrist
-        # rotation shown in the MediaPipe overlay becomes the exact target in
-        # MuJoCo, with no offset. Meaningful now that the arm palm frame is built
-        # from the STABLE image landmarks (the saved correction was fit against the
-        # old flip-prone world-landmark frame and is no longer valid).
+        # identity_orientation: force R_correct = I and DISABLE press-8 orientation
+        # recalibration — a FIXED direct hand->wrist mapping (R_des = R_mp_to_robot @ palm_R,
+        # no correction offset). This is the Friday-good behavior, restored: the press-8
+        # auto-calib (_has_full_correction=False, capturing R_correct = R_site_home @ raw.T)
+        # was added for the sequential-spawn per-object recalibration, but it made the wrist
+        # mapping depend on the exact hand pose held at press-8 — which lingered into normal
+        # single-object teleop and degraded control. Reverted to the fixed identity mapping.
+        # (If base re-yaw handling is needed again, gate the press-8 recal behind a flag
+        # rather than making it the default.)
         self._identity_orientation = identity_orientation
         if identity_orientation:
             self._R_correct = np.eye(3)
-            self._has_full_correction = True   # block press-8 from overwriting I
+            self._has_full_correction = True    # block press-8 from overwriting I (fixed mapping)
             print("[arm] identity orientation: direct hand->wrist mapping, "
                   "no calibration offset.")
         elif R_align is not None:

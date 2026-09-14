@@ -239,6 +239,45 @@ def casadi_fn(table, name="obj_sdf", conservative=True):
     return ca.Function(name, [x], [outside + interp(xc) - off])
 
 
+def load_or_build_casadi_fn(model, body_id, *, name, conservative=False,
+                            n=DEFAULT_N, pad=DEFAULT_PAD, cache_dir=CACHE_DIR,
+                            group=3):
+    """casadi_fn(...) with a DISK cache for the compiled CasADi Function.
+
+    load_or_bake already caches the SDF grid (.npz, keyed on the hull-vertex hash),
+    but building the B-spline `casadi_fn` from that grid is a ~20s SYMBOLIC-GRAPH
+    construction (ca.interpolant over the 64^3 lattice) that was repeated on EVERY
+    launch because only the grid, not the Function, was persisted. CasADi Functions
+    serialize to a .casadi file (save/Function.load), which round-trips exactly and
+    loads in ~40ms — so cache it keyed on the SAME shape hash + grid params +
+    conservative flag (everything the Function's content depends on). The gradient
+    and Hessian are cheap to re-derive from the loaded fn (~0.2s), so only the base
+    fn is cached here.
+
+    The on-disk Function's name is deterministic (independent of id(model)), so a
+    cached fn loads with a stable name regardless of which process/model built it.
+    """
+    hulls, verts = body_hull_halfspaces(model, body_id, group=group)
+    key = _cache_key(verts, n, pad)
+    tag = f"sdf_fn_{key}_{'c' if conservative else 'nc'}"
+    path = Path(cache_dir) / f"{tag}.casadi"
+    if path.exists():
+        try:
+            return ca.Function.load(str(path))
+        except Exception:
+            # Corrupt/incompatible cache (e.g. a CasADi version bump): rebuild.
+            pass
+    table, _ = load_or_bake(model, body_id, n=n, pad=pad,
+                            cache_dir=cache_dir, group=group)
+    fn = casadi_fn(table, name=tag, conservative=conservative)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fn.save(str(path))
+    except Exception:
+        pass   # best-effort cache; a write failure must not break the run
+    return fn
+
+
 def casadi_grad_fn(fn, name=None):
     """Gradient of a `casadi_fn`, i.e. the unnormalised outward normal."""
     x = ca.MX.sym("x", 3)

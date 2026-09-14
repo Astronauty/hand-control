@@ -33,6 +33,7 @@ if str(_BENCH) not in sys.path:
 
 from ycb_grasp import out_paths as OP                       # noqa: E402
 from ycb_grasp import plot_seed_quadratic as SQ             # noqa: E402
+from ycb_grasp import plot_grasp_contacts as GC             # noqa: E402
 
 
 def _scene_from_planner(planner, model, data):
@@ -163,7 +164,7 @@ def _lift(p, n_in, mm=1.2):
     return p - (n / d) * (mm * 1e-3) if d > 1e-12 else p
 
 
-def _draw_block(fig, gs, col0, recs, sc, header, ok, solved=None):
+def _draw_block(fig, gs, col0, recs, sc, header, ok, solved=None, max_tris=3000):
     """One column block (all accepted, or all rejected), one panel per seed.
 
     solved: optional dict(p1=..., p2=..., p3=...) of the contacts the NLP
@@ -192,7 +193,7 @@ def _draw_block(fig, gs, col0, recs, sc, header, ok, solved=None):
         # two rows were drawing nearly the same framing twice. Merging them puts
         # the seed, the solved contact and the patch each contact is confined to
         # in ONE picture, which is the comparison the figure is actually for.
-        SQ.draw_mesh(ax, sc, alpha=0.16)
+        SQ.draw_mesh(ax, sc, alpha=0.16, max_tris=max_tris)
 
         pts = []
         for key, p, nin in _contacts_of(rec):
@@ -267,9 +268,14 @@ def _draw_block(fig, gs, col0, recs, sc, header, ok, solved=None):
         ax.set_axis_off()
 
 
-def write_seed_figure(planner, model, data, out_path, title_extra="", res=None):
-    """Draw every seed this solve considered. Returns the written path, or None
-    when the planner recorded no seeds (e.g. a solve that never reached seeding).
+def _build_seed_figure(planner, model, data, title_extra="", res=None,
+                       max_tris=3000):
+    """Build (but do not save) the seed figure: every seed this solve considered.
+    Returns the matplotlib Figure, or None when the planner recorded no seeds
+    (e.g. a solve that never reached seeding). Shared by write_seed_figure
+    (-> file) and render_seed_figure_png (-> bytes, for the live dashboard).
+    `max_tris` caps the mesh scatter per subplot (draw_mesh already thins
+    triangles) so a live render stays cheap.
 
     res: the solve result dict. When given, the contacts the NLP CONVERGED TO
         (res['p1']/['p2']/['p3']) are overlaid on the accepted panels as a
@@ -343,9 +349,10 @@ def write_seed_figure(planner, model, data, out_path, title_extra="", res=None):
         # gate that only fires late is still represented.
         _idx = np.linspace(0, _n_rej_total - 1, _REJ_CAP).astype(int)
         rej_recs = [rej_recs[i] for i in _idx]
-    _draw_block(fig, gs, 0, acc_recs, sc, "accepted", True, solved=_solved)
+    _draw_block(fig, gs, 0, acc_recs, sc, "accepted", True, solved=_solved,
+                max_tris=max_tris)
     _draw_block(fig, gs, n_acc + (1 if (n_acc and n_rej) else 0),
-                rej_recs, sc, "rejected", False)
+                rej_recs, sc, "rejected", False, max_tris=max_tris)
 
     # ONE SHARED LEGEND. Finger role is carried by colour in every panel, and
     # marker shape separates the two ends of a contact's story (seed vs the
@@ -367,6 +374,103 @@ def write_seed_figure(planner, model, data, out_path, title_extra="", res=None):
     # around the rendered object, so the margins are pulled in hard.
     fig.subplots_adjust(left=0.015, right=0.985, top=0.90, bottom=0.10,
                         wspace=0.02)
+    return fig
+
+
+def write_seed_figure(planner, model, data, out_path, title_extra="", res=None):
+    """Draw every seed this solve considered to a PNG file. Returns the written path,
+    or None when the planner recorded no seeds. High-fidelity (dpi 115) for offline use.
+
+    res is forwarded to _build_seed_figure so the accepted panels carry the
+    SOLVED-contact overlay; see that function's docstring for why."""
+    fig = _build_seed_figure(planner, model, data, title_extra=title_extra, res=res)
+    if fig is None:
+        return None
     out = OP.savefig(fig, Path(out_path), dpi=115)
     plt.close(fig)
     return out
+
+
+def _stage_from_result(planner, model, data, res):
+    """The `stage` dict plot_grasp_contacts.build_grasp_contacts_figure expects,
+    built from a LIVE solve result instead of from a saved grasp3d_iter_*.npz.
+
+    Object pose comes from _scene_from_planner (BODY frame for meshes, GEOM frame
+    for primitives) -- the SAME convention _run_stage used when it wrote each
+    frame's seed_l/axis*_l (obj_center_np/obj_R_np at grasp_planner_3d.py:3069),
+    so the paraboloid params reproject correctly. The solved offset t{1,2,3}_sol is
+    injected into the frame copy as `t_sol`, matching how _iter_trace_quadratic_stages
+    folds quad{ci}_t_sol into each contact frame from the npz.
+
+    Contact 3 is included on the same terms as 1 and 2, and is absent at n=2.
+    At c3_own_patch=False its frame IS contact 2's (the shared patch), so the two
+    panels draw the same rectangle -- deliberate, and the differing t_sol is what
+    shows whether contact 3 collapsed onto contact 2.
+
+    Returns (V, F, stage) or None when the result carries no paraboloid frames
+    (e.g. a primitive solved with face-pin contacts, or a non-quadratic solve)."""
+    sc = _scene_from_planner(planner, model, data)
+    f1, f2 = res.get("quad1_frame"), res.get("quad2_frame")
+    f3 = res.get("quad3_frame")
+    t1, t2 = res.get("t1_sol"), res.get("t2_sol")
+    t3 = res.get("t3_sol")
+    contact = {}
+    for ci, fr, ts in ((1, f1, t1), (2, f2, t2), (3, f3, t3)):
+        if fr is None:
+            continue
+        c = dict(fr)
+        if ts is not None:
+            c["t_sol"] = np.asarray(ts, float).reshape(-1)
+        contact[ci] = c
+    if not contact:
+        return None
+    stage = dict(obj_center=sc["center"], obj_mat=sc["R"], contact=contact)
+    return sc["Vvis"], sc["Fvis"], stage
+
+
+def render_grasp_contacts_png(planner, model, data, res, object_id="", verify_info=None,
+                              title_extra="", dpi=60, max_tris=2000):
+    """The SOLVED grasp's contacts rendered to in-memory PNG BYTES (for the live
+    dashboard), or None when the result carries no paraboloid frames. This is the
+    live counterpart of benchmarks/ycb_grasp/plot_grasp_contacts.py: one overview
+    panel (both contacts + grasp axis) plus a per-contact zoom showing that
+    contact's paraboloid patch and the ✕ the solver actually landed on it -- the
+    CHOSEN contact location, as opposed to render_seed_figure_png which draws the
+    seed CANDIDATES. Reads only the in-memory solve result (res carries
+    quad{1,2}_frame / t{1,2}_sol) and the planner's live pose; no npz trace."""
+    import io
+    built = _stage_from_result(planner, model, data, res)
+    if built is None:
+        return None
+    V, F, stage = built
+    pl = planner._planner if hasattr(planner, "_planner") else planner
+    _sdf = pl._mesh_entry["fn"] if getattr(pl, "_mesh_entry", None) else None
+    fig = GC.build_grasp_contacts_figure(
+        V, F, stage, f"{object_id}{title_extra}", sdf_fn=_sdf,
+        verify_info=verify_info, max_tris=max_tris)
+    if fig is None:
+        return None
+    buf = io.BytesIO()
+    try:
+        fig.savefig(buf, format="png", dpi=dpi)
+    finally:
+        plt.close(fig)
+    return buf.getvalue()
+
+
+def render_seed_figure_png(planner, model, data, title_extra="", dpi=60, max_tris=2000,
+                           res=None):
+    """Same figure rendered to in-memory PNG BYTES (for the live dashboard), or None when
+    no seeds were recorded. Lower dpi + a tighter triangle cap keep the live render ~0.4 s
+    on the recommender thread; the seed points/patches are unaffected by the mesh thinning."""
+    import io
+    fig = _build_seed_figure(planner, model, data, title_extra=title_extra,
+                             max_tris=max_tris, res=res)
+    if fig is None:
+        return None
+    buf = io.BytesIO()
+    try:
+        fig.savefig(buf, format="png", dpi=dpi)
+    finally:
+        plt.close(fig)
+    return buf.getvalue()

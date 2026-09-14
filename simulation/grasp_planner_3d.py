@@ -441,7 +441,12 @@ def _mesh_sdf_entry(model, body_id: int) -> dict:
     # body_id-based name can collide across separate MjModel instances the
     # same way the old cache key did.
     _tag = f"gp3_sdf_{id(model)}_{body_id}"
-    fn = _object_sdf.casadi_fn(table, name=_tag, conservative=False)
+    # DISK-CACHED base fn: building the B-spline casadi_fn from the grid is a ~20s
+    # symbolic-graph construction; load_or_build_casadi_fn serializes it (keyed on the
+    # shape hash + grid params), so a re-launch on the same object loads it in ~40ms
+    # instead of rebuilding. The grad/Hessian below re-derive from it in ~0.2s.
+    fn = _object_sdf.load_or_build_casadi_fn(model, body_id, name=_tag,
+                                             conservative=False)
     # load_or_bake discards the raw hull vertices after baking (only keeps the
     # half-space (A,b) form) — re-extract them the same way
     # object_sdf.body_hull_halfspaces does, for _minor_axis_local's SVD (the
@@ -6551,6 +6556,27 @@ class GraspPlanner3D:
                         'middle': _t3_frame,
                     },
                     'grad_z':        _eval_grad_z(_sol.value),
+                    # Paraboloid patch frames + solved surface offsets, carried on the RESULT
+                    # so the contact-patch figure can render WITHOUT the grasp3d_iter_*.npz
+                    # traces (which are written only under --rec-log-dir and drag in the
+                    # expensive per-term gradient-norm logging). None for primitive objects.
+                    'quad1_frame':   _t1_frame,
+                    'quad2_frame':   _t2_frame,
+                    # Contact 3 on the same footing as 1 and 2, so the LIVE
+                    # figure path (seed_figure._stage_from_result) draws the
+                    # tripod the npz path already records via quad3_*. At
+                    # c3_own_patch=False _t3_frame IS _t2_frame -- the shared
+                    # patch, faithfully duplicated -- but t3_sol is its OWN
+                    # offset, which is what makes a third contact collapsing
+                    # onto contact 2 visible instead of invisible. None at n=2.
+                    'quad3_frame':   _t3_frame,
+                    't1_sol':        (np.asarray(_sol.value(_t1_var), float)
+                                      if _t1_frame is not None else None),
+                    't2_sol':        (np.asarray(_sol.value(_t2_var), float)
+                                      if _t2_frame is not None else None),
+                    't3_sol':        (np.asarray(_sol.value(_t3_var), float)
+                                      if (_t3_frame is not None
+                                          and _t3_var is not None) else None),
                 }
             except Exception as _e:
                 self.log.warning(f"GraspPlanner3D._run_stage({stage_label}): {_e}")
@@ -6590,6 +6616,12 @@ class GraspPlanner3D:
                                            if _gws_alpha is not None else None),
                         'quad_pinned':   _quad_pinned(_opti.debug.value),
                         'grad_z':        _eval_grad_z(_opti.debug.value),
+                        'quad1_frame':   _t1_frame,
+                        'quad2_frame':   _t2_frame,
+                        't1_sol':        (np.asarray(_opti.debug.value(_t1_var), float)
+                                          if _t1_frame is not None else None),
+                        't2_sol':        (np.asarray(_opti.debug.value(_t2_var), float)
+                                          if _t2_frame is not None else None),
                     }
                 except Exception as _e2:
                     self.log.error(f"GraspPlanner3D debug extraction: {_e2}")
