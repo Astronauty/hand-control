@@ -976,3 +976,31 @@ dirty tree (§0a).
 
 The 8 failing cells all have straddling seeds, so the seed is not the discriminator.
 `009_gelatin_box` fails all three seeds and is the flattest object in the set.
+
+
+### 13.9 Verified: both configurations build the friction cone at the same mu
+
+Checked directly rather than by reading the code. Recomputing `l_bar*` from each
+configuration's OWN solved contacts, at `mu = 2.0` and `mu = 1.6`, against what the
+NLP reported (`017_orange` seed 0, n=2):
+
+| config | reported | recomputed at mu=2.0 | recomputed at mu=1.6 | `mu` | `n_cols` |
+|---|---|---|---|---|---|
+| ours | 0.8069 | 0.9435 | 0.9297 | 2.000 | 12 |
+| frogger | 0.9996 | **0.9996** | 0.9995 | 2.000 | 12 |
+
+The cone friction is set in `_run_stage` at `_mu = round(1 * _mu_raw, 3)`, which is
+shared by both configurations with no gating, so both build `W` at MuJoCo's combined
+2.0. `frogger_raw_friction` affects only `verify()` and the post-solve gamma LP, never
+the cone.
+
+The frogger recomputation matches exactly. The `ours` gap of 0.137 is NOT friction --
+recomputing at 1.6 moves it by 0.014, an order of magnitude too little. It is
+`beta_delta`, the patch-versus-SDF normal difference of §8: `ours` builds `W` from
+quadratic-patch normals while the audit uses the SDF gradient, and the frogger
+configuration shows `beta_delta = -0.00000` precisely because it already uses SDF
+normals.
+
+So the two configurations differ in the NORMALS entering the cone, which is a
+deliberate and documented axis of the comparison (§2.2), not in the friction
+coefficient.
