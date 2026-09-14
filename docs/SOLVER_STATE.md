@@ -7,9 +7,9 @@ term, a constraint, or the way an environment calls the planner, update this fil
 same commit.
 
 Last verified against: `simulation/grasp_planner_3d.py`, `simulation/grasp_config_builder.py`,
-`kinova_common/{wrench,constants}.py`, `grasp_control/grasp_controller.py`,
+`kinova_common/{wrench,constants}.py`, `grasp_control/{grasp_controller,force_control}.py`,
 `benchmarks/ycb_grasp/{pick_from_floor,pick_and_place}.py`, `kinova_leap_pick_place.py`
-— 2026-09-12.
+— 2026-09-14.
 
 **Two JSON config files feed `GraspConfig3D`**, both read by `grasp_config_builder` and
 both applied as DEFAULTS, so an explicit CLI flag or `PFF_*` env var still wins
@@ -414,6 +414,51 @@ approach (kinematic replay) -> hold/settle -> GAP GATE -> squeeze ramp
   load and bleeds normal force. See `grasp_controller.effective_gains`.
 - **Jogs**: resolved-rate DLS, `JOG_SING_EPS = 0.02`, `JOG_LAM_MAX = 0.05`.
 
+### The squeeze force: cone-constrained, not sign-anchored
+
+`internal_force_torques` allocates `f_c = pinv(G) @ w_des + null(G) @ gamma`. **How `gamma`
+is chosen changed in `daf4207`, and the old rule was only ever correct at n=2.**
+
+`allocate()` (the fallback) orients each null-space basis vector using the FIRST non-None
+`inward_dirs` entry and then breaks. With 2 antipodal contacts `null(G)` is 1-D, so that one
+sign IS the answer. With 3 contacts the null space is 3-D and a uniform gamma over an
+arbitrary SVD basis lands anywhere in it — **nothing holds the non-anchor contacts
+compressive.** Measured on an asymmetric tripod: sign-anchor normal forces
+`[1.213, 0.047, 0.325] N` vs cone-solve `[1.000, 1.000, 1.000] N`.
+
+`solve_gamma_cone()` (default, `cone_gamma=True`) replaces it with an LP in `(gamma, t)`:
+
+```
+min  t   s.t.  f_k . n_k >= f_min      compressive, EVERY contact
+               f_k . n_k <= t          t = peak normal force
+               f_k . e_ki <= mu_eff * f_k . n_k    8-facet pyramid, per contact
+```
+
+The pyramid is **inscribed** (`mu_eff = mu * cos(pi/8) * (1 - margin)`), so feasibility
+implies feasibility for the true circular cone, not merely for the approximation. The LP
+returns the MINIMUM in-cone force (peak normal = `cone_f_min`); the caller's commanded
+`gamma` then scales it up, so `cone_f_min` sets the shape and `gamma` sets the magnitude.
+
+**Infeasible returns `None` rather than a fabricated gamma** — three near-parallel normals
+genuinely cannot squeeze. The controller then falls back to the sign-anchor path, which is
+sound at n=2 and is the only path when `cone_gamma=False`.
+
+Regression at n=2: `017_orange` thumb+index unchanged through the switch (lift 119.11 mm,
+contacts held), with squeeze forces RISING 1.20/1.19 -> 1.65/1.61 N as the cone solve
+distributes load more evenly.
+
+### `active_joint_slices` must match the run's fingers
+
+`effective_gains()` and `slip_correction_torques()` both gate on these slices, and the
+`GraspController` default is hardcoded `((7, 11), (19, 23))` — LEAP index and thumb. At
+three fingers the middle finger's joints (11..14) fall outside both, so **it never
+participates in the CLOSING/HOLDING switch at all**: it keeps full stiff gains, pinned at its
+planned pre-contact posture, while index and thumb soften to 0.25 to let the squeeze close.
+
+`constants.finger_joint_slices(model, fingers)` derives the slices from the model's own
+`leap_<code>_*` joint names. thumb+index reproduces `((7, 11), (19, 23))` exactly.
+**Only `pick_and_place.py` calls it** — see §9.
+
 ---
 
 ## 7. How each environment differs
@@ -428,6 +473,7 @@ approach (kinematic replay) -> hold/settle -> GAP GATE -> squeeze ramp
 | object friction | mu = 0.6 (per `pick_from_floor`'s own gamma comment; not re-queried live) |
 | gamma budget | `ACCEL_BUDGET_XYZ = (0.5,)*3`, `ANG_ACCEL_BUDGET = (0.1,)*3` — **not** migrated to the shared 20 m/s^2 box the tabletop and teleop now share (§5) |
 | LP infeasible | falls back to `GAMMA_FALLBACK = 2.0` (the tabletop aborts instead) |
+| controller | `GraspController` **defaults**: `cone_mu = 0.7` (vs the scene's own 0.6) and the hardcoded `((7,11),(19,23))` gain slices — neither is passed (§9) |
 | phases | approach -> hold -> squeeze -> lift. **No transport, no bin.** |
 | artifacts | `out/floor/<tag>/<object>/` |
 
@@ -443,6 +489,7 @@ approach (kinematic replay) -> hold/settle -> GAP GATE -> squeeze ramp
 | gamma budget | `(20,20,20) m/s^2` / `(1,1,1) rad/s^2`, shared with teleop and with the certificate (§5) |
 | LP infeasible | **aborts the grasp** — no fallback constant |
 | finger pairing | `--pairing {thumb_index,thumb_middle,tripod}`, default from `models/grasp_finger_config.json`. **Steers the PLANNER only** (§10) |
+| controller | the only env that configures it: `cone_mu` from the LIVE geom friction, `cone_margin = 0.2`, `cone_f_min = 0.5`, and `finger_joint_slices(model, _FSET)` (§6) |
 | phases | approach -> hold -> squeeze -> lift -> transport -> release, scored by `TS.in_bin` |
 | artifacts | `out/tabletop/<tag>/<object>/`, incl. `seed<N>_planned.png` (planned pose before squeeze) |
 
@@ -533,6 +580,16 @@ works alone.
   derates friction to `0.8 * mu` and the floor benchmark still uses its own small budget.
 - **The tripod is not wired past the NLP** (§10) — the planner solves a third contact that
   no consumer reads.
+- **Only the tabletop configures the controller.** `pick_from_floor.py` and
+  `kinova_leap_pick_place.py` construct `GraspController` without `cone_mu`/`cone_margin`/
+  `cone_f_min` or `active_joint_slices`, so both silently take the defaults: `cone_mu = 0.7`
+  and the hardcoded index+thumb gain slices (§6). Two consequences, unequal in severity:
+  - The friction default is **benign today**: `mu_eff = 0.7*cos(pi/8)*0.8 = 0.517` against
+    the floor scene's true 0.6, i.e. conservative. It is still a number that does not track
+    its scene, and would become optimistic for any object with mu < 0.52.
+  - The **gain-slice default is a real defect** for any run with more than two fingers, and
+    it is the exact bug `daf4207` fixed for the tabletop without propagating. Neither env
+    runs 3 fingers today, so it is latent rather than active.
 - **`thumb_middle` is the weaker pinch.** All ten measured cells certify wrench-feasible,
   but `gamma_min` rises on every object vs `thumb_index`, and on `036_wood_block` by 4.9x
   (3.08 -> 14.93 N against a 25 N ceiling). Its "converged" solver status there is not a
@@ -590,6 +647,16 @@ What does **not** see it yet:
       the 8 mm gate.
   This happens under BOTH patch branches: `c3_own_patch=True` still collapses (6.4 mm) and
   still aborts, so the shared trust region is NOT the cause — look at the seeding/objective.
+  **The CONTROLLER is ruled out too, and measurably so.** On `017_orange` seed 0, every
+  tripod config from effective kp 0.2 to 16 aborts with `squeeze_aborted_no_contact` — the
+  fingertips never get close enough to squeeze, so gains are irrelevant to this failure. On
+  the same object and seed the 2-contact grasp lifts 119 mm, and raising ITS gains actively
+  breaks it (eff kp >= 4.0: contact lost, 0 N, no lift), exactly as `effective_gains`'
+  docstring predicts. The soft-PD-plus-internal-force design is deliberate and correct; the
+  tripod's problem is upstream in contact PLACEMENT (0/15 tripod solves under 2 mm
+  worst-gap, vs 6/15 at n=2). The cone allocator (§6) and the gain-slice fix landed in the
+  same commit and neither moved the tripod — they were prerequisites for it working at all,
+  not the fix.
   On the CLEAN tree the two arms solve at comparable speed (2-finger 4.87 s, 3-finger
   5.58 s mean); the dirty tree's apparent "n=3 is 2x faster" was a property of that tree,
   not the formulation. Full table:
