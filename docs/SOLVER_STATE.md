@@ -43,9 +43,9 @@ seed generation  ->  local surface fit  ->  NLP (per Picard stage)  ->  post-pro
 
 The NLP's internal `gamma` is **not** what gets executed. See §5.
 
-The bracketed steps run only at `n_contacts >= 3` (the `tripod` pairing). That path is
-**planner-side only today** — the NLP solves for a third contact, but nothing downstream
-consumes it. See §10.
+The bracketed steps run only at `n_contacts >= 3` (the `tripod` pairing). `pick_and_place.py`
+consumes the third contact; the other two environments do not. It does not yet EXECUTE —
+contact 3 collapses onto contact 2 in every measured cell. See §10.
 
 ---
 
@@ -578,8 +578,8 @@ works alone.
 - **Verify/execute gamma: the budget half is fixed, the friction half is not** (§5). The
   tabletop executor and the certificate now share one disturbance box, but `verify()` still
   derates friction to `0.8 * mu` and the floor benchmark still uses its own small budget.
-- **The tripod is not wired past the NLP** (§10) — the planner solves a third contact that
-  no consumer reads.
+- **The tripod is wired but does not work** (§10) — `pick_and_place.py` reads `p3`, but
+  contact 3 collapses onto contact 2 in 15/15 measured cells and the arm executes 0/15.
 - **Only the tabletop configures the controller.** `pick_from_floor.py` and
   `kinova_leap_pick_place.py` construct `GraspController` without `cone_mu`/`cone_margin`/
   `cone_f_min` or `active_joint_slices`, so both silently take the defaults: `cone_mu = 0.7`
@@ -635,16 +635,28 @@ What does **not** see it yet:
   `_SLOTS` against the contact list so slots map to fingers positionally at n=2 or n=3.
   `pick_from_floor.py` and `kinova_leap_pick_place.py` are still 2-contact.
   **But three-finger execution does not WORK yet.** Measured 5 objects x 3 seeds, full
-  execution, CLEAN TREE at `7827ec3`: 2-finger 9/14 true grasps (one cell excluded as a
-  physics blow-up), 3-finger **1/15** (8/15 abort before squeeze). The n=3 arm is
-  BIT-IDENTICAL between the dirty and clean trees (all 15 cells, beta and gamma_min).
-  Every 3-finger plan certifies `wrench_feasible=True`, so this is not a metric failure.
-  Two causes, both measured:
-  (a) contact 3 COLLAPSES onto contact 2 — EXACTLY coincident, not merely close: the n=3
-      contacts figure's pairwise separations read `1-2 69mm  1-3 69mm  2-3 0mm` on
-      `017_orange` seed 0, supplying no off-axis moment arm;
-  (b) every fingertip misses its target by 13-21 mm, giving 19-33 mm squeeze gaps against
-      the 8 mm gate.
+  execution, CLEAN TREE at `2bcfae3`: 2-finger **10/15** true grasps, 3-finger **0/15**.
+  All 30 cells completed (exit 0); no cell blew up and none carries a negative beta, so
+  none is excluded from the means. The tabletop block of `models/scene_objects.json` is
+  byte-identical to `7827ec3`, so this is code drift, not scene drift.
+  Two n=3 failure modes, neither a metric failure:
+  (a) `squeeze_aborted_no_contact` (11 cells) — the tripod arrives ONE FINGER FIRST. In
+      11 of 12 cells one fingertip is already touching (gap ~0, often slightly negative)
+      while another is 12-48 mm away; `017_orange` s0 reads
+      `middle -0.02mm, index 24.5mm, thumb 3.2mm`. The gap gate fires, the squeeze never
+      starts, and no force fields are written at all.
+  (b) `gamma_infeasible_no_grasp` (3 cells, all `009_gelatin_box`) — `solve_gamma_live`
+      finds no gamma that resists the disturbance box and aborts BEFORE squeeze. These are
+      the only cells in either arm with `wrench_feasible: False`; the 2-finger grasp on the
+      same object and seeds certifies feasible. **This mode is NEW** — it is absent from the
+      `7827ec3` table. `daf4207` (cone squeeze) predates `7827ec3`, so the cone solve is not
+      the new variable.
+  **Contact 3 collapses onto contact 2 in 15/15 cells, EXACTLY coincident.** Read off the
+  pairwise-separation suptitle: `2-3 0mm` on every object and every seed, with `1-3` equal
+  to `1-2` throughout (54-103 mm). The NLP is solving a two-contact problem and reporting
+  it as three; the third contact supplies no off-axis moment arm, which is the only reason
+  it exists. A doubled contact is not an infeasible one, which is why these plans still
+  certify `wrench_feasible=True`.
   This happens under BOTH patch branches: `c3_own_patch=True` still collapses (6.4 mm) and
   still aborts, so the shared trust region is NOT the cause — look at the seeding/objective.
   **The CONTROLLER is ruled out too, and measurably so.** On `017_orange` seed 0, every
@@ -653,14 +665,16 @@ What does **not** see it yet:
   the same object and seed the 2-contact grasp lifts 119 mm, and raising ITS gains actively
   breaks it (eff kp >= 4.0: contact lost, 0 N, no lift), exactly as `effective_gains`'
   docstring predicts. The soft-PD-plus-internal-force design is deliberate and correct; the
-  tripod's problem is upstream in contact PLACEMENT (0/15 tripod solves under 2 mm
-  worst-gap, vs 6/15 at n=2). The cone allocator (§6) and the gain-slice fix landed in the
-  same commit and neither moved the tripod — they were prerequisites for it working at all,
-  not the fix.
-  On the CLEAN tree the two arms solve at comparable speed (2-finger 4.87 s, 3-finger
-  5.58 s mean); the dirty tree's apparent "n=3 is 2x faster" was a property of that tree,
-  not the formulation. Full table:
-  `benchmarks/ycb_grasp/out/tabletop/clean_7827ec3/RESULTS_2v3_finger.md`.
+  tripod's problem is upstream in contact PLACEMENT. The cone allocator (§6) and the
+  gain-slice fix landed in the same commit and neither moved the tripod — they were
+  prerequisites for it working at all, not the fix.
+  The two arms solve at comparable speed (2-finger 5.41 s mean over its 10 true grasps,
+  3-finger 2.8-9.5 s per cell). **Do not claim n=3 is faster** — an earlier dirty-tree
+  reading of "2x faster" was a property of that tree, not the formulation.
+  `036_wood_block`'s 2-finger blow-up is FIXED by `d9d2a16`: beta -0.1937 / dz -1356 mm at
+  `7827ec3`, now beta +0.0615 / dz 0 mm.
+  Full table (gitignored, regenerate by re-running the sweep):
+  `benchmarks/ycb_grasp/out/tabletop/default/RESULTS_2v3_finger.md`.
 - **`FINGER_SET` is import-time**, derived from the pairing file's `default`. So `--pairing`
   steers the PLANNER only; **plan-only sweeps are meaningful, execution runs with a
   non-default pairing are not.** `SLOT_ROLES` was added so the controller maps an NLP slot to
