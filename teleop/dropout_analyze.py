@@ -100,6 +100,20 @@ def main():
         durs = np.array([e[2] for e in eps])
         print(f"  episode duration: median {np.median(durs)*1e3:.0f}ms, "
               f"max {durs.max():.1f}s")
+        # Distinguish two regimes with different causes:
+        #  * SUSTAINED OUTAGE (episodes of seconds): the headset stopped tracking the hand
+        #    for an extended stretch (tracked=0 / "0.0 Hz published"), INDEPENDENT of what
+        #    the hand was doing that instant — often the hand held still. Per-frame pose
+        #    factors below do NOT explain these; the fix is headset-side (re-acquire: move
+        #    the hand out and back into clear view, check lighting/IR, headset thermal/battery).
+        #  * BRIEF per-motion dropouts (sub-second): correlate with reach/speed/orientation
+        #    below.
+        sustained = [e for e in eps if e[2] >= 2.0]
+        if sustained:
+            tot = sum(e[2] for e in sustained)
+            print(f"  ** {len(sustained)} SUSTAINED outage(s) >=2s (total {tot:.0f}s) — a headset "
+                  f"tracking loss, NOT a per-frame hand-pose issue. The pose factors below "
+                  f"describe only the onset; a still hand held in view can still show this. **")
     if not long_eps:
         print("  no substantial dropouts to characterize. (Good — or move the hand more.)")
         return
