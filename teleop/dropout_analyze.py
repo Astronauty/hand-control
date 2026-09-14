@@ -60,6 +60,15 @@ def _hand_span(lm):
     return float(np.mean(np.linalg.norm(tips, axis=1)))
 
 
+def _palm_normal(lm):
+    """Unit palm normal from wrist-relative landmarks (wrist=0, index_mcp=5, pinky_mcp=17).
+    Direction the palm faces. When this rotates edge-on to the cameras the Vive loses the
+    hand even with the wrist centered and in front — the classic hand-tracking failure."""
+    n = np.cross(lm[5] - lm[0], lm[17] - lm[0])
+    L = np.linalg.norm(n)
+    return n / L if L > 1e-9 else np.array([0.0, 0.0, 1.0])
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else _newest_trace()
     if not path or not os.path.exists(path):
@@ -135,6 +144,46 @@ def main():
         print("    -> dropouts happen with a MORE OPEN/extended hand.")
     else:
         print("    -> hand openness at dropouts is typical => pose-openness is not the main factor.")
+
+    # --- ORIENTATION: palm facing at dropout vs. overall (edge-on palm = classic Vive loss).
+    # This is often the trigger when the wrist is CENTERED and IN FRONT but rotated for a grasp:
+    # position/openness look fine, but the palm has turned away from the cameras.
+    pn_all = np.array([_palm_normal(hlm[i]) for i in np.where(valid)[0]])
+    good = pn_all.mean(0); good /= (np.linalg.norm(good) + 1e-9)   # typical well-tracked facing
+    ang_all = np.degrees(np.arccos(np.clip(pn_all @ good, -1, 1)))
+    ang_drop = np.array([np.degrees(np.arccos(np.clip(_palm_normal(hlm[i]) @ good, -1, 1)))
+                         for i in onset_idx])
+    print("\n  ORIENTATION (palm-facing angle from the typical well-tracked direction):")
+    print(f"    all tracked frames:   median {np.median(ang_all):.0f}deg  p90 {np.percentile(ang_all,90):.0f}deg")
+    print(f"    at dropout onsets:    median {np.median(ang_drop):.0f}deg  (each: "
+          f"{', '.join(f'{a:.0f}' for a in ang_drop)})")
+    if np.median(ang_drop) > np.percentile(ang_all, 75):
+        print("    -> dropouts happen with the palm ROTATED AWAY from typical (toward edge-on)")
+        print("       => PALM ORIENTATION is the trigger. Keep the palm facing the headset")
+        print("          cameras through the grasp; a wrist rotated edge-on loses tracking even")
+        print("          when centered and in front. (abs_scale/reach changes won't help this.)")
+    else:
+        print("    -> palm orientation at dropouts is typical => not primarily orientation.")
+
+    # --- SPEED: hand velocity just before dropout vs. overall (motion blur). ---
+    def _spd(k, w=3):
+        a = max(0, k - w)
+        if a == k or not (valid[a] and valid[k]):
+            return np.nan
+        return float(np.linalg.norm(hw[k] - hw[a]) / max(t[k] - t[a], 1e-3))
+    spd_all = np.array([_spd(k) for k in np.where(valid)[0]])
+    spd_all = spd_all[~np.isnan(spd_all)]
+    spd_drop = np.array([_spd(i) for i in onset_idx])
+    spd_drop = spd_drop[~np.isnan(spd_drop)]
+    print("\n  SPEED (wrist speed just before onset; motion blur):")
+    print(f"    all tracked frames:   median {np.median(spd_all):.2f} m/s  p90 {np.percentile(spd_all,90):.2f}")
+    if len(spd_drop):
+        print(f"    at dropout onsets:    median {np.median(spd_drop):.2f} m/s")
+        if np.median(spd_drop) > np.percentile(spd_all, 75):
+            print("    -> dropouts follow FASTER motion => motion blur is a contributing factor "
+                  "(move the hand more slowly through grasps).")
+        else:
+            print("    -> speed at dropouts is typical => not primarily motion blur.")
 
     print("\n  Cross-check against the console LOST/REGAINED logs and the wrist MP4 for the "
           "onset frames to confirm the trigger (edge-on palm, occlusion, reach to a corner).")
