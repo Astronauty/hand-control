@@ -312,7 +312,8 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                    lift_mode="standard", plan_override=None,
                    nullspace_tracking=False, gap_tol_m=None,
                    sep_hard=False, min_sep_mm=12.0,
-                   squeeze_pd_per_finger=False):
+                   squeeze_pd_per_finger=False, contact_gated_alloc=False,
+                   force_feedback_ki=0.0, advance_q_target=0.0):
     """Plan + execute one grasp on one object, then carry it to the bin.
 
     lift_mode : "standard" (default) runs this benchmark's own 12 cm lift, scored
@@ -845,6 +846,10 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         obj_body_id=obj_bid, kp=Kp, kd=Kd,
         gamma=gamma_live, squeeze_pd_scale=squeeze_pd_scale, support_weight=True,
         squeeze_pd_per_finger=squeeze_pd_per_finger,
+        tip_geom_ids=tip_geom_ids, obj_geom_ids=obj_gids,
+        contact_gated_alloc=contact_gated_alloc,
+        force_feedback_ki=force_feedback_ki,
+        advance_q_target=advance_q_target,
         # FRoGGeR eq. (18)'s tracking projector; off unless asked for. See
         # GraspController.nullspace_tracking.
         nullspace_tracking=nullspace_tracking,
@@ -1004,6 +1009,9 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         n_ramp = max(int(SQUEEZE_RAMP_S / model.opt.timestep), 1)
         _f_peak = np.zeros(len(tip_geom_ids))
         _n_force_samples = 0
+        _cmd_sum = np.zeros(len(tip_geom_ids))
+        _mes_sum = np.zeros(len(tip_geom_ids))
+        _n_track = 0
         _n_all_loaded = 0
         # PFF_DRIFT_TRACE=1 decomposes the squeeze: how big the internal-force
         # torque is against the PD torque that is supposed to hold the planned
@@ -1063,6 +1071,19 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
             _f_now = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
                                           obj_geom_ids=obj_gids)
             _f_peak = np.maximum(_f_peak, _f_now)
+            # FORCE-TRACKING ACCURACY: what the allocator COMMANDED vs what the
+            # contacts actually delivered, sampled over the whole ramp. The
+            # controller is open-loop in force -- it applies f_c and never checks
+            # -- so without this a -18% error on a seated finger and a -100%
+            # error on a stalled one are indistinguishable downstream.
+            # Compared on the NORMAL component, which is what f_c[3k] is in the
+            # contact frame and what _measured_tip_forces reports.
+            _fc = getattr(ctrl, 'last_f_c', None)
+            if _fc is not None and len(_fc) >= 3 * len(_f_now):
+                _cmd_now = np.abs([float(_fc[3 * _k]) for _k in range(len(_f_now))])
+                _cmd_sum += _cmd_now
+                _mes_sum += np.asarray(_f_now, float)
+                _n_track += 1
             _n_force_samples += 1
             _n_all_loaded += int(all(v > 0.0 for v in _f_now))
             if os.environ.get("PFF_SQUEEZE_TRACE") and i % 100 == 0:
@@ -1081,6 +1102,20 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         # did not change those verdicts -- but the metric should not depend on
         # that being true. squeeze_forces_peak_N is what a force-closure check
         # should read; squeeze_forces_N stays the end-of-ramp state.
+        # Mean over the ramp, per finger, plus the aggregate ratio. Reported even
+        # when open-loop, so every arm is comparable on the same number.
+        if _n_track:
+            _cmd_mean = _cmd_sum / _n_track
+            _mes_mean = _mes_sum / _n_track
+            result["force_cmd_mean_N"]  = dict(zip(_FSET, np.round(_cmd_mean, 3).tolist()))
+            result["force_meas_mean_N"] = dict(zip(_FSET, np.round(_mes_mean, 3).tolist()))
+            result["force_track_ratio"] = round(
+                float(_mes_mean.sum() / max(_cmd_mean.sum(), 1e-9)), 4)
+            # Worst per-finger relative error -- the aggregate can look healthy
+            # while one finger delivers nothing.
+            _rel = [(_mes_mean[i] - _cmd_mean[i]) / _cmd_mean[i]
+                    for i in range(len(_cmd_mean)) if _cmd_mean[i] > 1e-6]
+            result["force_track_worst_rel"] = round(float(min(_rel)), 4) if _rel else None
         result["squeeze_forces_peak_N"] = dict(
             zip(_FSET, np.round(_f_peak, 3).tolist()))
         result["squeeze_all_loaded_frac"] = round(float(_n_all_loaded)
@@ -1386,6 +1421,18 @@ def main():
                          "fails or gamma is infeasible, so the FAILURE is visible in "
                          "the recorded video instead of the clip ending at the abort. "
                          "Diagnostic only -- the run is still reported as failed.")
+    ap.add_argument("--contact-gated-alloc", action="store_true",
+                    help="build the grasp map G only from fingers ACTUALLY in "
+                         "contact, so the internal force is split over the grasp "
+                         "that exists rather than the one the plan hoped for")
+    ap.add_argument("--force-feedback-ki", type=float, default=0.0,
+                    help="integral gain on the per-finger force error "
+                         "(commanded minus measured normal). 0 = open loop, "
+                         "which is what the controller has always been")
+    ap.add_argument("--advance-q-target", type=float, default=0.0,
+                    help="re-datum a SEATED finger's PD target to where it "
+                         "actually is, so tracking stops pulling it back off the "
+                         "surface it just reached (any value > 0 enables)")
     ap.add_argument("--squeeze-pd-per-finger", action="store_true",
                     help="scale the squeeze-phase finger PD PER FINGER, by that "
                          "finger's own |tau_int|/|tau_pd| ratio, instead of one "
@@ -1493,6 +1540,9 @@ def main():
         fingers=args.fingers, force_execute=args.force_execute,
         sep_hard=args.sep_hard, min_sep_mm=args.min_sep_mm,
         squeeze_pd_per_finger=args.squeeze_pd_per_finger,
+        contact_gated_alloc=args.contact_gated_alloc,
+        force_feedback_ki=args.force_feedback_ki,
+        advance_q_target=args.advance_q_target,
         release_open_frac=args.release_open_frac,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
         directional_r_tip=args.directional_r_tip,
