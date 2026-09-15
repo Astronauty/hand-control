@@ -1671,3 +1671,68 @@ What IS clean and publishable is §11bis + this section: their method places 2/3
 its contacts within 2 mm of an edge where ours places none, and edge proximity
 predicts execution failure at r = +0.51. That is a mechanism, measured end to end, for
 a failure mode the paper names and leaves open.
+
+---
+
+## 14bis. The frogger arm reported the SITE as its contact (2026-09-14)
+
+§13bis reported the frogger arm at 1/15 pick success and said the number was not a
+clean method comparison. It was not, and the reason was a defect in this port, now
+fixed.
+
+### 14bis.1 The bug
+
+Under `frogger_fk_contacts` the surface equality (7d) is applied to the PAD POINT,
+`site + pad_offset * pad_axis`, which is the fixed fingertip point their App. B-F
+specifies. But `_p1`/`_p2` were assigned `_tp1_fk`/`_tp2_fk` -- the tip SITE. The
+constraint held one point to the surface while the solver REPORTED a different one,
+`pad_offset` away along the pad axis.
+
+Measured at the solution, SDF at the reported contact (0 = on surface):
+
+| | p1 | p2 |
+|---|---|---|
+| `017_orange` | **+9.51 mm** | **+9.74 mm** |
+| `014_lemon` | **+9.66 mm** | **+9.23 mm** |
+
+against a constraint satisfied to ~0. Everything downstream believed the reported
+point: W's wrench columns, the `gamma` certificate, and the executor's contact
+frames were all built at a location floating ~10 mm off the object.
+
+The visible consequence was a grasp opened about `2*pad_offset` too wide --
+contact separation 91 mm across a 73 mm orange, 70 mm across a 58 mm lemon -- so the
+fingers closed on air. This is what the failure videos show: the object is left on
+the table while the palm completes its 100 mm lift, giving the near-uniform
+`max_dev` of 98.6-100.8 mm in §13bis.
+
+### 14bis.2 It was not diagnosable from the metric
+
+`l_bar*` was +0.94 on exactly these cells. The min-weight metric is computed from
+the wrench matrix, which was assembled at the floating points, so it described a
+geometrically excellent grasp of a phantom object 10 mm larger than the real one.
+Nothing in the planner could see the error; it took executing the grasp, measuring
+the contact separation against the object's own width, and then querying the SDF at
+the reported contact.
+
+This is the same class as §7.1's 5th cone vertex and §9.1's gap-gate finding: a
+quantity that is internally consistent and externally wrong.
+
+### 14bis.3 Effect
+
+After the fix, SDF at the reported contact is +0.00 mm on both objects, and on the
+4 cells measured so far:
+
+| | before | after |
+|---|---|---|
+| fingertip gap at the hold | 6.4-9.3 mm | **~0.0 mm** |
+| squeeze force | 1.3-1.7 N | **2.0 N** |
+| lifts | 0/4 | **3/4** |
+
+`ours` is unaffected and verified bit-identical (`017_orange` seed 0,
+`gamma_min = 1.8735697484057219`, object rose 118.9 mm) -- the branch is inside
+`cfg.frogger_fk_contacts`.
+
+**Every frogger execution number recorded before this fix is void**, including
+§13bis's 1/15 and the r = +0.51 correlation, which was computed over those runs.
+The edge-seeking margins in §11bis are PLAN-ONLY and were computed from `p1`/`p2`,
+so they are affected too and must be re-measured.

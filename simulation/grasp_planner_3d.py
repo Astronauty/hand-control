@@ -5163,9 +5163,28 @@ class GraspPlanner3D:
                 # The FK callbacks are the same ones the IK cost uses, so the
                 # fingertip position entering W is the position the hand actually
                 # reaches, by construction rather than by penalty.
-                _p1 = _tp1_fk
-                _p2 = _tp2_fk
-                if _has_c3 and _tp3_fk is not None:
+                # THE CONTACT IS THE PAD POINT, NOT THE SITE. The surface equality
+                # below pins `site + pad_offset*pad_axis` to s(p)=0, because that is
+                # the fixed fingertip point their App. B-F specifies. Reporting the
+                # SITE as the contact then describes a point ~pad_offset OUTSIDE the
+                # object: measured +9.51/+9.74 mm on 017_orange and +9.66/+9.23 mm on
+                # 014_lemon against a constraint that holds to ~0.
+                #
+                # Everything downstream believed it -- W's wrench columns, the gamma
+                # certificate and the executor's contact frames were all built at a
+                # point floating off the surface, and the executed grasp opened
+                # ~2*pad_offset too wide (contact separation 91 mm across a 73 mm
+                # orange, 70 mm across a 58 mm lemon) and closed on air.
+                #
+                # Same expression as the constraint, so the two cannot drift.
+                _pa_r = np.asarray(cfg.pad_axis, float)
+                _pa_r = _pa_r / (np.linalg.norm(_pa_r) + 1e-12)
+                _po = float(cfg.frogger_pad_offset_m)
+                _p1 = _tp1_fk + _po * _thumb_pad_cb(_q)
+                _p2 = _tp2_fk + _po * _index_pad_cb(_q)
+                if _has_c3 and _tp3_fk is not None and _middle_pad_cb is not None:
+                    _p3 = _tp3_fk + _po * _middle_pad_cb(_q)
+                elif _has_c3 and _tp3_fk is not None:
                     _p3 = _tp3_fk
             elif _is_mesh and cfg.sdf_surface_contact:
                 # FRoGGeR (7d): free 3-vectors pinned by s(p) = 0. No trust region
