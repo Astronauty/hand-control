@@ -1444,7 +1444,60 @@ the SAME direction, 8.5 degrees apart, 125 mm apart on a 107 mm object.
 contacts.
 
 This is §14.3's same-side collapse at `n = 2` (it was recorded at `n = 3`, dots
-+0.914 / +0.966 / +0.931). The cause is unchanged and is structural: **(7a) is
-`max l*(q)` with no alignment term**, so nothing in their objective holds contacts
-opposed, and the seed's opposition is not preserved by the solve. Adding an
-alignment term would fix it and would no longer be FRoGGeR.
++0.914 / +0.966 / +0.931).
+
+### 10bis.6 Their sampler DOES enforce opposition, and ours reproduces it
+
+Checked against the paper (Sec. IV, App. C step 1, Fig. 4 caption), because an
+earlier note here implied opposition was simply absent from their method. It is not:
+
+> "(1) from the oriented bounding box of the object ... choose an axis with which to
+> align the palm's **y-axis** up to sign and **use the width of this box edge to fix
+> an initial guess for the separation of the hand's fingers**"
+
+Their palm convention (App. C) is x = outward normal, z = toward the fingers, y =
+right-handed -- so the y-axis IS the finger-spread direction. Aligning it to an OBB
+axis and opening the fingers to that edge's width makes the pre-shape BRACKET the
+object. Axis choice is weighted by side length (`a/(a+b+c)`), "motivated by
+observations of preferred human grasps".
+
+They state the mechanism is load-bearing:
+
+> "the overall performance of both FRoGGeR and the baseline was **highly sensitive to
+> the sampled initial conditions**. For instance, **if the initial width of the
+> fingertips was not guided by object bounding boxes, both methods suffered in terms
+> of runtime and grasp quality**, as enforcing surface constraints became harder."
+
+So opposition lives in the SAMPLER by design, not in (7a). The method is sampler +
+refinement as a unit, and criticizing (7a) for lacking an alignment term misreads it.
+
+**Our port reproduces this correctly.** Measured, `thumb,index`, opposition as the
+cosine between tip directions from the OBB CENTRE (-1 = perfectly opposed):
+
+| cell | seed `tip_dot` | solved `n1.n2` |
+|---|---|---|
+| `017_orange` s0 | **-1.000** | **-1.000** (kept) |
+| `017_orange` s1 | **-0.996** | +0.974 |
+| `017_orange` s2 | **-0.914** | +0.138 |
+| `036_wood_block` s0 | **-0.605** | +0.798 |
+| `036_wood_block` s1 | **-0.758** | +0.989 |
+| `036_wood_block` s2 | **-0.592** | +0.998 |
+
+**Every seed starts opposed; the SOLVE destroys it on 5 of 6.** That relocates the
+defect: it is not a seeding failure, and the sampler is not at fault. The solve walks
+a well-opposed start to a same-side configuration, which is what needs explaining.
+
+Note every one of these cells exits `best-effort` / `Maximum_Iterations_Exceeded`
+(§10bis.4), so a plausible reading is that the iterate is simply mid-flight rather
+than at any optimum of (7a) -- a hypothesis §10bis.4's `max_iter = 400` run does not
+support, and which the next investigation should settle before any claim is made
+about their objective.
+
+**MEASUREMENT HAZARD, found the hard way.** Scoring opposition about
+`data.xpos[bid]` gives entirely wrong answers: the YCB body origin sits at the
+object's BASE, 40.4 mm below the OBB centre on `017_orange`. Doing so made every
+seed read as same-side (`tip_dot` +0.12 to +0.28) when the same seeds are in fact
+-0.91 to -1.00 about the true centre, and briefly produced the conclusion that the
+sampler was broken. The sampler's own `_seg_dist` was right all along -- it scores
+against the OBB centre. Use the OBB centre (or `vol_centroid`), never the body
+origin.
