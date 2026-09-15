@@ -1501,3 +1501,76 @@ seed read as same-side (`tip_dot` +0.12 to +0.28) when the same seeds are in fac
 sampler was broken. The sampler's own `_seg_dist` was right all along -- it scores
 against the OBB centre. Use the OBB centre (or `vol_centroid`), never the body
 origin.
+
+---
+
+## 11bis. Edge-seeking, measured (2026-09-14)
+
+FRoGGeR names edge-seeking as the dominant failure mode of BOTH arms, attributes it
+to the metric preferring large moment arms, states it "yields unstable grasps in
+practice", and lists combating it as future work: "we hope to develop methods to
+combat edge-seeking behavior." **They give no metric for it.**
+`benchmarks/ycb_grasp/edge_seeking.py` supplies one.
+
+### 11bis.1 Two metrics, and why the obvious one is not comparable
+
+**Patch-bound margin** (`contact_edge_margins`): the distance from the solved contact
+to the nearest trust-region bound that was set by MEASURED SDF divergence, using the
+RAW (pre-inset) bound and skipping axes parked at `quadratic_t_bound_max` -- exactly
+the test `w_edge_margin`'s own hinge applies. Exact, free, and reads data each solve
+already records.
+
+**It is not usable for the comparison.** The frogger arm sets
+`frogger_fk_contacts=True`: its contacts are FK outputs pinned by (7d), with no local
+parameterization and therefore no bounds. Measured: `quad1_frame` is None on 15/15
+frogger solves. Reporting that as "no edge nearby" would credit their arm for a
+measurement never taken.
+
+**Geodesic margin** (`geodesic_edge_margin`), the comparable one: from the contact,
+step outward along 16 tangent directions, reprojecting to the surface each step,
+until the surface NORMAL turns more than 30 degrees from its value at the contact.
+The distance when that first happens, minimized over directions, is the margin.
+Asks the MESH, so it is identical for both arms regardless of representation.
+
+### 11bis.2 Result: 5 objects x 3 seeds, n = 2, plan-only
+
+| | ours | frogger |
+|---|---|---|
+| median geodesic margin | **12.0 mm** | 1.0 mm |
+| IQR | (11.0, 15.5) | (1.0, 8.0) |
+| worst grasp | 8.0 mm | 1.0 mm |
+| **contacts within 2 mm of an edge** | **0 / 30** | **20 / 30** |
+
+Per object (median over 3 seeds, mm):
+
+| object | ours | frogger |
+|---|---|---|
+| `014_lemon` | 12.0 | 1.0 |
+| `017_orange` | 18.0 | 17.0 |
+| `036_wood_block` | 11.0 | 1.0 |
+| `056_tennis_ball` | 15.0 | 1.0 |
+| `061_foam_brick` | 11.0 | 1.0 |
+
+Consistent on 4 of 5. `017_orange` is the exception and the informative one: a
+sphere has no edges, so neither arm can seek one and both sit ~17-18 mm from the
+nearest 30-degree normal turn. The separation appears exactly where edges exist.
+
+1.0 mm is the search STEP, so frogger's contacts are on the edge, not near it.
+
+### 11bis.3 What this does and does not establish
+
+Does: on this object set, at n = 2, the frogger arm places 2/3 of its contacts within
+2 mm of a measured surface boundary and ours places none. That is the behaviour the
+paper describes and does not quantify, measured on a shared object set with one
+representation-free metric.
+
+Does not: it is a PLAN-ONLY property and does not by itself show edge-seeking causes
+the execution failures. The mechanism is plausible (a contact on a crease has a
+friction cone falling off two faces) but untested here; pairing these margins with
+`frogger_exec_bench` outcomes is the test.
+
+Nor does it isolate WHICH of our mechanisms is responsible. `quadratic_bound_inset`
+(10 mm, active) is the obvious candidate and roughly matches the observed separation,
+`w_edge_margin` is OFF by default, and the patch parameterization confines contacts
+to a fitted trust region in the first place. An ablation over those three would
+attribute it; this measurement only establishes that the difference exists.

@@ -76,7 +76,9 @@ from ycb_grasp import out_paths as OP                               # noqa: E402
 from ycb_grasp import table_scene as TS                             # noqa: E402
 from ycb_grasp.frogger_bench import (ARMS, DEFAULT_OBJECTS,         # noqa: E402
                                      EXCLUDED_OBJECTS, SYNTH_BUDGET_S,
-                                     _build_cfg, _frogger_seed)
+                                     _build_cfg, _frogger_seed,
+                                     _frogger_synthesize)
+from simulation.grasp_planner_3d import MultiStartGraspPlanner3D  # noqa: E402
 from ycb_grasp.ik_demo import robot_geom_names                      # noqa: E402
 from ycb_grasp.pick_and_place import run_pick_place, _fmt_eps       # noqa: E402
 from simulation.grasp_config_builder import parse_fingers           # noqa: E402
@@ -109,12 +111,37 @@ def _arm_override(arm, *, k_l, sdf_normals, max_attempts, budget_s):
                          n_seeds=cfg_kw.get("n_seeds", 1),
                          max_iter=cfg_kw.get("max_iter", 80),
                          fingers=fingers, k_l=k_l, sdf_normals=sdf_normals)
-        # FRoGGeR's heuristic sampler (their App. B-C). Their (7a) has no IK or
-        # alignment term, so the preference for opposed contacts lives entirely
-        # here -- see run_pick_place's note at the solve call.
-        q0, sinfo = _frogger_seed(model, data, info, body_name,
-                                  np.asarray(q_home, float),
-                                  list(fingers or ["thumb", "index"]), seed)
+        # FRoGGeR's SYNTHESIS LOOP (Sec. IV / Table I), not a single draw. Their
+        # convergence rate is a property of resample-until-feasible: a run converges
+        # when it yields a grasp clearing the k_l floor inside 60 s, at a median of
+        # 3 solves (IQR 1-6). A single attempt is not their protocol and understates
+        # the method by construction.
+        #
+        # This must happen HERE rather than in run_pick_place, which solves exactly
+        # once from whatever start pose it is handed. So the loop runs to completion
+        # and returns the ACCEPTED attempt's q0; run_pick_place's own solve then
+        # re-solves from that seed, landing on the same grasp the loop accepted.
+        #
+        # Their sampler is where opposition lives (App. C step 1: palm y-axis to an
+        # OBB axis, fingers pre-opened to that edge's width), and the paper reports
+        # the method is "highly sensitive to the sampled initial conditions" -- so
+        # resampling is load-bearing, not a retry convenience.
+        roles = list(fingers or ["thumb", "index"])
+        if max_attempts > 1:
+            planner = MultiStartGraspPlanner3D(model, data, cfg, seed=seed)
+            _, sinfo = _frogger_synthesize(
+                planner, model, data, info, body_name,
+                np.asarray(q_home, float), roles, seed, pos,
+                cfg_kw.get("n_seeds", 1), k_l=k_l,
+                max_attempts=max_attempts, budget_s=budget_s)
+            # Re-draw the ACCEPTED attempt's seed: _frogger_synthesize returns the
+            # result, but run_pick_place needs the q0 that produced it.
+            q0, _ = _frogger_seed(model, data, info, body_name,
+                                  np.asarray(q_home, float), roles, seed,
+                                  attempt=max(int(sinfo.get("n_attempts", 1)) - 1, 0))
+        else:
+            q0, sinfo = _frogger_seed(model, data, info, body_name,
+                                      np.asarray(q_home, float), roles, seed)
         _override.seed_info = dict(sinfo)
         return cfg, q0
 
