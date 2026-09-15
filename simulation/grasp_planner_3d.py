@@ -5268,13 +5268,32 @@ class GraspPlanner3D:
             # solve has already moved away from -- the same inconsistency the
             # wrench frame had before quadratic_symbolic_normals. Falls back to
             # the frozen -d*_lp whenever the surrogate isn't active.
-            _n1_in_sym_cost = _n2_in_sym_cost = None
+            _n1_in_sym_cost = _n2_in_sym_cost = _n3_in_sym_cost = None
             if (cfg.quadratic_symbolic_normals and _is_mesh
                     and cfg.use_quadratic_contact
                     and _t1_frame is not None and _t2_frame is not None
                     and _t1_var is not None and _t2_var is not None):
                 _n1_in_sym_cost = _quadratic_inward_normal_ca(_t1_var, _t1_frame, obj_R_np)
                 _n2_in_sym_cost = _quadratic_inward_normal_ca(_t2_var, _t2_frame, obj_R_np)
+                # SLOT 3 was the only contact left on its FROZEN SEED normal, and it
+                # is the one that moves furthest. Measured seed-normal vs true normal
+                # at the solved contact, seed 0: slot 3 is worst on every object --
+                # 60.5 deg on 017_orange, 61.1 on 056_tennis_ball, 71.2 on
+                # 009_gelatin_box, i.e. a target displaced r_tip*|dn| = 14.7-22.7mm
+                # from the correct one. That is the whole 18-20mm the IK-only
+                # ablation stalls at (every other cost term zeroed and the tips STILL
+                # do not close, while a selective-damped DLS reaches 0.4mm on the same
+                # contacts), because a stale normal does not weaken the term -- it
+                # relocates its MINIMUM. 036_wood_block is the control: planar, drift
+                # 2.3 deg, offset 0.8mm, and the only object where ik_only improved.
+                #
+                # Under the default c3_own_patch=False, _t3_frame IS _t2_frame, so
+                # this evaluates the SAME paraboloid at contact 3's own coordinate --
+                # which is exactly the point: the two contacts sit at different t on
+                # one patch and therefore have different normals.
+                if _has_c3 and _t3_var is not None and _t3_frame is not None:
+                    _n3_in_sym_cost = _quadratic_inward_normal_ca(
+                        _t3_var, _t3_frame, obj_R_np)
 
             # Per-consumer ablation: each sub-flag can veto the symbolic normal
             # for ONE consumer while the others keep it (None = follow master).
@@ -5336,8 +5355,15 @@ class GraspPlanner3D:
                 _r3_ik = float(
                     (cfg.r_middle if cfg.r_middle is not None else cfg.r_index)
                     if r3_override is None else r3_override)
-                _n3_out_ik = ca.DM(np.asarray(
-                    d3_lp if d3_lp is not None else _n3_seed_out, float))
+                # Same per-consumer veto as slots 1 and 2 (_sym_pair): None or True
+                # follows the master switch, False forces the frozen seed normal.
+                _n3_ik_s = (_n3_in_sym_cost
+                            if (_n3_in_sym_cost is not None
+                                and cfg.quad_sym_normals_iktgt is not False)
+                            else None)
+                _n3_out_ik = (-_n3_ik_s if _n3_ik_s is not None
+                              else ca.DM(np.asarray(
+                                  d3_lp if d3_lp is not None else _n3_seed_out, float)))
                 _tp3_tgt = _p3 + _r3_ik * _n3_out_ik
                 _d3_sq = ca.sumsqr(_tp3 - _tp3_tgt)   # m²
 
