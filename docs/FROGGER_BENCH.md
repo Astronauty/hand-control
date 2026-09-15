@@ -1786,3 +1786,63 @@ does better. This is a real comparison now rather than a port artifact, but at 3
 seeds per cell the per-object Wilson intervals are wide ([6, 79] for 1/3) and
 overlapping -- no per-object claim is supported yet. The aggregate (ours 80% [55, 93]
 against frogger 40% [20, 64]) is the only interval that separates.
+
+---
+
+## 15bis. 20 seeds per object (2026-09-15)
+
+FRoGGeR's own protocol is 20 grasps per object. 5 objects x 20 seeds x 2 arms = 200
+executed cells, after the §14bis fix, on an identical 8 mm gap gate for both arms.
+
+| | ours | frogger |
+|---|---|---|
+| reached lift | **100% [96, 100]** | 75% [66, 82] |
+| pick success | **85% [77, 91]** | 35% [26, 45] |
+| held | **82% [73, 88]** | 29% [21, 39] |
+| median `l_bar*` | **0.87** (0.71, 0.94) | 0.52 (0.34, 0.83) |
+
+Wilson 95% intervals. The aggregate intervals separate with no overlap on all three
+rates, which the 3-seed run could not establish.
+
+### 15bis.1 Per object
+
+| object | ours pick | frogger pick |
+|---|---|---|
+| `014_lemon` | 100% [84, 100] | 40% [22, 61] |
+| `017_orange` | 100% [84, 100] | 70% [48, 85] |
+| `036_wood_block` | **25% [11, 47]** | **10% [3, 30]** |
+| `056_tennis_ball` | 100% [84, 100] | 20% [8, 42] |
+| `061_foam_brick` | 100% [84, 100] | 35% [18, 57] |
+
+**Two readings from the 3-seed run were sampling noise and are corrected here.**
+
+- `017_orange` looked like a TIE (3/3 both). At 20 seeds it is 100% against 70%.
+- `036_wood_block` looked like the one object where the frogger arm WINS (0/3
+  against 1/3). At 20 seeds ours is ahead, 25% against 10%. Both are poor: the block
+  is the object neither method grasps reliably at n = 2, and it is the only cell
+  where our own rate falls below 100%.
+
+This is the case for running their 20 and not our 3. Nothing about the aggregate
+moved much (80/40 at 3 seeds against 85/35 at 20), but two per-object conclusions
+inverted.
+
+### 15bis.2 `held` is consistently below `pick`, on BOTH arms
+
+82% against 85% for ours, 29% against 35% for frogger. Those gaps are grasps that
+satisfy FRoGGeR's displacement criteria while a fingertip has unloaded -- the
+phantom-success mode §9.2 found on one cell, now visible as a systematic few percent
+on both methods. It is a property of THEIR CRITERIA, not of either implementation,
+and it is the reason both columns are reported.
+
+### 15bis.3 The remaining frogger aborts are genuine
+
+25 frogger cells never reached the lift. Gap at abort: median 17.5 mm, min 8.6 mm,
+max 100 mm (the sentinel for no contact found). These are not the systematic
+~10 mm pad offset §14bis fixed -- they are solves that placed contacts the arm
+cannot reach.
+
+### 15bis.4 Edge-seeking correlation is unchanged
+
+The edge sweep covers seeds 0-2, so the join is over those 30 cells: held median
+12.0 mm (n=18) against failed 1.0 mm (n=12), r = **+0.574**. Extending the edge
+sweep to 20 seeds would tighten this and is the obvious next measurement.
