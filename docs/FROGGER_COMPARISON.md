@@ -113,6 +113,14 @@ normal derived from it, and §8.4a shows the surrogate term is ~1/16 of the disa
 
 ### 3.3 Task-specific wrench certification
 
+**Qualified 2026-09-14 after reading their App. B.** The contrast below holds for the
+PLANNER's `k_l` floor, which is genuinely task-agnostic. It does NOT hold for their
+CONTROLLER: eq. (18)'s contact-force QP tracks a desired wrench
+`^O w_des = R_OB(^B w_grav + ^B w_err)` whose `w_err` is a live PD error wrench on the
+object's own pose (`k_p,err = 50`, `k_d,err = 5`, `k_R,err = 50`, `k_omega,err = 5`),
+with a minimum normal force `F_min^n = 1.0 N`. That is task-specific in the same
+sense our `gamma` LP is. See FROGGER_BENCH §10bis.
+
 `solve_gamma_live` certifies against an explicit disturbance box (`m*a` force box, `I*alpha`
 torque box, gravity re-datumed about the contact centroid) and returns the internal-force
 scale `gamma` needed. FRoGGeR's `k_l` is task-agnostic. A task-specific certificate is

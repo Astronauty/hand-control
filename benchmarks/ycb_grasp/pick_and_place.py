@@ -282,7 +282,8 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                    gamma_ref=1.0,
                    lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS,
                    contact_profile="stock", fingers=None, force_execute=False,
-                   lift_mode="standard", plan_override=None):
+                   lift_mode="standard", plan_override=None,
+                   nullspace_tracking=False):
     """Plan + execute one grasp on one object, then carry it to the bin.
 
     lift_mode : "standard" (default) runs this benchmark's own 12 cm lift, scored
@@ -721,6 +722,9 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         model, N_ROBOT, tip_site_ids=tip_site_ids, obj_site_ids=None,
         obj_body_id=obj_bid, kp=Kp, kd=Kd,
         gamma=gamma_live, squeeze_pd_scale=squeeze_pd_scale, support_weight=True,
+        # FRoGGeR eq. (18)'s tracking projector; off unless asked for. See
+        # GraspController.nullspace_tracking.
+        nullspace_tracking=nullspace_tracking,
         pad_offsets=[pad_offset[f] for f in _FSET],
         # Cone-constrained gamma: solve null-space weights so EVERY contact is
         # compressive and in-cone, not just the sign-anchor contact. mu comes from
@@ -1206,6 +1210,14 @@ def main():
                          "eases in/out over JOG_RAMP_S, so this is the cruise speed.")
     ap.add_argument("--transport-speed", type=float, default=TRANSPORT_SPEED_MPS,
                     help=f"lateral carry speed m/s (default {TRANSPORT_SPEED_MPS})")
+    ap.add_argument("--nullspace-tracking", action="store_true",
+                    help="apply FRoGGeR's eq. (18) projector to the tracking torque "
+                         "while squeezing, so tracking cannot move the fingertips "
+                         "across the object surface. Their Allegro has 16 hand DOFs "
+                         "against a rank-12 Jh; our 2-contact LEAP has 8 against "
+                         "rank 6, so the projector discards ~55%% of finger tracking "
+                         "authority here (measured) -- expect a weaker hold, not "
+                         "just a cleaner one.")
     ap.add_argument("--lift-mode", choices=["standard", "shaky"], default="standard",
                     help="standard (default): this benchmark's 12cm lift, scored by "
                          "lift_ok. shaky: FRoGGeR's execution test (Sec. IV) -- 10cm "
@@ -1264,6 +1276,7 @@ def main():
         finger_kp=args.finger_kp, finger_kd=args.finger_kd,
         lift_speed=args.lift_speed, transport_speed=args.transport_speed,
         lift_mode=args.lift_mode,
+        nullspace_tracking=args.nullspace_tracking,
         contact_profile=args.contact_profile)
     print("\n=== RESULT ===")
     for k, v in result.items():

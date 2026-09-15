@@ -1330,3 +1330,121 @@ uv run python -m ycb_grasp.frogger_exec_bench --lift-mode standard
 `--mu` is deliberately NOT plumbed here and exits with a message: `run_pick_place`
 builds its own scene, so accepting the flag would have run at 2.0 while labelling the
 output 0.7. Use the plan-only harness for the paper's friction regime.
+
+---
+
+## 10bis. Appendix B: their controller, read at last (2026-09-14)
+
+§9 was written believing the paper specified no control law. **It does** -- App. B,
+"Controller Implementation Details," which had not been read. Correcting that record
+here, because it changes what our squeeze mechanism should be compared against.
+
+### 10bis.1 What they actually do
+
+Their control law (18):
+
+```
+tau = Jh^T R_BC F_C*  +  (I - Jh^T (Jh^T)^dagger) tau_joint
+```
+
+**Term 1 -- commanded contact forces**, from a QP solved online:
+
+```
+minimize_{F_C}  ||G F_C - (-^O w_des)||^2
+s.t.  Lambda_i F_C,i <= 0                       (pyramidal friction cones)
+      F_C,i^n >= F_min^n                        (minimum normal force)
+      tau_lb - tau_joint,h <= J_i^T R_BC F_C,i <= tau_ub - tau_joint,h
+```
+
+with **`F_min^n = 1.0 N`** (0.25 N under 0.01 kg). The desired wrench is
+`^O w_des = R_OB(^B w_grav + ^B w_err)`, gravity plus a PD **error wrench on the
+OBJECT's pose**: `k_p,err = 50`, `k_d,err = 5`, `k_R,err = 50`, `k_omega,err = 5`.
+
+**Term 2 -- tracking, null-space projected.** `tau_joint = tau_grav + tau_track`;
+arm at `K_p,arm = 500 I`, `K_d,arm = diag(1,1,1,1,0.1,0.1,0.1)` via Drake's
+differential IK; hand a **pure proportional** term
+`tau_hand = -k_p,hand (q_h - q_h*)` with **`k_p,hand = 5`**. The projector's stated
+purpose: applying these "does not change the contact positions between the hand and
+object." They note it "does not affect the arm torques at all."
+
+### 10bis.2 Consequences for this benchmark
+
+- **Their squeeze is COMMANDED, not emergent.** An earlier reading here guessed the
+  -3 mm interpenetration allowance was the force-generation mechanism. It is not:
+  force comes from the QP, and `F_min^n = 1.0 N` is a floor they set explicitly.
+- **Directly comparable to ours.** Their 1.0 N floor against our measured squeeze of
+  1.62 / 1.61 N on `017_orange` -- the same order, a comparison we could not make
+  before.
+- **FROGGER_COMPARISON §3.3 needs qualifying.** It records theirs as task-agnostic
+  and ours as task-specific. True of the PLANNER's `k_l` floor; NOT true of their
+  CONTROLLER, whose `w_err` is a live task-specific wrench like our `gamma` LP.
+- **Their hand gain is tiny and projected** (`k_p,hand = 5`), so tracking cannot
+  fight the force command. Our `squeeze_pd_scale = 0.25` pursues the same end by
+  weakening tracking globally instead of only where it conflicts.
+
+### 10bis.3 The projector is implemented; it does not transfer cleanly
+
+`GraspController(nullspace_tracking=True)` applies
+`(I - Jh^T (Jh^T)^dagger)` to the tracking torque while squeezing, scoped to the
+FINGER columns so the arm jog is untouched (their own note says the projection
+leaves arm torques alone). Verified: the component of tracking torque lying in
+`range(Jh^T)` drops from 4.46 to **5.9e-14**, the operator is idempotent to 4.0e-15,
+and arm columns are bit-identical.
+
+**But the DOF budget does not transfer.** Their Allegro has 16 hand DOFs against a
+rank-12 `Jh` (4 contacts). Our 2-contact LEAP has **8 finger DOFs against rank 6**,
+a null space of dimension 2, so the projector discards a measured **~55%** of finger
+tracking authority (mean surviving fraction 0.449 over 500 random torques).
+
+Measured end to end, `--lift-mode shaky`:
+
+| | baseline | nullspace |
+|---|---|---|
+| `017_orange` s0 squeeze (N) | 1.622 / 1.605 | **1.696 / 1.693** |
+| `017_orange` s0 shake deviation | **1.2 mm** | 2.2 mm |
+| `017_orange` s0 pick / lift_ok | OK / True | OK / True |
+| `036_wood_block` s0-s2 | 0/3 | 0/3 |
+
+Squeeze force rises slightly (tracking no longer fights it, which is the projector's
+purpose) and shake tracking degrades slightly (55% less authority). The block fails
+3/3 either way -- that is a grasp failure, not a control-law one.
+
+**Verdict: correct, faithful, and not a fix.** Worth keeping as an ablation and
+reporting as a DOF-budget finding -- eq. (18) assumes a hand with DOFs to spare, and
+a 2-contact pinch on an 8-DOF finger set does not have them. Default stays off.
+
+### 10bis.4 The pad constant, corrected and honestly inconclusive
+
+`frogger_pad_offset_m` was `0.011`, an ESTIMATE ("roughly one half-extent" of the tip
+geom's bounding box). Measured against the 52-vertex tip meshes, the pad surface
+along `pad_axis` is **9.96 mm** (thumb) / **9.95 mm** (index), site-to-geom-centre
+0.05 mm. Corrected to **0.00995**.
+
+The old value was wrong, so the correction stands on its own terms. It did **not**
+improve execution. Plan-only A/B, `thumb,index`, same seeds (`max_iter` 80; repeated
+at 400 with the same pattern, so this is not an iteration-budget artifact):
+
+| cell | 0.011 | 0.00995 |
+|---|---|---|
+| `017_orange` s0/s1/s2 | +0.998 / +0.935 / +0.976 | +0.995 / +0.933 / +0.949 |
+| `036_wood_block` s0 | -21.07 INFEAS | -1.74 INFEAS |
+| `036_wood_block` s1 | **+0.431** (gamma 35.98) | **-14.73 INFEAS** |
+| `036_wood_block` s2 | +0.302 (gamma 41.53) | +0.453 (gamma 23.99) |
+
+wrench-feasible 4/6 -> 3/6. The orange is unmoved; the block swings in both
+directions. Every cell exits `best-effort`/`Maximum_Iterations_Exceeded`, so the
+solve is landing in different basins rather than responding smoothly to a 1 mm
+change. **Report the constant as corrected, not as an improvement.**
+
+### 10bis.5 Why the frogger cells abort wrench-infeasible
+
+Traced on `036_wood_block` seed 1: `n1_in . n2_in = +0.989` -- the two contacts point
+the SAME direction, 8.5 degrees apart, 125 mm apart on a 107 mm object.
+`solve_gamma_live` is right to refuse it; no squeeze force holds two same-side
+contacts.
+
+This is §14.3's same-side collapse at `n = 2` (it was recorded at `n = 3`, dots
++0.914 / +0.966 / +0.931). The cause is unchanged and is structural: **(7a) is
+`max l*(q)` with no alignment term**, so nothing in their objective holds contacts
+opposed, and the seed's opposition is not preserved by the solve. Adding an
+alignment term would fix it and would no longer be FRoGGeR.

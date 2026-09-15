@@ -3738,12 +3738,30 @@ class UVAtlasConfig:
     # fingertip such that the forward kinematics were fixed" (App. B-F), at 60 deg
     # tilted toward the palm from the very tip of each finger.
     #
-    # The LEAP tip site sits at the tip GEOM's centre (measured 0.0-0.1 mm off
-    # geom_xpos) and that geom is a box of half-extents ~11 x 12 x 17 mm, so the pad
-    # surface along pad_axis is roughly one half-extent out. 0.011 m is that value;
-    # it is a fixed body-frame quantity, which is the property their sentence
+    # The LEAP tip site sits at the tip GEOM's centre (measured 0.05 mm off
+    # geom_xpos on both thumb and index). 0.011 was an ESTIMATE -- "roughly one
+    # half-extent" of the tip geom's ~11 x 12 x 17 mm bounding box. MEASURED against
+    # the tip mesh's actual vertices, the pad surface along pad_axis is:
+    #
+    #     thumb (leap_th_tip)  9.96 mm      index (leap_if_tip)  9.95 mm
+    #
+    # (52-vertex collision meshes, support distance max(V - site) . pad_axis taken
+    # in the world frame at the settled pose.) The estimate overshot the real pad
+    # surface by 1.05 mm, which placed the constraint point OUTSIDE the fingertip
+    # and biased every frogger solve to park the hand that much further off the
+    # object. 0.00995 m is the measured value, common to both tips to within
+    # 0.01 mm.
+    #
+    # It remains a FIXED body-frame quantity, which is the property their sentence
     # requires, unlike an offset along the object's own surface normal.
-    frogger_pad_offset_m:   float = 0.011
+    #
+    # This corrects the constant, NOT the mechanism. The constraint point lies on
+    # the pad surface only along pad_axis; measured 13.4 mm from the nearest tip
+    # vertex, it is inside no other direction. When the contact is off-axis -- and
+    # (7a) has no alignment term to prevent that -- the real geom surface is
+    # further out than this offset, which is the residual the executor's gap gate
+    # sees. See docs/FROGGER_BENCH.md §9.1.
+    frogger_pad_offset_m:   float = 0.00995
 
     # Per-constraint tolerances, FRoGGeR's Table III (App. B-F):
     #     joint 1e-2, surface contact 5e-4, collision 1e-3, force closure 1e-5.
