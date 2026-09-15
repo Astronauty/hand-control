@@ -255,7 +255,7 @@ def _ball(c, r, n=22):
 
 def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
                  box=None, scale=1.0, box_col="#6a3d9a", alpha_w=None,
-                 axis_len=None, lim=None):
+                 axis_len=None, lim=None, box_lab=None):
     """Convex hull of wrench columns in one 3-D subspace.
 
     ball  : draw the largest origin-centred ball inside the hull (Ferrari-Canny).
@@ -276,6 +276,8 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
 
     _pts = [P, np.zeros((1, 3))]
     if box is not None:
+        _lim0 = (np.asarray(lim, float) if lim is not None
+                 else np.vstack([P, np.zeros(3)]))
         b = np.asarray(box, float)
         sgn = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1)
                         for sz in (-1, 1)], float)
@@ -285,6 +287,29 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
         for i, j in edges:
             ax.plot(*zip(C[i], C[j]), "-", color=box_col, lw=0.65, zorder=7)
         _pts.append(C)
+        # BOX LIMITS ON THE AXES. Three separate per-axis labels collided into
+        # an unreadable blob ("2.362.36") -- the box is small relative to the
+        # frame, so its three +half-extent points project within a few px of
+        # each other. ONE label on the longest axis instead, offset along that
+        # axis, with the full triple left to the suptitle.
+        if box_lab is not None:
+            _kmax = int(np.argmax(b))
+            _d = np.eye(3)[_kmax]
+            _q = b[_kmax] * _d
+            ax.plot([_q[0]], [_q[1]], [_q[2]], "o", ms=2.0, color=box_col,
+                    zorder=8)
+            # Offset AWAY from the box along its own axis and clear of the
+            # marker: a multiplicative bump alone is too small here because the
+            # box half-extent is a fraction of the frame, so the text landed on
+            # the dot it labels. Add a constant fraction of the FRAME instead.
+            # Offset along the UNIT axis direction by a fraction of the frame.
+            # An earlier version normalised _q and then multiplied by _q again,
+            # which is just _q scaled -- the text stayed on its own marker.
+            _step = 0.26 * float(np.abs(np.asarray(_lim0)).max())
+            _o = _q + _step * _d
+            ax.text(_o[0], _o[1], _o[2], box_lab.format(v=b[_kmax]),
+                    fontsize=TICK_PT, color=box_col, ha="center", va="center",
+                    zorder=11)
 
     # SHARED LIMITS between (b) and (c) when given: the two panels only compare
     # if one unit of length means the same thing in both.
@@ -337,10 +362,12 @@ def panel_b(fig, gs, W, alpha, beta, box_f=None, box_t=None, lim_f=None,
     Wa = np.asarray(W, float)
     ax_f = fig.add_subplot(sub[0, 0], projection="3d")
     _wrench_hull(ax_f, Wa[3:, :].T, "", "#6baed6", "#2171b5",
-                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), box=box_f, lim=lim_f)
+                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), box=box_f, lim=lim_f,
+                 box_col="#6a3d9a", box_lab=r"{v:.2f}")
     ax_t = fig.add_subplot(sub[1, 0], projection="3d")
     _wrench_hull(ax_t, Wa[:3, :].T, "", "#c7e9c0", "#238b45",
-                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), box=box_t, lim=lim_t, box_col="#6a3d9a")
+                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), box=box_t,
+                 lim=lim_t, box_col="#6a3d9a", box_lab=r"{v:.2f}")
     return ax_f
 
 
@@ -365,11 +392,11 @@ def panel_c(fig, gs, W, gamma, box_f=None, box_t=None, lim_f=None,
     ax_f = fig.add_subplot(sub[0, 0], projection="3d")
     _wrench_hull(ax_f, Wa[3:, :].T, "", "#fdd0a2", "#d94801",
                  axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), scale=g, box=box_f,
-                 lim=lim_f)
+                 lim=lim_f, box_col="#6a3d9a", box_lab=r"{v:.2f}")
     ax_t = fig.add_subplot(sub[1, 0], projection="3d")
     _wrench_hull(ax_t, Wa[:3, :].T, "", "#fdd0a2", "#d94801",
                  axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), scale=g,
-                 box=box_t, lim=lim_t)
+                 box=box_t, lim=lim_t, box_col="#6a3d9a", box_lab=r"{v:.2f}")
     return ax_f
 
 
@@ -489,13 +516,23 @@ def main():
     # it. Without these the green/purple wireframe is an abstract shape.
     _mm, _aa = float(a[3]), float(np.asarray(a[4], float)[0])
     _bf = _mm * _aa
-    fig.text(0.5, 1.005,
-             rf"{args.object.replace('_',' ')}:  $m$ = {_mm:.3f} kg,  "
-             rf"$a$ = {_aa:.0f} m/s$^2$  $\Rightarrow$  "
-             rf"$m a$ = {_bf:.2f} N/axis ({np.linalg.norm([_bf]*3):.2f} N corner);   "
-             rf"$\beta$ = {float(r['gws_beta']):.3f},  "
-             rf"$\gamma$ = {cap['gamma']:.2f} N",
+    _angd = float(args.ang_display) if args.ang_display else float(
+        np.asarray(a[5], float)[0])
+    _bt = np.asarray(_inertia, float) * _angd
+    _star = r"$^{*}$" if args.ang_display else ""
+    fig.text(0.5, 1.055,
+             rf"{args.object.replace('_',' ')}:   $m$ = {_mm:.3f} kg,  "
+             rf"$a$ = {_aa:.0f} m/s$^2$ $\Rightarrow$ $ma$ = {_bf:.2f} N/axis"
+             rf"      $\alpha${_star} = {_angd:.0f} rad/s$^2$ $\Rightarrow$ "
+             rf"$\mathbf{{I}}\alpha$ = {_bt.max():.2f} N$\cdot$m",
              fontsize=TITLE_PT, ha="center", va="bottom")
+    fig.text(0.5, 1.005,
+             rf"$\beta$ = {float(r['gws_beta']):.3f} "
+             rf"($\sum\alpha_i = 1$),    "
+             rf"$\gamma$ = {cap['gamma']:.2f} N"
+             + (r"        $^{*}$illustrative angular budget; the measured one "
+                r"renders sub-pixel" if args.ang_display else ""),
+             fontsize=TICK_PT, ha="center", va="bottom", color="0.35")
     # top < 1 leaves the suptitle its own band; the panel titles sit at
     # pad=-2 inside their axes, so without this the two collide.
     fig.subplots_adjust(left=0.0, right=1.0, top=0.97, bottom=0.035)
