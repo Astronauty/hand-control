@@ -2678,6 +2678,16 @@ def build_W_ca(p1, p2, R1_param, R2_param, obj_center_np, obj_R_np, mu,
     return ca.horzcat(*cols)
 
 
+# Slack on the bounding-sphere lower-bound test that detects a phantom
+# mj_geomDistance result. The bound ||c1-c2|| - rb1 - rb2 is exact in real
+# arithmetic but is itself computed in floating point from geom_xpos and
+# geom_rbound, and MuJoCo's own distance carries solver tolerance, so a real
+# query may sit a hair below it without being phantom. 1e-9 m is far below any
+# geometric scale here (the tightest margin in play is the 1 mm safety clearance)
+# and far above that float noise.
+_GEOM_DIST_PHANTOM_TOL = 1e-9   # m
+
+
 class _ExactGeomDistanceJacCallback(ca.Callback):
     """d(exact distance)/dq by FRoGGeR's eq. (8), from the witness points.
 
@@ -2700,6 +2710,11 @@ class _ExactGeomDistanceJacCallback(ca.Callback):
       * A pair culled as distant gets a zero gradient, matching their broadphase
         treatment -- beyond the cutoff the constraint is inactive and its gradient
         carries no information.
+
+    One degeneracy the paper does not have, because it is MuJoCo's: 3.3.x's GJK can
+    return a phantom 0.0 for well-separated pairs. That corrupts the DIRECTION of
+    this gradient, not just its size, so every query is bounded below by the
+    bounding-sphere distance -- see the comment in `eval`.
     """
 
     def __init__(self, name, model, geom_id, obj_gids, n_robot, obj_qpos=None,
@@ -2738,9 +2753,35 @@ class _ExactGeomDistanceJacCallback(ca.Callback):
 
         # The binding pair is the nearest hull; only it constrains the solution, so
         # only its gradient is nonzero (the min over hulls is what the value returns).
-        best_d, best_og = float("inf"), None
+        #
+        # BOUNDING-SPHERE GUARD, matching _ExactGeomDistanceCallback.eval. MuJoCo
+        # 3.3.x's GJK can return a phantom 0.0 for well-SEPARATED convex pairs
+        # (ulp-sensitive; see scripts/rrt_planner.py and the guard in
+        # kinova_leap_pick_place._guarded_geom_dist). Here that is worse than a bad
+        # VALUE: a phantom 0.0 both flips `sign` (0.0 is not < 0, but a phantom
+        # NEGATIVE would) and, decisively, hands back WITNESS POINTS from a bogus
+        # query -- so n_AB points somewhere arbitrary and the gradient DIRECTION is
+        # wrong, not merely its magnitude. A wrong direction steers the solve;
+        # a wrong magnitude only scales a step.
+        #
+        # The exact distance can never be below ||c1-c2|| - rb1 - rb2, so the bound
+        # does double duty: pairs already clear of the cutoff skip the query
+        # outright (their gradient is zero anyway -- the paper's broadphase cull),
+        # and a returned distance BELOW the bound is impossible and therefore
+        # phantom, so the pair is skipped rather than trusted.
+        best_d, best_og, best_ft = float("inf"), None, None
         for og in self._obj_gids:
+            lb = (float(np.linalg.norm(d.geom_xpos[og] - d.geom_xpos[self._gid]))
+                  - float(m.geom_rbound[self._gid]) - float(m.geom_rbound[og]))
+            if lb > self._cutoff:
+                continue                             # provably culled; no query
             dist = mj.mj_geomDistance(m, d, self._gid, og, self._cutoff, self._fromto)
+            if dist < lb - _GEOM_DIST_PHANTOM_TOL:
+                # Below a bound it cannot physically be below: phantom. Skipping
+                # leaves this hull out of the min, which is the conservative
+                # choice -- a spurious zero would otherwise capture `best` (it is
+                # smaller than every real distance) and own the gradient.
+                continue
             if dist < best_d:
                 best_d, best_og = dist, og
                 best_ft = self._fromto.copy()

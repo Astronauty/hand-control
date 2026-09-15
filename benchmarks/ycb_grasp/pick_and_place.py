@@ -69,6 +69,8 @@ from kinova_common.constants import (FINGER_CODE, FINGER_SET,                   
                                      finger_joint_slices)
 from kinova_common.grasp_plots import write_grasp_plots                         # noqa: E402
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
+from simulation.epsilon_metric import (epsilon_quality,                        # noqa: E402
+                                       epsilon_subspace)
 from simulation.grasp_config_builder import (parse_fingers as _parse_fingers,    # noqa: E402
                                              for_gws_recommender,
                                              for_ablation_default,
@@ -157,6 +159,20 @@ JOG_ACCEL_BUDGET_MPS2 = 20.0    # teleop's NCF_ACCEL_BUDGET_XYZ (m/s^2)
 NCF_ACCEL_BUDGET_XYZ = (JOG_ACCEL_BUDGET_MPS2,) * 3
 NCF_ANG_ACCEL_BUDGET = (1.0, 1.0, 1.0)
 JOG_VEL_MAX_MPS = 0.3           # teleop's JOG_VEL peak-speed cap (m/s)
+
+# The shaky protocol's own lift height, imported rather than restated so the
+# lift_ok threshold and the executed trajectory cannot drift apart.
+from ycb_grasp.shaky_pickup import LIFT_HEIGHT_M as SHAKY_LIFT_M   # noqa: E402
+
+
+def _fmt_eps(v):
+    """Epsilon in the paper's units (x1e3), or a marker when it is undefined.
+
+    None is NOT formatted as 0: at n=2 the wrench set is rank-deficient and
+    epsilon does not exist, which is a different statement from "epsilon is zero"
+    (a grasp exactly on the closure boundary). See simulation/epsilon_metric.py.
+    """
+    return "--" if v is None else f"{1e3 * v:.2f}e-3"
 
 
 def _obj_hull_geom_ids(model, body_name):
@@ -263,9 +279,26 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                    quad_sym_normals=False, seed_rank_pool=1, backend=None,
                    impratio=None, gamma_override=None,
                    squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05,
+                   gamma_ref=1.0,
                    lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS,
-                   contact_profile="stock", fingers=None, force_execute=False):
-    """Plan + execute one grasp on one object, then carry it to the bin."""
+                   contact_profile="stock", fingers=None, force_execute=False,
+                   lift_mode="standard", plan_override=None):
+    """Plan + execute one grasp on one object, then carry it to the bin.
+
+    lift_mode : "standard" (default) runs this benchmark's own 12 cm lift, scored
+        by `lift_ok`. "shaky" substitutes FRoGGeR's execution test -- 10 cm in 1 s,
+        hold 1.5 s, 3 mm sinusoid in all axes -- and additionally reports
+        `pick_success` under their failure criteria. Only the LIFT changes; every
+        earlier phase is identical, so the two modes are comparable up to the lift.
+
+    plan_override : optional callable supplying (cfg, q_start) for an ALTERNATE
+        planner arm, so it can be executed and scored down this same path. Called
+        with keywords (body_name, model, data, info, cfg_kw, fingers, seed, pos,
+        q_home); `cfg_kw` carries this benchmark's assembled knobs for the arm to
+        extend. Return q_start=None to keep the HOME start. None (default) uses
+        `for_gws_recommender` from HOME, which is what every existing tabletop
+        result was measured with -- that path is unchanged.
+    """
     rng = np.random.default_rng(seed)
     t_build = time.time()
     model, data, info = TS.build([object_id], impratio=impratio)
@@ -446,13 +479,34 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
     # models/grasp_finger_config.json holds for this object (or its default list).
     # ORDER MATTERS: slot 1 anchors the antipodal seed march. The preset applies it
     # with setdefault, so every CLI/env override above still wins.
-    cfg = for_gws_recommender(body_name,
-                              cfg_kw.pop("arm_geom_names"),
-                              cfg_kw.pop("obj_clearance_by_geom"),
-                              accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
-                              ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
-                              fingers=fingers,
-                              **cfg_kw)
+    # PLAN OVERRIDE: let a caller supply the config and the start pose, so an
+    # ALTERNATE PLANNER ARM can be executed down this same path. Everything after
+    # the solve -- gamma, squeeze, lift, scoring -- is then shared by construction,
+    # which is the property a between-arm execution comparison needs. Without this
+    # the preset and the HOME start are hardcoded, so only `ours` was executable
+    # and the FRoGGeR arm stopped at the planner.
+    #
+    # The hook takes the assembled cfg_kw so an arm inherits this benchmark's tuned
+    # seeding/solver knobs and overrides only what its formulation requires.
+    if plan_override is not None:
+        # PARSED slot list, not the raw comma-string `fingers` arrives as. The
+        # override needs the same ordered role list `_SLOTS` is built from below;
+        # handing it the string made `FINGER_TIP_SITES[r]` iterate CHARACTERS
+        # (KeyError: 't').
+        cfg, q_start = plan_override(
+            body_name=body_name, model=model, data=data, info=info,
+            cfg_kw=dict(cfg_kw),
+            fingers=(_parse_fingers(fingers) or list(SLOT_ROLES)),
+            seed=seed, pos=pos, q_home=q_home)
+    else:
+        cfg = for_gws_recommender(body_name,
+                                  cfg_kw.pop("arm_geom_names"),
+                                  cfg_kw.pop("obj_clearance_by_geom"),
+                                  accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
+                                  ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
+                                  fingers=fingers,
+                                  **cfg_kw)
+        q_start = None
 
     log_dir = None
     if out_dir is not None:
@@ -467,9 +521,16 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
     # (qref_restart_sigma_*). Leaving this unset made every --seed produce a
     # byte-identical trajectory, which silently turned a 3-seed sweep into one
     # sample repeated three times.
+    #
+    # A plan_override arm may supply its own start pose: FRoGGeR's (7a) has no IK
+    # or alignment term, so nothing in its objective prefers opposed contacts --
+    # that preference lives entirely in its heuristic sampler, which is why the
+    # paper describes the sampler as part of the method. Starting it from HOME
+    # would handicap it for a reason unrelated to the formulation under test.
     planner = MultiStartGraspPlanner3D(model, data, cfg, log_dir=log_dir, seed=seed)
     t0 = time.time()
-    res = planner.solve(q_home, np.asarray(pos, float), max_seeds=cfg.n_seeds)
+    res = planner.solve(np.asarray(q_home if q_start is None else q_start, float),
+                        np.asarray(pos, float), max_seeds=cfg.n_seeds)
     t_solve = time.time() - t0
     print(f"[plan] status={res.get('status')} rs={res.get('return_status')} "
           f"iterations={res.get('iterations')}  ({t_solve * 1e3:.0f}ms)")
@@ -601,6 +662,35 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
               f"n1.n2={float(_n1 @ _n2):+.3f} "
               f"span={np.linalg.norm(np.asarray(res['p2'], float) - np.asarray(res['p1'], float)) * 1000:.1f}mm")
 
+    # FERRARI-CANNY EPSILON, the quality column FRoGGeR's Table I reports next to
+    # the normalized min-weight metric. Scored from `rec_local` -- the SAME contact
+    # geometry the gamma certificate is solved on, in the same object frame with the
+    # same inward-normal convention -- so the two numbers cannot describe different
+    # grasps. At a FIXED gamma=1.0 by design: epsilon scales linearly in gamma, so
+    # scoring at each run's own solved gamma would confound grasp geometry with how
+    # hard that run decided to squeeze. See simulation/epsilon_metric.py.
+    #
+    # Expect `degenerate` at n=2: a pinch's wrench set is rank-5-of-6 and contains
+    # no 6-ball. That is a structural property of two contacts, not a failure, and
+    # it is why the paper's epsilon column is a four-finger number.
+    try:
+        _eps = epsilon_quality([p for p, _ in rec_local],
+                              [R for _, R in rec_local],
+                              [float(model.geom_friction[
+                                  planner._planner._obj_gid, 0])] * len(rec_local),
+                              gamma=1.0)
+        result["epsilon"] = _eps.get("epsilon")
+        result["epsilon_degenerate"] = _eps.get("degenerate")
+        result["epsilon_force_sub"] = epsilon_subspace(
+            [p for p, _ in rec_local], [R for _, R in rec_local],
+            [float(model.geom_friction[planner._planner._obj_gid, 0])] * len(rec_local),
+            gamma=1.0, which="force")
+        print(f"[plan] epsilon={_fmt_eps(result['epsilon'])} "
+              f"(degenerate={result['epsilon_degenerate']}, "
+              f"force-subspace={_fmt_eps(result['epsilon_force_sub'])})")
+    except Exception as _e:
+        print(f"[plan] epsilon scoring failed: {_e}")
+
     gamma_live = _solve_gamma(model, data, obj_bid, R_WO, rec_local,
                               planner._planner._obj_gid, tip_geom_ids,
                               gamma_override)
@@ -638,6 +728,18 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         # carries the planner's own 0.8x safety margin via cone_margin.
         cone_mu=float(model.geom_friction[planner._planner._obj_gid, 0]),
         cone_margin=0.2, cone_f_min=0.5,
+        # Keep the finger PD's authority against the squeeze CONSTANT as gamma
+        # moves (see GraspController.effective_gains). finger_kp/kd were tuned
+        # when solved gamma was ~0.5; without this a budget change silently
+        # rescales the PD/squeeze ratio, and the tuning no longer means anything.
+        #
+        # Defaults to 1.0 (ON) because gamma now VARIES ACROSS OBJECTS in this
+        # benchmark -- measured: lemon ~1.0, orange ~1.8, tennis ball ~2.4,
+        # gelatin box ~4.8, wood block clamped at 12.0. One absolute finger gain
+        # cannot be right across a 12x spread; at the top of it the block's
+        # squeeze overwhelmed the PD and the grasp failed on every seed. The
+        # light objects sit near gamma_ref so their behaviour barely moves.
+        gamma_ref=gamma_ref,
         # Finger-gain slices for THIS run's fingers. The default is hardcoded to
         # index+thumb, so a tripod's middle finger kept full stiff gains while the
         # other two were softened to close -- it never took part in the
@@ -700,10 +802,23 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         result["phase_log"].append("approach_done")
         # PLANNED GRASP POSE: the hand where the NLP put it, before any squeeze
         # moves the object. Same far-side camera as the video.
+        #
+        # FRAME THE HAND, NOT THE OBJECT ORIGIN. lookat=pos aimed at the free
+        # joint's origin, which for YCB meshes sits at the object's BASE, not
+        # its centroid. At the planned pose the hand is above the object, so the
+        # taller the object the further the palm rode above the top of the
+        # frame -- the 036_wood_block renders clipped the hand off entirely at
+        # every seed while the lemon/ball (short, origin near the contact) were
+        # fine. Centre on the palm/object midpoint and widen dist with the
+        # vertical span so the whole hand is in frame for any object height.
         if out_dir is not None:
             try:
+                _p_palm = data.xpos[palm_bid].copy()
+                _mid = 0.5 * (np.asarray(pos, float) + _p_palm)
+                _vspan = float(abs(_p_palm[2] - pos[2]))
+                _pdist = max(0.7, 2.2 * _vspan + 0.35)
                 render(model, data, str(Path(out_dir) / f"seed{seed}_planned.png"),
-                       lookat=pos, dist=0.7, azim=_cam_azim, elev=-25)
+                       lookat=_mid, dist=_pdist, azim=_cam_azim, elev=-25)
             except Exception as _e:
                 print(f"[exec] planned-pose render failed: {_e}")
 
@@ -808,10 +923,38 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
 
         # LIFT: straight up, clear of the table.
         dt = model.opt.timestep
-        n_lift = _jog_steps(LIFT_DISTANCE_M, lift_speed, dt)
-        q_cmd, lost_lift = _jog_to(
-            model, data, ctrl, q_cmd, lambda i: np.array([0, 0, lift_speed, 0, 0, 0.]),
-            n_lift, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="lift", finger_set=_FSET)
+        if lift_mode == "shaky":
+            # FRoGGeR's execution test (their Sec. IV), which is what produces the
+            # paper's "% pick success" column. Replaces ONLY the lift jog: approach,
+            # settle, gap gate and squeeze ramp above are unchanged, because that
+            # sequence is measured and tuned (SOLVER_STATE sec 6) and re-deriving it
+            # would inject differences unrelated to the grasp under test.
+            #
+            # Scored by THEIR criteria (>30 deg rotation, >7.5 cm deviation) AND by
+            # this benchmark's own lift_ok below. Both are kept because they answer
+            # different questions and neither subsumes the other: their test can pass
+            # on a grasp that never really loaded the fingers (the object simply did
+            # not move much), which is the phantom-success mode lift_ok's force gate
+            # exists to catch.
+            from ycb_grasp import shaky_pickup as SP
+            _sh = SP.run_shaky_pickup(
+                model, data, ctrl, q_cmd, _jog_to, _sync, palm_bid, obj_bid,
+                tip_geom_ids=tip_geom_ids, obj_gid=obj_gid, finger_set=_FSET,
+                synth_time_s=float(result.get("t_solve_s", 0.0)))
+            q_cmd = _sh.pop("q_cmd", q_cmd)
+            lost_lift = _sh.pop("contact_lost", {})
+            result["pick_success"] = _sh["success"]
+            result["pick_fail_reason"] = _sh["fail_reason"]
+            result["pick_max_rot_deg"] = round(_sh["max_rot_deg"], 2)
+            result["pick_max_dev_m"] = round(_sh["max_dev_m"], 4)
+            print(f"[shaky] success={_sh['success']} reason={_sh['fail_reason']} "
+                  f"max_rot={_sh['max_rot_deg']:.1f}deg "
+                  f"max_dev={1e3 * _sh['max_dev_m']:.1f}mm")
+        else:
+            n_lift = _jog_steps(LIFT_DISTANCE_M, lift_speed, dt)
+            q_cmd, lost_lift = _jog_to(
+                model, data, ctrl, q_cmd, lambda i: np.array([0, 0, lift_speed, 0, 0, 0.]),
+                n_lift, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="lift", finger_set=_FSET)
         result["lift_obj_dz_mm"] = (float(data.xpos[obj_bid][2]) - obj_z0) * 1000
         result["lift_contact_lost"] = lost_lift
         # SUCCESS TEST (see LIFT_OK_MIN_FRAC above). Both halves are required:
@@ -826,7 +969,12 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         _f_end = (_measured_tip_forces(model, data, tip_geom_ids, obj_gid)
                   if (tip_geom_ids is not None and obj_gid is not None) else [])
         result["lift_final_forces_N"] = dict(zip(_FSET, np.round(_f_end, 4).tolist()))
-        _rose = result["lift_obj_dz_mm"] >= LIFT_OK_MIN_FRAC * LIFT_DISTANCE_M * 1000
+        # Against the distance THIS mode actually commanded. The shaky protocol
+        # lifts 10 cm (their number), not LIFT_DISTANCE_M's 12 cm, and scoring it
+        # against the larger figure would fail grasps that tracked the commanded
+        # trajectory perfectly.
+        _cmd_lift_m = (SHAKY_LIFT_M if lift_mode == "shaky" else LIFT_DISTANCE_M)
+        _rose = result["lift_obj_dz_mm"] >= LIFT_OK_MIN_FRAC * _cmd_lift_m * 1000
         _held = bool(_f_end) and all(f > LIFT_OK_MIN_FORCE_N for f in _f_end)
         result["lift_ok"] = bool(_rose and _held)
         result["phase_log"].append("lift_done")
@@ -1045,6 +1193,12 @@ def main():
                          "value is a bounding sphere around an elongated pad, so it "
                          "parks the tip ~9.5mm proud of the surface; this flag exists "
                          "to A/B that slack against the directional default.")
+    ap.add_argument("--gamma-ref", type=float, default=1.0,
+                    help="gamma that --finger-kp/--finger-kd were tuned at. The finger "
+                         "PD gains are scaled by gamma/gamma_ref, so the PD keeps "
+                         "constant authority against the squeeze as gamma changes (e.g. "
+                         "after a disturbance-budget change). Pass 0 for the legacy "
+                         "absolute-gain behaviour.")
     ap.add_argument("--finger-kp", type=float, default=0.8)
     ap.add_argument("--finger-kd", type=float, default=0.05)
     ap.add_argument("--lift-speed", type=float, default=LIFT_SPEED_MPS,
@@ -1052,6 +1206,13 @@ def main():
                          "eases in/out over JOG_RAMP_S, so this is the cruise speed.")
     ap.add_argument("--transport-speed", type=float, default=TRANSPORT_SPEED_MPS,
                     help=f"lateral carry speed m/s (default {TRANSPORT_SPEED_MPS})")
+    ap.add_argument("--lift-mode", choices=["standard", "shaky"], default="standard",
+                    help="standard (default): this benchmark's 12cm lift, scored by "
+                         "lift_ok. shaky: FRoGGeR's execution test (Sec. IV) -- 10cm "
+                         "in 1s, hold 1.5s, 3mm sinusoid in all axes from t+0.25s -- "
+                         "additionally scored by their failure criteria (>30deg "
+                         "rotation, >7.5cm deviation). This is what produces the "
+                         "paper's '% pick success' column.")
     OP.add_out_args(ap, OP.TABLETOP)
     args = ap.parse_args()
 
@@ -1098,8 +1259,11 @@ def main():
         seed_rank_pool=args.seed_rank_pool,
         impratio=args.impratio, gamma_override=args.gamma,
         squeeze_pd_scale=args.squeeze_pd_scale,
+        # --gamma-ref 0 opts back out to absolute gains.
+        gamma_ref=(args.gamma_ref or None),
         finger_kp=args.finger_kp, finger_kd=args.finger_kd,
         lift_speed=args.lift_speed, transport_speed=args.transport_speed,
+        lift_mode=args.lift_mode,
         contact_profile=args.contact_profile)
     print("\n=== RESULT ===")
     for k, v in result.items():

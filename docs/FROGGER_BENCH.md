@@ -1219,3 +1219,114 @@ because it failed, which moves a rate by construction; the honest statement is t
 the port converges at 93% on objects a two-finger pinch can physically grasp, and
 that the excluded object is the test case for the `n >= 3` path. It should return
 when that path works.
+
+---
+
+## 9. Execution scoring (2026-09-14): pick success, epsilon, and a gap-gate wall
+
+Qualification 1 of `FROGGER_STATUS.md` §1 is now closed: the paper's shaky pickup
+runs against live grasps. Two new instruments, both additive:
+
+- **`simulation/epsilon_metric.py`** — Ferrari-Canny `epsilon`, the classical quality
+  FRoGGeR SCORES with, as distinct from `l_bar*`, the relaxation they OPTIMIZE.
+  Verified against closed form on a 4-contact cross grasp (`eps = 2*mu*r` exactly,
+  7/7 across mu, r and gamma); `tests/test_epsilon_metric.py`, 5/5 passing.
+- **`benchmarks/ycb_grasp/frogger_exec_bench.py`** — plans with either arm and
+  EXECUTES through `pick_and_place`'s measured approach/settle/gap-gate/squeeze path,
+  with FRoGGeR's lift-and-shake substituted for the lift. `run_pick_place` grew a
+  `plan_override` hook (cfg + start pose) because it previously hardcoded
+  `for_gws_recommender` and a HOME start, so only `ours` was executable.
+
+### 9.1 Pilot result, 2 objects x 3 seeds x 2 arms
+
+`n = 2` (thumb+index), scene friction `mu = 2.0`, single solve, `k_l = 0.3`.
+
+| | ours | frogger |
+|---|---|---|
+| reached the squeeze | **6/6** | 1/6 |
+| pick success (of those that lifted) | 3/6 | 1/1 |
+| `lift_ok` (of those that lifted) | **3/6** | 0/1 |
+| median `l_bar*` | +0.945 | +0.398 |
+| median wall-clock | 12.7 s | 3.7 s |
+
+**The headline is the second row, and it is not a metric difference.** Five of six
+frogger cells never reached the squeeze:
+
+| cell | abort | fingertip gap (mm) |
+|---|---|---|
+| orange s0 | gap too large | index 8.54, thumb 11.56 |
+| orange s2 | wrench-infeasible | -- (`l_bar*` = -10.30) |
+| block s0 | gap too large | index 10.80, thumb 11.14 |
+| block s1 | gap too large | index 8.15, thumb 8.87 |
+| block s2 | gap too large | index 0.97, thumb 10.34 |
+
+The gaps cluster at 8-11.5 mm, which is `frogger_pad_offset_m` (0.011). That is the
+mechanism, not a coincidence. Their (7d) constrains `site + 11 mm * pad_axis` to the
+surface — a FIXED body-frame point, which is the faithful reading of their sentence
+and is already documented at `grasp_planner_3d.py:3705`. The executor's gap gate
+measures the ACTUAL tip-geom surface, and the LEAP tip is a box of half-extents
+~11 x 12 x 17 mm, so along any direction that is not the pad axis the real surface
+sits further out than the 11 mm the constraint assumed. The solve is satisfied; the
+hand is still a centimetre away.
+
+`l_bar*` cannot see this. Orange s0 reports **+0.9996**, essentially the ceiling of
+1.0, with the fingertips 8.5 and 11.6 mm off the object. A metric computed on
+contact points that the hand does not reach is measuring a grasp nobody is holding —
+the same class of defect as §7.1's 5th cone vertex, caught here only because the
+grasp was executed.
+
+### 9.2 Their criteria can score a one-finger carry as a success
+
+`frogger | 017_orange | seed 1` passed the shaky pickup — object rose 97.8 mm,
+rotated 2.5 deg, deviated 1.5 mm, all well inside their thresholds — while the index
+finger's measured force at the final step was **0.0 N**. The object was carried on
+the thumb alone.
+
+Their criteria are displacement-only and cannot detect this: an object that tracks
+the palm neither rotates nor deviates, however few fingers are actually loaded.
+`lift_ok`'s force gate does detect it, which is why both are reported and why
+`pick_success` alone should not be quoted from this harness. This is the
+`release_done != grasped` failure class in a new place.
+
+### 9.3 What this does and does not establish
+
+Does: the execution path is wired, both arms run through one shared executor, and
+the frogger arm's dominant failure mode on this hand is a REACHABILITY mismatch at
+the pad-offset constraint rather than a grasp-quality deficit.
+
+Does not: `n = 2` is not their configuration (four Allegro fingers), `mu = 2.0` is
+not their friction, and 12 cells is a pilot. The 3/6 vs 1/1 success comparison rests
+on one frogger cell that reached the lift and should not be quoted as a rate. The
+6/6 vs 1/6 squeeze-reach difference is the result worth carrying forward.
+
+### 9.4 The epsilon column is empty at n = 2, by construction
+
+All 12 cells report `epsilon` degenerate. A two-contact pinch's wrench set is
+rank-5-of-6 — it resists no torque about the line through its contacts — so it
+contains no origin-centred 6-ball and Ferrari-Canny `epsilon` does not exist. This is
+the same structural fact that gates `project_grasp_axis_torque` in the gamma
+certificate, and it is why the paper's `epsilon` column is a FOUR-finger number.
+Reporting 0.0 would have been wrong in a specific way: it reads as "closure, but
+weak" rather than "not defined".
+
+The force-subspace fallback is also uninformative at this scene's friction: it
+saturates at exactly 1.0 for any `mu >= 1` (measured 0.667 / 1.000 / 1.000 / 1.000 at
+mu = 0.5 / 1 / 2 / 4), because the normal direction is bounded by the normal force
+while the tangential extent grows with mu. **`epsilon` becomes measurable only when
+the `n >= 3` path works**, which makes it one more thing blocked on that path.
+
+### 9.5 Running it
+
+```bash
+cd benchmarks
+# the pilot above
+uv run python -m ycb_grasp.frogger_exec_bench \
+    --objects 017_orange,036_wood_block --seeds 0,1,2
+
+# our own 12 cm lift instead of their shaky one
+uv run python -m ycb_grasp.frogger_exec_bench --lift-mode standard
+```
+
+`--mu` is deliberately NOT plumbed here and exits with a message: `run_pick_place`
+builds its own scene, so accepting the flag would have run at 2.0 while labelling the
+output 0.7. Use the plan-only harness for the paper's friction regime.
