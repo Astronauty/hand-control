@@ -1,4 +1,4 @@
-"""Emit booktabs LaTeX for the FRoGGeR comparison tables, from measured JSON only.
+r"""Emit booktabs LaTeX for the FRoGGeR comparison tables, from measured JSON only.
 
 Reads the JSON written by `frogger_exec_bench --json-out` and
 `edge_seeking --json-out` and prints paper-ready tables. Nothing is hardcoded: every
@@ -7,7 +7,7 @@ number comes from a run, so a table cannot drift from the data that produced it.
 Statistics follow the paper's own convention (their Table I): median with the
 interquartile range in parentheses, over the cells that produced a result.
 
-PREAMBLE. The single-column tables use \multirow and \shortstack for the category
+PREAMBLE. The single-column tables use \multirow for the object
 column, so the document needs \usepackage{multirow} alongside \usepackage{booktabs}.
 The two-column forms need only booktabs. Not verified by compilation here (no LaTeX
 toolchain in this environment) -- check once before relying on them.
@@ -57,6 +57,32 @@ def _miqr(vals, fmt="%.2f", scale=1.0):
     v = np.asarray(v, float) * scale
     return (f"{fmt % np.median(v)} ({fmt % np.percentile(v, 25)}, "
             f"{fmt % np.percentile(v, 75)})")
+
+
+def _wilson(k, n, z=1.96):
+    """95% Wilson score interval for a binomial rate.
+
+    Per-object rates rest on few trials, where the textbook normal interval is
+    badly wrong near 0 and 1 -- at 0/20 it returns a zero-width interval, claiming
+    certainty from the one outcome that carries least information. Wilson stays
+    inside [0,1], never collapses, and is the standard choice at these counts.
+    Returns (lo, hi) as percentages.
+    """
+    if not n:
+        return (float("nan"), float("nan"))
+    p = k / n
+    d = 1.0 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return (100.0 * max(0.0, c - h), 100.0 * min(1.0, c + h))
+
+
+def _rate_ci(k, n):
+    """`53\% [30, 75]` -- the rate with its Wilson interval, for per-object cells."""
+    if not n:
+        return "--"
+    lo, hi = _wilson(k, n)
+    return r"%.0f\%% [%.0f, %.0f]" % (100.0 * k / n, lo, hi)
 
 
 def _frac_bare(num, den):
@@ -192,60 +218,75 @@ def edge_per_object(rows):
     return "\n".join(out)
 
 
+def _objs(rows):
+    return sorted({r["object"] for r in rows if r.get("object")})
+
+
+def _oname(o):
+    """YCB id as a compact table label: drop the numeric prefix, escape underscores."""
+    base = o.split("_", 1)[1] if "_" in o and o.split("_", 1)[0].isdigit() else o
+    return r"\texttt{%s}" % base.replace("_", r"\_")
+
+
 def exec_table_1col(rows, n_contacts=2, mu=2.0):
-    """Single-column (IEEE \\columnwidth) execution table, segmented by category.
+    """Per-object execution table, single IEEE column.
 
-    A two-column IEEE page gives ~3.5 in, which will not hold six numeric columns at
-    readable size. Two things buy the space: metrics become ROWS and methods become
-    columns (two data columns, not six), and the category segmentation FRoGGeR uses
-    groups objects instead of listing them.
+    PER OBJECT rather than by category. A category median hides which objects a
+    method fails on, and with a handful of objects the categories carry 2-3 members
+    -- too few for the grouping to buy statistical strength, and enough to hide the
+    per-object spread that is the actually interesting signal.
 
-    Percentages drop their (k/n) parenthetical -- at 3 objects x 3 seeds the
-    denominator is uniform and stating it once in the caption is enough.
+    Rates carry 95% Wilson intervals because a per-object rate rests on one object's
+    seeds. Reporting `80%` from 4/5 as if it were 80% from 400/500 would overstate
+    what the sweep supports; `80\% [38, 96]` does not.
     """
     arms = [a for a in ("ours", "frogger") if any(r.get("arm") == a for r in rows)]
-    cats = _cats_present(rows)
+    objs = _objs(rows)
+    n_seeds = max(len({r["seed"] for r in rows if r.get("object") == o})
+                  for o in objs) if objs else 0
     out = []
     out.append(r"\begin{table}[t]")
     out.append(r"\centering")
-    out.append(r"\caption{Execution on the YCB tabletop scene ($n=2$ contacts, "
-               r"$\mu=2.0$, 3 seeds per object). Categories follow Li et al. "
-               r"Quality is median (IQR). \emph{Held} additionally requires every "
-               r"fingertip to still carry load at the end of the lift, which "
-               r"displacement-only criteria cannot detect. FRoGGeR's lift rate is "
-               r"depressed by our port's fixed-pad-point constraint, not by their "
-               r"method; see text.}")
+    out.append(r"\caption{Execution on the YCB tabletop scene, per object "
+               r"($n=%d$ contacts, $\mu=2.0$, %d seeds per object per method). "
+               r"\emph{Lift} is the fraction of grasps reaching the lift phase; "
+               r"\emph{pick} is the shaky-pickup criteria of Li et al.; "
+               r"\emph{held} additionally requires every fingertip to still carry "
+               r"load at the end of the lift, which displacement-only criteria "
+               r"cannot detect. Brackets give 95\%% Wilson intervals.}"
+               % (n_contacts, n_seeds))
     out.append(r"\label{tab:execution-1col}")
     out.append(r"\small")
-    out.append(r"\setlength{\tabcolsep}{4pt}")
+    out.append(r"\setlength{\tabcolsep}{3pt}")
     out.append(r"\begin{tabular}{@{}llcc@{}}")
     out.append(r"\toprule")
-    out.append(r"category & metric & " + " & ".join(ARM_LABEL.get(a, a) for a in arms)
+    out.append(r"object & metric & " + " & ".join(ARM_LABEL.get(a, a) for a in arms)
                + r" \\")
-    for ci, cat in enumerate(cats):
+    specs = [
+        (r"lift $\uparrow$",
+         lambda g: _rate_ci(len([r for r in g
+                                 if "lift_done" in (r.get("phase_log") or "")]),
+                            len(g))),
+        (r"pick $\uparrow$",
+         lambda g: _rate_ci(sum(1 for r in g if r.get("pick_success")), len(g))),
+        (r"held $\uparrow$",
+         lambda g: _rate_ci(sum(1 for r in g if r.get("lift_ok")), len(g))),
+        (r"$\bar{\ell}^*$ $\uparrow$",
+         lambda g: _miqr([r.get("l_bar") for r in g
+                          if r.get("l_bar") is not None], "%.2f")),
+    ]
+    for o in objs:
         out.append(r"\midrule")
-        sub = [r for r in rows if CATEGORY.get(r.get("object")) == cat]
-        n_obj = len({r["object"] for r in sub})
-        rowspec = [
-            (r"\% reached lift $\uparrow$",
-             lambda g: _frac_bare(len([r for r in g
-                                      if "lift_done" in (r.get("phase_log") or "")]),
-                                  len(g))),
-            (r"\% pick success $\uparrow$",
-             lambda g: _frac_bare(sum(1 for r in g if r.get("pick_success")), len(g))),
-            (r"\% held $\uparrow$",
-             lambda g: _frac_bare(sum(1 for r in g if r.get("lift_ok")), len(g))),
-            (r"$\bar{\ell}^*$ $\uparrow$",
-             lambda g: _miqr([r.get("l_bar") for r in g
-                              if r.get("l_bar") is not None], "%.2f")),
-            (r"time (s) $\downarrow$",
-             lambda g: _miqr([r.get("t_total_s") for r in g], "%.0f")),
-        ]
-        for mi, (label, fn) in enumerate(rowspec):
+        sub = [r for r in rows if r.get("object") == o]
+        for mi, (label, fn) in enumerate(specs):
+            lead = (r"\multirow{%d}{*}{%s}" % (len(specs), _oname(o))) if mi == 0 else ""
             cells = [fn([r for r in sub if r.get("arm") == a]) for a in arms]
-            lead = (r"\multirow{%d}{*}{\shortstack[l]{%s\\(%d obj.)}}"
-                    % (len(rowspec), cat.replace("/", r"/"), n_obj)) if mi == 0 else ""
             out.append("%s & %s & %s \\\\" % (lead, label, " & ".join(cells)))
+    out.append(r"\midrule")
+    for mi, (label, fn) in enumerate(specs):
+        lead = (r"\multirow{%d}{*}{\textbf{all}}" % len(specs)) if mi == 0 else ""
+        cells = [fn([r for r in rows if r.get("arm") == a]) for a in arms]
+        out.append("%s & %s & %s \\\\" % (lead, label, " & ".join(cells)))
     out.append(r"\bottomrule")
     out.append(r"\end{tabular}")
     out.append(r"\end{table}")
@@ -253,49 +294,50 @@ def exec_table_1col(rows, n_contacts=2, mu=2.0):
 
 
 def edge_table_1col(rows):
-    """Single-column edge-seeking table, segmented by category."""
+    """Per-object edge-seeking table, single IEEE column."""
     arms = [a for a in ("ours", "frogger") if any(r.get("arm") == a for r in rows)]
-    cats = _cats_present(rows)
+    objs = _objs(rows)
     out = []
     out.append(r"\begin{table}[t]")
     out.append(r"\centering")
-    out.append(r"\caption{Edge-seeking. Li et al. name edge-seeking as the dominant "
-               r"failure mode of both their method and their baseline and leave "
-               r"combating it to future work, without a metric for it. For each "
-               r"solved contact we measure the geodesic distance along the object "
-               r"surface to the nearest point where the surface normal turns by "
-               r"more than $30^\circ$ -- a representation-independent edge test "
-               r"applied identically to both methods. Spheroids have no edges and "
-               r"act as a control.}")
+    out.append(r"\caption{Edge-seeking, per object. Li et al. name edge-seeking as "
+               r"the dominant failure mode of both their method and their baseline "
+               r"and leave combating it to future work, without a metric for it. For "
+               r"each solved contact we measure the geodesic distance along the "
+               r"object surface to the nearest point where the surface normal turns "
+               r"by more than $30^\circ$ -- a representation-independent edge test "
+               r"applied identically to both methods. Margins are median (IQR) over "
+               r"contacts; \emph{near} is the fraction of contacts within 2\,mm of "
+               r"an edge. \texttt{orange} is the control: it is the one object on "
+               r"which both methods keep comparable margins, consistent with a "
+               r"near-sphere offering no edge to seek.}")
     out.append(r"\label{tab:edge-1col}")
     out.append(r"\small")
-    out.append(r"\setlength{\tabcolsep}{4pt}")
+    out.append(r"\setlength{\tabcolsep}{3pt}")
     out.append(r"\begin{tabular}{@{}llcc@{}}")
     out.append(r"\toprule")
-    out.append(r"category & metric & " + " & ".join(ARM_LABEL.get(a, a) for a in arms)
+    out.append(r"object & metric & " + " & ".join(ARM_LABEL.get(a, a) for a in arms)
                + r" \\")
-    for cat in cats:
+
+    def _per(g):
+        out_ = []
+        for r in g:
+            out_ += [x for x in (r.get("geo_margins_mm") or []) if x is not None]
+        return out_
+
+    for o in objs + [None]:
         out.append(r"\midrule")
-        sub = [r for r in rows if CATEGORY.get(r.get("object")) == cat]
-        n_obj = len({r["object"] for r in sub})
-        per_arm = {}
-        for a in arms:
-            per = []
-            for r in [x for x in sub if x.get("arm") == a]:
-                per += [x for x in (r.get("geo_margins_mm") or []) if x is not None]
-            per_arm[a] = per
-        specs = [
-            (r"margin (mm) $\uparrow$",
-             lambda a: _miqr(per_arm[a], "%.1f")),
-            (r"$\leq 2$\,mm from edge $\downarrow$",
-             lambda a: _frac_bare(sum(1 for x in per_arm[a] if x <= 2.0),
-                                  len(per_arm[a]))),
-        ]
-        for mi, (label, fn) in enumerate(specs):
-            lead = (r"\multirow{%d}{*}{\shortstack[l]{%s\\(%d obj.)}}"
-                    % (len(specs), cat, n_obj)) if mi == 0 else ""
-            out.append("%s & %s & %s \\\\"
-                       % (lead, label, " & ".join(fn(a) for a in arms)))
+        sub = rows if o is None else [r for r in rows if r.get("object") == o]
+        lab = r"\textbf{all}" if o is None else _oname(o)
+        for mi, (label, fn) in enumerate((
+                (r"margin (mm) $\uparrow$",
+                 lambda g: _miqr(_per(g), "%.1f")),
+                (r"near ($\leq\!2$\,mm) $\downarrow$",
+                 lambda g: _rate_ci(sum(1 for x in _per(g) if x <= 2.0),
+                                    len(_per(g)))))):
+            lead = (r"\multirow{2}{*}{%s}" % lab) if mi == 0 else ""
+            cells = [fn([r for r in sub if r.get("arm") == a]) for a in arms]
+            out.append("%s & %s & %s \\\\" % (lead, label, " & ".join(cells)))
     out.append(r"\bottomrule")
     out.append(r"\end{tabular}")
     out.append(r"\end{table}")

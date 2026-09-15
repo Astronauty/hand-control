@@ -90,7 +90,8 @@ from simulation.grasp_config_builder import parse_fingers           # noqa: E402
 PILOT_OBJECTS = ["017_orange", "036_wood_block"]
 
 
-def _arm_override(arm, *, k_l, sdf_normals, max_attempts, budget_s):
+def _arm_override(arm, *, k_l, sdf_normals, max_attempts, budget_s,
+                  sdf_surface=True):
     """Build the `plan_override` hook for one arm, or None for `ours`.
 
     None is not a stub: `ours` IS `run_pick_place`'s own default path (the
@@ -110,7 +111,8 @@ def _arm_override(arm, *, k_l, sdf_normals, max_attempts, budget_s):
         cfg = _build_cfg(arm, _override.object_id, body_name, rgeoms, obj_geom0,
                          n_seeds=cfg_kw.get("n_seeds", 1),
                          max_iter=cfg_kw.get("max_iter", 80),
-                         fingers=fingers, k_l=k_l, sdf_normals=sdf_normals)
+                         fingers=fingers, k_l=k_l, sdf_normals=sdf_normals,
+                         sdf_surface=sdf_surface)
         # FRoGGeR's SYNTHESIS LOOP (Sec. IV / Table I), not a single draw. Their
         # convergence rate is a property of resample-until-feasible: a run converges
         # when it yields a grasp clearing the k_l floor inside 60 s, at a median of
@@ -156,10 +158,11 @@ def _arm_override(arm, *, k_l, sdf_normals, max_attempts, budget_s):
 
 def run_one(arm, object_id, seed, *, fingers, k_l, sdf_normals, mu,
             max_attempts, budget_s, out_dir, lift_mode, do_transport,
-            gap_tol_m=None):
+            gap_tol_m=None, sdf_surface=True):
     """Plan + execute one grasp with one arm. Returns the scored row."""
     ov = _arm_override(arm, k_l=k_l, sdf_normals=sdf_normals,
-                       max_attempts=max_attempts, budget_s=budget_s)
+                       max_attempts=max_attempts, budget_s=budget_s,
+                       sdf_surface=sdf_surface)
     if ov is not None:
         ov.object_id = object_id
 
@@ -268,6 +271,14 @@ def main():
                     help="also carry to the bin after the lift. OFF by default: the "
                          "paper's test ends at the hold, and the carry adds a phase "
                          "their criteria say nothing about.")
+    ap.add_argument("--patch-contacts", action="store_true",
+                    help="run the frogger OBJECTIVE and floor on OUR quadratic-patch "
+                         "contact parameterization instead of their (7d) FK contacts. "
+                         "This separates their formulation from our implementation "
+                         "of it: the fixed body-frame pad point is what leaves the "
+                         "pad 8-11 mm clear of the object, so removing it while "
+                         "keeping `max l*` and k_l says whether the execution "
+                         "failures are theirs or ours. NOT the faithful port.")
     ap.add_argument("--gap-tol-m", type=float, default=0.014,
                     help="pre-squeeze fingertip-gap tolerance for the NON-'ours' "
                          "arms, metres. The 8 mm default is sized for this solver's "
@@ -318,7 +329,8 @@ def main():
                                 budget_s=SYNTH_BUDGET_S, out_dir=str(od),
                                 lift_mode=args.lift_mode,
                                 do_transport=args.do_transport,
-                                gap_tol_m=args.gap_tol_m)
+                                gap_tol_m=args.gap_tol_m,
+                                sdf_surface=not args.patch_contacts)
                 except Exception as e:
                     import traceback
                     traceback.print_exc()

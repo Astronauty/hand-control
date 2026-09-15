@@ -1618,3 +1618,56 @@ and correct -- it is the n = 3 CONTACT PLACEMENT that is not ready. Fixing the
 collapse, not the metric, is what unblocks this column, and epsilon is now the
 sharpest available test of whether a fix worked: it goes from ~0 to positive exactly
 when the third contact becomes independent.
+
+---
+
+## 13bis. Edge-seeking PREDICTS execution failure (2026-09-14)
+
+§11bis measured edge margins plan-only and said explicitly it "does NOT by itself
+show that edge-seeking causes failure. Pair it with execution outcomes... which is
+the comparison the paper's 'yields unstable grasps in practice' claim actually
+needs." Done, joining the 30 edge cells to the 30 execution cells by
+(arm, object, seed):
+
+| | median edge margin | n |
+|---|---|---|
+| grasps that held (`lift_ok`) | **12.0 mm** | 13 |
+| grasps that failed | **1.0 mm** | 17 |
+
+Point-biserial correlation between edge margin and success: **r = +0.51** over 30
+trials. FRoGGeR states edge-seeking "yields unstable grasps in practice" and gives no
+measurement; this is that claim, measured.
+
+### 13bis.1 The executor is not the difference
+
+Squeeze force at the hold is effectively IDENTICAL between arms -- 1.62/1.61 N on
+`017_orange` for both -- and the frogger arm's commanded `gamma` is equal or higher
+than ours (1.92 vs 1.67; 31.2 vs 25.3 on the block). So the failures are not an
+executor that is treating the two arms differently, and there is no squeeze setting
+left to tune. What differs is WHERE THE CONTACTS ARE.
+
+### 13bis.2 Two settings tried, neither helps
+
+| setting | result |
+|---|---|
+| `--k-l 0.5` (stricter floor than their 0.3) | 0/4 lifts, object never rises |
+| `--patch-contacts` (our patch instead of their (7d) FK contacts) | WORSE: gaps of 100 mm, i.e. no contact at all, at `l_bar* = +0.98` |
+
+`--patch-contacts` reproduces the failure `for_frogger`'s own docstring records: free
+contacts reach the hand only through an IK cost, and the frogger preset zeroes every
+cost but `beta`, so the optimizer places contacts the hand cannot reach (measured
+1211/1315/1259 mm in the original note). **Their FK-contact formulation (7d) is
+load-bearing**, and the confound it introduces on our fingertip cannot be removed by
+turning it off.
+
+### 13bis.3 Standing state of the execution comparison
+
+`ours` 12/15 pick success against `frogger` 1/15 (10/15 reaching the lift after the
+gap-gate fix). That number is NOT yet a clean method comparison and should not be
+published as one: it still contains our pad-offset geometry, which their (7d)
+assumes differs from ours by a fixed body-frame offset and which measurably does not.
+
+What IS clean and publishable is §11bis + this section: their method places 2/3 of
+its contacts within 2 mm of an edge where ours places none, and edge proximity
+predicts execution failure at r = +0.51. That is a mechanism, measured end to end, for
+a failure mode the paper names and leaves open.
