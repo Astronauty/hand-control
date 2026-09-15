@@ -129,19 +129,23 @@ def _arm_override(arm, *, k_l, sdf_normals, max_attempts, budget_s):
         roles = list(fingers or ["thumb", "index"])
         if max_attempts > 1:
             planner = MultiStartGraspPlanner3D(model, data, cfg, seed=seed)
-            _, sinfo = _frogger_synthesize(
+            res, sinfo = _frogger_synthesize(
                 planner, model, data, info, body_name,
                 np.asarray(q_home, float), roles, seed, pos,
                 cfg_kw.get("n_seeds", 1), k_l=k_l,
                 max_attempts=max_attempts, budget_s=budget_s)
-            # Re-draw the ACCEPTED attempt's seed: _frogger_synthesize returns the
-            # result, but run_pick_place needs the q0 that produced it.
-            q0, _ = _frogger_seed(model, data, info, body_name,
-                                  np.asarray(q_home, float), roles, seed,
-                                  attempt=max(int(sinfo.get("n_attempts", 1)) - 1, 0))
-        else:
-            q0, sinfo = _frogger_seed(model, data, info, body_name,
-                                      np.asarray(q_home, float), roles, seed)
+            _override.seed_info = dict(sinfo)
+            # Hand back the ACCEPTED result, not a seed to re-solve from. An
+            # earlier version re-drew the seed by attempt index and let
+            # run_pick_place solve again; that does not reproduce the accepted
+            # grasp (measured contacts 345-484 mm from the hand against an
+            # accepted attempt that had them on the object), because the solve is
+            # not a pure function of the draw index -- the planner's own restart
+            # RNG has advanced. Returning the result makes the executed grasp
+            # exactly the one the loop certified.
+            return cfg, None, res
+        q0, sinfo = _frogger_seed(model, data, info, body_name,
+                                  np.asarray(q_home, float), roles, seed)
         _override.seed_info = dict(sinfo)
         return cfg, q0
 
@@ -151,7 +155,8 @@ def _arm_override(arm, *, k_l, sdf_normals, max_attempts, budget_s):
 
 
 def run_one(arm, object_id, seed, *, fingers, k_l, sdf_normals, mu,
-            max_attempts, budget_s, out_dir, lift_mode, do_transport):
+            max_attempts, budget_s, out_dir, lift_mode, do_transport,
+            gap_tol_m=None):
     """Plan + execute one grasp with one arm. Returns the scored row."""
     ov = _arm_override(arm, k_l=k_l, sdf_normals=sdf_normals,
                        max_attempts=max_attempts, budget_s=budget_s)
@@ -163,7 +168,12 @@ def run_one(arm, object_id, seed, *, fingers, k_l, sdf_normals, mu,
         object_id, seed,
         fingers=",".join(fingers) if fingers else None,
         out_dir=out_dir, do_transport=do_transport,
-        lift_mode=lift_mode, plan_override=ov)
+        lift_mode=lift_mode, plan_override=ov,
+        # The frogger arm's pad-offset constraint parks the pad further out by
+        # construction (see run_pick_place's gate comment), so it gets a tolerance
+        # sized for ITS convention. `ours` keeps the 8 mm default every existing
+        # tabletop result was measured at.
+        gap_tol_m=(gap_tol_m if arm != "ours" else None))
     t_total = time.time() - t0
 
     row = dict(arm=arm, object=object_id, seed=seed, t_total_s=round(t_total, 2))
@@ -258,6 +268,15 @@ def main():
                     help="also carry to the bin after the lift. OFF by default: the "
                          "paper's test ends at the hold, and the carry adds a phase "
                          "their criteria say nothing about.")
+    ap.add_argument("--gap-tol-m", type=float, default=0.014,
+                    help="pre-squeeze fingertip-gap tolerance for the NON-'ours' "
+                         "arms, metres. The 8 mm default is sized for this solver's "
+                         "r_tip convention; FRoGGeR's (7d) pins a fixed body-frame "
+                         "pad point, which leaves the real pad 8-11 mm clear when "
+                         "the contact is off that axis, so the default rejects "
+                         "grasps that are otherwise sound. The squeeze and the "
+                         "post-lift force test still have to pass. `ours` always "
+                         "keeps the 8 mm default.")
     ap.add_argument("--json-out", default=None)
     OP.add_out_args(ap, OP.TABLETOP)
     args = ap.parse_args()
@@ -298,7 +317,8 @@ def main():
                                 max_attempts=args.max_attempts,
                                 budget_s=SYNTH_BUDGET_S, out_dir=str(od),
                                 lift_mode=args.lift_mode,
-                                do_transport=args.do_transport)
+                                do_transport=args.do_transport,
+                                gap_tol_m=args.gap_tol_m)
                 except Exception as e:
                     import traceback
                     traceback.print_exc()

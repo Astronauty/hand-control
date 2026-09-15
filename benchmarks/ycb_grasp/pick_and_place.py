@@ -284,7 +284,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                    contact_profile="stock", fingers=None, force_execute=False,
                    release_open_frac=0.5,
                    lift_mode="standard", plan_override=None,
-                   nullspace_tracking=False):
+                   nullspace_tracking=False, gap_tol_m=None):
     """Plan + execute one grasp on one object, then carry it to the bin.
 
     lift_mode : "standard" (default) runs this benchmark's own 12 cm lift, scored
@@ -495,12 +495,24 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         # override needs the same ordered role list `_SLOTS` is built from below;
         # handing it the string made `FINGER_TIP_SITES[r]` iterate CHARACTERS
         # (KeyError: 't').
-        cfg, q_start = plan_override(
+        _ov = plan_override(
             body_name=body_name, model=model, data=data, info=info,
             cfg_kw=dict(cfg_kw),
             fingers=(_parse_fingers(fingers) or list(SLOT_ROLES)),
             seed=seed, pos=pos, q_home=q_home)
+        # An arm may return a THIRD element: a result it already solved. FRoGGeR's
+        # synthesis loop draws seeds until one yields a feasible grasp, so the
+        # accepted grasp belongs to a specific attempt; re-solving from a re-drawn
+        # seed does NOT reproduce it (measured: contacts 345-484 mm from the hand
+        # where the accepted attempt had them on the object). Executing the
+        # accepted result directly is the only faithful reading of their protocol.
+        _pre_res = None
+        if isinstance(_ov, tuple) and len(_ov) == 3:
+            cfg, q_start, _pre_res = _ov
+        else:
+            cfg, q_start = _ov
     else:
+        _pre_res = None
         cfg = for_gws_recommender(body_name,
                                   cfg_kw.pop("arm_geom_names"),
                                   cfg_kw.pop("obj_clearance_by_geom"),
@@ -531,8 +543,11 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
     # would handicap it for a reason unrelated to the formulation under test.
     planner = MultiStartGraspPlanner3D(model, data, cfg, log_dir=log_dir, seed=seed)
     t0 = time.time()
-    res = planner.solve(np.asarray(q_home if q_start is None else q_start, float),
-                        np.asarray(pos, float), max_seeds=cfg.n_seeds)
+    if _pre_res is not None:
+        res = _pre_res                      # the attempt synthesis accepted
+    else:
+        res = planner.solve(np.asarray(q_home if q_start is None else q_start, float),
+                            np.asarray(pos, float), max_seeds=cfg.n_seeds)
     t_solve = time.time() - t0
     print(f"[plan] status={res.get('status')} rs={res.get('return_status')} "
           f"iterations={res.get('iterations')}  ({t_solve * 1e3:.0f}ms)")
@@ -837,10 +852,29 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
 
         gaps = _tip_gaps_mm(model, data, tip_geom_ids, obj_gid, obj_geom_ids=obj_gids)
         result["tip_gaps_mm"] = dict(zip(_FSET, gaps))
-        if any(g > CONTACT_GAP_TOL_M * 1000 for g in gaps):
+        # PER-ARM gap tolerance. The 8 mm default is sized for THIS solver's r_tip
+        # convention, where the IK target is the MAX tip-mesh offset and the
+        # "safe" solution deliberately leaves up to ~4-5 mm for the squeeze to
+        # close. A FRoGGeR-style arm parks the pad further out by construction:
+        # its (7d) pins a FIXED body-frame point (site + pad_offset*pad_axis) to
+        # the surface, and wherever the contact is off that axis the real geom
+        # surface lies beyond it -- measured 8-11 mm on this fingertip, whose
+        # off-axis angle at the solution is 11-25 deg.
+        #
+        # Raising the gate for that arm is NOT weakening the check: the squeeze
+        # still has to close the gap and the post-lift force test still has to
+        # pass, so a grasp that is merely far away still fails, just later and
+        # with a measured reason instead of being refused a chance. The gate's
+        # purpose -- catching an IK that converged nowhere near the object -- is
+        # preserved, since the failures it was written for are hundreds of mm out.
+        _gap_tol_mm = (gap_tol_m if gap_tol_m is not None
+                       else CONTACT_GAP_TOL_M) * 1000
+        if any(g > _gap_tol_mm for g in gaps):
             result["gap_check_failed"] = True
             if not force_execute:
-                print(f"[exec] ABORT before SQUEEZE — gap too large: {result['tip_gaps_mm']}")
+                print(f"[exec] ABORT before SQUEEZE — gap too large: "
+                      f"{result['tip_gaps_mm']} (tol {_gap_tol_mm:.1f} mm)")
+                result["gap_tol_mm"] = _gap_tol_mm
                 result["phase_log"].append("squeeze_aborted_no_contact")
                 return res, result
             # --force-execute: carry on so the recorded video SHOWS the failure
