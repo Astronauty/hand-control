@@ -33,6 +33,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "benchmarks"))
 
 import numpy as np
+from mpl_toolkits.mplot3d import proj3d
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -323,6 +324,88 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
         ax.set_title(title, fontsize=TITLE_PT, pad=-4)
 
 
+def _magnifier(fig, host, P, col_lo, col_hi, lim, side="left",
+               frac=0.34, pad=0.012):
+    """Exploded-view magnifier: a circled copy of the hull, drawn at its own
+    scale, joined to the parent by two leader lines.
+
+    Panel (b) shares axis limits with (c) so the task box is directly
+    comparable -- that is the point of the panel -- but it leaves V(1) small.
+    The magnifier shows the same hull framed to itself.
+
+    Placed OUTSIDE the host axes (side='left'/'right'), not in a corner of it:
+    an earlier inset in the host's lower-right landed on the f_y / tau_y
+    labels. The circle is drawn in FIGURE coordinates so the leaders can run
+    between two different axes.
+    """
+    P = np.asarray(P, float)
+    bb = host.get_position()
+    r = min(bb.width, bb.height) * frac * 0.5
+    # Bubble in the white space outboard of the plot, raised so the leaders do
+    # not run along the x-axis arm.
+    cy = bb.y0 + bb.height * 0.70
+    cx = (bb.x0 - pad - r) if side == "left" else (bb.x1 + pad + r)
+
+    # circle + leaders, in figure space
+    import matplotlib.patches as mpatches
+    circ = mpatches.Circle((cx, cy), r, transform=fig.transFigure,
+                           facecolor="white", edgecolor=col_hi, lw=0.6,
+                           zorder=20)
+    fig.patches.append(circ)
+    # SOURCE CIRCLE on the hull's ACTUAL projected position, not the axes
+    # centre: the hull sits high in the frame (the shared limits are set by the
+    # task box, which is larger), so a circle at the centre pointed the leaders
+    # at empty space. Project the hull's own points through the host's 3D
+    # transform and take their image-space centroid and radius.
+    try:
+        _pr = np.array([proj3d.proj_transform(*q, host.get_proj())[:2] for q in P])
+        _c2 = host.transData.transform(_pr)
+        _c2 = fig.transFigure.inverted().transform(_c2)
+        sx, sy = float(_c2[:, 0].mean()), float(_c2[:, 1].mean())
+        # The source-to-bubble RADIUS RATIO is what reads as magnification, so
+        # the source circle is capped well below the bubble. Sized to the hull
+        # but never more than 45% of the bubble; an uncapped 1.25x padding made
+        # the two circles equal and the callout read as two linked plots.
+        sr = min(float(np.abs(_c2 - [sx, sy]).max()) * 1.05, r * 0.45)
+    except Exception:
+        sx, sy = bb.x0 + bb.width * 0.5, bb.y0 + bb.height * 0.52
+        sr = min(bb.width, bb.height) * 0.12
+    src = mpatches.Circle((sx, sy), sr, transform=fig.transFigure,
+                          facecolor="none", edgecolor=col_hi, lw=0.5,
+                          alpha=0.9, zorder=20)
+    fig.patches.append(src)
+    # two tangent leaders, so it reads as an exploded callout rather than an
+    # arrow pointing at something
+    d = np.hypot(cx - sx, cy - sy)
+    if d > 1e-9:
+        ux, uy = (cx - sx) / d, (cy - sy) / d
+        nx, ny = -uy, ux
+        for s in (+1.0, -1.0):
+            fig.add_artist(Line2D(
+                [sx + s * nx * sr, cx + s * nx * r],
+                [sy + s * ny * sr, cy + s * ny * r],
+                transform=fig.transFigure, color=col_hi, lw=0.5, alpha=0.9,
+                zorder=19))
+
+    ax = fig.add_axes([cx - r * 0.72, cy - r * 0.72, r * 1.44, r * 1.44],
+                      projection="3d", zorder=21)
+    ax.patch.set_alpha(0.0)
+    try:
+        from scipy.spatial import ConvexHull
+        h = ConvexHull(P)
+        _pc = Poly3DCollection([P[s] for s in h.simplices], linewidths=0.22)
+        _pc.set_facecolor((*matplotlib.colors.to_rgb(col_lo), 0.32))
+        _pc.set_edgecolor((*matplotlib.colors.to_rgb(col_hi), 0.95))
+        ax.add_collection3d(_pc)
+    except Exception:
+        pass
+    _iso(ax, np.vstack([P, np.zeros(3)]), elev=35.264, azim=45)
+    _m = float(np.abs(np.asarray(lim)).max()) / max(float(np.abs(P).max()), 1e-12)
+    fig.text(cx, cy - r - 0.004, rf"$\times${_m:.0f}", fontsize=TICK_PT,
+             color=col_hi, ha="center", va="top", zorder=21)
+    return ax
+
+
 def panel_b(fig, gs, W, alpha, beta, box_f=None, box_t=None, lim_f=None,
             lim_t=None):
     """(b) GRASP WRENCH SPACE at unit internal force, V(1).
@@ -353,6 +436,10 @@ def panel_b(fig, gs, W, alpha, beta, box_f=None, box_t=None, lim_f=None,
     _wrench_hull(ax_t, Wa[:3, :].T, "", "#c7e9c0", "#238b45",
                  axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), box=box_t,
                  lim=lim_t, box_col="#6a3d9a", box_lab=r"{v:.2f}")
+    # Exploded magnifiers on the OUTBOARD side of each plot, where there is
+    # white space between panel (a) and panel (b).
+    _magnifier(fig, ax_f, Wa[3:, :].T, "#6baed6", "#2171b5", lim_f, side="left")
+    _magnifier(fig, ax_t, Wa[:3, :].T, "#c7e9c0", "#238b45", lim_t, side="left")
     return ax_f
 
 
