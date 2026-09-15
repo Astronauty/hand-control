@@ -402,20 +402,22 @@ def _stage_from_result(planner, model, data, res):
     injected into the frame copy as `t_sol`, matching how _iter_trace_quadratic_stages
     folds quad{ci}_t_sol into each contact frame from the npz.
 
-    Contact 3 is included on the same terms as 1 and 2, and is absent at n=2.
-    At c3_own_patch=False its frame IS contact 2's (the shared patch), so the two
-    panels draw the same rectangle -- deliberate, and the differing t_sol is what
-    shows whether contact 3 collapsed onto contact 2.
+    Contacts 3 and 4 are included on the same terms as 1 and 2, and are absent
+    below n=3 / n=4. At c3_own_patch / c4_own_patch = False their frames ARE
+    contact 2's (the shared patch), so those panels draw the same rectangle --
+    deliberate, and the differing t_sol is what shows whether a contact collapsed
+    onto another. With three fingertips sharing one patch at n=4 this is the
+    figure that answers whether the patch was big enough.
 
     Returns (V, F, stage) or None when the result carries no paraboloid frames
     (e.g. a primitive solved with face-pin contacts, or a non-quadratic solve)."""
     sc = _scene_from_planner(planner, model, data)
     f1, f2 = res.get("quad1_frame"), res.get("quad2_frame")
-    f3 = res.get("quad3_frame")
+    f3, f4 = res.get("quad3_frame"), res.get("quad4_frame")
     t1, t2 = res.get("t1_sol"), res.get("t2_sol")
-    t3 = res.get("t3_sol")
+    t3, t4 = res.get("t3_sol"), res.get("t4_sol")
     contact = {}
-    for ci, fr, ts in ((1, f1, t1), (2, f2, t2), (3, f3, t3)):
+    for ci, fr, ts in ((1, f1, t1), (2, f2, t2), (3, f3, t3), (4, f4, t4)):
         if fr is None:
             continue
         c = dict(fr)

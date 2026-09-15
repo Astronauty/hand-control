@@ -595,6 +595,39 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         result["phase_log"].append("plan_failed")
         return res, result
 
+    # Pairwise contact separations, printed for EVERY run at n>=3. The n=3 work
+    # established that a collapsed contact is invisible in every other number the
+    # plan reports -- it still certifies wrench_feasible, because a doubled
+    # contact is not an infeasible one -- and at n=4 three fingertips share one
+    # quadratic patch, so this is the measurement that says whether the patch was
+    # large enough. Also prints what the SEEDER proposed, so a collapse caused by
+    # the seeder can be told apart from one caused by the NLP.
+    _sol_pts = [(_k, np.asarray(res[_k], float).reshape(3))
+                for _k in ("p1", "p2", "p3", "p4") if res.get(_k) is not None]
+    if len(_sol_pts) >= 3:
+        _sep = "  ".join(
+            f"{_a[0][-1]}-{_b[0][-1]} {np.linalg.norm(_a[1] - _b[1]) * 1e3:5.1f}mm"
+            for _i, _a in enumerate(_sol_pts) for _b in _sol_pts[_i + 1:])
+        print(f"[contacts] solved separations: {_sep}")
+        _c4t = getattr(planner, "last_c4_rank_table", None)
+        if _c4t:
+            _acc = next((r for r in _c4t if r.get("accepted")), _c4t[0])
+            print(f"[contacts] c4 seed: {len(_c4t)} ranked, accepted "
+                  f"fan={_acc.get('fan_deg'):+.0f}deg "
+                  f"sep_c2={_acc.get('sep2_mm'):.1f}mm "
+                  f"sep_c3={_acc.get('sep3_mm'):.1f}mm "
+                  f"rf_dls={_acc.get('rf_dls_res_mm'):.1f}mm")
+        elif len(_sol_pts) < 4:
+            print("[contacts] c4 seed: NO viable candidate -- ran as a "
+                  f"{len(_sol_pts)}-contact grasp")
+        _pd = getattr(planner, "last_c4_patch_diag", None)
+        if _pd:
+            print(f"[contacts] c4 patch: half-extents "
+                  f"{'/'.join(f'{h:.1f}' for h in _pd['half_extents_mm'])}mm  "
+                  f"min={_pd['min_half_mm']:.1f}mm  fan_r={_pd['fan_r_mm']:.1f}mm  "
+                  f"max_chord={_pd['max_chord_mm']:.1f}mm  "
+                  f"min_sep={_pd['min_sep_mm']:.0f}mm")
+
     verify_info = planner._planner.verify(res)
     result["gamma_min"] = verify_info.get("gamma_min")
     result["wrench_feasible"] = verify_info.get("wrench_feasible")
@@ -640,7 +673,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         # placement problem) or placed it sensibly and the IK failed to track it
         # (a kinematics problem). Printing both, plus the per-contact IK residual,
         # separates those.
-        _pts = [res.get("p1"), res.get("p2"), res.get("p3")]
+        _pts = [res.get("p1"), res.get("p2"), res.get("p3"), res.get("p4")]
         for _slot, _p in zip(_SLOTS, _pts):
             if _p is None:
                 continue
@@ -675,20 +708,48 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
     # contact 3's inward normal is taken from the same _geom_normal_np it wraps.
     _slot_pts = [np.asarray(res["p1"], float), np.asarray(res["p2"], float)]
     _slot_nrm = [n1_in, n2_in]
-    _p3_exec = res.get("p3")
-    if _p3_exec is not None and len(_SLOTS) >= 3:
-        _p3_exec = np.asarray(_p3_exec, float).reshape(3)
-        _n3_out = _geom_normal_np(
-            _p3_exec, int(model.geom_type[planner._planner._obj_gid]),
+    # Contacts 3 and 4 are bound the same way, in slot order. Written as a loop so
+    # a fifth slot would not need a third hand-written copy of this block.
+    for _key, _min_slots in (("p3", 3), ("p4", 4)):
+        _p_exec = res.get(_key)
+        if _p_exec is None or len(_SLOTS) < _min_slots:
+            continue
+        _p_exec = np.asarray(_p_exec, float).reshape(3)
+        _n_out = _geom_normal_np(
+            _p_exec, int(model.geom_type[planner._planner._obj_gid]),
             data.xpos[obj_bid].copy(), data.xmat[obj_bid].reshape(3, 3).copy(),
             model.geom_size[planner._planner._obj_gid].copy(),
             mesh_entry=planner._planner._mesh_entry)
-        _slot_pts.append(_p3_exec)
-        _slot_nrm.append(-np.asarray(_n3_out, float))
+        _slot_pts.append(_p_exec)
+        _slot_nrm.append(-np.asarray(_n_out, float))
+    # DEGRADE, don't fail, when the solve returned FEWER contacts than --fingers
+    # named. This used to raise, and that was right while the only way to get
+    # here was a planner/executor disagreement -- a bug. It is no longer the only
+    # way: the third- and fourth-contact seeders are both documented to return
+    # nothing rather than force an unreachable contact ("the tripod is an
+    # upgrade, not a precondition"), so a four-finger request on an object whose
+    # patch cannot separate a fourth contact legitimately yields three. Raising
+    # there threw away a perfectly good tripod AND the measurement of why the
+    # fourth contact was dropped -- the cells that most need to be looked at.
+    #
+    # Trailing slots are released: _SLOTS is positional and slot k is served by
+    # the k-th contact, so dropping the TAIL is the only reduction that keeps
+    # every remaining binding correct.
     if len(_slot_pts) < len(_SLOTS):
-        raise RuntimeError(
-            f"--fingers names {len(_SLOTS)} fingers but the solve returned "
-            f"{len(_slot_pts)} contacts; cannot bind slot -> finger.")
+        print(f"[fingers] solve returned {len(_slot_pts)} contacts for "
+              f"{len(_SLOTS)} named fingers ({','.join(_SLOTS)}) -- executing as "
+              f"a {len(_slot_pts)}-contact grasp with "
+              f"{','.join(_SLOTS[:len(_slot_pts)])}")
+        _SLOTS = _SLOTS[:len(_slot_pts)]
+        _FSET = list(reversed(_SLOTS))
+        tip_site_ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE,
+                                      FINGER_TIP_SITES[f]) for f in _FSET]
+        tip_geom_ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM,
+                                      f"leap_{FINGER_CODE[f]}_tip") for f in _FSET]
+    elif len(_slot_pts) > len(_SLOTS):
+        _slot_pts = _slot_pts[:len(_SLOTS)]
+        _slot_nrm = _slot_nrm[:len(_SLOTS)]
+    result["n_contacts_executed"] = len(_slot_pts)
     by_p = {r: v for r, v in zip(_SLOTS, _slot_pts)}
     by_n = {r: v for r, v in zip(_SLOTS, _slot_nrm)}
     rec_local = [local_contact_frame(np.asarray(by_p[f], float),

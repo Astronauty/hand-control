@@ -48,13 +48,14 @@ FINGER_COLORS = {
     1: ("#d94801", "#fdd0a2"),   # thumb  — orange
     2: ("#2171b5", "#c6dbef"),   # index  — blue
     3: ("#238b45", "#c7e9c0"),   # middle — green
+    4: ("#6a51a3", "#dadaeb"),   # ring   — purple
 }
 # SLOT labels, not finger identities. Slot 3 is whatever --fingers names third;
 # 'middle' is only the default pairing's third entry. kinova_common.constants
 # owns the real slot->finger mapping (SLOT_ROLES) and the executor binds them
 # positionally -- this table exists so a panel has a caption, and deliberately
 # does not try to re-derive that mapping from a trace that never recorded it.
-FINGER_NAMES = {1: "thumb", 2: "index", 3: "middle"}
+FINGER_NAMES = {1: "thumb", 2: "index", 3: "middle", 4: "ring"}
 
 
 def _patch_points(frame, t0_range, t1_range, n=13):
@@ -139,7 +140,7 @@ def build_grasp_contacts_figure(V, F, stage, object_id, sdf_fn=None,
     center = np.asarray(stage["obj_center"], float)
     R = np.asarray(stage["obj_mat"], float).reshape(3, 3)
     Vw = _to_world(V, center, R)
-    contacts = [(ci, stage["contact"][ci]) for ci in (1, 2, 3)
+    contacts = [(ci, stage["contact"][ci]) for ci in (1, 2, 3, 4)
                 if ci in stage["contact"]]
     if not contacts:
         return None

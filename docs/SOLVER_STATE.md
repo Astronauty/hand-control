@@ -36,7 +36,7 @@ The 80/3 budget is measured, and is NOT a speed-for-quality trade — see §11.
 ## 0. Pipeline at a glance
 
 ```
-seed generation  ->  local surface fit  ->  NLP (per Picard stage)  ->  post-process gamma  ->  execute
+seed generation  ->  local surface fit  ->  NLP (SINGLE stage by default)  ->  post-process gamma  ->  execute
    _seed_pair         quadratic patch       q, t1, t2, gamma, y        solve_gamma_live       squeeze + jog
    [+ _seed_third_contact fan]              [+ t3 on slot 2's patch]
 ```
@@ -84,6 +84,48 @@ Each candidate is then filtered by `_reachable_contact` (both contacts must sit 
 fingertip's isotropic bounding-sphere radius otherwise) and `_seed_kappa_ok`
 (`seed_kappa_max_reject`, evaluated on the MESH-FIT curvature when
 `quadratic_mesh_fit` is on, so the gate and the surrogate judge the same surface).
+
+### Ranking: patch extent is the KEY, DLS is a filter (`6dd34f6`)
+
+With `seed_dls_rank_pool > 1` the generator OVER-generates `n_seeds * pool` candidates and
+ranks them. **The ranking key changed in `6dd34f6` and the old description (DLS residual)
+is no longer what runs.** Two stages:
+
+1. **DLS reachability FILTER.** `_dls_residual` drops any candidate whose worst fingertip
+   residual exceeds `seed_dls_reject_m` (60 mm). If the filter would empty the pool it is
+   skipped — a badly reachable grasp still beats no grasp, and the NLP gets the final say.
+2. **Rank by PATCH EXTENT, descending**, with the DLS residual as a tiebreak (patch extent
+   quantised to 1 mm, or the tiebreak would be dead code) and the minor-axis seed's index
+   `-1` breaking an exact tie in its favour.
+
+**Why the key changed.** The DLS residual answers "can the arm reach this pair", which is
+necessary but was measured NOT to predict grasp quality: over 5 objects with 3 DLS-ranked
+candidates each, the DLS-best candidate was cost-best in **0/5** and WORST in **3/5**, and
+on `056_tennis_ball` it did not converge while the DLS-worst candidate converged cleanly.
+The residuals barely separate anyway — `036_wood_block`'s ten candidates span 25.1-27.4 mm
+(2.3 mm) while their patch extents span 102.6-183.0 mm, and two candidates with IDENTICAL
+residuals differ by 34 mm of patch. The old ranking was sorting on noise.
+
+Patch extent is independently measured to BIND: the IPOPT multipliers at the solution put
+the patch trust-region bounds in the **top three active constraints on all five objects**
+(lambda 24-347). A thin patch gives the optimizer no room before it hits that wall. Scored
+as `min` over the pair — a pinch is only as good as its worse patch.
+
+**At `n >= 3` the residual scores the MIDDLE site too.** Scoring only thumb+index leaves the
+screen structurally blind to the finger that actually fails: on `009_gelatin_box` the
+best-patch pair put thumb and index at -0.02/-0.08 mm and the middle finger **31.4 mm** off
+its contact at 0.0 N. Patch-ranking alone cost that object 3/3 -> 1/3 at n=3; adding the
+third site restores 3/3 by rejecting that pair outright. Since the pair seed carries no
+`p3s` at ranking time, a PROVISIONAL third contact is generated for scoring only — it is not
+stored and does not preempt the real c3 selection.
+
+**Selective damping is not optional here.** At the shipped `damping=0.01` with
+`null_gain=0.3` the ranking residuals read 25-53 mm; with selective damping they are sub-mm.
+A screen that cannot distinguish "unreachable" from "my IK gave up" measures nothing.
+
+Measured together: **18/36 -> 21/36** true grasps over 6 objects x 3 seeds x 2 arms, no cell
+regressed. Rankings land in `last_seed_rank_table` (`dls_res_mm`, `patch_extent_mm`,
+`accepted`).
 
 ### Reading the seed figure (`seed<N>_contact_seeds.pdf`)
 
@@ -212,9 +254,34 @@ the face it was fitted to; after, every contact on orange/gelatin/block lands at
 searches walk out until the centre-lines reach the tolerance, the corners start over it,
 so most contacts on every object measured enter the bisection.
 
+**`quadratic_bound_inset` (10 mm) — crease reserve, fixed twice in `d692d2c`.** Two defects,
+both surfaced by `025_mug`'s thumb parking on the rim while `solve_gamma_live` correctly
+refused the grasp:
+
+1. **Curved axes got NO reserve at all.** `_inset_for` returned 0.0 whenever `kappa != 0`,
+   on the reasoning that the SDF-error search had already shrunk the axis. That fails for
+   exactly the case the inset exists to cover: the SDF test asks whether the paraboloid
+   still MATCHES the surface, and on a curved object that stays true right up to a rim —
+   the fit tracks the curvature until the surface ENDS. Same blind spot it has on a box
+   face. `017_orange` / `014_lemon` / `009_gelatin_box` carry kappa 19-47.
+2. **The cap was not PER SIDE**, despite its comment saying so: it read
+   `_room = min(abs(lo), abs(hi))`, one cut sized by the TIGHTER side and applied to BOTH.
+   On `025_mug` slot 1 (bounds `[-34.39, +45.33]` mm) each side lost 10 mm and the contact
+   STILL solved to `t0 = +45.33` — pinned exactly at the wide bound, which is the rim.
+
+Measured, 3-finger, 6 objects x 3 seeds, phantom-grasp criterion (force on EVERY finger AND
+dz > 5 mm): **5/18 true grasps against 0/15** at the last clean baseline `2bcfae3`.
+`036_wood_block` lifts for the first time; `009_gelatin_box` lifts on all three seeds.
+Fix (1) alone was a WASH (traded orange for tennis ball, within seed noise) — **(2) is what
+moved the result** — but (1) is kept because its reasoning is independently sound and it is
+what makes a curved rim reservable at all.
+
 **Measured caveat:** the solution sits AT a trust-region bound (`pinned=True`) 9/9 stages.
-The Picard loop takes maximum-length steps, so the final contact is largely
-seed + N x bound rather than an interior optimum. Directly relevant to seeding work.
+The contact runs to the edge of its patch, so the final position is largely
+seed + bound rather than an interior optimum. (That measurement dates from when the
+Picard loop still ran multiple stages — under the current single-stage preset it is
+one bound, not N accumulated ones, which makes the SEED's patch the whole budget. This
+is the direct motivation for ranking seeds by patch extent, §1.)
 
 ### The third contact SHARES slot 2's patch
 
@@ -725,16 +792,22 @@ works alone.
   derates friction to `0.8 * mu` and the floor benchmark still uses its own small budget.
 - **The tripod is wired but does not work** (§10) — `pick_and_place.py` reads `p3`, but
   contact 3 collapses onto contact 2 in 15/15 measured cells and the arm executes 0/15.
-- **Only the tabletop configures the controller.** `pick_from_floor.py` and
-  `kinova_leap_pick_place.py` construct `GraspController` without `cone_mu`/`cone_margin`/
-  `cone_f_min` or `active_joint_slices`, so both silently take the defaults: `cone_mu = 0.7`
-  and the hardcoded index+thumb gain slices (§6). Two consequences, unequal in severity:
-  - The friction default is **benign today**: `mu_eff = 0.7*cos(pi/8)*0.8 = 0.517` against
-    the floor scene's true 0.6, i.e. conservative. It is still a number that does not track
-    its scene, and would become optimistic for any object with mu < 0.52.
-  - The **gain-slice default is a real defect** for any run with more than two fingers, and
-    it is the exact bug `daf4207` fixed for the tabletop without propagating. Neither env
-    runs 3 fingers today, so it is latent rather than active.
+- ~~**Only the tabletop configures the controller.**~~ **FIXED** (`02de7a9`). All three call
+  sites now read `cone_mu` from the live model's `geom_friction` and derive
+  `active_joint_slices` from `finger_joint_slices(model, FINGER_SET)`. The friction default
+  was worse than first recorded here: 0.7 UNDERSTATES the authored props (mu 1.2-2.0;
+  `017_orange` reads 1.0), so the cone solve demanded more normal force than physics
+  requires — and `pick_from_floor` already computed the true mu for `solve_gamma_live`, then
+  built the controller without it, sizing gamma and the cone constraint against *different*
+  friction. The gain-slice half was latent (the default happens to equal
+  `finger_joint_slices(model, ['thumb','index'])`, which is what the JSON currently selects)
+  but would break on the first 3- or 4-finger config, and since all three scripts read
+  `FINGER_SET` from that JSON, a one-line config edit would desynchronize two of the three
+  executors. Verified bit-identical on the one caller that was already correct (tabletop
+  `017_orange` seed 0: `gamma_min` 1.9195016, `gws_beta` 0.0800089, lift 118.271162 mm).
+  **Separately unresolved:** `017_orange` on the FLOOR scene does not lift at HEAD, with or
+  without the fix — squeeze drift ~96 mm, contact lost on both fingers. That regression
+  predates the commit.
 - **`thumb_middle` is the weaker pinch.** All ten measured cells certify wrench-feasible,
   but `gamma_min` rises on every object vs `thumb_index`, and on `036_wood_block` by 4.9x
   (3.08 -> 14.93 N against a 25 N ceiling). Its "converged" solver status there is not a
@@ -779,7 +852,19 @@ What does **not** see it yet:
   now: it binds contact 3, derives its inward normal from `_geom_normal_np`, and zips
   `_SLOTS` against the contact list so slots map to fingers positionally at n=2 or n=3.
   `pick_from_floor.py` and `kinova_leap_pick_place.py` are still 2-contact.
-  **But three-finger execution does not WORK yet.** Measured 5 objects x 3 seeds, full
+  **SUPERSEDED BY `bab0417` — read that first.** Everything from here to the end of this
+  bullet is the measurement at `2bcfae3`, and its headline number is no longer current.
+  The benchmark was not consulting `per_object` at all: without `--fingers` it fell back
+  to the import-time `SLOT_ROLES`, so **every object in that sweep ran at thumb+index**
+  and the "3-finger 0/15" was measuring n=2 throughout. After `bab0417` wired
+  `_fingers_for_object` into BOTH the planner cfg and the executor's `_SLOTS`, the same
+  protocol (6 objects x 3 seeds, `--force-execute`, force closure AND `in_bin`) measures
+  **14/18**, with `009_gelatin_box` 3/3 and `036_wood_block` 3/3 on closure at n=3. The
+  diagnosis below — the collapse, the one-finger-first arrival — was nonetheless real and
+  is NOT retracted; see §10a, where the same collapse is reproduced at n=4 and its cause
+  located. The retained text:
+
+  Measured 5 objects x 3 seeds, full
   execution, CLEAN TREE at `2bcfae3`: 2-finger **10/15** true grasps, 3-finger **0/15**.
   All 30 cells completed (exit 0); no cell blew up and none carries a negative beta, so
   none is excluded from the means. The tabletop block of `models/scene_objects.json` is
@@ -831,6 +916,122 @@ Also measured while building this: `r_middle` must be taken from the middle **si
 LEAP middle pad by 4.2 mm (23.68 vs 19.47 mm). The inflated value fed the third IK target
 (`p + r*n`) and pushed it ~4 mm off the surface. Index and middle share mesh dataid 13, so
 the corrected `r_middle` equals `r_index` exactly.
+
+---
+
+## 10a. Four-finger (`n_contacts >= 4`) — wired, measured, and NOT working
+
+The ring finger is slot 4. Everything the tripod has, slot 4 now has: `ring_site` in
+`GeometryNames`, a fourth entry in `_SLOT_FIELDS` (which lifts `load_finger_config`'s
+2..3 cap by itself, since that check reads `len(_SLOT_FIELDS)`), `_ring_sid` /
+`_ring_verts_sl`, a `'ring'` entry in BOTH `_tip_support_along` dicts, `p4_init`/`d4` on
+`solve()`, `_has_c4` in `_run_stage`, the IK term, the symbolic normal, the contact frame
+in all three branches, the GWS `extra_contacts` column block, `p4`/`quad4_frame`/`t4_sol`
+on every return dict, and `verify()` counting it.
+
+Three fixes landed alongside, each a latent defect the fourth slot exposed:
+
+- **`r_ring` was taking `geom_rbound`.** `_tip_radius` was called without a site, so it
+  returned the bounding sphere about the mesh frame origin — the same +4.2 mm over-report
+  the file already documents for `r_middle`, which would have fed `_r4_ik` exactly as the
+  inflated `r_middle` fed `_r3_ik`.
+- **The IK cost's literal `/3.0` divisor** is now an average over the terms present, so a
+  fourth contact cannot silently re-tune `w_ik` against reg/align/gws.
+- **The best-effort return dict was missing `quad3_frame`/`t3_sol`** (the converged one has
+  them), so a non-converged tripod could not be drawn or inspected for collapse — exactly
+  the run you most want to look at. Both slots are now present in both dicts.
+
+And one behaviour change in the benchmark: **a solve returning fewer contacts than
+`--fingers` named now DEGRADES instead of raising.** Raising was right while the only way
+to get there was a planner/executor disagreement, but both the third- and fourth-contact
+seeders are documented to return nothing rather than force an unreachable contact, so a
+four-finger request on an object whose patch cannot separate a fourth contact legitimately
+yields three. Trailing slots are released (slot k is served by contact k, so dropping the
+TAIL is the only reduction that keeps the remaining bindings correct) and the cell reports
+`n_contacts_executed`.
+
+### The measurement: 6 objects x 3 seeds, `--fingers thumb,index,middle,ring`
+
+Regenerate with `python benchmarks/ycb_grasp/four_finger_report.py` over
+`out/tabletop/default/four_finger/` (gitignored).
+
+| verdict | cells |
+|---|---|
+| `patch-too-small` — `max_chord < min_sep`, seeder proposed nothing | 9/18 |
+| `seed-screen-empty` — patch marginally big enough, no bearing survived | 6/18 |
+| `nlp-collapse` — 4 contacts returned, contact 4 driven onto contact 3 | 3/18 |
+| **a SEPARATED fourth contact** | **0/18** |
+
+**Is the contact patch big enough for four fingers? For five of six objects, NO — and not
+marginally.** Slots 3 and 4 both ride slot 2's quadratic patch by default, so at n=4 that
+ONE paraboloid carries THREE fingertips. The seeder sizes its fan radius from the
+SMALLEST of the patch's four half-extents (a full-circle fan clamps at the tightest
+bearing), and `_frac_of_patch=0.8` keeps seeds off the boundary, so the furthest two fan
+bearings can be apart is `max_chord = 2 * 0.8 * min_half`. Measured `min_half` / `max_chord`,
+against a `c4_min_sep_m` of 12 mm (one LEAP pad extent, i.e. two pads just touching):
+
+| object | min_half (mm) | max_chord (mm) | verdict |
+|---|---|---|---|
+| `009_gelatin_box` | 1.9 – 6.5 | 3.0 – 10.4 | below min_sep on all 3 seeds |
+| `025_mug` | 4.9 – 8.9 | 7.9 – 14.2 | 1 below, 2 marginal |
+| `014_lemon` | 7.1 – 7.4 | 11.4 – 11.9 | below min_sep on all 3 seeds |
+| `056_tennis_ball` | 7.3 – 8.4 | 11.7 – 13.4 | 2 below, 1 marginal |
+| `017_orange` | 8.4 – 8.6 | 13.4 – 13.8 | marginal on all 3 seeds |
+| `036_wood_block` | 8.0 – 18.9 | 12.8 – 30.0 | the ONLY object with real room |
+
+The scale to compare against is not `min_sep` alone but the hand: **the LEAP middle and
+ring fingertips sit 45.4 mm apart at rest** (the rigid base-mount pitch). A patch offering
+11–14 mm of total chord is being asked to seat two fingers whose natural spacing is three
+to four times that. Raising `quadratic_sdf_err_tol` to buy patch is a bad trade and
+already measured so: surrogate error tracks it almost linearly (tol 8 mm -> max|SDF|
+4.8–8.0 mm against a ~10.8 mm pad extent), and over-large patches are implicated in the
+41-degree paraboloid-vs-true-normal deviation on flat faces.
+
+**But on the one object with room, the patch is NOT the binding constraint — and this is
+the more important half of the result.** On `036_wood_block` the seeder placed contact 4
+with **13.2 mm** of real separation from contact 3 (seed 2: 21.2 mm) and the NLP returned
+**0.0 mm** on all three seeds. Pushing the request to `c4_patch_offset_m=0.030` with
+`c4_min_sep_m=0.020` still returned **0.0 mm**. So a bigger patch, a better seeder, and a
+different `set_initial` quadrant are all ruled out on this object: there was room, the
+seed used it, and the solve gave it back.
+
+### Why nothing stops the collapse
+
+**There is no contact-separation term anywhere in the NLP — objective or constraint.** The
+only things holding contacts apart are the seed positions and `set_initial`, and the
+optimizer is free to leave both.
+
+`w_span` does not serve this role, and the reason is structural rather than a matter of
+tuning. The term is `-w_span * logdet(W W^T + delta*I)` and `W W^T` is **6x6**: a
+duplicated contact leaves it FULL RANK 6, because the rank comes from the other contacts.
+Measured on a synthetic 4-contact grasp:
+
+```
+4 separated           rank(W)=6  logdet=-10.8661
+c4 == c3 (collapsed)  rank(W)=6  logdet=-11.5868
+```
+
+A TOTAL collapse costs ~0.72 of logdet at `w_span=1.0`, against a `w_ik` term that is
+genuinely cheaper to satisfy when two fingers target one point. Rank-deficiency detection
+structurally cannot see this, and neither can the min-weight `beta`: a doubled contact is
+not an infeasible one, which is why all three `nlp-collapse` cells still certify
+`wrench_feasible=True` with `beta` ~ +0.021 and lift the block 115 mm — **on three
+fingers, with the middle finger reading exactly 0.00 N.** Apply the phantom-grasp
+criterion here: `lift_obj_dz_mm` of 115 with a finger at 0 N is not a four-finger grasp.
+
+This is the same failure the n=3 work measured (contacts 2 and 3 exactly coincident in
+15/15 cells) reproduced one slot up, and it now has a located cause rather than a
+suspicion. Fixing it needs an explicit term — a pairwise separation penalty or constraint
+on the contact positions, or a metric that degrades when two wrench columns become
+parallel. `c3_own_patch`/`c4_own_patch` are NOT the fix and were already ruled out at n=3.
+
+### What would have to change for four fingers to be worth re-measuring
+
+1. A contact-separation term in the NLP. Without it, more patch just moves the collapse.
+2. Per-slot patches for slots 3 and 4, or a patch fitted to the finger pitch rather than
+   to the SDF tolerance — but only AFTER (1), since an independent patch was measured to
+   land 183 mm off when nothing tied it to contact 2's neighbourhood.
+3. The gap gate and the one-finger-first arrival recorded in §10 apply unchanged at n=4.
 
 ---
 
