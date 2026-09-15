@@ -311,8 +311,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                    release_open_frac=0.5,
                    lift_mode="standard", plan_override=None,
                    nullspace_tracking=False, gap_tol_m=None,
-                   w_sep=0.0, sep_hard=False, sep_hard_mode="ball",
-                   min_sep_mm=12.0):
+                   sep_hard=False, min_sep_mm=12.0):
     """Plan + execute one grasp on one object, then carry it to the bin.
 
     lift_mode : "standard" (default) runs this benchmark's own 12 cm lift, scored
@@ -554,14 +553,15 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                                   # object planned 2 contacts and execution then
                                   # died binding 3 slots to them.
                                   fingers=_fingers_for_object(object_id, fingers),
-                                  # Contact-separation term. Both default OFF, so
-                                  # an untouched run is bit-identical to before
+                                  # Contact separation. Defaults OFF, so an
+                                  # untouched run is bit-identical to before
                                   # (verified: 014_lemon n=2 and 036_wood_block
                                   # n=3 reproduce gamma/beta/forces to every
-                                  # digit).
-                                  w_sep=float(w_sep),
+                                  # digit). sep_hard_mode is left at its 'ball'
+                                  # default and is NOT exposed here -- see the
+                                  # GraspConfig3D field for the measurement that
+                                  # settled it.
                                   sep_hard=bool(sep_hard),
-                                  sep_hard_mode=str(sep_hard_mode),
                                   contact_min_sep_m=float(min_sep_mm) * 1e-3,
                                   **cfg_kw)
         q_start = None
@@ -1372,25 +1372,18 @@ def main():
                          "fails or gamma is infeasible, so the FAILURE is visible in "
                          "the recorded video instead of the clip ending at the abort. "
                          "Diagnostic only -- the run is still reported as failed.")
-    ap.add_argument("--w-sep", type=float, default=0.0,
-                    help="weight on the pairwise contact-separation HINGE "
-                         "(0 = off). Prices a shortfall below --min-sep-mm; "
-                         "always returns an answer but can be outbid by w_ik")
     ap.add_argument("--sep-hard", action="store_true",
-                    help="enforce contact separation as a HARD constraint "
-                         "instead of (or as well as) --w-sep. Guarantees the "
-                         "floor; can make the solve infeasible on a patch too "
-                         "small to hold the contacts that far apart")
-    ap.add_argument("--sep-hard-mode", choices=("ball", "box"), default="ball",
-                    help="'ball': |p_i-p_j|^2 >= d^2, one nonconvex constraint "
-                         "per pair, any bearing allowed (admits 87.8%% of a "
-                         "+/-30mm patch). 'box': per-axis ordering on the primal "
-                         "patch variables, LINEAR but strictly stronger "
-                         "(admits 30.6%%)")
+                    help="require every pair of contacts to be at least "
+                         "--min-sep-mm apart, as a HARD NLP constraint. Without "
+                         "it nothing keeps two contacts apart and they collapse "
+                         "onto one point -- measured 15/15 cells at n=3 and 3/3 "
+                         "four-contact cells at n=4, all still certifying "
+                         "wrench_feasible because a doubled contact is not an "
+                         "infeasible one. Can make the solve infeasible on a "
+                         "patch too small to hold the contacts that far apart")
     ap.add_argument("--min-sep-mm", type=float, default=12.0,
-                    help="separation floor (mm) for --w-sep / --sep-hard. "
-                         "Default 12 = one LEAP pad extent, i.e. two pads just "
-                         "touching")
+                    help="separation floor (mm) for --sep-hard. Default 12 = one "
+                         "LEAP pad extent, i.e. two pads just touching")
     ap.add_argument("--fingers", default=None,
                     help="comma-separated fingers to grasp with, IN SLOT ORDER, e.g. "
                          "'thumb,middle' or 'thumb,index,middle'. Slot 1 anchors the "
@@ -1440,7 +1433,7 @@ def main():
                          "in 1s, hold 1.5s, 3mm sinusoid in all axes from t+0.25s -- "
                          "additionally scored by their failure criteria (>30deg "
                          "rotation, >7.5cm deviation). This is what produces the "
-                         "paper's '% pick success' column.")
+                         "paper's '%% pick success' column.")
     OP.add_out_args(ap, OP.TABLETOP)
     args = ap.parse_args()
 
@@ -1478,8 +1471,7 @@ def main():
         args.object, args.seed, n_seeds=args.n_seeds, n_relin=args.n_relin,
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
         fingers=args.fingers, force_execute=args.force_execute,
-        w_sep=args.w_sep, sep_hard=args.sep_hard,
-        sep_hard_mode=args.sep_hard_mode, min_sep_mm=args.min_sep_mm,
+        sep_hard=args.sep_hard, min_sep_mm=args.min_sep_mm,
         release_open_frac=args.release_open_frac,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
         directional_r_tip=args.directional_r_tip,
