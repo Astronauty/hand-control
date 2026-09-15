@@ -84,6 +84,233 @@ def group_trials(rows: list[dict]) -> dict[int, list[dict]]:
     return started
 
 
+def method_from_dir(run_dir: Path) -> str | None:
+    """The retargeter arm, read from the RUN DIRECTORY name ('anyteleop_2026...' ->
+    'anyteleop'). Returns None if the name carries no recognized arm.
+
+    Why not trial_start.method: mode normalization collapses every baseline onto the
+    dexpilot pipeline (anyteleop/vwj run it with a different retargeter), and the dexpilot
+    start_trial call additionally hardcoded the literal 'dexpilot'. So EVERY trial in every
+    baseline log — AnyTeleop runs included — recorded method='dexpilot', and keying on that
+    field silently pooled the two arms into one column. The directory name is the only
+    reliable arm signal in the existing logs. Both are now fixed at the source
+    (kinova_leap_pick_place.py logs _RETARGETER), so newer logs agree with the folder;
+    this stays as the authority so old and new runs parse the same way."""
+    name = Path(run_dir).name.lower()
+    for arm in ('contact_aware_w_anyteleop', 'contact_aware_w_vwj_upstream',
+                'contact_aware_w_vwj', 'contact_aware_w_dexpilot',
+                'contact_aware_teleop', 'contact_aware_autonomous',
+                'vwj_upstream', 'anyteleop', 'dexpilot', 'vwj'):
+        if name.startswith(arm):
+            return arm
+    return None
+
+
+def _ev_t(e: dict) -> float | None:
+    """Sim-time of an event (data.time). Sim-time is the right clock for WITHIN-trial
+    durations: it is monotonic inside a trial and immune to the sim's real-time factor,
+    which varies by several x between runs."""
+    t = e.get('t')
+    return float(t) if isinstance(t, (int, float)) else None
+
+
+def read_release_peak_speed(run_dir: Path, trial_id: int) -> float | None:
+    """Peak object speed in the RELEASE window, from the per-trial trace npz.
+
+    The trace carries obj_linvel and an int phase code (1 == TRANSPORT, 0 otherwise; see
+    the trace.sample call in kinova_leap_pick_place.py). The release window is the tail of
+    the trace after transport ends — what separates a clean set-down from chatter or a
+    roll-out. Returns None when the trial has no trace file (e.g. abandoned before any
+    trace rows) or the trace predates these channels."""
+    hits = sorted(Path(run_dir).glob(f'trial_{trial_id:04d}_*.npz'))
+    if not hits:
+        return None
+    try:
+        z = np.load(hits[0], allow_pickle=True)
+        if 'obj_linvel' not in z or 'phase' not in z or 't' not in z:
+            return None
+        v = np.linalg.norm(np.asarray(z['obj_linvel'], float), axis=1)
+        ph = np.asarray(z['phase'])
+        t = np.asarray(z['t'], float)
+        tr = np.where(ph == 1)[0]
+        if not len(tr):
+            return None
+        t_end = t[tr[-1]]
+        w = (t >= t_end) & (t <= t_end + 1.0)      # 1 s post-transport window
+        return float(v[w].max()) if w.any() else None
+    except Exception:
+        return None
+
+
+SETTLE_SPEED  = 0.05    # object speed (m/s) below which it counts as come-to-rest.
+SETTLE_CAP_S  = 2.0     # how far past an episode to look for that rest. Measured: rest
+                        # arrives within 0.25s at the median and 1.70s at p95, but 6 of 47
+                        # episodes never settle before the trial ends, so the search is
+                        # capped rather than unbounded.
+HELD_GAP_M    = 0.08    # fingertip-midpoint-to-object distance below which the object is
+                        # treated as STILL HELD, used only to merge an episode across a
+                        # mid-carry dip. NOTE this proxy is weak: measured over these runs
+                        # the held distribution (p75 65mm, p90 77mm) overlaps the resting
+                        # one (p25 60mm, p50 109mm), so 80mm is the least-bad cut rather
+                        # than a clean separation. It is deliberately used ONLY for merging,
+                        # never to decide whether a grasp succeeded.
+REGRIP_GAP_S  = 0.40    # a dip longer than this ends the episode even if the hand stayed
+                        # near the object — a genuine re-grasp, not a clip on the bin.
+MOVED_M = 0.05          # lateral travel above which a lift counts as a TRANSPORT rather
+                        # than a stationary grasp try. Chosen from the measured episode
+                        # distribution over the ICRA runs: displacements cluster below
+                        # ~50mm (1, 0, 4, 12, 13, 32, 38, 41mm — the object lifted and set
+                        # straight back down) and then form a continuum from ~130mm up.
+                        # The arm RANKING is insensitive to this cut anywhere in 20-150mm;
+                        # only the absolute split between the two rows shifts.
+
+
+def lift_episodes(run_dir: Path, trial_id: int, lift_m: float = 0.015,
+                  min_s: float = 0.15, moved_m: float = MOVED_M,
+                  bin_x: tuple = (0.320, 0.680),
+                  bin_y: tuple = (-0.080, 0.600)) -> dict | None:
+    """Recompute grasp attempts and drops from the per-trial trace, which is the
+    AUTHORITY for both. Returns {'attempts': int, 'drops': int, 'episodes': [...]}, or
+    None when the trial has no usable trace.
+
+    A lift episode is the object rising `lift_m` above the surface it was resting on and
+    staying up for at least `min_s`. Each episode is then classified by how far the object
+    actually TRAVELLED, which is what distinguishes the two failure modes:
+
+      ATTEMPT — the object was grasped and lifted but went nowhere (lateral travel
+                <= `moved_m`): a grasp try that did not turn into a carry.
+      DROP    — the object was carried somewhere (travel > `moved_m`) and ended up back on
+                a surface OUTSIDE the target bin: it was lost in transport.
+
+    An episode that travels and ends INSIDE the bin is a placement, not a drop — without
+    that test every successful trial's final carry would be counted as a loss.
+
+    Classifying by displacement, rather than by which side of pick_confirmed an episode
+    falls on, is what keeps the two counts independent. Earlier cuts of this function
+    anchored on the state machine and made drops a deterministic function of attempts.
+
+    Why recompute rather than trust the logged counts:
+      * attempt_start fired on the raw grasp-trigger rising edge with no lift requirement
+        and no debounce, so it counted contact chatter — measured median inter-attempt gap
+        12ms, median attempt duration 4ms. One trial logged 119 attempts for 5 real lifts.
+      * drop detection only ran in TRANSPORT and tested height_above_rest < LIFT_HEIGHT_M.
+        height_above_rest is referenced to the TABLE top, so in these runs it never fell
+        below +0.85 and the test could not fire at all. Worse, 17 of 20 trials had their
+        real lift/lose cycles BEFORE pick_confirmed, i.e. before TRANSPORT was ever
+        entered, so they were invisible by construction. The logger recorded 1 drop across
+        20 trials; the traces show ~47 lift episodes, about half landing back on a surface.
+
+    The surface baseline is the running minimum of object z over a trailing 2s window, so
+    it adapts when the object is set down somewhere new (counter vs bin floor) and needs no
+    rest-height constant."""
+    hits = sorted(Path(run_dir).glob(f'trial_{trial_id:04d}_*.npz'))
+    if not hits:
+        return None
+    try:
+        z = np.load(hits[0], allow_pickle=True)
+        if 'obj_pos' not in z or 't' not in z:
+            return None
+        t = np.asarray(z['t'], float)
+        op = np.asarray(z['obj_pos'], float)
+        oz = op[:, 2]
+    except Exception:
+        return None
+    if len(t) < 2:
+        return None
+    # Optional channels: used to keep an episode open across a mid-carry dip, and to find
+    # where the object actually came to rest. Absent in older traces -> the simpler
+    # episode-end behaviour, which is what this function did originally.
+    vel = (np.linalg.norm(np.asarray(z['obj_linvel'], float), axis=1)
+           if 'obj_linvel' in z else None)
+    hand = (0.5 * (np.asarray(z['p_thumb'], float) + np.asarray(z['p_index'], float))
+            if ('p_thumb' in z and 'p_index' in z) else None)
+    gap = np.linalg.norm(hand - op, axis=1) if hand is not None else None
+
+    lifted = np.zeros(len(t), bool)
+    for i in range(len(t)):
+        w0 = np.searchsorted(t, t[i] - 2.0)
+        base = oz[w0:i + 1].min() if i > w0 else oz[i]
+        lifted[i] = (oz[i] - base) > lift_m
+
+    def _settle_idx(j, limit):
+        """Index where the object comes to REST after the episode ends.
+
+        Landing must be judged where the object stops, not where it was the instant the
+        lift ended. A golf ball released above the bin was still 100mm up and short of the
+        rim at episode end; it travelled a further 131mm over 1.56s and settled on the bin
+        floor. Judging at episode end scored that placement as a drop.
+
+        `limit` is the first index of the NEXT lift episode: the search must never run past
+        the moment the object is picked up again, or it samples a position from the middle
+        of the following grasp. That bug read a mug's 824mm carry as ending outside the bin
+        (it sampled 1.7s later, inside a re-grasp that began 0.4s after the carry ended)
+        and gave a stationary 12mm attempt 518mm of 'settle travel'."""
+        if vel is None:
+            return j
+        k = j
+        t_cap = t[j] + SETTLE_CAP_S
+        while k < min(limit, len(t)) and t[k] <= t_cap:
+            if vel[k] < SETTLE_SPEED:
+                k2 = min(int(np.searchsorted(t, t[k] + 0.1)), limit - 1)
+                if k2 <= k or np.all(vel[k:k2 + 1] < SETTLE_SPEED):
+                    return k
+            k += 1
+        # Never settled before the cap or the next pick-up (still rolling, re-grasped
+        # immediately, or the trial ended): take the last frame in the allowed window.
+        return max(j, min(int(np.searchsorted(t, t_cap)), limit - 1, len(t) - 1))
+
+    eps, i = [], 0
+    while i < len(lifted):
+        if lifted[i]:
+            j = i
+            while j + 1 < len(lifted) and lifted[j + 1]:
+                j += 1
+            # MERGE across a momentary dip while the object is STILL HELD. The height
+            # baseline is a trailing minimum, so an object that clips the bin wall mid-carry
+            # dips under the lift threshold for a few frames and the episode closes there —
+            # mid-transport, still gripped — and then gets classified by wherever it
+            # happened to be. That is how a successful golf-ball placement was scored as a
+            # drop: 626mm travelled, hand still 17mm from the object, outside the footprint
+            # at that instant. If the hand is still on the object and the lift resumes
+            # shortly, it is one carry, not two episodes.
+            while gap is not None and j + 1 < len(lifted):
+                nxt = j + 1
+                while nxt < len(lifted) and not lifted[nxt]:
+                    nxt += 1
+                if nxt >= len(lifted) or (t[nxt] - t[j]) > REGRIP_GAP_S:
+                    break
+                if gap[j:nxt + 1].max() > HELD_GAP_M:
+                    break        # hand let go during the dip -> a genuine episode boundary
+                j = nxt
+                while j + 1 < len(lifted) and lifted[j + 1]:
+                    j += 1
+            if t[j] - t[i] >= min_s:
+                # First frame of the NEXT lift episode (or end of trace): the settle search
+                # must stop there, never sampling a position from inside a later grasp.
+                nxt_lift = j + 1
+                while nxt_lift < len(lifted) and not lifted[nxt_lift]:
+                    nxt_lift += 1
+                s = _settle_idx(j, nxt_lift)
+                dxy = float(np.linalg.norm(op[j, :2] - op[i, :2]))
+                in_bin = bool(bin_x[0] <= op[s, 0] <= bin_x[1]
+                              and bin_y[0] <= op[s, 1] <= bin_y[1])
+                eps.append({'t0': float(t[i]), 't1': float(t[j]),
+                            't_settle': float(t[s]),
+                            'peak_m': float(oz[i:j + 1].max() - oz[i]),
+                            'end_z': float(oz[s]), 'dxy_m': dxy, 'ended_in_bin': in_bin,
+                            'settle_travel_m': float(
+                                np.linalg.norm(op[s, :2] - op[j, :2])),
+                            'kind': ('attempt' if dxy <= moved_m
+                                     else ('placed' if in_bin else 'drop'))})
+            i = j + 1
+        else:
+            i += 1
+    return {'attempts': sum(1 for e in eps if e['kind'] == 'attempt'),
+            'drops':    sum(1 for e in eps if e['kind'] == 'drop'),
+            'lifts':    len(eps),
+            'episodes': eps}
+
+
 def trial_summary(evs: list[dict]) -> dict | None:
     """Reduce one trial's events to the fields the tables need. Returns None if the
     trial neither ended (trial_end) nor reached a successful place (arrival).
@@ -134,11 +361,28 @@ def trial_summary(evs: list[dict]) -> dict | None:
             comp = e.get('component'); ms = e.get('ms')
             if comp is not None and ms is not None:
                 solve_ms.setdefault(comp, []).append(float(ms))
+    # --- Subtask DURATIONS, in sim-time (see _ev_t) -------------------------------------
+    # pick      : phase_enter(PICK) -> pick_confirmed   (grasp committed -> sustained lift)
+    # transport : pick_confirmed    -> arrival          (carry)
+    # Both are None when the trial never reached that stage, so they never fabricate a 0.
+    _t_pick_enter = next((_ev_t(e) for e in evs
+                          if e.get('event') == 'phase_enter' and e.get('phase') == 'PICK'),
+                         None)
+    _pick_ev = next((e for e in evs if e.get('event') == 'pick_confirmed'), None)
+    _t_pick_ok = _ev_t(_pick_ev) if _pick_ev else None
+    _t_arrival = _ev_t(arrival) if arrival else None
+    pick_dur = (None if (_t_pick_enter is None or _t_pick_ok is None)
+                else max(0.0, _t_pick_ok - _t_pick_enter))
+    transport_dur = (None if (_t_pick_ok is None or _t_arrival is None)
+                     else max(0.0, _t_arrival - _t_pick_ok))
     return {
         'method':       start.get('method', 'unknown'),
         'object':       start.get('object', 'unknown'),
         'outcome':      end.get('outcome'),
         'duration_s':   end.get('duration_s'),
+        'duration_sim_s': end.get('duration_sim_s'),
+        'pick_duration_s':      pick_dur,
+        'transport_duration_s': transport_dur,
         'pick_confirmed': picked,
         # Subtask outcomes (see above). Conditional rates are computed in collect().
         'pickup':       picked,
@@ -167,12 +411,15 @@ def trial_summary(evs: list[dict]) -> dict | None:
 def collect(run_dirs):
     """Pool VALID trials across run dirs into records keyed by (method, object).
 
-    A trial is VALID iff it reached a terminal state (trial_end or a successful arrival) and
-    was NOT abandoned (operator reset / target switch). A trial that timed out without ever
-    confirming a pick IS valid — it is a genuine TASK FAILURE (the operator could not grasp
-    the object within the time budget) and counts against end-to-end, not silently excluded.
-    Only abandoned trials (operator gave up / switched target) and unterminated trials (run
-    killed mid-trial — trial_summary returns None) are excluded. Each record:
+    A trial is VALID iff it reached a terminal state — trial_end (success, timeout, or
+    abandoned) or a successful arrival. Every terminated trial that did not succeed is a
+    TASK FAILURE and counts against end-to-end:
+      * timeout   — could not grasp the object within the time budget.
+      * abandoned — the operator ended a trial they could not finish (object rolled off the
+                    table, or out of reach). A failure of the method, not an exclusion.
+    Only unterminated trials (run killed mid-trial — trial_summary returns None) are
+    dropped. Excluding either failure mode inflates every arm, and inflates the worse arm
+    most, because the worse arm is precisely the one that fails more often. Each record:
       duration_s, n_drops(int), success(bool), + the object property fields.
     Everything is event-based (no trace files)."""
     records = defaultdict(list)
@@ -183,8 +430,14 @@ def collect(run_dirs):
             s = trial_summary(evs)
             if s is None:
                 continue   # trial never reached a terminal state (run killed mid-trial)
-            if s['outcome'] == 'abandoned':
-                continue   # excluded: operator reset / target switch (not a real attempt)
+            # NOTE: 'abandoned' trials are INCLUDED, as task failures. In these runs an
+            # abandon means the object rolled off the table or could not be reached — the
+            # operator ending a trial they cannot finish, which is a failure of the
+            # method, not an experimental exclusion. Dropping them inflates every arm and
+            # inflates the WORSE arm most: it removed 3 DexPilot trials (32 attempts and
+            # never picked; 50 attempts, picked then lost) against 1 AnyTeleop trial, and
+            # turned a 7/10 vs 9/10 result into a meaningless 100% vs 100%.
+            # Only unterminated trials (run killed mid-trial) are dropped, above.
             # Per-trial retarget latency (mean ms) if the 'solve' component=='retarget' event
             # was logged; and per-trial grasp-hold force from trial_end (peak/mean N).
             retarget_ms = None
@@ -192,8 +445,23 @@ def collect(run_dirs):
             if 'retarget' in comp and comp['retarget']:
                 retarget_ms = float(np.mean(comp['retarget']))
             _end = next((e for e in evs if e.get('event') == 'trial_end'), {})
-            records[(s['method'], s['object'])].append({
+            # Arm from the DIRECTORY, not trial_start.method — see method_from_dir.
+            _arm = method_from_dir(rd) or s['method']
+            _lift = lift_episodes(rd, tid)
+            records[(_arm, s['object'])].append({
                 'duration_s': s['duration_s'],
+                'duration_sim_s': s.get('duration_sim_s'),
+                'pick_duration_s': s.get('pick_duration_s'),
+                'transport_duration_s': s.get('transport_duration_s'),
+                'release_peak_mps': read_release_peak_speed(rd, tid),
+                'timeout':   (s['outcome'] == 'timeout'),
+                'abandoned': (s['outcome'] == 'abandoned'),
+                # Trace-derived attempts/drops — the AUTHORITY (see lift_episodes). Kept
+                # alongside the logged n_attempts/n_drops so the disagreement on runs
+                # recorded before the logger fix is visible rather than silent.
+                'attempts_trace': (_lift or {}).get('attempts'),
+                'drops_trace':    (_lift or {}).get('drops'),
+                'lifts_trace':    (_lift or {}).get('lifts'),
                 'n_attempts': s.get('n_attempts', 0) or 0,
                 'n_drops':   s.get('n_drops', 0) or 0,
                 'success':   (s['outcome'] == 'success'),
@@ -473,9 +741,161 @@ def build_subtask_conditional_table(records, methods, objects, method_labels):
 
 METHOD_LABELS = {
     'dexpilot': r'DexPilot \cite{handaDexPilotVisionBasedTeleoperation2020}',
+    'anyteleop': r'AnyTeleop \cite{qinAnyTeleopGeneralVisionBased2023}',
+    'vwj': r'VWJ \cite{xinAnalyzingKeyObjectives2025}',
+    'vwj_upstream': r'VWJ (upstream)',
     'contact_aware_teleop':
         r'\begin{tabular}[c]{@{}l@{}}Contact-Aware\\ Teleop (Ours)\end{tabular}',
+    'contact_aware_w_dexpilot':
+        r'\begin{tabular}[c]{@{}l@{}}Ours\\ + DexPilot\end{tabular}',
+    'contact_aware_w_anyteleop':
+        r'\begin{tabular}[c]{@{}l@{}}Ours\\ + AnyTeleop\end{tabular}',
+    'contact_aware_w_vwj':
+        r'\begin{tabular}[c]{@{}l@{}}Ours\\ + VWJ\end{tabular}',
 }
+
+
+def _median_iqr(vals, unit='', fmt='.1f'):
+    """Median [Q1, Q3] — the distribution summary to report instead of mean +/- std.
+
+    These durations are strongly right-skewed (one object needing 119 grasp attempts sits
+    in the same cell as one needing 1), so a mean +/- std implies a symmetric spread that
+    does not exist and hides the tail. The IQR shows it."""
+    v = [x for x in vals if x is not None and np.isfinite(x)]
+    if not v:
+        return r'$-$'
+    q1, med, q3 = np.percentile(v, [25, 50, 75])
+    return f'${med:{fmt}}$ [{q1:{fmt}}, {q3:{fmt}}]{unit}'
+
+
+def build_metrics_table(records, methods, objects, method_labels):
+    """The per-method metric panel: everything the current logs actually support, with the
+    unsupported metrics named explicitly rather than quietly omitted.
+
+    Every rate's DENOMINATOR is stated in its row label, because a conditional rate without
+    one is uninterpretable. Valid = terminated and not abandoned; a timeout that never
+    grasped IS valid and counts as a failure (excluding timeouts inflates every arm, and
+    inflates the worse arm most)."""
+    def pooled(m):
+        recs = [r for o in objects for r in records.get((m, o), [])]
+        n = len(recs)
+        succ = [r for r in recs if r['success']]
+        picked = [r for r in recs if r.get('pickup')]
+        return dict(
+            n=n, recs=recs,
+            n_e2e=len(succ), n_pick=len(picked),
+            n_trans=sum(1 for r in recs if r.get('transport')),
+            n_timeout=sum(1 for r in recs if r.get('timeout')),
+            n_aband=sum(1 for r in recs if r.get('abandoned')),
+            t_total=[r['duration_s'] for r in succ],
+            t_pick=[r.get('pick_duration_s') for r in recs],
+            t_trans=[r.get('transport_duration_s') for r in recs],
+            attempts=[r.get('n_attempts', 0) for r in recs],
+            drops=[r.get('n_drops', 0) for r in picked],
+            attempts_tr=[r.get('attempts_trace') for r in recs],
+            drops_tr=[r.get('drops_trace') for r in recs],
+            lifts_tr=[r.get('lifts_trace') for r in recs],
+            vrel=[r.get('release_peak_mps') for r in recs],
+            lat=[r['retarget_ms'] for r in recs if r.get('retarget_ms') is not None],
+            gfp=[r['grip_force_peak_n'] for r in recs
+                 if r.get('grip_force_peak_n') not in (None, 0.0)],
+        )
+
+    def frac(a, b):
+        return r'$-$' if not b else f'{a}/{b} ({100.0*a/b:.0f}\\%)'
+
+    def permean(vals):
+        v = [x for x in vals if x is not None]
+        return r'$-$' if not v else f'${np.mean(v):.1f}$'
+
+    P = {m: pooled(m) for m in methods}
+    rows = [
+        (r'\multicolumn{%d}{l}{\emph{Task}} \\' % (len(methods) + 1), None),
+        ('Valid trials ($n$)', lambda p: str(p['n'])),
+        ('End-to-end success (/ valid)', lambda p: frac(p['n_e2e'], p['n'])),
+        ('  failures: timeout', lambda p: str(p['n_timeout'])),
+        ('  failures: abandoned\\tnote{c}', lambda p: str(p['n_aband'])),
+        ('Completion time (s), median [IQR]', lambda p: _median_iqr(p['t_total'])),
+        (r'\midrule \multicolumn{%d}{l}{\emph{Pick}} \\' % (len(methods) + 1), None),
+        ('Pick success (/ valid)', lambda p: frac(p['n_pick'], p['n'])),
+        (r'Total lifts per trial\tnote{d}', lambda p: permean(p['lifts_tr'])),
+        (r'\quad of which stationary (attempts)', lambda p: permean(p['attempts_tr'])),
+        (r'\quad (attempts as logged, uncorrected)', lambda p: permean(p['attempts'])),
+        ('Pick duration (s), median [IQR]', lambda p: _median_iqr(p['t_pick'])),
+        (r'\midrule \multicolumn{%d}{l}{\emph{Transport}} \\' % (len(methods) + 1), None),
+        ('Transport success (/ picked)', lambda p: frac(p['n_trans'], p['n_pick'])),
+        (r'Drops per trial\tnote{d}', lambda p: permean(p['drops_tr'])),
+        (r'\quad (as logged, uncorrected)', lambda p: permean(p['drops'])),
+        ('Transport duration (s), median [IQR]', lambda p: _median_iqr(p['t_trans'])),
+        ('Release peak speed (m/s), median [IQR]',
+         lambda p: _median_iqr(p['vrel'], fmt='.3f')),
+        (r'\midrule \multicolumn{%d}{l}{\emph{Physical / computation}} \\'
+         % (len(methods) + 1), None),
+        (r'Grasp-hold force, peak (N)\tnote{a}', lambda p: _median_iqr(p['gfp'])),
+        (r'Retarget latency (ms)\tnote{b}', lambda p: _median_iqr(p['lat'], fmt='.2f')),
+    ]
+    lines = [
+        r'\begin{table}[t]', r'  \centering', r'  \begin{threeparttable}',
+        r'    \caption{Teleoperation baselines, pooled over objects. Distributions are '
+        r'reported as median [Q1, Q3]: the completion-time spread is the result, and a '
+        r'mean $\pm$ std would imply a symmetry these trials do not have. Every rate names '
+        r'its denominator. A timeout without success counts as a failure, not an exclusion.}',
+        r'    \label{tab:teleop_metrics}',
+        r'    \begin{tabular}{l' + 'c' * len(methods) + '}',
+        r'      \toprule',
+        '      Metric & ' + ' & '.join(method_labels.get(m, m) for m in methods) + r' \\',
+        r'      \midrule',
+    ]
+    for label, fn in rows:
+        if fn is None:
+            lines.append('      ' + label)
+            continue
+        lines.append('      ' + label + ' & '
+                     + ' & '.join(fn(P[m]) for m in methods) + r' \\')
+    lines += [
+        r'      \bottomrule',
+        r'    \end{tabular}',
+        r'    \begin{tablenotes}[para,flushleft]',
+        r'      \footnotesize',
+        r'      \item[a] Finger$\to$object normal force during transport '
+        r'(\texttt{trial\_end.grip\_force\_peak\_n}); trials reporting exactly 0 N are '
+        r'excluded as unmeasured rather than averaged in as zero.',
+        r'      \item[b] Per-frame retargeting solve time — the like-for-like planning cost. '
+        r'Absent from runs recorded before the emitter guard was fixed.',
+        r'      \item[c] Trials the operator ended without completing — the object rolled '
+        r'off the table or could not be reached. Counted as task failures, not excluded.',
+        r'      \item[e] Every lift of the object off its resting surface, decomposed as '
+        r'lifts $=$ stationary attempts $+$ drops $+$ placements. A lift that travels '
+        r'further than 50\,mm and ends outside the bin is a drop; one that travels and '
+        r'ends inside it is the placement. The stationary row is small by construction: '
+        r'most lifts in these runs became carries.',
+        r'      \item[d] Recomputed from the per-trial object trace (a grasp attempt is a '
+        r'sustained lift off the resting surface; a drop is a lift that ends back on one). '
+        r'The logged rows beneath are shown for comparison: attempt events fired on the raw '
+        r'grasp-trigger edge with no lift test or debounce (median 4\,ms duration, so they '
+        r'counted contact chatter), and drop detection ran only in TRANSPORT against a '
+        r'table-referenced height that could not fire once the object was in the bin.',
+        r'    \end{tablenotes}',
+        r'  \end{threeparttable}',
+        r'\end{table}',
+    ]
+    return '\n'.join(lines)
+
+
+# Metrics that were requested but CANNOT be produced from these logs. Printed to stderr so
+# the gap is explicit in the run output rather than showing up as a silent dash in a cell.
+UNAVAILABLE_METRICS = [
+    ('Gap-gate abort rate',
+     "attempt_result.outcome is 'released' for every attempt in these runs — the "
+     "squeeze_aborted_no_contact outcome is emitted only by benchmarks/ycb_grasp/*, "
+     "not by this teleop pipeline."),
+    ('Certified squeeze gamma*, force-tracking error, excess force, '
+     'certificate issuance rate',
+     'no solve/certificate events: these come from the contact-aware grasp path, which '
+     'the DexPilot/AnyTeleop baseline arms never execute.'),
+    ('Per-grasp solve time, fingertip residual, one-time SDF setup cost',
+     'same reason — no grasp_rec/ik solve events in baseline-only runs.'),
+]
 
 
 def emit_tables(dirs, args, heading=None):
@@ -496,7 +916,7 @@ def emit_tables(dirs, args, heading=None):
     if heading:
         print(f'# === {heading} ===', file=sys.stderr)
     print('# VALID trials pooled per (method, object)  '
-          '[valid = terminated & not abandoned]:', file=sys.stderr)
+          '[valid = terminated; timeout/abandoned count as failures]:', file=sys.stderr)
     for (m, o), recs in sorted(records.items()):
         n = len(recs)
         ndrops = sum(r['n_drops'] for r in recs)
@@ -509,11 +929,28 @@ def emit_tables(dirs, args, heading=None):
         print(f'% ===== {heading} =====')
     print(build_object_properties_table(records, objects))
     print()
+    print(build_metrics_table(records, methods, objects, METHOD_LABELS))
+    if getattr(args, 'per_object', False):
+        # One metric panel per object. Same builder, single-object `objects` list, so every
+        # rate keeps its denominator and the per-object n is visible (it is small — 2 trials
+        # per object per arm in the ICRA runs — so read these as a breakdown of the pooled
+        # table above, not as independently powered comparisons).
+        for _o in objects:
+            if not any((m, _o) in records for m in methods):
+                continue
+            print()
+            print(f'% ----- per-object: {_o} -----')
+            print(build_metrics_table(records, methods, [_o], METHOD_LABELS))
+    print()
     print(build_time_table(records, methods, objects, METHOD_LABELS))
     print()
     print(build_success_table(records, methods, objects, METHOD_LABELS))
     print()
     print(build_subtask_conditional_table(records, methods, objects, METHOD_LABELS))
+    print('# metrics NOT computable from these logs:', file=sys.stderr)
+    for name, why in UNAVAILABLE_METRICS:
+        print(f'#   {name}\n#     -> {why}', file=sys.stderr)
+    print('', file=sys.stderr)
     return True
 
 
@@ -523,6 +960,9 @@ def main():
     ap.add_argument('run_dirs', nargs='+', help='logs/<run>/ directories (globs expanded)')
     ap.add_argument('--objects', nargs='*', default=None,
                     help='explicit object column order/subset (default: auto, sorted)')
+    ap.add_argument('--per-object', dest='per_object', action='store_true',
+                    help='also emit one metric panel per object (breakdown of the pooled '
+                         'table; per-object n is small, so treat it as diagnostic)')
     ap.add_argument('--per-run', action='store_true',
                     help='emit a separate table pair per run dir (default: pool all dirs '
                          'into one table pair)')

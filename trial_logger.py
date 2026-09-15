@@ -64,6 +64,32 @@ ARRIVAL_DWELL_S     = 0.5    # sim-time the object must stay in-place, settled a
                              # before arrival is counted. Mirrors DWELL_S/DROP_DWELL_S: an
                              # instantaneous frame where the fingers lose contact mid-carry
                              # (or a one-frame contact flicker) is not a placement.
+ATTEMPT_LIFT_M      = 0.015  # object clearance above its CURRENT resting surface for a lift to
+                             # count as a real grasp attempt. Deliberately NOT LIFT_HEIGHT_M:
+                             # that is compared against rest_half_height, which is referenced to
+                             # the TABLE top, so an object resting in the bin (10mm higher) or
+                             # toppled onto its side never reads near zero. This threshold is
+                             # relative to a surface baseline tracked per trial (see
+                             # TrialState.surface_z), so it works on the table, in the bin, and
+                             # for any object orientation.
+ATTEMPT_MIN_S       = 0.15   # a lift must persist this long to be an attempt. Sub-150ms blips
+                             # are contact jitter, not an operator trying to grasp.
+ATTEMPT_DEBOUNCE_S  = 0.30   # after a lift ends, ignore a re-lift for this long: one grasp that
+                             # bobbles is ONE attempt, not two.
+ATTEMPT_MOVED_M     = 0.05   # lateral travel that turns a lift into a TRANSPORT. A lift that
+                             # ends within this of where it started is a grasp ATTEMPT (picked
+                             # it up, it went nowhere); one that travels further and is then
+                             # put back down away from the target is a DROP (lost in transit).
+                             # Measured over the ICRA runs: episode displacements cluster
+                             # under 50mm or exceed ~130mm, so the cut sits in the gap.
+                             #
+                             # Why any of this exists: attempts used to be counted on the raw
+                             # rising edge of the grasp trigger, with no lift requirement and no
+                             # debounce. Measured over the ICRA runs, that produced a median
+                             # inter-attempt gap of 12ms and a median attempt duration of 4ms —
+                             # it was counting finger-contact chatter at physics-step resolution.
+                             # One gelatin-box trial logged 119 "attempts" where the object was
+                             # actually lifted and lost 5 times (~24x inflation).
 ARRIVAL_LAPSE_S     = 0.15   # how long the arrival conditions may momentarily lapse WITHOUT
                              # restarting the dwell. A settled object still shows brief
                              # contact-jitter spikes: in a real placement 96.4% of the final
@@ -434,6 +460,19 @@ class TrialState:
     arrive_lapse_t0: float | None = None  # sim-time the current momentary lapse of those
                                     # conditions began. Only a lapse lasting ARRIVAL_LAPSE_S
                                     # clears arrive_t0, so contact jitter doesn't starve the dwell.
+    # --- Lift tracking: the basis for BOTH attempt counting and drop detection ----------
+    # An attempt is a LIFT episode (object leaves its resting surface by ATTEMPT_LIFT_M and
+    # stays off for ATTEMPT_MIN_S), not a trigger edge. A drop is a lift episode that ends
+    # with the object back on a surface instead of held. Tracking the surface height per
+    # trial makes both orientation- and container-independent.
+    surface_z: float | None = None   # running estimate of the height the object RESTS at
+                                     # (lowest recent object z). Re-learned continuously, so a
+                                     # set-down in the bin becomes the new surface.
+    lift_t0: float | None = None     # sim-time the current above-surface excursion began
+    lift_counted: bool = False       # this excursion already incremented attempt_id
+    last_lift_end_t: float | None = None   # sim-time the last excursion ended (debounce)
+    lift_xy0: tuple | None = None    # object xy when the current excursion began — the
+                                     # travel from here decides attempt vs drop at lift end
     pick_confirmed: bool = False
     pick_logged: bool = False   # forward phase_enter PICK emitted for the current PICK entry
                                  # (reset on a drop so a re-pick logs PICK again)
@@ -594,7 +633,9 @@ class TrialRunner:
                                 object_speed: float | None = None,
                                 place_marker_half_extent: float = 0.15,
                                 inside_container: bool | None = None,
-                                hand_touching: bool | None = None):
+                                hand_touching: bool | None = None,
+                                object_z: float | None = None,
+                                object_xy: tuple | None = None):
         """Call every step once REACH has ended (GRASP begins). Drives the attempt /
         dwell / confirm / transport / drop / arrival state machine.
 
@@ -640,8 +681,14 @@ class TrialRunner:
             state.phase = TrialPhase.PICK
 
         if state.phase == TrialPhase.PICK:
+            # An ATTEMPT is a LIFT, not a trigger edge. The trigger still tells us the hand
+            # is engaged (and still opens the PICK phase), but attempt_id only advances once
+            # the object has actually left its resting surface by ATTEMPT_LIFT_M for
+            # ATTEMPT_MIN_S. See the ATTEMPT_* constants for the measurements that forced
+            # this: the old edge-triggered count inflated attempts ~24x by counting 4ms
+            # contact flickers.
             if trigger_fired and not state.attempt_active:
-                # Log the forward APPROACH→PICK entry on the FIRST attempt (idempotent via
+                # Log the forward APPROACH→PICK entry on the FIRST trigger (idempotent via
                 # set_phase; state.phase is already PICK so we force the log with a small
                 # helper). Single owner of PICK logging for all modes — the control-loop
                 # marker no longer logs PICK (it never could for dexpilot: no 'GRASP').
@@ -649,18 +696,81 @@ class TrialRunner:
                     state.pick_logged = True
                     self.events.log(state.trial_id, t_now, 'phase_enter',
                                      phase=TrialPhase.PICK)
-                state.attempt_id += 1
                 state.attempt_active = True
                 state.dwell_t0 = None
-                self.events.log(state.trial_id, t_now, 'attempt_start',
-                                 attempt=state.attempt_id)
 
             if not trigger_active and state.attempt_active:
-                # grasp released before confirmation -> attempt ends, unconfirmed
                 state.attempt_active = False
                 state.dwell_t0 = None
-                self.events.log(state.trial_id, t_now, 'attempt_result',
-                                 attempt=state.attempt_id, outcome='released')
+
+            # --- Lift tracking (runs every step, trigger or not) ---------------------
+            # object_z is the object's world height; when the caller cannot supply it we
+            # fall back to the legacy height_above_rest behaviour so older call sites keep
+            # working (they just lose pre-confirm drop detection).
+            if object_z is not None:
+                if state.surface_z is None:
+                    state.surface_z = float(object_z)
+                above = float(object_z) - state.surface_z
+                if above > ATTEMPT_LIFT_M:
+                    if state.lift_t0 is None:
+                        # Debounce: a re-lift within ATTEMPT_DEBOUNCE_S of the last one is
+                        # the SAME attempt bobbling, not a new try.
+                        if (state.last_lift_end_t is not None
+                                and t_now - state.last_lift_end_t < ATTEMPT_DEBOUNCE_S):
+                            state.lift_t0 = state.last_lift_end_t   # continue the old one
+                            state.lift_counted = True
+                        else:
+                            state.lift_t0 = t_now
+                            state.lift_counted = False
+                            # Where the carry started, for the travel test at lift end.
+                            state.lift_xy0 = (tuple(object_xy)
+                                              if object_xy is not None else None)
+                    elif (not state.lift_counted
+                            and t_now - state.lift_t0 >= ATTEMPT_MIN_S):
+                        # A real attempt: sustained lift off the surface.
+                        state.lift_counted = True
+                        state.attempt_id += 1
+                        self.events.log(state.trial_id, t_now, 'attempt_start',
+                                         attempt=state.attempt_id)
+                else:
+                    # Back down on a surface: this lift is over. Close the attempt.
+                    #
+                    # This is NOT a drop. A failed lift before the pick is confirmed is an
+                    # unsuccessful ATTEMPT, already counted as one above; calling it a drop
+                    # too would count the same event twice and make drops a deterministic
+                    # function of attempts. A drop means losing the object after the pick
+                    # succeeded — that is handled in the TRANSPORT branch, once
+                    # pick_confirmed is set.
+                    if state.lift_t0 is not None:
+                        if state.lift_counted:
+                            # Classify by TRAVEL, not by phase. A lift that ends roughly
+                            # where it began is a grasp attempt that went nowhere; one that
+                            # carried the object somewhere and then put it back down is a
+                            # DROP. (Carries that end in the target are placements and are
+                            # resolved by the arrival check, which owns TRANSPORT.)
+                            _dxy = None
+                            if state.lift_xy0 is not None and object_xy is not None:
+                                _dxy = float(((object_xy[0] - state.lift_xy0[0]) ** 2
+                                              + (object_xy[1] - state.lift_xy0[1]) ** 2) ** 0.5)
+                            _moved = (_dxy is not None and _dxy > ATTEMPT_MOVED_M)
+                            self.events.log(state.trial_id, t_now, 'attempt_result',
+                                             attempt=state.attempt_id,
+                                             outcome=('dropped' if _moved else 'lift_lost'),
+                                             lift_s=round(t_now - state.lift_t0, 3),
+                                             travel_m=(None if _dxy is None
+                                                       else round(_dxy, 4)))
+                            if _moved:
+                                state.n_drops += 1
+                                self.events.log(state.trial_id, t_now, 'drop',
+                                                 count=state.n_drops,
+                                                 travel_m=round(_dxy, 4))
+                        state.last_lift_end_t = t_now
+                        state.lift_xy0 = None
+                        state.lift_t0 = None
+                        state.lift_counted = False
+                    # Re-learn the resting surface: the object is down, so THIS is the
+                    # height it rests at now (counter, bin floor, or on top of something).
+                    state.surface_z = min(state.surface_z, float(object_z))
 
             if state.attempt_active:
                 lifted = height_above_rest > LIFT_HEIGHT_M

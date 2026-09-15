@@ -101,6 +101,14 @@ sim)
 	# record) so a "sim gets stuck" stall shows which bucket spiked. An env assignment must
 	# precede the command (or the shell tries to exec a program literally named DP_PROFILE=1);
 	# `exec env VAR=val cmd` is the exec-safe form. Set to 0 (or drop it) to silence profiling.
+	#
+	# BLAS threads: OpenBLAS defaults to one thread per core (48 here), which OVER-
+	# SUBSCRIBES the grasp NLP's MUMPS/BLAS calls (~18x slower at 48 vs the ~4-thread knee).
+	# That is fixed SURGICALLY in-code (threadpool_limits scoped to JUST the grasp-solver
+	# thread — see _blas_pin in kinova_leap_pick_place.py); we deliberately DO NOT cap
+	# threads process-wide here, because that also throttled the RRT collision checks and
+	# other numpy-heavy main-loop work (a process-wide cap made lock-in RRT crawl). Set
+	# GRASP_BLAS_THREADS=N to change the in-code grasp-solver cap only.
 	exec env DP_PROFILE="${DP_PROFILE:-1}" python3 kinova_leap_pick_place.py \
 		--mode "$MODE" --no-mediapipe "$@"
 	;;

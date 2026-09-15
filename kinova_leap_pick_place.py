@@ -73,14 +73,23 @@ def _latin_row(n: int, row: int) -> list:
     with them. That is ORDINAL-POSITION counterbalancing, and it is the claim to make in a
     write-up: "presentation order was counterbalanced across sessions with a Latin square."
 
-    What this does NOT give you: carryover balance. Every row here is the same sequence
-    shifted (row r = seed + r mod n), so the successor relation is identical in all rows —
-    at n=5 only 10 of the 20 ordered pairs ever occur, each twice, and the other 10 never.
-    Do NOT describe this as a Williams square: a Williams square is built by a different
-    rule (reverse-and-interleave, not cyclic shift) and is what actually balances
-    first-order carryover. A true Williams square is exactly carryover-balanced in n rows
-    for EVEN n; for ODD n no single n x n square can be, and it takes 2n rows (the square
-    plus its row-reversed mirror) — 10 sessions at n=5.
+    Carryover balance depends on the PARITY of n, because the zig-zag seed row (0, 1, n-1,
+    2, n-2, ...) is exactly the Williams construction and every later row is a cyclic shift
+    of it:
+
+      EVEN n (the `robocasa` scene, n=4): this IS a Williams square. All n(n-1) ordered
+      pairs occur exactly once across the n rows — verified at n=4: 12 of 12 pairs, each
+      once. So four sessions (--order 1..4) balance BOTH ordinal position AND first-order
+      carryover, and the write-up may claim "a Williams square balanced presentation order
+      and first-order carryover across sessions."
+
+      ODD n (the `pick_place` scene, n=5): no single n x n square can be carryover-balanced.
+      The successor relation is identical in all rows, so only 10 of the 20 ordered pairs
+      occur, each twice, and the other 10 never. Balanced carryover at odd n needs 2n rows
+      (this square plus its row-reversed mirror) — 10 sessions at n=5. With only 5 sessions
+      claim POSITIONAL balance only, and do NOT call it a Williams square.
+
+    Positional balance holds for either parity and is the cheap, defensible property.
 
     Positional balance is the cheap, defensible property, and it is more order control than
     the teleoperation baselines do: DexPilot runs 5 consecutive trials per task (explicitly
@@ -354,10 +363,12 @@ if __name__ == "__main__":
              "Across the N runs every object appears in every ordinal position exactly once, "
              "so order effects (operator learning, fatigue, headset thermal drift) are "
              "balanced by POSITION rather than confounded with the object. Run each session "
-             "with a different --order 1..N; N equals the number of objects (5 for both "
-             "bundled scenes). NOTE this balances position only, NOT carryover (which object "
-             "follows which) — that needs a true Williams square, and at odd N twice as many "
-             "sessions. Omit for the config order (unbalanced; fine for piloting). The "
+             "with a different --order 1..N; N equals the scene's object count — 4 for the "
+             "robocasa scene, 5 for pick_place. At EVEN N (robocasa) the square is also a "
+             "Williams square, so those 4 sessions balance first-order carryover (which "
+             "object follows which) as well; at ODD N (pick_place) 5 sessions balance "
+             "position only, and carryover would need 10. Omit for the config order "
+             "(unbalanced; fine for piloting). The "
              "realized order is printed and logged to events.jsonl as spawn_order.")
     _arg_parser.add_argument(
         '--rec-log-dir', dest='rec_log_dir', default=None, metavar='DIR',
@@ -1543,7 +1554,14 @@ if __name__ == "__main__":
         dexpilot-vs-anyteleop headline latency; parse_trials_tables.py surfaces it per method.
         Clears the controller's rolling window so each trial's stat is its own. No-op without
         a trial logger or an active dexpilot controller."""
-        if _dexpilot_ctrl is None or 'args' not in dir() or not getattr(args, 'trial_log', None):
+        # NB: do NOT test `'args' not in dir()` here. dir() with no argument lists the
+        # LOCAL namespace, which inside this nested function never contains `args` (a
+        # module-level name reached as a free variable) — so that clause was always True
+        # and this function returned early on every call. Result: not one 'retarget' solve
+        # row was ever written, and the baseline per-frame retargeting cost (the
+        # like-for-like planning-cost comparison against the contact-aware arm) was silently
+        # missing from every log. Guard on the things that can actually be absent instead.
+        if _dexpilot_ctrl is None or _trial_events is None:
             return
         try:
             st = _dexpilot_ctrl.retarget_latency_stats(clear=True)
@@ -1699,6 +1717,7 @@ if __name__ == "__main__":
     print(f"[IK] active-finger geoms (tiered object clearance, floor kept): "
           f"{len(_active_finger_geoms)}")
 
+
     # Dedicated MjData for background IK solves so the IK thread never touches the main
     # simulation data. Object positions are set per solve from the live-scene snapshot
     # taken at selection time (obj_qpos_snap), so IK always targets current object poses.
@@ -1841,6 +1860,21 @@ if __name__ == "__main__":
     # geom-vs-floor pair stays checked at the full clearance.
     _ACTIVE_SKIP_GIDS = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g) for g in _active_finger_geoms]
 
+    # Support-surface geom(s) the target objects REST ON (table/counter top). Grasping an
+    # object sitting on a surface necessarily brings the active fingers down to ~surface
+    # level, so the fingertip skims the table along the whole approach — not just at the
+    # goal. Endpoint grace only relaxes the finger-vs-table pair AT each endpoint, so an
+    # interior RRT step (arm slightly different, finger dipping a hair lower) violates the
+    # un-graced 5mm table clearance and is rejected — freezing BOTH trees at 1 node (probe:
+    # leap_mf_ds_collision_2 vs 'table' @ 0.0mm on the first step). So the active fingers
+    # get the same touch-but-don't-penetrate (0mm) exemption vs the support surface that
+    # they already get vs the target object. pick_and_place.py never hit this because its
+    # benchmark objects float 6cm above the floor; teleop grasps objects resting on a table.
+    _SUPPORT_SURFACE_GIDS = [gid for gid in
+                             (mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g)
+                              for g in ('table', 'floor'))
+                             if gid >= 0]
+
     # Background RRT: result dict shared between thread and main loop
     _plan_result = {}
 
@@ -1918,15 +1952,99 @@ if __name__ == "__main__":
         #      move away, never deeper.
         # Everything else — palm, proximal links, wrist, non-active fingers, and every
         # geom vs the floor — stays checked at the full clearance.
-        pair_clearance = {(g, obj_target['id_geom']): 0.0 for g in _ACTIVE_SKIP_GIDS}
+        #
+        # MULTI-HULL FIX: a YCB mesh object's body carries MANY collision hulls (e.g. the
+        # 43-hull mug), and the grasp goal lands the active fingertips ON one of them. The
+        # exemption must cover EVERY hull of the target object, not just the single named
+        # `<name>_geom`: an active finger touching a *different* hull was checked at full
+        # clearance, flagged the GOAL config as in-collision, and the goal tree could never
+        # grow — so RRT-Connect exhausted all 30000 iters and fell back to the (unsafe)
+        # linear path. Measured: 0/6 RRT success on mesh objects vs 126/126 on primitives
+        # (single-geom), the exact split this fixes. _OBJ_COL_GIDS already holds the full
+        # per-object hull list (built for the same-class mug-placement bug).
+        _tgt_idx = _OBJ_GID_TO_IDX.get(obj_target['id_geom'])
+        _tgt_hulls = (_OBJ_COL_GIDS.get(_tgt_idx) if _tgt_idx is not None
+                      else None) or [obj_target['id_geom']]
+        pair_clearance = {(g, _h): 0.0
+                          for g in _ACTIVE_SKIP_GIDS for _h in _tgt_hulls}
         # Re-branch the goal's continuous (base/wrist) joints onto the turn nearest the
         # current pose, so the arm never unwinds a near-full revolution just because the IK
         # left a joint on a far 2pi branch. Same configuration, planner-friendly numbering.
         q_goal = planner.rebranch(q_start, q_grasp)
+        # INVESTIGATE: at the goal pose, report each NON-ACTIVE finger geom's signed distance
+        # to the support surface(s). The probe found the idle middle finger (mf, non-active
+        # when FINGER_SET=index+thumb) touching 'table' @ 0mm along the whole path, freezing
+        # both trees. This says whether the idle fingers are splayed DOWN onto the table at
+        # the grasp (a goal-pose issue) or the whole hand is too low (a deeper problem).
+        _nonactive_surface = None
+        try:
+            _dchk = mj.MjData(model)
+            _dchk.qpos[N_ROBOT:] = data.qpos[N_ROBOT:]
+            _dchk.qpos[:N_ROBOT] = q_goal
+            mj.mj_forward(model, _dchk)
+            _na_geoms = [g for g in _robot_geom_names if g not in _active_finger_geoms
+                         and any(g.startswith(f'leap_{c}_') for c in ('if', 'mf', 'rf', 'th'))]
+            _ft = np.zeros(6); _rows = []
+            for _gname in _na_geoms:
+                _gid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, _gname)
+                if _gid < 0:
+                    continue
+                for _sgid in _SUPPORT_SURFACE_GIDS:
+                    _d = mj.mj_geomDistance(model, _dchk, _gid, _sgid, 1.0, _ft)
+                    if _d < 0.006:   # only report near/touching pairs
+                        _rows.append({'finger': _gname,
+                                      'surf': mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, _sgid),
+                                      'dist_mm': round(_d * 1e3, 1)})
+            _nonactive_surface = sorted(_rows, key=lambda r: r['dist_mm'])[:8]
+            if _nonactive_surface:
+                print(f"\r\n[RRT-investigate] non-active fingers near support surface at GOAL: "
+                      f"{_nonactive_surface}")
+        except Exception:
+            traceback.print_exc()
+        # Goal/start admissibility pre-flight: if either endpoint is in collision the RRT
+        # goal tree can't grow and plan() is doomed to fall back — this attributes such a
+        # failure precisely (which finger vs which object hull), and confirms the multi-hull
+        # clearance fix (goal_free should now be True on mesh objects). Cheap; logged below.
+        try:
+            _adm = planner.admissibility(q_start, q_goal, pair_clearance=pair_clearance)
+        except Exception:
+            traceback.print_exc()
+            _adm = None
+        if _adm is not None and not _adm.get('goal_free', True):
+            print(f"\r\n[RRT] GOAL in collision before planning — "
+                  f"{_adm.get('goal_block')} (RRT will fail; check clearance/hulls)")
         _t0 = time.time()
         path = planner.plan(q_start, q_goal, pair_clearance=pair_clearance)
         plan_time = time.time() - _t0
         fallback = path is None
+        # Durable record: RRT outcome + endpoint admissibility, so 'why did RRT fail' is
+        # answerable from the log alone (co-located with the grasp solves).
+        try:
+            _grasp_log({
+                't_wall':      round(time.time(), 6),
+                'component':   'rrt',
+                'object':      obj_target['name'],
+                'plan_ms':     round(plan_time * 1e3, 1),
+                'fallback':    bool(fallback),
+                'n_waypoints': len(path) if path is not None else 0,
+                'n_target_hulls': len(_tgt_hulls),
+                'admissibility': _adm,
+                # Speed-vs-connectivity diagnostics from the planner (set by plan()).
+                'iters':        getattr(planner, 'last_iters', None),
+                'start_tree':   getattr(planner, 'last_start_tree', None),
+                'goal_tree':    getattr(planner, 'last_goal_tree', None),
+                'checks':       getattr(planner, '_isfree_n', None),
+                'checks_ms':    round(getattr(planner, '_isfree_ms', 0.0), 1),
+                'first_step_block': getattr(planner, 'first_step_block', None),
+                'nonactive_surface': _nonactive_surface,
+                # Path-quality diagnostics: raw -> shortcut -> densified waypoint counts and
+                # the shortcut path's convolution ratio (~1.0 = straight, >1 = detours left).
+                'raw_wp':       getattr(planner, 'last_raw_wp', None),
+                'shortcut_wp':  getattr(planner, 'last_shortcut_wp', None),
+                'conv_ratio':   getattr(planner, 'last_conv_ratio', None),
+            })
+        except Exception:
+            traceback.print_exc()
         if fallback:
             # Linear-interpolation fallback: 100 intermediate configs so the PD
             # controller tracks a smooth sequence rather than jumping to the goal,
@@ -2123,6 +2241,13 @@ if __name__ == "__main__":
             # so RRT has a valid, in-place goal rather than crashing.
             print("[teleop] WARNING: recommendation carries no q — committing live pose.")
             q_rec = np.asarray(q_seed, float).copy()
+        # NOTE: an idle-finger "tuck" was applied here on the theory that a splayed non-active
+        # finger caught the table slab. That diagnosis was WRONG (it came from an offline scene
+        # rebuild that forgot to re-mount the base to counter height, so it mis-placed the hand
+        # ~0.86m low). With the correct mount the hand is ~38cm ABOVE the table at accept, so
+        # the tuck is not applied — the committed grasp keeps the recommender + live pose as
+        # before. The live RRT probe (phantom-check) will say whether the interior collision
+        # is real or a box-box mj_geomDistance phantom before any real fix is added.
         obj['q_target'] = q_rec
 
         # Report where the recommender's own pose lands the tip SITES vs its recommended
@@ -3085,6 +3210,60 @@ if __name__ == "__main__":
                               # -> 5 seeds gives ~99% chance of >=1 converged vs 3 seeds' ~94%.
                               # No warm-start, so no seed is wasted on a boundary-jammed re-seed.)
     REC_REACH_TOL_MM = 15.0   # lock-in IK residual above which a rec is flagged unreachable
+    # GRASP_PROFILE=1: print a per-solve breakdown from the recommender thread — solve /
+    # verify(LP) / trace-move / seed-viz ms, plus per-seed solve ms + IPOPT iters — so the
+    # single _solve_ms number in the status line stops hiding WHERE the time goes. Opt-in
+    # (off by default); pairs with the BLAS thread cap to confirm the fix took.
+    GRASP_PROFILE = os.environ.get('GRASP_PROFILE', '0') == '1'
+    # The ACTUAL OpenBLAS thread count, recorded in the grasp-solver log for context (NOT a
+    # cap we set — see the note at the solve site: runtime pool mutation stalled the RRT on
+    # this pthreads OpenBLAS build, so we no longer pin). Read once for logging; falls back
+    # to the env hint or -1 if threadpoolctl can't report it.
+    try:
+        import threadpoolctl as _tpc
+        _GRASP_BLAS_THREADS = next((i.get('num_threads')
+                                    for i in _tpc.threadpool_info()
+                                    if i.get('user_api') == 'blas'), -1)
+    except Exception:
+        _GRASP_BLAS_THREADS = int(os.environ.get('OPENBLAS_NUM_THREADS', '-1'))
+    # --- Grasp-solver log (ALWAYS ON): one JSONL row per NLP solve, with the full
+    # per-seed breakdown (solve ms / IPOPT iters / status / cost), the total solve/verify/
+    # seed-viz ms, and the BLAS thread count. This is the durable record for offline
+    # timing analysis (teleop vs autonomous, before/after the thread pin) — the per-seed
+    # detail the GRASP_PROFILE stdout print shows but never persisted. Co-located with
+    # events.jsonl when --trial-log is on, else its own logs/grasp_solver/ file so it works
+    # for plain runs too. Written from the recommender daemon thread (see _grasp_log()).
+    if _CAT_MODE or _AUTO_REC:
+        if args.trial_log:
+            _grasp_log_path = Path('logs') / args.trial_log / 'grasp_solver.jsonl'
+        else:
+            _gls_dir = Path('logs') / 'grasp_solver'
+            _gls_dir.mkdir(parents=True, exist_ok=True)
+            _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _grasp_log_path = _gls_dir / f'grasp_solver_{_run_label}_{_ts}.jsonl'
+        _grasp_log_path.parent.mkdir(parents=True, exist_ok=True)
+        _grasp_log_fh = open(_grasp_log_path, 'a', encoding='utf-8')
+        _grasp_log_lock = threading.Lock()
+        print(f"[grasp-solver-log] per-solve timings -> {_grasp_log_path}")
+    else:
+        _grasp_log_fh = None
+        _grasp_log_lock = threading.Lock()
+
+    def _grasp_log(row: dict):
+        """Append one grasp-solve record (thread-safe, best-effort). No-op if disabled."""
+        if _grasp_log_fh is None:
+            return
+        try:
+            line = json.dumps(row, default=lambda o: (o.tolist()
+                              if isinstance(o, np.ndarray)
+                              else o.item() if isinstance(o, (np.floating, np.integer))
+                              else str(o)))
+            with _grasp_log_lock:
+                _grasp_log_fh.write(line + '\n')
+                _grasp_log_fh.flush()
+        except Exception:
+            traceback.print_exc()
+
     _rec1_mocap = int(model.body_mocapid[
         mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'rec1_body')])
     _rec2_mocap = int(model.body_mocapid[
@@ -3338,6 +3517,14 @@ if __name__ == "__main__":
                              if q_robot_fire is not None
                              else data.qpos[:N_ROBOT].copy())
             _t_fire_wall = time.time()
+            # NOTE: an earlier attempt pinned BLAS threads here (threadpool_limits) to curb
+            # OpenBLAS oversubscription in the grasp NLP. It was REMOVED: this OpenBLAS build
+            # is the `pthreads` layer, and mutating its global thread pool at runtime inside
+            # this thread-heavy process (render + physics + 2 encoders + retarget worker +
+            # plan_thread) stalled the RRT plan() call — lock-in produced NO [RRT] output at
+            # all. We now leave the thread pool untouched; the timing profiler + grasp_solver
+            # log below still measure the solve, and the fix for a genuinely slow NLP (if
+            # needed) must NOT mutate the shared pthreads pool at runtime.
             _t0 = time.time()
             try:
                 res = planner.solve(q_snap, obj_pos, max_seeds=_REC_NC)
@@ -3351,10 +3538,12 @@ if __name__ == "__main__":
             # to show this candidate — the visualization must only ever recommend a
             # wrench-feasible grasp. Also feeds the dashboard below.
             _vinfo = {}
+            _t_verify0 = time.time()
             try:
                 _vinfo = planner._planner.verify(res) or {}
             except Exception:
                 traceback.print_exc()
+            _verify_ms = (time.time() - _t_verify0) * 1e3
             _wf = bool(_vinfo.get('wrench_feasible', False))
 
             # SNAPSHOT this solve's npz trace. Every solve for an object reuses that
@@ -3461,7 +3650,9 @@ if __name__ == "__main__":
             # t{1,2,3}_sol, contact 3 only at n>=3) and ship it. On THIS recommender daemon thread (serialized with
             # the solve by the _rec_idle gate), so it never touches the render/physics
             # thread. Best-effort.
+            _seedviz_ms = 0.0
             if _SEED_VIZ_DASH or _SEED_VIZ_FILE:
+                _t_sv0 = time.time()
                 try:
                     from kinova_common.seed_figure import render_grasp_contacts_png
                     _png = render_grasp_contacts_png(
@@ -3479,6 +3670,56 @@ if __name__ == "__main__":
                              ).write_bytes(_png)
                 except Exception:
                     traceback.print_exc()
+                _seedviz_ms = (time.time() - _t_sv0) * 1e3
+
+            # --- Per-seed breakdown (shared by the GRASP_PROFILE print + the durable log) ---
+            _all = res.get('all_results') or [res]
+            _nconv = sum(1 for r in _all if r.get('status') == 'converged')
+            _seed_rows = [{
+                'seed_index': r.get('seed_index', j),
+                'solve_ms':   (round(float(r['solve_ms']), 1)
+                               if r.get('solve_ms') is not None else None),
+                'iterations': r.get('iterations'),
+                'status':     r.get('status'),
+                'cost':       (round(float(r['cost']), 4) if r.get('cost') is not None else None),
+                'wrench_ok':  bool(r.get('wrench_ok', False)),
+            } for j, r in enumerate(_all)]
+
+            # --- GRASP_PROFILE: attribute the solve's wall time across phases (stdout) ---
+            # The status line reports only _solve_ms (the NLP). This breaks the rest out —
+            # verify(LP), seed-viz — and lists per-seed solve ms + IPOPT iters, so a slow
+            # object shows WHERE the time went (and confirms the BLAS pin worked).
+            if GRASP_PROFILE:
+                _per_seed = " ".join(
+                    f"s{s['seed_index']}:"
+                    f"{(s['solve_ms'] if s['solve_ms'] is not None else float('nan')):.0f}ms"
+                    f"/{s['iterations'] if s['iterations'] is not None else '?'}it"
+                    f"/{(s['status'] or '?')[:4]}"
+                    for s in _seed_rows)
+                print(f"[GRASP_PROFILE] {objects[obj_idx]['name']}  "
+                      f"solve={_solve_ms:.0f}ms  verify={_verify_ms:.0f}ms  "
+                      f"seedviz={_seedviz_ms:.0f}ms  blas_threads={_GRASP_BLAS_THREADS}\n"
+                      f"                per-seed[{len(_seed_rows)}]: {_per_seed}")
+
+            # --- Durable grasp-solver record (ALWAYS written; see _grasp_log setup) ---
+            _grasp_log({
+                't_wall':          round(_t_fire_wall, 6),
+                'object':          objects[obj_idx]['name'],
+                'status':          res.get('status'),
+                'solve_ms':        round(_solve_ms, 1),
+                'verify_ms':       round(_verify_ms, 1),
+                'seedviz_ms':      round(_seedviz_ms, 1),
+                'n_seeds':         len(_seed_rows),
+                'n_converged':     _nconv,
+                'gamma_min':       _vinfo.get('gamma_min'),
+                'wrench_feasible': bool(_vinfo.get('wrench_feasible', False)),
+                'ik_thumb_mm':     _vinfo.get('ik_thumb_mm'),
+                'ik_index_mm':     _vinfo.get('ik_index_mm'),
+                'blas_threads':    _GRASP_BLAS_THREADS,
+                'mode':            _run_label,
+                'seeds':           _seed_rows,
+            })
+
             if _trial_events is not None:
                 # The recommender fires continuously (proximity-based) BEFORE lock-in
                 # starts a trial, so a solve for this object may predate any matching
@@ -4471,7 +4712,11 @@ if __name__ == "__main__":
                     _trial_state, _tnow_tr, trigger_fired=False, trigger_active=False,
                     height_above_rest=_h_tr, place_xy_offset=_xy_tr, object_speed=_spd_tr,
                     inside_container=_object_in_bowl(active_idx),
-                    hand_touching=_touch_tr)
+                    hand_touching=_touch_tr,
+                    # Object world height: drives the lift-episode attempt/drop tracking
+                    # (see ATTEMPT_LIFT_M). Without it that tracking is inert.
+                    object_z=float(data.geom_xpos[_ao['id_geom']][2]),
+                    object_xy=tuple(data.geom_xpos[_ao['id_geom']][:2]))
                 # Arrival sets outcome=SUCCESS but does NOT write trial_end / save the trace —
                 # the caller must call end_trial. Do so on arrival, or on a timeout.
                 if _arrived_tr:
@@ -4548,8 +4793,18 @@ if __name__ == "__main__":
                 # measurement the dashboard's normal-force plot uses (_hand_object_contact_
                 # metrics -> dash 'normals'/'wrench'). Logged in FINGER_SET order so an
                 # auto-vs-teleop normal-force comparison reads straight off the trace.
+                # Measure against the TRIAL'S object, not the proximity pick. Under
+                # --sequential-spawn _prox_idx stays 0 (only one object is ever on the
+                # table and the nearest-object argmin never moves off it) while the carried
+                # object is objects[active_idx] — so these channels were recording forces on
+                # a STOWED object and read 0.000 N for the whole carry. active_idx is the
+                # trial's target (set from _seq_order at press-8); fall back to _prox_idx
+                # outside a trial.
+                _pt_obj_idx = (active_idx if (_trial_state is not None
+                                              and 0 <= active_idx < len(objects))
+                               else _prox_idx)
                 _pt_fnet, _pt_taunet, _pt_norm, _pt_tan = \
-                    _hand_object_contact_metrics(_prox_idx)
+                    _hand_object_contact_metrics(_pt_obj_idx)
                 # Standardized phase for this trace row: the success machine owns
                 # TRANSPORT/PLACE (its phase advances past PICK on lift/arrival), so honor
                 # that when present; otherwise classify the control state (APPROACH/PICK).
@@ -5519,7 +5774,13 @@ if __name__ == "__main__":
                     # Median-filtered d_s1 so the trial trigger matches the DEBOUNCED
                     # pinch the fingers actually act on (falls back to raw if absent).
                     _rtg = _dexpilot_ctrl.retargeter
-                    _d_s1_dp = getattr(_rtg, 'last_d_s1_filt', _rtg.last_d_s1)
+                    # Two-step getattr, NOT getattr(rtg, 'filt', rtg.last_d_s1): a default
+                    # argument is evaluated EAGERLY, so the one-liner touches last_d_s1 even
+                    # when last_d_s1_filt exists — and a retargeter carrying neither (any
+                    # whole-robot backend with no pinch concept) took down the whole sim.
+                    _d_s1_dp = getattr(_rtg, 'last_d_s1_filt', None)
+                    if _d_s1_dp is None:
+                        _d_s1_dp = getattr(_rtg, 'last_d_s1', [float('inf')] * 3)
                     # Touching = the hand contacts ANY of the object's collision hulls (a
                     # multi-hull mesh like the mug is grasped on a _col_N hull, not _geom).
                     _dp_obj_gids = _OBJ_COL_GID_SET.get(_dp_idx, {_dp_obj['id_geom']})
@@ -5554,7 +5815,9 @@ if __name__ == "__main__":
                         height_above_rest=_height_above_rest_dp,
                         place_xy_offset=_xy_off_dp, object_speed=_spd_dp,
                         inside_container=_object_in_bowl(_dp_idx),
-                        hand_touching=_touching_dp)
+                        hand_touching=_touching_dp,
+                        object_z=float(data.geom_xpos[_dp_obj['id_geom']][2]),
+                        object_xy=tuple(data.geom_xpos[_dp_obj['id_geom']][:2]))
                     _dp_thumb_sid = id_C[FINGER_SET.index('thumb')]
                     _dp_index_sid = id_C[FINGER_SET.index('index')]
                     # Grasp-hold force summary: total finger->object normal force this step,
@@ -6793,9 +7056,14 @@ if __name__ == "__main__":
                     _hh = _trial_rest_hh[active_idx]
                     _height_above_rest = float(data.geom_xpos[obj['id_geom']][2]) - _hh
                     if _dp_trigger is not None:
-                        _d_s1 = ([float('inf')] * 3 if _dexpilot_ctrl is None
-                                 else getattr(_dexpilot_ctrl.retargeter, 'last_d_s1_filt',
-                                              _dexpilot_ctrl.retargeter.last_d_s1))
+                        # Two-step: see the eager-default note at the dexpilot trial block.
+                        if _dexpilot_ctrl is None:
+                            _d_s1 = [float('inf')] * 3
+                        else:
+                            _rtg_ca = _dexpilot_ctrl.retargeter
+                            _d_s1 = getattr(_rtg_ca, 'last_d_s1_filt', None)
+                            if _d_s1 is None:
+                                _d_s1 = getattr(_rtg_ca, 'last_d_s1', [float('inf')] * 3)
                         # Touch ANY of the object's collision hulls (multi-hull mesh safe).
                         _obj_gids = _OBJ_COL_GID_SET.get(active_idx, {obj['id_geom']})
                         _touching = bool(_obj_gids & {
@@ -6819,6 +7087,8 @@ if __name__ == "__main__":
                         trigger_active=_active, height_above_rest=_height_above_rest,
                         place_xy_offset=_xy_off, object_speed=_spd,
                         inside_container=_object_in_bowl(active_idx),
+                        object_z=float(data.geom_xpos[obj['id_geom']][2]),
+                        object_xy=tuple(data.geom_xpos[obj['id_geom']][:2]),
                         hand_touching=bool(
                             _OBJ_COL_GID_SET.get(active_idx, {obj['id_geom']}) & {
                                 (c.geom2 if c.geom1 in _HAND_GIDS else c.geom1)
@@ -6917,6 +7187,11 @@ if __name__ == "__main__":
         print(f"[pose-trace] saved {_pose_path} ({_pose_n} rows)")
     if _scene_recorder is not None:
         _scene_recorder.close()   # finalize the overview + wrist MP4s
+    if _grasp_log_fh is not None:
+        try:
+            _grasp_log_fh.close()   # flush + close the grasp-solver timing log
+        except Exception:
+            pass
     if dash is not None:
         dash.close()
     # (retargeting sliders live in the MediaPipe subprocess window; it cleans up
