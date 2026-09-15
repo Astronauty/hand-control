@@ -254,7 +254,8 @@ def _ball(c, r, n=22):
 
 
 def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
-                 box=None, scale=1.0, box_col="#238b45"):
+                 box=None, scale=1.0, box_col="#238b45", alpha_w=None,
+                 axis_len=None):
     """Convex hull of wrench columns in one 3-D subspace.
 
     ball  : draw the largest origin-centred ball inside the hull (Ferrari-Canny).
@@ -274,12 +275,30 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
         pass
 
     _pts = [P, np.zeros((1, 3))]
-    if ball:
-        r = _hull_inradius(P)
-        if r > 0:
-            ax.plot_surface(*_ball(np.zeros(3), r), color=col_hi, alpha=0.30,
-                            linewidth=0, antialiased=True, shade=False)
-            _pts.append(np.eye(3) * r)
+    if alpha_w is not None:
+        # THE MIN-WEIGHT METRIC. beta = min(alpha) from
+        #     max beta  s.t.  W alpha = 0,  sum(alpha) = 1,  alpha >= beta
+        # so beta is carried by ONE column -- argmin(alpha) -- and that column
+        # is what the LP is pushing up. Marked here rather than drawn as a
+        # length: beta is a property of the WEIGHTS and has no radius in wrench
+        # space (unlike Ferrari-Canny, which does).
+        #
+        # NOT the vertex closest to the origin, which is a different column:
+        # measured here argmin(alpha) = 6 while argmin|w_i| = 4 in 6D (10 in
+        # force, 1 in torque), and corr(alpha, |w|) = 0.19. A column gets a
+        # small weight because of its DIRECTION relative to the others in
+        # W alpha = 0, not its length -- the four shortest columns (|w| = 1.004)
+        # are the soft-finger torsion ones and carry middling alpha.
+        aw = np.asarray(alpha_w, float)
+        _kb = int(np.argmin(aw))
+        _v = P[_kb]
+        ax.plot([_v[0]], [_v[1]], [_v[2]], "o", ms=5.0, color=col_hi,
+                mec="k", mew=0.6, zorder=10)
+        ax.plot(*zip(np.zeros(3), _v), "-", color=col_hi, lw=1.0, zorder=9)
+        _tp = _v * 1.17
+        ax.text(_tp[0], _tp[1], _tp[2], r"$\beta$", fontsize=AXLAB_PT,
+                color=col_hi, ha="center", va="center", zorder=11)
+
     if box is not None:
         b = np.asarray(box, float)
         sgn = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1)
@@ -296,9 +315,11 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
         # PER-AXIS arm length: these hulls are strongly anisotropic, so one
         # global radius buries the arm along a wide direction and leaves the
         # arm along a narrow one floating.
-        _ext = np.abs(_lim).max(0)
-        _ext = np.maximum(_ext, _ext.max() * 0.35)
-        _r_ax = 1.50 * _ext
+        # EQUAL-LENGTH arms: a triad whose arms differ per axis reads as a
+        # scale cue that is not there. One length for all three, sized off the
+        # largest extent so none is swallowed.
+        _r = 1.34 * float(np.abs(_lim).max())
+        _r_ax = np.array([_r, _r, _r]) if axis_len is None else np.asarray(axis_len, float)
         _lim = np.vstack([_lim, np.diag(_r_ax) * 1.24, -np.diag(_r_ax) * 0.12])
     # True isometric: elev atan(1/sqrt(2)), azim 45 -- the three axes subtend
     # equal angles, so no wrench component is visually privileged.
@@ -307,7 +328,7 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
         for _k, (_lb, _d) in enumerate(zip(axlab, np.eye(3))):
             _end = _r_ax[_k] * _d
             ax.plot(*zip(np.zeros(3), _end), "-", color="0.35", lw=0.55, zorder=2)
-            _tp = 1.18 * _end
+            _tp = 1.30 * _end
             ax.text(_tp[0], _tp[1], _tp[2], _lb, fontsize=AXLAB_PT,
                     color="0.25", ha="center", va="center", zorder=9)
     if title:
@@ -333,14 +354,15 @@ def panel_b(fig, gs, W, alpha, beta):
     Wa = np.asarray(W, float)
     ax_f = fig.add_subplot(sub[0, 0], projection="3d")
     _wrench_hull(ax_f, Wa[3:, :].T, "", "#6baed6", "#2171b5",
-                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), ball=True)
+                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), alpha_w=alpha)
     ax_t = fig.add_subplot(sub[1, 0], projection="3d")
     _wrench_hull(ax_t, Wa[:3, :].T, "", "#c7e9c0", "#238b45",
-                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), ball=True)
+                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), alpha_w=alpha)
     return ax_f
 
 
-def panel_c(fig, gs, W, gamma, abox, angbox, mass, inertia):
+def panel_c(fig, gs, W, gamma, abox, angbox, mass, inertia,
+            ang_display=None):
     """(c) GAMMA SCALING against the task disturbance box.
 
     Cone vertices scale LINEARLY in the internal force, V(gamma) = gamma * V(1),
@@ -364,8 +386,17 @@ def panel_c(fig, gs, W, gamma, abox, angbox, mass, inertia):
     ax_t = fig.add_subplot(sub[1, 0], projection="3d")
     _wrench_hull(ax_t, Wa[:3, :].T, "", "#fdd0a2", "#d94801",
                  axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), scale=g,
-                 box=np.asarray(inertia, float) * np.asarray(angbox, float),
+                 box=np.asarray(inertia, float) * np.asarray(
+                     ang_display if ang_display is not None else angbox, float),
                  box_col="#238b45")
+    # ang_display: the TRUE angular budget is 1 rad/s^2, which on this object
+    # (principal inertia ~1.3e-4 kg m^2) gives a 2.25e-4 N m box against a
+    # 0.79 N m gamma-scaled hull -- 5255x smaller, i.e. sub-pixel at the origin.
+    # That is the real measurement and it is the finding: FORCE sets gamma here
+    # (4.33 N hull inradius against a 4.09 N box corner) while torque has three
+    # orders of slack. For the FIGURE ONLY, --ang-display inflates the angular
+    # budget so the box is visible as a shape; it changes nothing the solver
+    # computed and must be stated in the caption when used.
     # NOTE the torque box is ~2.2e-4 N m against a 0.279 N m scaled hull, i.e.
     # three orders of magnitude inside it -- it collapses to a point at the
     # origin at any shared scale. That is the finding, not a rendering bug:
@@ -391,7 +422,7 @@ def _iso(ax, P, elev=30, azim=-60):
     # azim ~138, which puts the handle BEHIND the cup -- rejected on the render.
     # (30, -60) shows the hole with both cones still reading as cones.
     ax.view_init(elev=elev, azim=azim)
-    try: ax.set_box_aspect(None, zoom=1.42)
+    try: ax.set_box_aspect(None, zoom=1.52)
     except TypeError: pass
 
 
@@ -399,6 +430,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--object", default="025_mug")
     ap.add_argument("--seed", type=int, default=2)
+    ap.add_argument("--ang-display", type=float, default=None,
+                    help="FIGURE ONLY: angular-accel budget (rad/s^2) used to "
+                         "draw the torque task box. The true budget is 1.0, "
+                         "which renders sub-pixel (the box is 5255x smaller "
+                         "than the gamma-scaled torque hull). 1000 puts it at "
+                         "~19%% of the hull. Changes nothing the solver did; "
+                         "state it in the caption if used.")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -430,7 +468,7 @@ def main():
     # Taller and tighter: (b)/(c) are 2-row subgrids, so the old 0.30 aspect
     # left each hull in a sliver. wspace 0 -- the panels carry their own
     # whitespace from the 3D axes' margins, so any grid spacing is additive.
-    fig = plt.figure(figsize=(COL_IN, COL_IN * 0.46))
+    fig = plt.figure(figsize=(COL_IN, COL_IN * 0.52))
     gs = GridSpec(1, 3, figure=fig, wspace=0.0)
     import traceback
     for _nm, _fn in (("a", lambda: panel_a(fig, gs[0, 0], pl, pl._planner.model,
@@ -439,7 +477,10 @@ def main():
                                           np.asarray(r["gws_alpha"]).flatten(),
                                           float(r["gws_beta"]))),
                      ("c", lambda: panel_c(fig, gs[0, 2], r["gws_W"], cap["gamma"],
-                                          a[4], a[5], a[3], _inertia))):
+                                          a[4], a[5], a[3], _inertia,
+                                          ang_display=(
+                                              (args.ang_display,) * 3
+                                              if args.ang_display else None)))):
         try:
             _fn()
         except Exception:
@@ -454,8 +495,9 @@ def main():
          Line2D([], [], ls="", marker="s", ms=3.0, color="#238b45", mec="k",
                 mew=0.3,
                 label=r"task box  $m\mathbf{a}$ / $\mathbf{I}\boldsymbol{\alpha}$"),
-         Line2D([], [], ls="", marker="o", ms=4.0, color="#2171b5", alpha=0.45,
-                mec="none", label="inscribed ball (Ferrari-Canny)")]
+         Line2D([], [], ls="-", marker="o", ms=4.0, color="#2171b5", lw=1.0,
+                mec="k", mew=0.5,
+                label=r"$\beta = \min_i \alpha_i$  (min-weight column)")]
     fig.legend(handles=h, loc="lower center", ncol=4, frameon=False,
                fontsize=LEG_PT, handletextpad=0.25, columnspacing=1.1,
                bbox_to_anchor=(0.5, -0.02))
@@ -473,7 +515,7 @@ def main():
              fontsize=TITLE_PT, ha="center", va="bottom")
     # top < 1 leaves the suptitle its own band; the panel titles sit at
     # pad=-2 inside their axes, so without this the two collide.
-    fig.subplots_adjust(left=0.0, right=1.0, top=0.94, bottom=0.07)
+    fig.subplots_adjust(left=0.0, right=1.0, top=0.955, bottom=0.05)
     out = Path(args.out or (REPO / "figures" /
                f"pipeline_{args.object}_s{args.seed}.pdf"))
     fig.savefig(out, format="pdf", dpi=600, bbox_inches="tight")
