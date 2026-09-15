@@ -311,7 +311,8 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                    release_open_frac=0.5,
                    lift_mode="standard", plan_override=None,
                    nullspace_tracking=False, gap_tol_m=None,
-                   sep_hard=False, min_sep_mm=12.0):
+                   sep_hard=False, min_sep_mm=12.0,
+                   squeeze_pd_per_finger=False):
     """Plan + execute one grasp on one object, then carry it to the bin.
 
     lift_mode : "standard" (default) runs this benchmark's own 12 cm lift, scored
@@ -843,6 +844,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         model, N_ROBOT, tip_site_ids=tip_site_ids, obj_site_ids=None,
         obj_body_id=obj_bid, kp=Kp, kd=Kd,
         gamma=gamma_live, squeeze_pd_scale=squeeze_pd_scale, support_weight=True,
+        squeeze_pd_per_finger=squeeze_pd_per_finger,
         # FRoGGeR eq. (18)'s tracking projector; off unless asked for. See
         # GraspController.nullspace_tracking.
         nullspace_tracking=nullspace_tracking,
@@ -954,6 +956,12 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
             mj.mj_step(model, data)
             _sync()
         result["phase_log"].append("hold_settled")
+        # Diagnostic hook: a probe may be attached as pick_and_place._PROBE_DUMP
+        # to inspect per-finger contact state at the phase boundaries. Absent in
+        # normal runs, so this costs one attribute lookup.
+        _pd = globals().get("_PROBE_DUMP")
+        if _pd is not None:
+            _pd("hold", model, data, tip_geom_ids, obj_gids, _FSET, ctrl)
 
         gaps = _tip_gaps_mm(model, data, tip_geom_ids, obj_gid, obj_geom_ids=obj_gids)
         result["tip_gaps_mm"] = dict(zip(_FSET, gaps))
@@ -1081,6 +1089,12 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         # mislabelling them would report the middle finger's load under 'index'.
         result["squeeze_forces_N"] = dict(zip(_FSET, np.round(f_meas, 3).tolist()))
         result["phase_log"].append("squeeze_done")
+        # Diagnostic hook: a probe may be attached as pick_and_place._PROBE_DUMP
+        # to inspect per-finger contact state at the phase boundaries. Absent in
+        # normal runs, so this costs one attribute lookup.
+        _pd = globals().get("_PROBE_DUMP")
+        if _pd is not None:
+            _pd("squeeze", model, data, tip_geom_ids, obj_gids, _FSET, ctrl)
         print(f"[squeeze] final={result['squeeze_forces_N']}")
 
         # Holding gains for everything that follows (see effective_gains).
@@ -1372,6 +1386,12 @@ def main():
                          "fails or gamma is infeasible, so the FAILURE is visible in "
                          "the recorded video instead of the clip ending at the abort. "
                          "Diagnostic only -- the run is still reported as failed.")
+    ap.add_argument("--squeeze-pd-per-finger", action="store_true",
+                    help="scale the squeeze-phase finger PD PER FINGER, by that "
+                         "finger's own |tau_int|/|tau_pd| ratio, instead of one "
+                         "global --squeeze-pd-scale. A finger already winning "
+                         "keeps full tracking authority; only one losing the "
+                         "standoff is softened, and only by its shortfall")
     ap.add_argument("--sep-hard", action="store_true",
                     help="require every pair of contacts to be at least "
                          "--min-sep-mm apart, as a HARD NLP constraint. Without "
@@ -1472,6 +1492,7 @@ def main():
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
         fingers=args.fingers, force_execute=args.force_execute,
         sep_hard=args.sep_hard, min_sep_mm=args.min_sep_mm,
+        squeeze_pd_per_finger=args.squeeze_pd_per_finger,
         release_open_frac=args.release_open_frac,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
         directional_r_tip=args.directional_r_tip,

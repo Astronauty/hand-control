@@ -33,6 +33,8 @@ def _peak_internal_normal(f_int, n_contacts, contact_dof=3):
 class GraspController:
     def __init__(self, model, n_robot, tip_site_ids, obj_site_ids, obj_body_id,
                  kp, kd, gamma=5.0, squeeze_pd_scale=1.0, transport_pd_scale=1.0,
+                 squeeze_pd_per_finger=False, squeeze_pd_ratio_target=2.0,
+                 squeeze_pd_min_scale=0.05,
                  active_joint_slices=((7, 11), (19, 23)),
                  support_weight=False, pad_offsets=None,
                  grasp_map_computer=None, allocator=None,
@@ -116,6 +118,26 @@ class GraspController:
         self.kp = np.asarray(kp, dtype=float).copy()
         self.kd = np.asarray(kd, dtype=float).copy()
         self.squeeze_pd_scale = squeeze_pd_scale
+        # Per-finger squeeze authority. OFF by default: every measured result in
+        # this repo was taken with the single global scale, and this changes the
+        # gains a running grasp sees. See _per_finger_pd_scales().
+        self.squeeze_pd_per_finger  = squeeze_pd_per_finger
+        # Ratio |tau_int| / |tau_pd| a finger is considered to have enough
+        # authority at. 2.0, not 1.0: at exactly 1.0 the two torques balance and
+        # the finger stalls, which is the measured failure (0.93x stalled at
+        # 4.24 mm). The three fingers that DID seat in that run were at 1.5x,
+        # 8.5x and 15.1x, so 2.0 sits just above the lowest observed success and
+        # leaves the comfortable fingers untouched.
+        self.squeeze_pd_ratio_target = squeeze_pd_ratio_target
+        # Floor on the per-finger cut. A finger with no tracking authority at all
+        # drifts across the surface under the squeeze -- the failure
+        # effective_gains' own docstring records for the lift phase -- so the cut
+        # is bounded rather than allowed to go to zero.
+        self.squeeze_pd_min_scale   = squeeze_pd_min_scale
+        # Previous step's finger torques, the input to the per-finger ratio.
+        # None until the first compute().
+        self._last_tau_pd  = None
+        self._last_tau_int = None
         self.transport_pd_scale = transport_pd_scale
         self.transporting = False
         self.active_joint_slices = tuple(active_joint_slices)
@@ -252,13 +274,101 @@ class GraspController:
         if self.gamma_ref is not None:
             g_cmd = float(np.max(np.atleast_1d(self.allocator.gamma)))
             scale *= max(g_cmd, 1e-9) / self.gamma_ref
-        if scale == 1.0:
+        # PER-FINGER authority (squeeze_pd_per_finger). One global scale is the
+        # wrong instrument for the failure it was introduced to fix, and the
+        # measurement says so directly. At the squeeze plateau on
+        # 036_wood_block seed 0 (n=4), |tau_int| / |tau_pd| per finger read
+        #
+        #     thumb 15.1x   index 8.5x   ring 1.5x   middle 0.93x
+        #
+        # and ONLY the finger below 1.0 failed to close -- it stalled 4.24 mm off
+        # the surface at 0.00 N while the other three were seated. The object had
+        # moved 0.6 mm, the joints had 0.84 rad of margin and the actuators were
+        # at 0.7 of +/-8 Nm, so this is a quasi-static standoff between two
+        # COMMANDED torques, not a limit and not a reach failure.
+        #
+        # Lowering the global scale does fix that finger (0.00 -> 8.46 N at 0.10,
+        # and the first four-finger lift) but it pays for it everywhere: measured
+        # max fingertip drift off the planned contact went 5.2 -> 10.7 mm, and
+        # because the allocator re-solves from the LIVE contact geometry its own
+        # command then moved too (middle 7.75 -> 14.13 N at the same gamma). A
+        # finger that is already seated does not need its tracking weakened.
+        #
+        # So: scale each finger's slice by what THAT finger needs. A finger whose
+        # ratio is already comfortable keeps full tracking authority.
+        #
+        # MEASURED, AND IT DOES NOT FIX THE 0 N FINGER. Kept because the negative
+        # result is what locates the real cause, and re-deriving it costs a day.
+        # On the same cell it drives middle's ratio to exactly the target
+        # (|pd| 0.743 -> 0.340, ratio 0.93x -> 2.0x) and the finger STILL reads
+        # 0.00 N at 5.7 mm. Raising the target to 4.0 and 8.0 changes nothing.
+        # The global scale=0.10 that DOES work differs in a way this cannot
+        # reproduce: softening EVERY finger lets the whole hand settle, the live
+        # contact geometry moves, and the allocator -- which re-solves G from
+        # `_live_contacts` every step -- then hands the middle finger a much
+        # larger share. Measured |f_c| at the same gamma:
+        #
+        #     global 0.10   ring  7.69  middle 14.13  index  9.16  thumb 27.41
+        #     per-finger    ring 12.75  middle  7.72  index 10.99  thumb 27.37
+        #
+        # i.e. the middle finger's ALLOCATED force nearly doubles under the
+        # global softening. The 0 N finger is not short of PD authority, it is
+        # short of ALLOCATED FORCE, and softening its own tracking cannot give it
+        # more. The fix belongs in the allocator (a finger not yet in contact
+        # should be commanded harder, not the others weaker), not here.
+        #
+        # OFF by default, accordingly.
+        per = self._per_finger_pd_scales() if (
+            self.squeeze and not self.transporting
+            and self.squeeze_pd_per_finger) else None
+        if scale == 1.0 and per is None:
             return self.kp, self.kd
         kp, kd = self.kp.copy(), self.kd.copy()
-        for lo, hi in self.active_joint_slices:
-            kp[lo:hi] *= scale
-            kd[lo:hi] *= scale
+        for _k, (lo, hi) in enumerate(self.active_joint_slices):
+            s_k = scale * (1.0 if per is None else float(per[_k]))
+            kp[lo:hi] *= s_k
+            kd[lo:hi] *= s_k
         return kp, kd
+
+    def _per_finger_pd_scales(self):
+        """Multiplier per finger slice, in active_joint_slices order.
+
+        Derived from the ratio the standoff is actually decided by:
+
+            r_k = |tau_int,k| / |tau_pd,k|
+
+        both measured on the SAME joints on the previous control step. Where
+        r_k >= squeeze_pd_ratio_target the finger is winning comfortably and
+        keeps its gain; where it is below, the gain is cut by exactly the
+        shortfall, r_k / target, so the finger is given just enough authority to
+        close rather than being softened wholesale. Clamped below by
+        squeeze_pd_min_scale so a finger can never be left with no tracking at
+        all -- an unconstrained cut is how a finger ends up drifting across the
+        surface, which is the failure mode squeeze_pd_scale's own docstring
+        records for the LIFT phase.
+
+        Returns None before the first compute() has populated the torque
+        history, so the first step is unchanged.
+
+        NOTE this reads the PREVIOUS step's torques, which is what makes it
+        cheap and non-circular: scaling kp changes tau_pd on the NEXT step, and
+        the ratio re-measures it. It is a slow outer loop around the PD, not an
+        algebraic solve.
+        """
+        if self._last_tau_pd is None or self._last_tau_int is None:
+            return None
+        tgt = float(self.squeeze_pd_ratio_target)
+        lo_s = float(self.squeeze_pd_min_scale)
+        out = []
+        for (lo, hi) in self.active_joint_slices:
+            pd_k = float(np.abs(self._last_tau_pd[lo:hi]).max())
+            it_k = float(np.abs(self._last_tau_int[lo:hi]).max())
+            if pd_k <= 1e-9:
+                out.append(1.0)          # already at target, nothing to fight
+                continue
+            r_k = it_k / pd_k
+            out.append(1.0 if r_k >= tgt else max(lo_s, r_k / tgt))
+        return out
 
     def _live_contacts(self, data):
         """Per-contact (p_W (3,), R_W_inward (3,3)) at the current data, in
@@ -298,7 +408,16 @@ class GraspController:
             tau[:n] = self._project_out_contact_dirs(data, tau[:n])
 
         if self.squeeze:
-            tau[:n] += self.internal_force_torques(data)
+            # Recorded SEPARATELY, before they are summed, because
+            # _per_finger_pd_scales needs the two in isolation -- once added
+            # there is no way to recover which part is tracking and which is
+            # squeeze. tau[:n] at this point is the tracking term (plus the
+            # null-space projection when enabled), which is exactly the torque
+            # the squeeze has to overcome.
+            _tau_int = self.internal_force_torques(data)
+            self._last_tau_pd  = tau[:n].copy()
+            self._last_tau_int = _tau_int[:n].copy()
+            tau[:n] += _tau_int
 
         # Gravity/bias compensation for the robot chain only.
         tau[:n] += data.qfrc_bias[:n]
