@@ -113,8 +113,16 @@ DEFAULT_OBJECTS = ["036_wood_block", "017_orange", "065-a_cups"]
 # second (pale) colour: the patch panel draws the trust region only, so there
 # is no extrapolation band for a pale colour to mean.
 FINGER_COLORS = {
-    "thumb": "#d94801",   # orange
-    "index": "#2171b5",   # blue
+    "thumb":  "#d94801",   # orange
+    "index":  "#2171b5",   # blue
+    # Slots 3 and 4. This module's own figure only ever draws the seed PAIR, but
+    # kinova_common.seed_figure builds its palette from this dict (see its
+    # _FINGER_COLORS) and does draw the later slots, so the keys live here where
+    # both readers see one table. Same values as
+    # plot_grasp_contacts.FINGER_COLORS[3]/[4], so a contact keeps ONE colour
+    # across every figure.
+    "middle": "#238b45",   # green
+    "ring":   "#6a51a3",   # purple
 }
 
 
@@ -356,7 +364,11 @@ def draw_seed_rays(ax, sc, rec, show_geom_origin=False):
     # it is the single point both contacts ray from, so colouring it for one
     # finger would be a lie. A rejected seed overrides everything to red.
     def _fcol(key):
-        return FINGER_COLORS[key] if ok else "#cb181d"
+        # .get, not [key]: a bare lookup raised KeyError for any slot beyond the
+        # pair, and the caller swallows that into a bare "[plan] seed figure
+        # failed: 'ring'" with no figure written. A missing colour should cost
+        # the reader a distinct hue, not the whole figure.
+        return FINGER_COLORS.get(key, "0.3") if ok else "#cb181d"
 
     # CENTROID -> LANDING POINT, one coloured segment per finger, stopping at
     # the surface. Nothing is drawn outside the object.
@@ -431,7 +443,9 @@ def draw_quadratic(ax, sc, frame, key, color=None, alpha=0.55, depth_sort=False)
     color: override the finger colour (a shared patch drawn once for two
         fingers has no single finger colour to take).
     """
-    c_in = FINGER_COLORS[key] if color is None else color
+    # .get for the same reason _fcol uses it: this helper is called with a SLOT
+    # key by kinova_common.seed_figure, which draws slots beyond the pair.
+    c_in = FINGER_COLORS.get(key, "0.3") if color is None else color
     center, R = sc["center"], sc["R"]
     lo0, hi0 = frame["t_lo_0"], frame["t_hi_0"]
     lo1, hi1 = frame["t_lo_1"], frame["t_hi_1"]

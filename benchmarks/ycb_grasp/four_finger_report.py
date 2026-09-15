@@ -77,11 +77,18 @@ def parse_cell(path):
                     ("gamma_min", float), ("gws_beta", float),
                     ("lift_obj_dz_mm", float), ("epsilon", float)):
         v = _field(t, k)
-        if v is not None:
-            try:
-                out[k] = cast(v)
-            except ValueError:
-                out[k] = v
+        if v is None:
+            continue
+        # A field can be present and literally "None" -- verify() returns no
+        # gamma when its LP finds none (measured on 025_mug s0). Dropping the
+        # key is right: the column then prints nan like a missing field rather
+        # than crashing the formatter on a str, and no summary averages it.
+        if v == "None":
+            continue
+        try:
+            out[k] = cast(v)
+        except ValueError:
+            out[k] = v
     v = _field(t, "squeeze_forces_N")
     if v:
         try:

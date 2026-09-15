@@ -8373,6 +8373,10 @@ class MultiStartGraspPlanner3D:
         # built), so a row carries them only once that seed has been through the
         # fan -- which is exactly the condition under which the figure should draw
         # a middle-finger seed. Absent at n=2, and the figure draws two contacts.
+        # p4s/n4_in work identically and are BACK-FILLED by the fourth-contact
+        # block below (there is no p4s on the seed dict yet at this point), which
+        # is why neither is splatted here. The two are independent: a seed can
+        # carry p3s and not p4s when the fourth fan came back empty.
         self.last_seed_accept_table = [
             dict(kind=_s.get('kind', 'random'), why='accepted',
                  p1s=np.asarray(_s['p1s'], float).copy(),

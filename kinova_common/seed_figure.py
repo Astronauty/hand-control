@@ -65,9 +65,11 @@ def _scene_from_planner(planner, model, data):
 def _as_rec(entry, ok):
     """One accept/reject table row -> the `rec` shape draw_seed_rays wants.
 
-    p3s/n3_in ride along when the row has them (a tripod seed that cleared the
-    third-contact fan). Absent at n=2, and the caller then draws two contacts --
-    never a fabricated third."""
+    p3s/n3_in and p4s/n4_in ride along when the row has them (a seed that cleared
+    the third- / fourth-contact fan). Absent below n=3 / n=4, and the caller then
+    draws only the contacts that exist -- never a fabricated one. The two are
+    INDEPENDENT: the fourth-contact seeder can come back empty on a seed whose
+    third contact was placed, so a row may carry p3s without p4s."""
     seed = dict(p1s=np.asarray(entry["p1s"], float),
                 p2s=np.asarray(entry["p2s"], float),
                 n1_in=np.asarray(entry["n1_in"], float),
@@ -77,6 +79,10 @@ def _as_rec(entry, ok):
         seed["p3s"] = np.asarray(entry["p3s"], float)
         seed["n3_in"] = np.asarray(entry["n3_in"], float)
         seed["p3"] = seed["p3s"]
+    if entry.get("p4s") is not None:
+        seed["p4s"] = np.asarray(entry["p4s"], float)
+        seed["n4_in"] = np.asarray(entry["n4_in"], float)
+        seed["p4"] = seed["p4s"]
     return dict(seed=seed, kind=entry.get("kind", "random"), ok=ok,
                 why=entry.get("why", "accepted"),
                 ray=dict(origin=None, u=None))
@@ -96,16 +102,21 @@ def _contacts_of(rec):
     out = [("thumb", s_["p1s"], s_["n1_in"]), ("index", s_["p2s"], s_["n2_in"])]
     if s_.get("p3s") is not None:
         out.append(("middle", s_["p3s"], s_["n3_in"]))
+    if s_.get("p4s") is not None:
+        out.append(("ring", s_["p4s"], s_["n4_in"]))
     return out
 
 
-_MIDDLE_COLOR = "#238b45"   # green -- distinct from thumb orange / index blue
+_MIDDLE_COLOR = "#238b45"   # green  -- distinct from thumb orange / index blue
+_RING_COLOR   = "#6a51a3"   # purple -- and distinct from all three above.
+                            # Matches plot_grasp_contacts.FINGER_COLORS[4], so a
+                            # contact keeps ONE colour across both figures.
 
 # One colour per finger, used for BOTH ends of that contact's story: the o at
 # the seed and the ^ at the NLP's converged position. Rejected seeds keep the
 # finger colours too -- the panel header already says the seed was rejected, so
 # recolouring everything red only destroys the finger encoding.
-_FINGER_COLORS = dict(SQ.FINGER_COLORS, middle=_MIDDLE_COLOR)
+_FINGER_COLORS = dict(SQ.FINGER_COLORS, middle=_MIDDLE_COLOR, ring=_RING_COLOR)
 
 
 def _FCOL(key):
@@ -124,8 +135,9 @@ def _overlay_solved(ax, solved, normals=None):
     p2 = solved.get("p2")
     if p1 is None or p2 is None:
         return
-    for key in ("thumb", "index", "middle"):
-        p = solved.get({"thumb": "p1", "index": "p2", "middle": "p3"}[key])
+    for key in ("thumb", "index", "middle", "ring"):
+        p = solved.get({"thumb": "p1", "index": "p2",
+                        "middle": "p3", "ring": "p4"}[key])
         if p is None:
             continue
         # Lifted off the surface for the same reason the seed o is -- the NLP
@@ -357,9 +369,22 @@ def _build_seed_figure(planner, model, data, title_extra="", res=None,
     # ONE SHARED LEGEND. Finger role is carried by colour in every panel, and
     # marker shape separates the two ends of a contact's story (seed vs the
     # NLP's converged position), so a single key replaces every per-panel tag.
-    _has_mid = (bool(_solved) and _solved.get("p3") is not None) or any(
-        r["seed"].get("p3s") is not None for r in recs)
-    _keys = ["thumb", "index"] + (["middle"] if _has_mid else [])
+    # A slot earns a legend entry iff it appears SOMEWHERE on the figure -- as a
+    # seed o on any panel, or as the winner's solved ^. Checking both matters at
+    # n=4 for a reason that is the point of the figure: the fourth-contact seeder
+    # can come back empty, so a run configured for four fingers may draw a ring
+    # SOLUTION with no ring seed, or ring seeds on panels whose seed lost. Keying
+    # the legend off only one of the two would silently drop the marker the
+    # reader is trying to find.
+    def _slot_present(solved_key, seed_key):
+        return ((bool(_solved) and _solved.get(solved_key) is not None)
+                or any(r["seed"].get(seed_key) is not None for r in recs))
+
+    _keys = ["thumb", "index"]
+    if _slot_present("p3", "p3s"):
+        _keys.append("middle")
+    if _slot_present("p4", "p4s"):
+        _keys.append("ring")
     _h = [plt.Line2D([], [], color=_FCOL(k), marker="o", ls="none", ms=7,
                      mec="k", mew=0.4, label=k) for k in _keys]
     _h += [plt.Line2D([], [], color="0.35", marker="o", ls="none", ms=7,
