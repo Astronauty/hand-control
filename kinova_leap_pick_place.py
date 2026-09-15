@@ -3030,15 +3030,23 @@ if __name__ == "__main__":
     # by noise. Ranking first and solving once is ~5x less work per recommendation,
     # which is what makes the 2s cadence comfortable rather than tight.
     #
-    # TRADE, stated: there is no cost-ranked fallback if the single winner solves
-    # badly. The per-seed IK-convergence argument for 5 (~99% vs ~94% chance of at
-    # least one converged) still holds in principle; it is accepted here because the
-    # recommender re-solves every _REC_INTERVAL_S anyway, so a bad solve costs one
-    # cycle rather than the grasp. Raise this if live trials show dropped
-    # recommendations.
-    _REC_NC         = 1
-    _REC_RANK_POOL  = 5       # candidates GENERATED per solve, then ranked; only the
-                              # winner reaches the NLP (cfg.seed_dls_rank_pool).
+    # BEST-OF-5 KEPT FOR NOW. Dropping to 1 is ~5x less work per recommendation and
+    # the ranked pool makes the single winner a considered choice rather than an
+    # arbitrary one -- but it removes the cost-ranked fallback, and the per-seed
+    # IK-convergence argument for 5 still stands (~99% vs ~94% chance that at least
+    # one seed converges). It also matters more at counter height than on the
+    # benchmark table: a good tripod seed is RARER up there (measured 2/6 sampled
+    # seeds at 0.86m vs 4/6 at 0.625m), so a single draw returns a collapsed third
+    # contact more often. Revisit once live trials show the ranking holds.
+    _REC_NC         = 5
+    # OVER-GENERATION MULTIPLIER, not an absolute count: seed_dls_rank_pool
+    # generates n_seeds * this many candidates and keeps the best n_seeds by patch
+    # extent (DLS filter + 3-site tiebreak). At _REC_NC=5 a multiplier of 5 would
+    # generate 25 candidates and rank them for 5 solves, which spends more on
+    # ranking than the solves save. 2 -> 10 candidates for 5 slots: the screen
+    # still discards the worst half, at a cost of ~10 DLS solves (milliseconds
+    # each) against five multi-second NLPs.
+    _REC_RANK_POOL  = 2
     REC_REACH_TOL_MM = 15.0   # lock-in IK residual above which a rec is flagged unreachable
     _rec1_mocap = int(model.body_mocapid[
         mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'rec1_body')])
@@ -3238,10 +3246,14 @@ if __name__ == "__main__":
                 # --fingers still wins, since parse_fingers returns non-None only
                 # when the operator passed one.
                 fingers=_rec_fingers_for(o['name']),
-                # ONE NLP from a RANKED pool (see _REC_NC / _REC_RANK_POOL). The pool
-                # is over-generated and ordered by patch extent before a single solve
-                # runs, so this is 'seed once, pick the best candidate' rather than
-                # 'solve five and pick the best result'.
+                # RANKED candidate pool (see _REC_NC / _REC_RANK_POOL). Candidates
+                # are over-generated and ordered by PATCH EXTENT -- with the DLS
+                # residual demoted to a reachability filter plus a tiebreak --
+                # before the NLPs run. The previous screen was the DLS residual
+                # alone, which does not separate candidates: on 036_wood_block all
+                # ten span 25.1-27.4mm while their patch extents span 102.6-183.0mm.
+                # So the best-of-N is now over a list ordered by something that
+                # discriminates, rather than by noise.
                 seed_dls_rank_pool=_REC_RANK_POOL,
                 # w_ik 0.70 -> 5.0 (wrench_feasibility tuning, preserved via the builder's
                 # overrides): the keyframe convergence sweep showed the baseline
@@ -5990,14 +6002,18 @@ if __name__ == "__main__":
                         # seed lifts. Not integrator divergence, so the stability
                         # ceiling is the wrong tool for it.
                         #
-                        # 1.0 matches the benchmark, where the gamma units are the same
-                        # newtons after the normalisation fix (see the GAMMA_SAFETY
-                        # note above). Teleop's gamma_live is GAMMA_SAFETY_FACTOR x
-                        # larger than the benchmark's solved gamma for the same object,
-                        # so the fingers are scaled correspondingly harder here -- which
-                        # is the intent: the squeeze is 5x, so the PD holding against it
-                        # must be too.
-                        gamma_ref=1.0,
+                        # MATCHED TO THE BENCHMARK, which is a RATIO not a value.
+                        # effective_gains scales the finger PD by gamma/gamma_ref, and
+                        # the benchmark passes its SOLVED gamma against gamma_ref=1.0.
+                        # Teleop passes gamma_live = gamma_raw * GAMMA_SAFETY_FACTOR,
+                        # so the same object at the same solved gamma would scale the
+                        # PD 5x harder here than in the harness where gamma_ref was
+                        # tuned -- 135x vs 27x on 036_wood_block. Setting gamma_ref to
+                        # the same factor cancels it, so gamma_live/gamma_ref reduces
+                        # to gamma_raw/1.0 and the PD authority per grasp is identical
+                        # in both. The SQUEEZE is still 5x (gamma_live is unchanged);
+                        # only the PD's scaling against it is matched.
+                        gamma_ref=GAMMA_SAFETY_FACTOR,
                         obj_contact_provider=_grasp_provider)
                     # Grasp controller is now executing: clear the approach visualizations —
                     # the RRT path trace (ghost capsules) and the achieved-contact markers
