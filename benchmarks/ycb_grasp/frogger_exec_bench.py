@@ -279,15 +279,17 @@ def main():
                          "pad 8-11 mm clear of the object, so removing it while "
                          "keeping `max l*` and k_l says whether the execution "
                          "failures are theirs or ours. NOT the faithful port.")
-    ap.add_argument("--gap-tol-m", type=float, default=0.014,
+    ap.add_argument("--gap-tol-m", type=float, default=None,
                     help="pre-squeeze fingertip-gap tolerance for the NON-'ours' "
-                         "arms, metres. The 8 mm default is sized for this solver's "
-                         "r_tip convention; FRoGGeR's (7d) pins a fixed body-frame "
-                         "pad point, which leaves the real pad 8-11 mm clear when "
-                         "the contact is off that axis, so the default rejects "
-                         "grasps that are otherwise sound. The squeeze and the "
-                         "post-lift force test still have to pass. `ours` always "
-                         "keeps the 8 mm default.")
+                         "arms, metres. None (default) uses the same 8 mm gate as "
+                         "`ours`. This was briefly raised to 14 mm because the "
+                         "frogger arm's grasps sat 8-11 mm clear of the object -- "
+                         "which turned out to be a PORT DEFECT (the reported "
+                         "contact was the tip site, not the constrained pad point; "
+                         "FROGGER_BENCH 14bis), not a property of their "
+                         "formulation. With that fixed the gaps are 0-2.6 mm and "
+                         "the shared gate is correct, so raising it would only "
+                         "mask a real failure.")
     ap.add_argument("--json-out", default=None)
     OP.add_out_args(ap, OP.TABLETOP)
     args = ap.parse_args()

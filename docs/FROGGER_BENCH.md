@@ -1736,3 +1736,53 @@ After the fix, SDF at the reported contact is +0.00 mm on both objects, and on t
 §13bis's 1/15 and the r = +0.51 correlation, which was computed over those runs.
 The edge-seeking margins in §11bis are PLAN-ONLY and were computed from `p1`/`p2`,
 so they are affected too and must be re-measured.
+
+### 14bis.4 Re-measured after the fix
+
+All §13bis numbers re-run. `ours` unchanged (it never used the broken branch).
+
+| | pre-fix | post-fix |
+|---|---|---|
+| frogger reached lift | 10/15 | **12/15** |
+| frogger pick success | 1/15 | **6/15** |
+| frogger median `l_bar*` | +0.53 | +0.59 |
+| ours pick success | 12/15 | 12/15 (unchanged) |
+
+**The gap gate no longer needs raising.** `--gap-tol-m 0.014` was added to stop the
+8 mm gate rejecting frogger grasps; with contacts reported correctly the gaps are
+0-2.6 mm and the shared 8 mm gate passes them. The default is back to None (= the
+same gate as `ours`), since raising it now would only mask real failures. The three
+remaining aborts are genuine: 40-50 mm gaps, i.e. contacts the arm cannot reach.
+
+**The edge-seeking result is unchanged.** Re-measured on corrected contacts: ours
+median 12.0 mm (IQR 11.0-15.5) against frogger 1.0 mm (IQR 1.0-1.0). The plan-only
+margins did not move, which is expected -- the offset displaced both contacts along
+their own pad axes, roughly normal to the surface, so distance ALONG the surface to
+the nearest edge was largely preserved.
+
+**The correlation strengthened.** Edge margin against `lift_ok` over the corrected
+30 cells:
+
+| | median edge margin | n |
+|---|---|---|
+| held | **12.0 mm** | 18 |
+| failed | **1.0 mm** | 12 |
+
+r = **+0.574** (pre-fix +0.512). So the causal claim in §13bis survives the defect
+that voided the execution rates it was computed alongside.
+
+### 14bis.5 Where the arms now differ, per object
+
+| object | ours pick | frogger pick |
+|---|---|---|
+| `017_orange` | 3/3 | **3/3** |
+| `056_tennis_ball` | 3/3 | **0/3** |
+| `014_lemon` | 3/3 | 1/3 |
+| `061_foam_brick` | 3/3 | 1/3 |
+| `036_wood_block` | **0/3** | 1/3 |
+
+The orange is a tie at 3/3, and the block is the one object where the frogger arm
+does better. This is a real comparison now rather than a port artifact, but at 3
+seeds per cell the per-object Wilson intervals are wide ([6, 79] for 1/3) and
+overlapping -- no per-object claim is supported yet. The aggregate (ours 80% [55, 93]
+against frogger 40% [20, 64]) is the only interval that separates.
