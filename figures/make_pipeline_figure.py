@@ -45,6 +45,7 @@ from kinova_common import seed_figure as SF
 from ycb_grasp import plot_seed_quadratic as SQ
 
 COL_IN = 7.16          # IEEE DOUBLE column width (two-column span)
+AXLAB_PT = 9.0         # wrench-axis labels; the panels carry no title now
 TITLE_PT, LAB_PT, TICK_PT, LEG_PT = 9.0, 8.0, 7.0, 7.5
 C_TH, C_IX = "#d94801", "#2171b5"
 
@@ -227,61 +228,153 @@ def panel_a(fig, gs, pl, model, data, res, max_tris=2600):
             ax.add_collection3d(_hd)
     ax.plot([c[0]], [c[1]], [c[2]], "x", ms=4.5, color="k", mew=1.1, zorder=6)
     _iso(ax, V)
-    ax.set_title("(a) seed, patch, friction cone", fontsize=TITLE_PT, pad=-2)
+    # No axes title: the COLUMN title above the figure names this stage.
+    # Both together read as two headings for one panel.
     return ax
+
+
+def _hull_inradius(P):
+    """Distance from the ORIGIN to the nearest facet of conv(P).
+
+    This is the Ferrari-Canny epsilon metric restricted to the subspace P spans:
+    the radius of the largest ball centred at the origin that fits inside the
+    wrench set. Negative when the origin is outside, i.e. no force closure.
+    """
+    from scipy.spatial import ConvexHull
+    h = ConvexHull(np.asarray(P, float))
+    return float((-h.equations[:, -1]
+                  / np.linalg.norm(h.equations[:, :3], axis=1)).min())
+
+
+def _ball(c, r, n=22):
+    u = np.linspace(0, np.pi, n); v = np.linspace(0, 2 * np.pi, n)
+    return (c[0] + r * np.outer(np.sin(u), np.cos(v)),
+            c[1] + r * np.outer(np.sin(u), np.sin(v)),
+            c[2] + r * np.outer(np.cos(u), np.ones_like(v)))
+
+
+def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
+                 box=None, scale=1.0, box_col="#238b45"):
+    """Convex hull of wrench columns in one 3-D subspace.
+
+    ball  : draw the largest origin-centred ball inside the hull (Ferrari-Canny).
+    box   : (3,) half-extents of the task disturbance box, drawn as a wireframe.
+    scale : multiply the hull by this (gamma). V(gamma) = gamma * V(1) exactly,
+            which is what makes min_gamma_for_accel_lp linear.
+    """
+    P = np.asarray(P, float) * float(scale)
+    try:
+        from scipy.spatial import ConvexHull
+        h = ConvexHull(P)
+        _pc = Poly3DCollection([P[s] for s in h.simplices], linewidths=0.30)
+        _pc.set_facecolor((*matplotlib.colors.to_rgb(col_lo), 0.22))
+        _pc.set_edgecolor((*matplotlib.colors.to_rgb(col_hi), 0.80))
+        ax.add_collection3d(_pc)
+    except Exception:
+        pass
+
+    _pts = [P, np.zeros((1, 3))]
+    if ball:
+        r = _hull_inradius(P)
+        if r > 0:
+            ax.plot_surface(*_ball(np.zeros(3), r), color=col_hi, alpha=0.30,
+                            linewidth=0, antialiased=True, shade=False)
+            _pts.append(np.eye(3) * r)
+    if box is not None:
+        b = np.asarray(box, float)
+        sgn = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1)
+                        for sz in (-1, 1)], float)
+        C = sgn * b
+        edges = [(i, j) for i in range(8) for j in range(i + 1, 8)
+                 if np.sum(np.abs(sgn[i] - sgn[j])) == 2]
+        for i, j in edges:
+            ax.plot(*zip(C[i], C[j]), "-", color=box_col, lw=0.65, zorder=7)
+        _pts.append(C)
+
+    _lim = np.vstack(_pts)
+    if axlab is not None:
+        # PER-AXIS arm length: these hulls are strongly anisotropic, so one
+        # global radius buries the arm along a wide direction and leaves the
+        # arm along a narrow one floating.
+        _ext = np.abs(_lim).max(0)
+        _ext = np.maximum(_ext, _ext.max() * 0.35)
+        _r_ax = 1.50 * _ext
+        _lim = np.vstack([_lim, np.diag(_r_ax) * 1.24, -np.diag(_r_ax) * 0.12])
+    # True isometric: elev atan(1/sqrt(2)), azim 45 -- the three axes subtend
+    # equal angles, so no wrench component is visually privileged.
+    _iso(ax, _lim, elev=35.264, azim=45)
+    if axlab is not None:
+        for _k, (_lb, _d) in enumerate(zip(axlab, np.eye(3))):
+            _end = _r_ax[_k] * _d
+            ax.plot(*zip(np.zeros(3), _end), "-", color="0.35", lw=0.55, zorder=2)
+            _tp = 1.18 * _end
+            ax.text(_tp[0], _tp[1], _tp[2], _lb, fontsize=AXLAB_PT,
+                    color="0.25", ha="center", va="center", zorder=9)
+    if title:
+        ax.set_title(title, fontsize=TITLE_PT, pad=-4)
 
 
 def panel_b(fig, gs, W, alpha, beta):
-    """Wrench space: hull of the FORCE rows of W, with the alpha weights."""
-    ax = fig.add_subplot(gs, projection="3d")
-    Wf = np.asarray(W, float)[:3, :].T            # force rows, one point per column
-    try:
-        from scipy.spatial import ConvexHull
-        hull = ConvexHull(Wf)
-        ax.add_collection3d(Poly3DCollection(
-            [Wf[s] for s in hull.simplices], facecolor="#6baed6",
-            alpha=0.30, edgecolor="#2171b5", linewidths=0.35))
-    except Exception:
-        pass
-    n = Wf.shape[0] // 2
-    for i, p in enumerate(Wf):
-        ax.plot([p[0]], [p[1]], [p[2]], "o", ms=2.6,
-                color=(C_TH if i < n else C_IX), mec="k", mew=0.25)
-    ax.plot([0], [0], [0], "x", ms=4.5, color="k", mew=1.1)
-    _iso(ax, Wf)
-    ax.set_title(r"(b) wrench space, $\mathbf{W}\alpha=0$",
-                 fontsize=TITLE_PT, pad=-2)
-    return ax
+    """(b) GRASP WRENCH SPACE, split into its force and torque subspaces.
+
+    W is 6 x 6n and the wrench set lives in R^6, so it cannot be drawn directly.
+    Projecting onto (fx,fy,fz) and (tx,ty,tz) is the honest reduction, and the
+    two need their OWN axes: the torque rows run 9-15x the force rows on this
+    grasp, so a shared scale collapses the force hull to a dot.
+
+    ROW ORDER checked against the code, not assumed: build_W's _col() returns
+    ca.vertcat(tau, f_O), so rows 0-2 are TORQUE and rows 3-5 are FORCE.
+
+    The shaded ball is the largest origin-centred ball inside each hull -- the
+    Ferrari-Canny epsilon restricted to that subspace. Force closure is the
+    origin being INTERIOR, so a visible ball is the certificate.
+    """
+    sub = gs.subgridspec(2, 1, hspace=0.0)
+    Wa = np.asarray(W, float)
+    ax_f = fig.add_subplot(sub[0, 0], projection="3d")
+    _wrench_hull(ax_f, Wa[3:, :].T, "", "#6baed6", "#2171b5",
+                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), ball=True)
+    ax_t = fig.add_subplot(sub[1, 0], projection="3d")
+    _wrench_hull(ax_t, Wa[:3, :].T, "", "#c7e9c0", "#238b45",
+                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), ball=True)
+    return ax_f
 
 
-def panel_c(fig, gs, W, gamma, abox, angbox, mass):
-    """gamma scaling: V(1) inside V(gamma), against the task box corners."""
-    ax = fig.add_subplot(gs, projection="3d")
-    Wf = np.asarray(W, float)[:3, :].T
-    try:
-        from scipy.spatial import ConvexHull
-        for scale, fc, ec, al in ((1.0, "#9ecae1", "#6baed6", 0.22),
-                                  (float(gamma), "#fdd0a2", "#d94801", 0.16)):
-            P = Wf * scale
-            h = ConvexHull(P)
-            ax.add_collection3d(Poly3DCollection(
-                [P[s] for s in h.simplices], facecolor=fc, alpha=al,
-                edgecolor=ec, linewidths=0.35))
-    except Exception:
-        pass
-    # task disturbance box corners: m*a, the FORCE the grasp must resist
-    f = float(mass) * np.asarray(abox, float)
-    corners = np.array([[sx*f[0], sy*f[1], sz*f[2]]
-                        for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)])
-    ax.plot(corners[:, 0], corners[:, 1], corners[:, 2], "s", ms=2.2,
-            color="#238b45", mec="k", mew=0.25, ls="none")
-    _iso(ax, np.vstack([Wf*float(gamma), corners]))
-    ax.set_title(rf"(c) $\gamma$ = {gamma:.1f} N scaling",
-                 fontsize=TITLE_PT, pad=-2)
-    return ax
+def panel_c(fig, gs, W, gamma, abox, angbox, mass, inertia):
+    """(c) GAMMA SCALING against the task disturbance box.
+
+    Cone vertices scale LINEARLY in the internal force, V(gamma) = gamma * V(1),
+    which is exactly what makes min_gamma_for_accel_lp an LP rather than a
+    binary search. gamma is the smallest scale whose wrench set contains every
+    corner of the task box (m*a in force, I*alpha in torque).
+
+    Drawn per subspace for the same reason as (b), and because the two are NOT
+    equally binding: measured on this grasp the gamma-scaled force hull has
+    inradius 4.33 N against a 4.09 N box corner (tight), while the torque hull
+    has 0.279 N m against 2.25e-4 N m (three orders of slack). FORCE is what
+    sets gamma here; a single combined plot would hide that.
+    """
+    sub = gs.subgridspec(2, 1, hspace=0.0)
+    Wa = np.asarray(W, float)
+    g = float(gamma)
+    ax_f = fig.add_subplot(sub[0, 0], projection="3d")
+    _wrench_hull(ax_f, Wa[3:, :].T, "", "#fdd0a2", "#d94801",
+                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), scale=g,
+                 box=float(mass) * np.asarray(abox, float))
+    ax_t = fig.add_subplot(sub[1, 0], projection="3d")
+    _wrench_hull(ax_t, Wa[:3, :].T, "", "#fdd0a2", "#d94801",
+                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), scale=g,
+                 box=np.asarray(inertia, float) * np.asarray(angbox, float),
+                 box_col="#238b45")
+    # NOTE the torque box is ~2.2e-4 N m against a 0.279 N m scaled hull, i.e.
+    # three orders of magnitude inside it -- it collapses to a point at the
+    # origin at any shared scale. That is the finding, not a rendering bug:
+    # FORCE is what sets gamma on this grasp (4.33 N hull inradius against a
+    # 4.09 N box corner), and the caption should say so.
+    return ax_f
 
 
-def _iso(ax, P):
+def _iso(ax, P, elev=30, azim=-60):
     P = np.asarray(P, float)
     c = P.mean(0); r = float(np.abs(P - c).max()) * 1.05 or 1.0
     ax.set_xlim(c[0]-r, c[0]+r); ax.set_ylim(c[1]-r, c[1]+r); ax.set_zlim(c[2]-r, c[2]+r)
@@ -297,8 +390,8 @@ def _iso(ax, P):
     # down the grasp axis and hid the handle entirely. Scores alone favoured
     # azim ~138, which puts the handle BEHIND the cup -- rejected on the render.
     # (30, -60) shows the hole with both cones still reading as cones.
-    ax.view_init(elev=30, azim=-60)
-    try: ax.set_box_aspect(None, zoom=1.28)
+    ax.view_init(elev=elev, azim=azim)
+    try: ax.set_box_aspect(None, zoom=1.42)
     except TypeError: pass
 
 
@@ -332,8 +425,13 @@ def main():
 
     r, pl = cap["r"], cap["pl"]
     a, _k = cap["ga"]
-    fig = plt.figure(figsize=(COL_IN, COL_IN * 0.30))
-    gs = GridSpec(1, 3, figure=fig, wspace=0.02)
+    _M, _D = pl._planner.model, pl._planner.data
+    _inertia = _M.body_inertia[pl._planner._obj_bid].copy()
+    # Taller and tighter: (b)/(c) are 2-row subgrids, so the old 0.30 aspect
+    # left each hull in a sliver. wspace 0 -- the panels carry their own
+    # whitespace from the 3D axes' margins, so any grid spacing is additive.
+    fig = plt.figure(figsize=(COL_IN, COL_IN * 0.46))
+    gs = GridSpec(1, 3, figure=fig, wspace=0.0)
     import traceback
     for _nm, _fn in (("a", lambda: panel_a(fig, gs[0, 0], pl, pl._planner.model,
                                           pl._planner.data, r)),
@@ -341,7 +439,7 @@ def main():
                                           np.asarray(r["gws_alpha"]).flatten(),
                                           float(r["gws_beta"]))),
                      ("c", lambda: panel_c(fig, gs[0, 2], r["gws_W"], cap["gamma"],
-                                          a[4], a[5], a[3]))):
+                                          a[4], a[5], a[3], _inertia))):
         try:
             _fn()
         except Exception:
@@ -352,19 +450,30 @@ def main():
          Line2D([], [], ls="", marker="o", ms=3.4, color=C_IX, mec="k", mew=0.3,
                 label="index"),
          Line2D([], [], ls="", marker="x", ms=4.0, color="k", mew=1.0,
-                label="centroid / origin"),
+                label="ray origin (volumetric centroid)"),
          Line2D([], [], ls="", marker="s", ms=3.0, color="#238b45", mec="k",
-                mew=0.3, label=r"task box $m\mathbf{a}$")]
+                mew=0.3,
+                label=r"task box  $m\mathbf{a}$ / $\mathbf{I}\boldsymbol{\alpha}$"),
+         Line2D([], [], ls="", marker="o", ms=4.0, color="#2171b5", alpha=0.45,
+                mec="none", label="inscribed ball (Ferrari-Canny)")]
     fig.legend(handles=h, loc="lower center", ncol=4, frameon=False,
                fontsize=LEG_PT, handletextpad=0.25, columnspacing=1.1,
                bbox_to_anchor=(0.5, -0.02))
-    fig.suptitle(rf"{args.object.replace('_',' ')}   "
-                 rf"$\beta$ = {float(r['gws_beta']):.3f},   "
-                 rf"$\gamma$ = {cap['gamma']:.2f} N",
-                 fontsize=TITLE_PT, y=1.06)
+    # One title per COLUMN, naming the stage, plus the two scalars the figure
+    # is about. The per-plot titles were dropped -- the axis labels say which
+    # subspace each hull is -- but the columns still need naming.
+    for _x, _s in ((0.17, "(a) seeding"),
+                   (0.50, "(b) grasp wrench space"),
+                   (0.84, r"(c) $\gamma$ scaling vs task box")):
+        fig.text(_x, 0.955, _s, fontsize=TITLE_PT, ha="center", va="bottom")
+    fig.text(0.5, 1.005,
+             rf"{args.object.replace('_',' ')}    "
+             rf"$\beta$ = {float(r['gws_beta']):.3f}  "
+             rf"($\sum\alpha = 1$),    $\gamma$ = {cap['gamma']:.2f} N",
+             fontsize=TITLE_PT, ha="center", va="bottom")
     # top < 1 leaves the suptitle its own band; the panel titles sit at
     # pad=-2 inside their axes, so without this the two collide.
-    fig.subplots_adjust(left=0.0, right=1.0, top=0.86, bottom=0.10)
+    fig.subplots_adjust(left=0.0, right=1.0, top=0.94, bottom=0.07)
     out = Path(args.out or (REPO / "figures" /
                f"pipeline_{args.object}_s{args.seed}.pdf"))
     fig.savefig(out, format="pdf", dpi=600, bbox_inches="tight")
