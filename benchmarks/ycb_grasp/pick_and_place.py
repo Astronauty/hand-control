@@ -202,7 +202,7 @@ def _jog_steps(distance_m, speed_mps, dt):
 
 def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
             obj_bid=None, tip_geom_ids=None, obj_gid=None, label="jog",
-            finger_set=None):
+            finger_set=None, obj_geom_ids=None):
     """Resolved-rate DLS jog driven by a per-step world-frame palm twist.
 
     Same singularity-robust pattern as pick_from_floor._run_lift_jog (JOG_SING_EPS
@@ -254,7 +254,8 @@ def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
         _sync()
 
         if tip_geom_ids is not None and obj_gid is not None:
-            f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+            f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                     obj_geom_ids=obj_geom_ids)
             for fname, force in zip(_fset, f):
                 if force <= 1e-6:
                     contact_lost[fname] = True
@@ -889,6 +890,9 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         # SQUEEZE: ramp the internal force in.
         ctrl.set_squeeze(True)
         n_ramp = max(int(SQUEEZE_RAMP_S / model.opt.timestep), 1)
+        _f_peak = np.zeros(len(tip_geom_ids))
+        _n_force_samples = 0
+        _n_all_loaded = 0
         # PFF_DRIFT_TRACE=1 decomposes the squeeze: how big the internal-force
         # torque is against the PD torque that is supposed to hold the planned
         # posture, and how far each fingertip actually travels from where the
@@ -936,19 +940,39 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                     _rows.append(f"{_FSET[_k]}: |pd|={np.abs(_t_pd[_lo:_hi]).max():.3f} "
                                  f"|int|={np.abs(_t_int[_lo:_hi]).max():.3f} "
                                  f"drift={_dr[_k]:.1f}mm")
-                _f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+                _f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                             obj_geom_ids=obj_gids)
                 _op = data.xpos[obj_bid]
                 _fc = ctrl.last_f_c_W
                 print(f"[drift] i={i:4d} scale={min(1.0, i / n_ramp):.2f}  "
                       + "  ".join(_rows) + f"  fn={np.round(_f, 2).tolist()}"
                       + f"  obj={np.round(_op, 3).tolist()}"
                       + f"  |f_c|={np.round(np.linalg.norm(_fc, axis=1), 2).tolist()}")
+            _f_now = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                          obj_geom_ids=obj_gids)
+            _f_peak = np.maximum(_f_peak, _f_now)
+            _n_force_samples += 1
+            _n_all_loaded += int(all(v > 0.0 for v in _f_now))
             if os.environ.get("PFF_SQUEEZE_TRACE") and i % 100 == 0:
                 _g = _tip_gaps_mm(model, data, tip_geom_ids, obj_gid, obj_gids)
-                _f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+                _f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                             obj_geom_ids=obj_gids)
                 print(f"[squeeze] i={i:4d} scale={scale:.2f} "
                       f"gap={np.round(_g, 2).tolist()} f={np.round(_f, 2).tolist()}")
-        f_meas = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+        f_meas = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                      obj_geom_ids=obj_gids)
+        # PEAK over the whole ramp alongside the final instant. The reported
+        # value was a single sample at the end of the squeeze, which cannot tell
+        # "this finger never touched" from "this finger was loaded and then the
+        # object shifted". Measured on the three rounded objects at n=3, the
+        # zero-force finger is zero in 1007 of 1007 samples, so the distinction
+        # did not change those verdicts -- but the metric should not depend on
+        # that being true. squeeze_forces_peak_N is what a force-closure check
+        # should read; squeeze_forces_N stays the end-of-ramp state.
+        result["squeeze_forces_peak_N"] = dict(
+            zip(_FSET, np.round(_f_peak, 3).tolist()))
+        result["squeeze_all_loaded_frac"] = round(float(_n_all_loaded)
+                                                  / max(_n_force_samples, 1), 4)
         # _FSET, not the global: these are the MEASURED per-fingertip forces and
         # mislabelling them would report the middle finger's load under 'index'.
         result["squeeze_forces_N"] = dict(zip(_FSET, np.round(f_meas, 3).tolist()))
@@ -993,7 +1017,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
             n_lift = _jog_steps(LIFT_DISTANCE_M, lift_speed, dt)
             q_cmd, lost_lift = _jog_to(
                 model, data, ctrl, q_cmd, lambda i: np.array([0, 0, lift_speed, 0, 0, 0.]),
-                n_lift, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="lift", finger_set=_FSET)
+                n_lift, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="lift", finger_set=_FSET, obj_geom_ids=obj_gids)
         result["lift_obj_dz_mm"] = (float(data.xpos[obj_bid][2]) - obj_z0) * 1000
         result["lift_contact_lost"] = lost_lift
         # SUCCESS TEST (see LIFT_OK_MIN_FRAC above). Both halves are required:
@@ -1005,7 +1029,8 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         #             is sticky: it latches on the first momentary unload and so
         #             cannot say whether the grasp RECOVERED. Both numbers are
         #             kept in the result so either reading stays available.
-        _f_end = (_measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+        _f_end = (_measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                             obj_geom_ids=obj_gids)
                   if (tip_geom_ids is not None and obj_gid is not None) else [])
         result["lift_final_forces_N"] = dict(zip(_FSET, np.round(_f_end, 4).tolist()))
         # Against the distance THIS mode actually commanded. The shaky protocol
@@ -1033,7 +1058,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                 model, data, ctrl, q_cmd,
                 lambda i: np.array([dirn[0] * transport_speed,
                                     dirn[1] * transport_speed, 0, 0, 0, 0.]),
-                n_tr, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="transport", finger_set=_FSET)
+                n_tr, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="transport", finger_set=_FSET, obj_geom_ids=obj_gids)
             result["transport_contact_lost"] = lost_tr
             result["phase_log"].append("transport_done")
 
