@@ -282,6 +282,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                    gamma_ref=1.0,
                    lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS,
                    contact_profile="stock", fingers=None, force_execute=False,
+                   release_open_frac=0.5,
                    lift_mode="standard", plan_override=None,
                    nullspace_tracking=False):
     """Plan + execute one grasp on one object, then carry it to the bin.
@@ -1002,9 +1003,33 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
             result["transport_contact_lost"] = lost_tr
             result["phase_log"].append("transport_done")
 
-            # RELEASE: stop squeezing and let the object settle into the bin.
+            # RELEASE: stop squeezing AND actively open the fingers.
             ctrl.set_squeeze(False)
             ctrl.set_transporting(False)
+            # Dropping the squeeze is not the same as letting go. The PD setpoint
+            # is still q_target -- the GRASP pose -- so the fingers hold their
+            # closed shape and the object is released only if gravity can pull it
+            # free. That works for a lemon and fails for anything the hand can
+            # wedge: measured on 025_mug 2-finger, seeds 1 and 2 finish at
+            # z = 0.805 / 0.810 against a bin floor of 0.630, i.e. ~180mm up,
+            # still on the hand, and `release_done` is appended regardless.
+            #
+            # Blend the GRASPING fingers' joints toward q_home rather than adding
+            # a constant offset: the joint sign that opens a finger is NOT shared
+            # across fingers (measured: +0.3 rad on every grasping joint EXTENDS
+            # the index, tip-to-palm 117.9 -> 122.2mm, while CURLING the thumb,
+            # 148.2 -> 129.9mm), so a uniform delta closes half the hand. q_home
+            # holds index and thumb at 0.0 -- the open pose -- so interpolating
+            # toward it opens each finger in its own correct direction.
+            # Only the fingers named by --fingers move; the arm keeps its
+            # transport pose so the object is dropped where it was carried.
+            if release_open_frac > 0.0:
+                _q_open = np.array(q_target, float)
+                _f = float(np.clip(release_open_frac, 0.0, 1.0))
+                for _lo, _hi in finger_joint_slices(model, _FSET):
+                    _q_open[_lo:_hi] = ((1.0 - _f) * np.asarray(q_target, float)[_lo:_hi]
+                                        + _f * np.asarray(q_home, float)[_lo:_hi])
+                ctrl.set_target(_q_open)
             # PEAK RELEASE VELOCITY — the fling metric. contact_tuning.py scores
             # every contact setting on BOTH grasp force AND this number, because
             # the two trade off along the same axis and optimizing either alone
@@ -1170,6 +1195,15 @@ def main():
                     help="finger PD multiplier DURING the squeeze ramp. Lower lets the "
                          "internal-force term win against the finger PD; too low and the "
                          "measured force falls short of the commanded gamma.")
+    ap.add_argument("--release-open-frac", type=float, default=0.5,
+                    help="how far to open the GRASPING fingers toward q_home at "
+                         "release, 0..1 (0 = legacy: hold the grasp pose and let "
+                         "gravity do it). Dropping the squeeze alone leaves the PD "
+                         "holding the closed shape, which wedges wide objects -- "
+                         "025_mug finished ~180mm above the bin floor, still on "
+                         "the hand. 0.5 is measured best: it unwedges without the "
+                         "extra release impulse a full open imparts (1.0 costs "
+                         "014_lemon its in_bin).")
     ap.add_argument("--force-execute", action="store_true",
                     help="run the squeeze/lift even when the pre-squeeze gap check "
                          "fails or gamma is infeasible, so the FAILURE is visible in "
@@ -1262,6 +1296,7 @@ def main():
         args.object, args.seed, n_seeds=args.n_seeds, n_relin=args.n_relin,
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
         fingers=args.fingers, force_execute=args.force_execute,
+        release_open_frac=args.release_open_frac,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
         directional_r_tip=args.directional_r_tip,
         sdf_err_tol=args.sdf_err_tol, bound_inset=args.bound_inset,
