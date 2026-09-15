@@ -1574,3 +1574,47 @@ Nor does it isolate WHICH of our mechanisms is responsible. `quadratic_bound_ins
 `w_edge_margin` is OFF by default, and the patch parameterization confines contacts
 to a fitted trust region in the first place. An ablation over those three would
 attribute it; this measurement only establishes that the difference exists.
+
+---
+
+## 12bis. Ferrari-Canny epsilon at n = 3 (2026-09-14)
+
+§9.4 recorded epsilon as unmeasurable at n = 2 (a pinch's wrench set is rank-5-of-6,
+so it contains no origin-centred 6-ball) and blocked on the n >= 3 path. That path
+now runs: `--fingers thumb,index,middle` plans, `verify()` certifies, and
+`epsilon_quality` returns `degenerate=False`. The column is unblocked.
+
+**But the values say the tripod is not a real tripod.** Plan-only, `ours`, 5 objects
+x 3 seeds, mu_opt = 0.8*2.0, gamma = 1.0:
+
+| object | seed 0 | seed 1 | seed 2 |
+|---|---|---|---|
+| `017_orange` | 2.84e-3 | 1.34e-3 | 1.63e-3 |
+| `061_foam_brick` | 27.36e-3 | 1.45e-3 | 21.66e-3 |
+| `036_wood_block` | **-1.1e-16** | **-1.1e-16** | **-1.1e-16** |
+| `014_lemon` | **-3.6e-17** | **-3.6e-17** | **-3.6e-17** |
+| `056_tennis_ball` | **-4.2e-17** | **-2.8e-17** | **-2.4e-17** |
+
+Nine of fifteen cells are zero to machine precision: the origin lies exactly ON a
+facet of the grasp wrench set, which is the boundary of force closure, not its
+interior. `verify()` reports `wrench_feasible=True` on all fifteen.
+
+The two are not in conflict. `verify()`'s `gamma` LP asks whether a specific
+disturbance BOX can be resisted at some finite internal force; epsilon asks for the
+largest ball in EVERY direction at gamma = 1. A wrench set that is a thin sliver --
+wide where the task needs it, zero-thickness elsewhere -- passes the first and scores
+zero on the second.
+
+The sliver is the known n = 3 defect. §10bis measured contacts 2 and 3 at 4.0 mm
+apart on `017_orange` (17.2 mm on one seed) and 25.8 mm on `036_wood_block`, against
+68-90 mm from contact 1 -- so the "tripod" is geometrically a pinch with a doubled
+finger, and a doubled contact adds no independent wrench directions. The three
+objects reporting exact zeros are precisely the ones where the two contacts are
+closest.
+
+**Do not report an epsilon median from this.** A median over nine machine-precision
+zeros ("-0.00e-3") describes the collapse, not the method. Epsilon is now instrumented
+and correct -- it is the n = 3 CONTACT PLACEMENT that is not ready. Fixing the
+collapse, not the metric, is what unblocks this column, and epsilon is now the
+sharpest available test of whether a fix worked: it goes from ~0 to positive exactly
+when the third contact becomes independent.
