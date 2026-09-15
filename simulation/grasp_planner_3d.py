@@ -4076,6 +4076,13 @@ class MultiStartConfig:
     # the surface while fingertip geoms stop 3-9mm short. Costs one DLS solve
     # per candidate (milliseconds) against a multi-second NLP per seed.
     seed_dls_rank_pool: int = 1
+    # DLS-IK residual (m) above which a candidate is rejected as UNREACHABLE.
+    # Used as a FILTER only -- the surviving candidates are ranked by patch
+    # extent, because the residual was measured not to predict grasp quality
+    # (0/5 objects; docs/SOLVER_STATE.md 11). Generous by design: it is meant to
+    # drop pairs the arm plainly cannot get to, not to express a preference.
+    # Set to inf to disable the filter and rank the whole pool.
+    seed_dls_reject_m: float = 0.060
     seed_kappa_max_reject: float = 150.0
 
     # Vertical room the SEED gate requires under a contact, in metres. None
@@ -7551,13 +7558,61 @@ class MultiStartGraspPlanner3D:
             _d.qpos[act_idx] = np.asarray(q_ref, float)[:len(act_idx)]
             _t1 = s['p1s'] + cfg.r_thumb * (-s['n1_in'])
             _t2 = s['p2s'] + cfg.r_index * (-s['n2_in'])
-            self._planner._dls_ik.solve(
-                model, _d, [self._planner._thumb_sid, self._planner._index_sid],
-                [_t1, _t2], q_bias=q_ref, null_gain=0.3)
+            # THIRD SITE at n>=3. Scoring only thumb+index makes this screen
+            # structurally blind to the finger that actually fails: measured on
+            # 009_gelatin_box, the pair ranked best by patch extent put thumb and
+            # index at -0.02/-0.08mm and the MIDDLE finger 31.4mm off its contact
+            # at 0.0N. No weighting of a 2-site residual can see that.
+            #
+            # The pair seed carries no p3s here (_seed_third_contact runs much
+            # later, per seed), so a PROVISIONAL third contact is generated for
+            # scoring only. It is not stored on the seed and does not preempt the
+            # real c3 selection -- it exists so the pair can be judged on whether
+            # a third finger could reach anything from it.
+            _sids = [self._planner._thumb_sid, self._planner._index_sid]
+            _tgts = [_t1, _t2]
+            if (int(getattr(cfg, 'n_contacts', 2)) >= 3
+                    and self._planner._middle_sid is not None):
+                try:
+                    _c3_probe = _seed_third_contact(
+                        s, geom_type, geom_size, obj_center_np, obj_R_np, self._rng,
+                        mesh_entry=self._mesh_entry, n_fan=3, fan_half_deg=40.0,
+                        strategy=str(getattr(cfg, 'c3_seed_strategy', 'fan')),
+                        prefer_outer=cfg.seed_prefer_outer_surface)
+                except Exception:
+                    _c3_probe = []
+                _best3 = None
+                for _cand in (_c3_probe or []):
+                    if _reachable_contact(_cand['p3s'], _ground_z, _r_tip_min):
+                        _best3 = _cand
+                        break
+                if _best3 is not None:
+                    _r_mf = float(cfg.r_middle if cfg.r_middle is not None
+                                  else cfg.r_index)
+                    _sids.append(self._planner._middle_sid)
+                    _tgts.append(_best3['p3s'] + _r_mf * (-_best3['n3_in']))
+            # SELECTIVE DAMPING for the ranking solve. The shipped damping=0.01
+            # with null_gain=0.3 makes I - J^+ J a poor projector, so the posture
+            # bias leaks into the task direction and the solve stalls far from a
+            # reachable target -- measured, a 20mm target converges to 8.29mm at
+            # damping=0.01 vs 0.06mm at 1e-4, and the warm-start residuals this
+            # screen shares ran 15-47mm where a selective-damped solve reached
+            # sub-2mm. A screen that cannot tell "unreachable" from "my IK gave
+            # up" is not measuring reachability. Selective damping damps only the
+            # near-singular directions, so the well-conditioned ones keep full
+            # accuracy and the residual means what it says. Built once and cached.
+            _rank_ik = getattr(self, '_rank_dls_ik', None)
+            if _rank_ik is None:
+                _rank_ik = SpatialIKSolver(
+                    n_robot=len(act_idx), selective_damping=True, sigma0=0.05)
+                self._rank_dls_ik = _rank_ik
+            _rank_ik.solve(model, _d, _sids, _tgts, q_bias=q_ref, null_gain=0.3)
             mj.mj_kinematics(model, _d)
+            # WORST site, not the mean: a pair is only as reachable as the finger
+            # that cannot get there, which is the whole point of adding site 3.
             return float(max(
-                np.linalg.norm(_d.site_xpos[self._planner._thumb_sid] - _t1),
-                np.linalg.norm(_d.site_xpos[self._planner._index_sid] - _t2)))
+                np.linalg.norm(_d.site_xpos[_sid] - _tg)
+                for _sid, _tg in zip(_sids, _tgts)))
 
         seeds, attempts, rejected = [], 0, 0
         # Per-seed REJECT record, so a paired diagnostic can draw the seeds the
@@ -7755,6 +7810,57 @@ class MultiStartGraspPlanner3D:
             _assign_seed_by_finger(s, _live_th, _live_if)
             _pool.append(s)
 
+        def _patch_extent_score(s) -> float:
+            """Usable trust-region size for a seed PAIR, in metres. Larger is better.
+
+            WHY THIS AND NOT THE DLS RESIDUAL. The DLS screen answers "can the arm
+            reach this pair", which is necessary but was measured NOT to predict
+            grasp quality: over 5 objects, 3 DLS-ranked candidates each, all
+            solved, the DLS-best candidate was cost-best in 0/5 and WORST in 3/5,
+            and on 056_tennis_ball it did not converge at all while the DLS-worst
+            candidate converged cleanly (see docs/SOLVER_STATE.md 11). The
+            residuals barely separate either -- 009_gelatin_box spans 0.3mm across
+            its three candidates, which is not a ranking signal.
+
+            Patch extent is a signal we have separately measured to BIND: the
+            IPOPT multipliers at the solution put the patch trust-region bounds in
+            the top three active constraints on every one of the five objects
+            (lambda 24-347), i.e. the contacts run to the edge of their
+            paraboloid. A seed whose patch is thin gives the optimizer no room
+            before it hits that wall.
+
+            MIN over the two contacts, not the product or the mean: a pinch is
+            only as good as its WORSE patch, and a thin-and-wide pair is exactly
+            the failure being screened out. Returns 0.0 for any pair whose patch
+            cannot be built, which sorts it last.
+            """
+            if not (geom_type == _GEOM_TYPE_MESH
+                    and self._planner._mesh_entry is not None
+                    and cfg.use_quadratic_contact):
+                return 0.0
+            _diags = []
+            for _pk, _nk, in (('p1s', 'n1_in'), ('p2s', 'n2_in')):
+                try:
+                    _n_out = -np.asarray(s[_nk], float)
+                    _throw = ca.Opti()
+                    _, _, _, _fr = _mesh_quadratic_contact_ca(
+                        _throw, np.asarray(s[_pk], float), _n_out,
+                        obj_center_np, obj_R_np, self._planner._mesh_entry,
+                        t_bound_max=cfg.quadratic_t_bound_max,
+                        sdf_err_tol=cfg.quadratic_sdf_err_tol,
+                        mesh_fit=cfg.quadratic_mesh_fit,
+                        mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
+                        mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
+                        bound_inset=cfg.quadratic_bound_inset,
+                        extent_clip=cfg.quadratic_extent_clip,
+                        bound_keep_frac=cfg.quadratic_bound_keep_frac)
+                    _s0 = float(_fr['t_hi_0']) - float(_fr['t_lo_0'])
+                    _s1 = float(_fr['t_hi_1']) - float(_fr['t_lo_1'])
+                    _diags.append(float(np.hypot(_s0, _s1)))
+                except Exception:
+                    return 0.0
+            return min(_diags) if _diags else 0.0
+
         if _rank_random and (_pool or _minor_pool):
             # Best-reachable first, with the MINOR-AXIS seed in the same pool
             # (chart-pair seeds are already DLS-ranked upstream and keep their
@@ -7764,18 +7870,54 @@ class MultiStartGraspPlanner3D:
             # arm reaches it equally well, and loses only when some random
             # candidate is measurably more reachable.
             _rank_pool = [(-1, _s) for _s in _minor_pool] + list(enumerate(_pool))
-            _scored = sorted(((_dls_residual(_s), _i, _s)
-                              for _i, _s in _rank_pool), key=lambda t: t[:2])
+            # TWO-STAGE: DLS is a reachability FILTER, patch extent is the RANK.
+            # Candidates the arm cannot reach are dropped outright (the screen the
+            # DLS residual is actually good at); the survivors are then ordered by
+            # the quantity measured to bind the solve. If the filter would empty
+            # the pool it is skipped rather than failing the solve -- a badly
+            # reachable grasp still beats no grasp, and the NLP gets the final say.
+            _dls_all = [(_dls_residual(_s), _i, _s) for _i, _s in _rank_pool]
+            _keep = [x for x in _dls_all
+                     if x[0] <= float(cfg.seed_dls_reject_m)]
+            if not _keep:
+                _keep = _dls_all
+            _n_filtered = len(_dls_all) - len(_keep)
+            # Sort by DESCENDING patch extent, with the DLS residual as a
+            # TIEBREAK and the minor-axis index (-1) breaking an exact tie after
+            # that. Patch extent is quantised to 1mm for the comparison: raw
+            # floats almost never tie, so an un-quantised key would make the
+            # tiebreak dead code. 1mm is below the scale that separates
+            # candidates (80mm spread measured on 036_wood_block) and above
+            # float noise.
+            #
+            # CAUTION about what the tiebreak can and cannot do: _dls_residual
+            # solves for the THUMB and INDEX sites only -- there is no middle
+            # site in its target list -- so it is structurally blind to the
+            # third finger's reach. It cannot rescue the n=3 failure mode where
+            # a large-patch pair is picked and the MIDDLE finger then cannot get
+            # there (measured on 009_gelatin_box: middle 31.4mm off its contact
+            # at 0.0N while thumb and index sat at -0.02/-0.08mm). Ranking by
+            # patch alone cost that object 3/3 -> 1/3 at n=3; the tiebreak only
+            # separates pairs the patch score already calls equal.
+            _scored = sorted(((_r, _i, _s) for _r, _i, _s in _keep),
+                             key=lambda x: (-round(_patch_extent_score(x[2]) * 1e3),
+                                            x[0], x[1]))
             _minor_rank = next((_k for _k, (_r, _i, _s) in enumerate(_scored)
                                 if _i == -1), None)
-            log.info(f"[seed_gen] DLS-ranked {len(_pool)} random"
+            _ext = [_patch_extent_score(_s) for _r, _i, _s in _scored]
+            log.info(f"[seed_gen] {len(_pool)} random"
                      f"{' + 1 minor-axis' if _minor_pool else ''} candidates; "
-                     f"residuals {_scored[0][0]*1e3:.1f}..{_scored[-1][0]*1e3:.1f}mm, "
+                     f"DLS filter dropped {_n_filtered} over "
+                     f"{float(cfg.seed_dls_reject_m)*1e3:.0f}mm; "
+                     f"ranked by PATCH EXTENT "
+                     f"{(max(_ext) if _ext else 0.0)*1e3:.1f}.."
+                     f"{(min(_ext) if _ext else 0.0)*1e3:.1f}mm, "
                      f"keeping best {max(n_seeds - len(seeds), 0)}"
                      + (f"; minor-axis ranked {_minor_rank + 1}/{len(_scored)}"
                         if _minor_rank is not None else ""))
             self.last_seed_rank_table = [
-                dict(dls_res_mm=_r * 1e3, accepted=(_k < max(n_seeds - len(seeds), 0)))
+                dict(dls_res_mm=_r * 1e3, patch_extent_mm=_ext[_k] * 1e3,
+                     accepted=(_k < max(n_seeds - len(seeds), 0)))
                 for _k, (_r, _i, _s) in enumerate(_scored)
             ]
             for _r, _i, _s in _scored:
