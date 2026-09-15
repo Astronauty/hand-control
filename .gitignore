@@ -253,3 +253,4 @@ wrist
 # not authoritative — see teleop/wrist_track_tune.py DEFAULTS).
 teleop/calibration/wrist_track_config.json
 teleop/calibration/wrist_track_error.jsonl
+third_party/

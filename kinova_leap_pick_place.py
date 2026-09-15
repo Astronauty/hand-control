@@ -63,6 +63,47 @@ from environments.randomization.properties import randomize_primitive
 from environments.randomization.pose import sample_nonoverlapping_xy
 
 
+def _latin_row(n: int, row: int) -> list:
+    """Row `row` (0-based) of a CYCLIC LATIN SQUARE on n items, as 0-based indices.
+
+    What this DOES give you: every item appears in every ordinal position exactly once
+    across the n rows. Run one session per row and each object leads once, is second once,
+    third once, and so on — so effects that grow over a session (operator learning,
+    fatigue, headset thermal drift) are spread evenly over objects rather than confounded
+    with them. That is ORDINAL-POSITION counterbalancing, and it is the claim to make in a
+    write-up: "presentation order was counterbalanced across sessions with a Latin square."
+
+    What this does NOT give you: carryover balance. Every row here is the same sequence
+    shifted (row r = seed + r mod n), so the successor relation is identical in all rows —
+    at n=5 only 10 of the 20 ordered pairs ever occur, each twice, and the other 10 never.
+    Do NOT describe this as a Williams square: a Williams square is built by a different
+    rule (reverse-and-interleave, not cyclic shift) and is what actually balances
+    first-order carryover. A true Williams square is exactly carryover-balanced in n rows
+    for EVEN n; for ODD n no single n x n square can be, and it takes 2n rows (the square
+    plus its row-reversed mirror) — 10 sessions at n=5.
+
+    Positional balance is the cheap, defensible property, and it is more order control than
+    the teleoperation baselines do: DexPilot runs 5 consecutive trials per task (explicitly
+    to avoid preferential selection, not to balance order), AnyTeleop 10 trials per task,
+    and arXiv:2506.09384 evaluates its conditions "sequentially" — none of the three
+    counterbalances or reports a significance test.
+    """
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if not 0 <= row < n:
+        raise ValueError(f"row {row} out of range for n={n}")
+    # Zig-zag seed row: 0, 1, n-1, 2, n-2, ... Later rows are cyclic shifts of it, which is
+    # what makes the square Latin (position-balanced) but NOT carryover-balanced.
+    first, lo, hi = [], 0, n - 1
+    while lo <= hi:
+        first.append(lo)
+        if lo != hi:
+            first.append(hi)
+        lo += 1
+        hi -= 1
+    return [(v + row) % n for v in first]
+
+
 # Table top height (metres): the reachy simpleWoodTable top surface. Objects for the
 # clear-the-table task rest on the table (z = TABLE_TOP_Z + half-height), and the robot
 # base_link is mounted at this height (see the loader). MUST match the table body in
@@ -126,8 +167,9 @@ if __name__ == "__main__":
     _arg_parser.add_argument(
         '--mode',
         choices=['contact_aware_autonomous', 'contact_aware_teleop', 'dexpilot',
-                 'anyteleop', 'contact_aware_w_dexpilot', 'contact_aware_w_anyteleop',
-                 'rrt'],
+                 'anyteleop', 'vwj', 'vwj_upstream', 'contact_aware_w_dexpilot',
+                 'contact_aware_w_anyteleop', 'contact_aware_w_vwj',
+                 'contact_aware_w_vwj_upstream', 'rrt'],
         default='contact_aware_teleop',
         help="contact_aware_teleop (default): teleop the wrist (DexPilot mapping) with "
              "MediaPipe fingers while an NLP continuously recommends grasp contacts for "
@@ -138,9 +180,15 @@ if __name__ == "__main__":
              "teleop via ROS 2.  |  ---- Baseline comparison (2x2 of pipeline x finger "
              "retargeter) ----  | dexpilot: plain teleop + our DexPilot retargeter.  | "
              "anyteleop: plain teleop + the AnyTeleop (dex-retargeting) backend.  | "
+             "vwj: plain teleop + the whole-arm-hand Vector-Wrist-Joint optimizer "
+             "(arXiv:2506.09384, clean-room) — it owns the ARM too (one 23-DOF solve/frame), "
+             "unlike the finger-only baselines.  | vwj_upstream: the SAME method but the "
+             "authors' optimizer run VERBATIM from a local clone (third_party/, not committed) "
+             "— the A/B partner to vwj.  | "
              "contact_aware_w_dexpilot: OUR contact-aware pipeline + our DexPilot "
              "(== contact_aware_teleop).  | contact_aware_w_anyteleop: OUR pipeline + the "
-             "AnyTeleop backend. The *_anyteleop modes need the optional dep: "
+             "AnyTeleop backend.  | contact_aware_w_vwj: OUR pipeline + the VWJ optimizer. "
+             "The *_anyteleop modes need the optional dep: "
              "`uv sync --extra anyteleop` (see anyteleop/README.md).")
     _arg_parser.add_argument(
         '--recommender-grasp', action='store_true',
@@ -300,6 +348,18 @@ if __name__ == "__main__":
              "are stowed below the floor and teleported up in turn. Needs --trial-log (the "
              "advance trigger is the trial_end the success state machine emits).")
     _arg_parser.add_argument(
+        '--order', dest='order', type=int, default=None, metavar='N',
+        help="--sequential-spawn: present the objects in row N (1-based) of a CYCLIC LATIN "
+             "SQUARE for the scene's object count, instead of the scene_objects.json order. "
+             "Across the N runs every object appears in every ordinal position exactly once, "
+             "so order effects (operator learning, fatigue, headset thermal drift) are "
+             "balanced by POSITION rather than confounded with the object. Run each session "
+             "with a different --order 1..N; N equals the number of objects (5 for both "
+             "bundled scenes). NOTE this balances position only, NOT carryover (which object "
+             "follows which) — that needs a true Williams square, and at odd N twice as many "
+             "sessions. Omit for the config order (unbalanced; fine for piloting). The "
+             "realized order is printed and logged to events.jsonl as spawn_order.")
+    _arg_parser.add_argument(
         '--rec-log-dir', dest='rec_log_dir', default=None, metavar='DIR',
         help="contact-aware modes: write the grasp recommender's per-Picard-stage NLP "
              "traces under DIR/<object>/ and, on each L lock-in, render the grasp "
@@ -436,10 +496,22 @@ if __name__ == "__main__":
     _RETARGETER = 'dexpilot'
     if args.mode == 'anyteleop':
         args.mode, _RETARGETER = 'dexpilot', 'anyteleop'
+    elif args.mode == 'vwj':
+        args.mode, _RETARGETER = 'dexpilot', 'vwj'
+    elif args.mode == 'vwj_upstream':
+        args.mode, _RETARGETER = 'dexpilot', 'vwj_upstream'
     elif args.mode == 'contact_aware_w_dexpilot':
         args.mode = 'contact_aware_teleop'
     elif args.mode == 'contact_aware_w_anyteleop':
         args.mode, _RETARGETER = 'contact_aware_teleop', 'anyteleop'
+    elif args.mode == 'contact_aware_w_vwj':
+        args.mode, _RETARGETER = 'contact_aware_teleop', 'vwj'
+    elif args.mode == 'contact_aware_w_vwj_upstream':
+        args.mode, _RETARGETER = 'contact_aware_teleop', 'vwj_upstream'
+    # VWJ is a WHOLE-ROBOT retargeter (owns the arm): the drive loop tracks its solved
+    # 7 arm joints as a position target instead of the shared resolved-rate wrist IK.
+    # Both the clean-room 'vwj' and the verbatim-upstream 'vwj_upstream' take this path.
+    _VWJ = (_RETARGETER in ('vwj', 'vwj_upstream'))
     # For the AnyTeleop baseline, --anyteleop-type distinguishes the two optimizer conditions
     # (vector vs dexpilot). Append it to the run label so logs/<...>_<type>/ stays distinct;
     # ignored for non-anyteleop runs.
@@ -453,6 +525,10 @@ if __name__ == "__main__":
         _arg_parser.error("--sequential-spawn needs --trial-log: the advance-to-next-object "
                           "trigger is the trial_end emitted by the success state machine, "
                           "which only runs under --trial-log.")
+    if args.order is not None and not args.sequential_spawn:
+        _arg_parser.error("--order only means anything with --sequential-spawn: it permutes "
+                          "the ORDER objects are presented in, and without the sequential "
+                          "spawner every object is on the table at once.")
     # Multicam fusion is the DEFAULT hand source in teleop modes: a bare run
     # auto-discovers calibrated cameras and fuses them, so the single-cam publisher
     # (teleop/ui.py, the "Hand Tracking [cam N]" window) never opens.
@@ -1080,7 +1156,21 @@ if __name__ == "__main__":
     # far below the floor and teleported up to the spawn point in turn. See the loop-top
     # advance-on-trial-end block for the trigger.
     _SEQ_SPAWN = args.sequential_spawn
-    _seq_next = 1                 # next stowed obj index to present (0 starts on the table)
+    # Presentation ORDER is an indirection, NOT a reordering of `objects`: _seq_order[slot]
+    # is the objects[] index shown in that slot. The `objects` list itself must stay in
+    # config order because the shared spawn point is taken from _scene_cfg[0]'s xy (below) —
+    # permuting the list would move the spawn point run-to-run and destroy the identical
+    # initial condition that is this spawner's whole purpose.
+    # _seq_next is therefore a SLOT counter (1..N), not an object index.
+    if args.order is not None and not 1 <= args.order <= len(objects):
+        # Bounds can only be checked here: argparse runs before the scene is compiled, so
+        # the object count isn't known yet. One row per object = one balanced session each.
+        _arg_parser.error(f"--order must be 1..{len(objects)} (this scene has "
+                          f"{len(objects)} object(s); the Latin square has one row per "
+                          f"object, so run one session per row). Got {args.order}.")
+    _seq_order = _latin_row(len(objects), args.order - 1) if args.order is not None \
+        else list(range(len(objects)))
+    _seq_next = 1                 # next SLOT to present (slot 0 starts on the table)
     _seq_last_ended_id = None     # trial_id of the last trial we already advanced past
     # One-shot "skip physics THIS iteration" flag for the sequential reset. Distinct
     # from _dp_reset_frame because the sequential reset fires from the trial-end block
@@ -1146,16 +1236,26 @@ if __name__ == "__main__":
             model.qpos0[_qa + 3:_qa + 7] = _seq_spawn_quat[i]
             mj.mj_forward(model, data)
 
-        # Present object 0 at the shared spawn point; stow the rest.
-        for _oi in range(1, len(objects)):
+        # Present the FIRST-IN-ORDER object at the shared spawn point; stow the rest.
+        for _oi in _seq_order[1:]:
             _stow_object(_oi)
-        _spawn_object_at(0, _seq_spawn_xy)
+        _spawn_object_at(_seq_order[0], _seq_spawn_xy)
+        _seq_order_names = [objects[_i]['name'] for _i in _seq_order]
         print(f"[sequential-spawn] presenting {len(objects)} object(s) one at a time at "
               f"xy={[round(v, 3) for v in _seq_spawn_xy]}; {len(objects) - 1} stowed.")
+        print(f"[sequential-spawn] order "
+              f"({'latin row ' + str(args.order) if args.order is not None else 'config'})"
+              f": {' -> '.join(_seq_order_names)}")
         # EventLogger drives BOTH streams (events.jsonl phase markers + the pose trace's
         # correlated timestamps), so it's created in every mode. The TrialRunner + attempt
         # trigger (the success state machine) only exist where a trigger is defined.
         _trial_events = EventLogger(Path('logs') / args.trial_log)
+        # Stamp the REALIZED presentation order into the event stream, so the session's
+        # counterbalancing is recoverable from the log alone (not from lab notes) when the
+        # runs are pooled for analysis. trial_id=0 = run-level, before any trial starts.
+        _trial_events.log(0, 0.0, 'spawn_order',
+                          scheme=('cyclic_latin' if args.order is not None else 'config'),
+                          row=args.order, order=_seq_order, names=_seq_order_names)
         # Video recording (3rd-person `overview` + 1st-person `wrist`), tied to --trial-log.
         # Best-effort: a GL/codec failure disables it with a warning, run continues.
         _scene_recorder = None
@@ -1345,16 +1445,32 @@ if __name__ == "__main__":
                         support |= _jg
                         _added = True
                         break
+        # NOTE: deliberately NO penetration-depth filter here. A depth threshold was tried
+        # (CONTACT_PENETRATION_M, 0.5mm) and it broke placement entirely: a resting object
+        # interpenetrates only as much as the contact solver allows — measured 0.018mm at
+        # solref=(0.004,1), 0.15mm at (0.012,1), 0.37mm at the (0.02,1) default, and the
+        # depth is MASS-INDEPENDENT (identical for 0.047kg and 1.5kg). So resting contact is
+        # always shallower than 0.5mm and every genuine placement was rejected. Depth
+        # measures solver stiffness, not whether the object is really down. What separates
+        # the two failure cases is contact EXISTENCE, not depth: a box wedged on a wall with
+        # its underside 9.6mm clear of the floor has NO object<->base pair at all, while a
+        # placed box has one. `support` is the bin BASE only (walls excluded above), so the
+        # pair's identity already carries the meaning.
         for ci in range(data.ncon):
             c = data.contact[ci]
             g1, g2 = c.geom1, c.geom2
             if (g1 in my_gids and g2 in support) or (g2 in my_gids and g1 in support):
                 return True
-        if data.ncon > 0:
-            return False
-        # No contacts this step: fall back to the footprint z-band.
-        _cz = float(data.geom_xpos[objects[obj_idx]['id_geom']][2])
-        return bool(_BOWL['z_lo'] <= _cz <= _BOWL['z_hi'])
+        # NO contact with the bin base => NOT placed. There is deliberately no position-only
+        # fallback here. There used to be one ("if no contacts this step, accept anything in
+        # the footprint z-band"), and it was the false-'place' bug: a gelatin box wedged
+        # against the bin's WEST WALL, its underside 9.6mm clear of the bin floor and held
+        # perfectly static (0.07mm drift over 4.5s), never touched the base at all — but sat
+        # inside the z-band, so the fallback certified it as placed. Resting ON the bin is a
+        # CONTACT fact; inferring it from position is exactly what lets a wall-wedged or
+        # interpenetrating object score. An object leaning on a wall but genuinely resting on
+        # the floor still touches the base, so this stays correct for the leaning case.
+        return False
 
     def _hand_object_contact_metrics(obj_idx):
         """Scan live contacts once and return
@@ -2680,7 +2796,7 @@ if __name__ == "__main__":
             # Higher = less reach needed but coarser precision + more tremor amplification. This
             # is the VR path's value (the config's abs_scale is for the MediaPipe path). Re-run
             # dropout_analyze to verify / retune.
-            "abs_scale": 3.0,
+            "abs_scale": 2.0,
             "scale_x": 1.0,                # already metres
             "scale_z": 1.0,
             "identity_orientation": True,  # direct hand->wrist, no press-8 offset
@@ -2844,6 +2960,14 @@ if __name__ == "__main__":
         elif _RETARGETER == 'anyteleop':
             print("[AnyTeleop] finger retargeting via dex-retargeting "
                   "(edit calibration/anyteleop_config.json; hot-reloaded each frame).")
+        elif _RETARGETER == 'vwj':
+            print("[VWJ] whole-arm-hand retargeting (Vector-Wrist-Joint, arXiv:2506.09384) "
+                  "— one 23-DOF solve/frame; the optimizer OWNS the arm (wrist relaxes for "
+                  "fingertip accuracy). Edit calibration/vwj_config.json; hot-reloaded each frame.")
+        elif _RETARGETER == 'vwj_upstream':
+            print("[VWJ-upstream] whole-arm-hand retargeting via the AUTHORS' optimizer run "
+                  "VERBATIM (Mingrui-Yu/retargeting, local clone under third_party/) on MuJoCo "
+                  "FK — the A/B partner to --mode vwj. Shares calibration/vwj_config.json.")
 
         print("[DexPilot] ROS subscriber active — waiting for /hand/joint_angles (≥120 floats)")
         print("[DexPilot] Press 8 to start tracking (captures your current wrist "
@@ -4454,10 +4578,19 @@ if __name__ == "__main__":
                         data.geom_xpos[_ao['id_geom']][:2] - data.site_xpos[_sid_tr][:2]))
                     _da_tr = _trial_dofadr[active_idx]
                     _spd_tr = float(np.linalg.norm(data.qvel[_da_tr:_da_tr + 3]))
+                # Robot-contact fact for the RELEASE condition. This site passes
+                # trigger_active=False unconditionally, so the runner's trigger-based
+                # fallback would read "released" on every step — compute the real contact.
+                _touch_tr = bool(
+                    _OBJ_COL_GID_SET.get(active_idx, {_ao['id_geom']}) & {
+                        (c.geom2 if c.geom1 in _HAND_GIDS else c.geom1)
+                        for c in data.contact[:data.ncon]
+                        if c.geom1 in _HAND_GIDS or c.geom2 in _HAND_GIDS})
                 _arrived_tr = _trial_runner.step_pick_or_transport(
                     _trial_state, _tnow_tr, trigger_fired=False, trigger_active=False,
                     height_above_rest=_h_tr, place_xy_offset=_xy_tr, object_speed=_spd_tr,
-                    inside_container=_object_in_bowl(active_idx))
+                    inside_container=_object_in_bowl(active_idx),
+                    hand_touching=_touch_tr)
                 # Arrival sets outcome=SUCCESS but does NOT write trial_end / save the trace —
                 # the caller must call end_trial. Do so on arrival, or on a timeout.
                 if _arrived_tr:
@@ -4480,14 +4613,15 @@ if __name__ == "__main__":
                     and _trial_state.outcome is not None
                     and _trial_state.trial_id != _seq_last_ended_id):
                 _seq_last_ended_id = _trial_state.trial_id
-                # The presented object is always _seq_next-1 (index 0 first, then 1, ...),
+                # The presented object is whatever the ORDER puts in slot _seq_next-1,
                 # independent of how each mode sets active_idx.
                 _seq_done = _seq_next - 1
                 if 0 <= _seq_done < len(objects):
-                    _stow_object(_seq_done)
+                    _stow_object(_seq_order[_seq_done])
                 if _seq_next < len(objects):
-                    _spawn_object_at(_seq_next, _seq_spawn_xy)
-                    _new_idx = _seq_next
+                    _new_idx = _seq_order[_seq_next]
+                    _spawn_object_at(_new_idx, _seq_spawn_xy)
+                    _seq_slot = _seq_next + 1        # 1-based slot for the operator message
                     _seq_next += 1
                     # OBJECT-WISE EXPERIMENTAL CONSISTENCY: after each placement, RESET THE
                     # ROBOT TO HOME and FREEZE tracking, then REQUIRE press-8 to recalibrate
@@ -4510,7 +4644,7 @@ if __name__ == "__main__":
                     _seq_reset_robot_home()   # Backspace-equivalent reset-to-home + freeze
                     print(f"[sequential-spawn] trial ended ({_trial_state.outcome}); "
                           f"robot RESET to home, tracking FROZEN. Presenting object "
-                          f"{_new_idx + 1}/{len(objects)} ({objects[_new_idx]['name']}) — "
+                          f"{_seq_slot}/{len(objects)} ({objects[_new_idx]['name']}) — "
                           f"press 8 to recalibrate and start its trial.")
                 else:
                     _seq_reset_robot_home()   # last object done: end in a clean home state
@@ -4642,9 +4776,10 @@ if __name__ == "__main__":
                     _draw_camera_views()   # per-camera feed grid (no-op unless --camera-views)
                     _teleop_cam_t = _now
                 _check_pipeline_alive()  # warn if the multicam child died
-                if _tune_retarget or _RETARGETER == 'anyteleop':
-                    # DexPilot: hot-reload retarget_config.json; AnyTeleop: hot-reload
-                    # anyteleop_config.json (both via the backend's poll_config()).
+                if _tune_retarget or _RETARGETER in ('anyteleop', 'vwj', 'vwj_upstream'):
+                    # DexPilot: hot-reload retarget_config.json; AnyTeleop:
+                    # anyteleop_config.json; VWJ: vwj_config.json (all via the backend's
+                    # poll_config()).
                     _dexpilot_ctrl.poll_retarget_config()
                 if TELEOP_PROFILE:
                     _t = time.perf_counter(); _tp_acc['camviews'] += _t - _tp_s; _tp_s = _t
@@ -4892,6 +5027,21 @@ if __name__ == "__main__":
                         _teleop_arm_hold = data.qpos[:7].copy()   # seed at the live arm pose
                     _qdot_arm, _teleop_jog_v, _teleop_jog_w, _sigma_min = _solve_wrist_qdot(
                         _teleop_wrist_tgt, _teleop_jog_v, _teleop_jog_w)
+
+                    # --- VWJ (whole-arm-hand optimizer) arm drive -----------------
+                    # Unlike dexpilot/anyteleop (finger-only + shared resolved-rate arm
+                    # IK), VWJ (arXiv:2506.09384) SOLVED the 7 arm joints itself as part
+                    # of its one 23-DOF optimize — that IS the method (it relaxes the
+                    # wrist for fingertip accuracy). So for VWJ we DISCARD the resolved-
+                    # rate _qdot_arm and instead drive the arm as a POSITION target to
+                    # _teleop_q[:7] (VWJ already speed-clamps per frame). The finger
+                    # drive, physics/damping, singularity gate, and substep loop below
+                    # are all UNCHANGED — only the arm target source differs. _sigma_min
+                    # from _solve_wrist_qdot is still used for the singularity gate.
+                    if _VWJ and _teleop_q is not None:
+                        _teleop_arm_hold = _teleop_q[:7].copy()   # VWJ-solved arm joints
+                        _clamp_arm_hold(_teleop_arm_hold)
+                        _qdot_arm = np.zeros(7)                    # position target, no vel-inject
 
                     # SINGULAR-STATE GATE (root-cause fix for the qacc explosion). An
                     # out-of-band mj_resetData (viewer Backspace / BADQACC, both on other
@@ -5176,9 +5326,10 @@ if __name__ == "__main__":
                 if DP_PROFILE:
                     _t = time.perf_counter(); _dpp_acc['camviews'] += _t - _dpp_s
                 _check_pipeline_alive()  # warn if the multicam child died
-                if _tune_retarget or _RETARGETER == 'anyteleop':
-                    # DexPilot: hot-reload retarget_config.json; AnyTeleop: hot-reload
-                    # anyteleop_config.json (both via the backend's poll_config()).
+                if _tune_retarget or _RETARGETER in ('anyteleop', 'vwj', 'vwj_upstream'):
+                    # DexPilot: hot-reload retarget_config.json; AnyTeleop:
+                    # anyteleop_config.json; VWJ: vwj_config.json (all via the backend's
+                    # poll_config()).
                     _dexpilot_ctrl.poll_retarget_config()
                 if DP_PROFILE:
                     _dpp_acc['spin_draw'] += time.perf_counter() - _dpp_iter0
@@ -5256,10 +5407,12 @@ if __name__ == "__main__":
                             _trial_id = (_trial_state.trial_id + 1
                                         if _trial_state is not None else 1)
                             # Normally objects[0] (single-object batch). Under
-                            # --sequential-spawn the presented object is _seq_next-1 (the one
-                            # just teleported to the spawn point), so press-8 starts the trial
-                            # for THAT object, not a stowed objects[0].
-                            _dp_start_idx = (_seq_next - 1) if _SEQ_SPAWN else 0
+                            # --sequential-spawn the presented object is the one the ORDER
+                            # puts in slot _seq_next-1 (just teleported to the spawn point),
+                            # so press-8 starts the trial for THAT object, not a stowed
+                            # objects[0]. Note _seq_next is a SLOT, not an object index —
+                            # under --order the two differ.
+                            _dp_start_idx = _seq_order[_seq_next - 1] if _SEQ_SPAWN else 0
                             _tobj = objects[_dp_start_idx]
                             active_idx = _dp_start_idx
                             _trial_state = _trial_runner.start_trial(
@@ -5468,9 +5621,10 @@ if __name__ == "__main__":
                     # Baseline dexpilot tracks a single object. Normally that's objects[0];
                     # under --sequential-spawn only ONE object is on the table at a time (the
                     # rest stowed below the floor), so follow the currently-presented one
-                    # (_seq_next-1) instead — else the trial would score a stowed object and
-                    # never detect arrival.
-                    _dp_idx  = (_seq_next - 1) if _SEQ_SPAWN else 0
+                    # (_seq_order[_seq_next-1] — a SLOT lookup, which under --order is not
+                    # the same as the object index) instead — else the trial would score a
+                    # stowed object and never detect arrival.
+                    _dp_idx  = _seq_order[_seq_next - 1] if _SEQ_SPAWN else 0
                     _dp_obj  = objects[_dp_idx]
                     _trial_runner.step_approach(
                         _trial_state, _tnow_dp, data.contact[:data.ncon],
@@ -5515,7 +5669,8 @@ if __name__ == "__main__":
                         trigger_active=_active_dp,
                         height_above_rest=_height_above_rest_dp,
                         place_xy_offset=_xy_off_dp, object_speed=_spd_dp,
-                        inside_container=_object_in_bowl(_dp_idx))
+                        inside_container=_object_in_bowl(_dp_idx),
+                        hand_touching=_touching_dp)
                     _dp_thumb_sid = id_C[FINGER_SET.index('thumb')]
                     _dp_index_sid = id_C[FINGER_SET.index('index')]
                     # Grasp-hold force summary: total finger->object normal force this step,
@@ -6820,7 +6975,12 @@ if __name__ == "__main__":
                         _trial_state, _tnow, trigger_fired=_fired,
                         trigger_active=_active, height_above_rest=_height_above_rest,
                         place_xy_offset=_xy_off, object_speed=_spd,
-                        inside_container=_object_in_bowl(active_idx))
+                        inside_container=_object_in_bowl(active_idx),
+                        hand_touching=bool(
+                            _OBJ_COL_GID_SET.get(active_idx, {obj['id_geom']}) & {
+                                (c.geom2 if c.geom1 in _HAND_GIDS else c.geom1)
+                                for c in data.contact[:data.ncon]
+                                if c.geom1 in _HAND_GIDS or c.geom2 in _HAND_GIDS}))
                     _trial_runner.trace.sample(
                         t=_tnow,
                         p_thumb=data.site_xpos[id_C[FINGER_SET.index('thumb')]].copy(),

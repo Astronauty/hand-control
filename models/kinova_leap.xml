@@ -220,6 +220,10 @@
                               <geom name="leap_if_ds_collision_3" class="leap_collision" size="0.007 0.011 0.002" pos="0 -0.006 -0.001" type="box" material="leap_black"/>
                               <geom name="leap_if_tip" class="leap_tip" material="leap_white" mesh="leap_tip"/>
                               <site name="leap_if_ds_tip" pos="-0.0013 -0.0336 0.0145" size="0.005" group="0" rgba="0.5 0.5 0.5 1"/>
+                              <!-- DIP-joint site (distal body origin): tip - lower = distal-phalanx
+                                   direction, the fingertip-ORIENTATION target for the VWJ retargeter
+                                   (arXiv:2506.09384). group=4 so it is hidden by default. -->
+                              <site name="leap_if_ds_lower" pos="0 0 0" size="0.004" group="4" rgba="0.2 0.6 0.9 1"/>
                             </body>
                           </body>
                         </body>
@@ -257,6 +261,7 @@
                               <geom name="leap_mf_ds_collision_3" class="leap_collision" size="0.007 0.011 0.002" pos="0 -0.006 -0.001" type="box" material="leap_black"/>
                               <geom name="leap_mf_tip" class="leap_tip" material="leap_white" mesh="leap_tip"/>
                               <site name="leap_mf_ds_tip" pos="-0.0013 -0.0336 0.0145" size="0.005" group="0" rgba="0.5 0.5 0.5 1"/>
+                              <site name="leap_mf_ds_lower" pos="0 0 0" size="0.004" group="4" rgba="0.2 0.6 0.9 1"/>
                             </body>
                           </body>
                         </body>
@@ -294,6 +299,7 @@
                               <geom name="leap_rf_ds_collision_3" class="leap_collision" size="0.007 0.011 0.002" pos="0 -0.006 -0.001" type="box" material="leap_black"/>
                               <geom name="leap_rf_tip" class="leap_tip" material="leap_white" mesh="leap_tip"/>
                               <site name="leap_rf_ds_tip" pos="-0.0013 -0.0336 0.0145" size="0.005" group="0" rgba="0.5 0.5 0.5 1"/>
+                              <site name="leap_rf_ds_lower" pos="0 0 0" size="0.004" group="4" rgba="0.2 0.6 0.9 1"/>
                             </body>
                           </body>
                         </body>
@@ -328,6 +334,7 @@
                               <geom name="leap_th_ds_collision_3" class="leap_collision" size="0.004 0.012 0.009" pos="0.015 -0.0175 -0.0115" type="box" material="leap_black"/>
                               <geom name="leap_th_tip" class="leap_thumb_tip" material="leap_white" mesh="leap_thumb_tip"/>
                               <site name="leap_th_ds_tip" pos="-0.0013 -0.0456 -0.0145" size="0.005" group="0" rgba="0.5 0.5 0.5 1"/>
+                              <site name="leap_th_ds_lower" pos="0 0 0" size="0.004" group="4" rgba="0.2 0.6 0.9 1"/>
                             </body>
                           </body>
                         </body>
