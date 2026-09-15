@@ -5292,8 +5292,15 @@ if __name__ == "__main__":
                             _dp_start_idx = _seq_order[_seq_next - 1] if _SEQ_SPAWN else 0
                             _tobj = objects[_dp_start_idx]
                             active_idx = _dp_start_idx
+                            # Log the RETARGETER as the method, not args.mode. Mode
+                            # normalization collapses every baseline onto 'dexpilot'
+                            # (anyteleop/vwj all run the dexpilot pipeline with a different
+                            # retargeter), so args.mode — and the old hardcoded 'dexpilot'
+                            # here — labelled an AnyTeleop run as DexPilot. Every trial in
+                            # every baseline log therefore read method='dexpilot', and any
+                            # analysis keyed on that field silently pooled the two arms.
                             _trial_state = _trial_runner.start_trial(
-                                _trial_id, 'dexpilot', _tobj['name'], data.time,
+                                _trial_id, _RETARGETER, _tobj['name'], data.time,
                                 props=object_props_from_model(
                                     model, _tobj['id_body'], _tobj['id_geom']))
                             _dp_trigger.reset()

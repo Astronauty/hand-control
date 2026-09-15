@@ -12,7 +12,8 @@
     "fingertip_orientation": 10.0,
     "wrist_rotation": 0.1
   },
-  "joint_position_weights": [0, 0, 1.0, 0, 0.5, 0, 0, 0.5, 0, 0, 0, 0.5, 0, 0, 0, 0.5, 0, 0, 0.5, 0, 0.1, 0, 0],
+  "_joint_position_weights_note": "REMAPPED to this repo's LEAP joint order [mcp,rot,pip,dip] per finger. Upstream's Paxini order is [side,mcp,pip,dip], so its side-joint regs (0.5) must land on the *_rot joints here, NOT *_mcp. The verbatim upstream vector regularized the MCP FLEXION joints toward a curled home, which stopped fingers (esp. middle) from uncurling. Now: if_rot/mf_rot/rf_rot=0.5 (anti-splay), rf_dip=0.5, th_mcp=0.1.",
+  "joint_position_weights": [0, 0, 1.0, 0, 0.5, 0, 0, 0, 0.5, 0, 0, 0, 0.5, 0, 0, 0, 0.5, 0, 0.5, 0, 0, 0.1, 0],
   "joint_velocity_weights": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01],
   "max_joint_speed": [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
   "_joint_limit_overrides_note": "Upstream clamps the PIP+DIP of index/middle/ring fingers to >=0 (no hyperextension). Opt-vector indices 9,10=if_pip,if_dip; 13,14=mf_pip,mf_dip; 17,18=rf_pip,rf_dip. Same numeric indices as the upstream LEAP profile (arm[0:7]+LEAP[7:23] order matches).",
