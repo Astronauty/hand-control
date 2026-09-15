@@ -61,8 +61,10 @@ home configuration with no sampler.
 \subsubsection{Protocol}
 
 Both planners run in one simulator and share the scene, seeding pool, collision
-model, execution stack, and scoring instruments; only the planner differs. Five YCB
-objects, 20 seeds per object per method, 200 executed trials, scored by FRoGGeR's
+model, execution stack, and scoring instruments; only the planner differs. Four YCB
+objects spanning the shape classes that stress a two-contact grasp---a box, a
+near-sphere, a thin-walled concave mug, and a flat box \SI{34}{\milli\meter}
+deep---with 20 seeds per object per method, 160 executed trials, scored by FRoGGeR's
 shaky-pickup protocol: lift \SI{10}{\centi\meter} in \SI{1}{\second}, hold
 \SI{1.5}{\second}, with \SI{3}{\milli\meter} sinusoidal perturbation in all spatial
 axes, failing on $>30^\circ$ rotation or $>\SI{7.5}{\centi\meter}$ deviation from the
@@ -85,35 +87,30 @@ Brackets are $95\%$ Wilson intervals.}
 \toprule
 object & metric & \textbf{Ours} & FRoGGeR \\
 \midrule
-\multirow{4}{*}{\texttt{lemon}} & lift $\uparrow$ & 100\% [84, 100] & 80\% [58, 92] \\
- & pick $\uparrow$ & 100\% [84, 100] & 40\% [22, 61] \\
- & held $\uparrow$ & 100\% [84, 100] & 35\% [18, 57] \\
- & $\bar{\ell}^*$ $\uparrow$ & 0.71 (0.71, 0.72) & 0.45 (0.35, 0.62) \\
+\multirow{4}{*}{\texttt{gelatin\_box}} & lift $\uparrow$ & 100\% [84, 100] & 15\% [5, 36] \\
+ & pick $\uparrow$ & 90\% [70, 97] & 0\% [0, 16] \\
+ & held $\uparrow$ & 90\% [70, 97] & 0\% [0, 16] \\
+ & $\bar{\ell}^*$ $\uparrow$ & 0.90 (0.85, 0.91) & -1.21 (-1.81, -0.50) \\
 \midrule
 \multirow{4}{*}{\texttt{orange}} & lift $\uparrow$ & 100\% [84, 100] & 95\% [76, 99] \\
  & pick $\uparrow$ & 100\% [84, 100] & 70\% [48, 85] \\
  & held $\uparrow$ & 100\% [84, 100] & 55\% [34, 74] \\
  & $\bar{\ell}^*$ $\uparrow$ & 0.93 (0.90, 0.94) & 0.91 (0.84, 0.97) \\
 \midrule
+\multirow{4}{*}{\texttt{mug}} & lift $\uparrow$ & 55\% [34, 74] & 50\% [30, 70] \\
+ & pick $\uparrow$ & 50\% [30, 70] & 5\% [1, 24] \\
+ & held $\uparrow$ & 30\% [15, 52] & 5\% [1, 24] \\
+ & $\bar{\ell}^*$ $\uparrow$ & 0.88 (0.85, 0.93) & 0.31 (0.30, 0.44) \\
+\midrule
 \multirow{4}{*}{\texttt{wood\_block}} & lift $\uparrow$ & 100\% [84, 100] & 60\% [39, 78] \\
  & pick $\uparrow$ & 25\% [11, 47] & 10\% [3, 30] \\
  & held $\uparrow$ & 10\% [3, 30] & 5\% [1, 24] \\
  & $\bar{\ell}^*$ $\uparrow$ & 0.73 (0.36, 0.92) & 0.37 (0.30, 0.44) \\
 \midrule
-\multirow{4}{*}{\texttt{tennis\_ball}} & lift $\uparrow$ & 100\% [84, 100] & 70\% [48, 85] \\
- & pick $\uparrow$ & 100\% [84, 100] & 20\% [8, 42] \\
- & held $\uparrow$ & 100\% [84, 100] & 20\% [8, 42] \\
- & $\bar{\ell}^*$ $\uparrow$ & 0.94 (0.92, 0.94) & 0.63 (0.49, 0.83) \\
-\midrule
-\multirow{4}{*}{\texttt{foam\_brick}} & lift $\uparrow$ & 100\% [84, 100] & 70\% [48, 85] \\
- & pick $\uparrow$ & 100\% [84, 100] & 35\% [18, 57] \\
- & held $\uparrow$ & 100\% [84, 100] & 30\% [15, 52] \\
- & $\bar{\ell}^*$ $\uparrow$ & 0.81 (0.55, 0.89) & 0.35 (0.30, 0.67) \\
-\midrule
-\multirow{4}{*}{\textbf{all}} & lift $\uparrow$ & \textbf{100\% [96, 100]} & 75\% [66, 82] \\
- & pick $\uparrow$ & \textbf{85\% [77, 91]} & 35\% [26, 45] \\
- & held $\uparrow$ & \textbf{82\% [73, 88]} & 29\% [21, 39] \\
- & $\bar{\ell}^*$ $\uparrow$ & \textbf{0.87 (0.71, 0.94)} & 0.52 (0.34, 0.83) \\
+\multirow{4}{*}{\textbf{all}} & lift $\uparrow$ & 89\% [80, 94] & 55\% [44, 65] \\
+ & pick $\uparrow$ & 66\% [55, 76] & 21\% [14, 31] \\
+ & held $\uparrow$ & 58\% [47, 68] & 16\% [10, 26] \\
+ & $\bar{\ell}^*$ $\uparrow$ & 0.90 (0.82, 0.93) & 0.35 (0.15, 0.66) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -121,20 +118,27 @@ object & metric & \textbf{Ours} & FRoGGeR \\
 \subsubsection{Execution}
 
 Table~\ref{tab:execution} reports per-object outcomes. Aggregated, our method
-reaches the lift on $100\%$ $[96,100]$ of trials against $75\%$ $[66,82]$, succeeds
-on $85\%$ $[77,91]$ against $35\%$ $[26,45]$, and holds on $82\%$ $[73,88]$ against
-$29\%$ $[21,39]$; all three separate without overlap.
+reaches the lift on $89\%$ $[80,94]$ of trials against $55\%$ $[44,65]$, succeeds on
+$66\%$ $[55,76]$ against $21\%$ $[14,31]$, and holds on $58\%$ $[47,68]$ against
+$16\%$ $[10,26]$; all three separate without overlap.
 
-The deficit has two distinct sources: 25 of 100 baseline trials never reach the
-lift, their solves placing contacts a median of \SI{17.5}{\milli\meter} from the
-fingertip surface, and a further 40 grip the object and then lose it. Conditioned on
-reaching the lift the baseline succeeds on $47\%$ against our $85\%$, so a single
-rate conflates a reachability failure with a grasp-quality one. The modes differ in
-kind---ours rotation-dominated (12 against 3), the baseline's deviation-dominated
-(28 against 12), the object not held at all. Both methods fail on
-\texttt{036\_wood\_block}, which demands $\gamma \approx \SI{26}{\newton}$ of
-internal force against \SIrange{1}{2}{\newton} elsewhere and drives baseline solves
-to the \SI{60}{\newton} stability ceiling.
+The deficit has two distinct sources: 36 of 80 baseline trials never reach the lift,
+their solves placing contacts far enough from the fingertip surface to fail a
+pre-squeeze gap check, and a further 27 grip the object and then lose it.
+Conditioned on reaching the lift the baseline succeeds on $39\%$ against our $75\%$,
+so a single rate conflates a reachability failure with a grasp-quality one.
+
+Per object the two methods separate unevenly. On \texttt{017\_orange} both succeed
+and the gap is modest; on \texttt{025\_mug} and \texttt{009\_gelatin\_box} the
+baseline essentially fails ($1/20$ and $0/20$) where ours reaches $10/20$ and
+$18/20$. \texttt{036\_wood\_block} is hard for both ($5/20$ against $2/20$): it
+demands $\gamma \approx \SI{26}{\newton}$ of internal force against
+\SIrange{1}{2}{\newton} elsewhere and drives baseline solves to the
+\SI{60}{\newton} stability ceiling, which we read as the two-contact limit rather
+than a formulation difference. The \emph{held} column is consistently below
+\emph{pick} on both methods---most visibly on the mug, $6/20$ against $10/20$---
+those being grasps that satisfy the displacement criteria while a fingertip has
+unloaded, a property of the criteria rather than of either planner.
 
 \begin{table}[t]
 \centering
@@ -150,23 +154,20 @@ methods. Margins are median (IQR) over contacts; \emph{near} is the fraction wit
 \toprule
 object & metric & \textbf{Ours} & FRoGGeR \\
 \midrule
-\multirow{2}{*}{\texttt{lemon}} & margin (mm) $\uparrow$ & 13.0 (12.0, 14.0) & 1.0 (1.0, 1.0) \\
- & near $\downarrow$ & 0\% [0, 39] & 100\% [61, 100] \\
+\multirow{2}{*}{\texttt{gelatin\_box}} & margin (mm) $\uparrow$ & 3.5 (3.0, 6.0) & 1.0 (1.0, 1.0) \\
+ & near ($\leq\!2$\,mm) $\downarrow$ & 20\% [8, 42] & 100\% [84, 100] \\
 \midrule
-\multirow{2}{*}{\texttt{orange}} & margin (mm) $\uparrow$ & 18.5 (18.0, 19.0) & 17.5 (5.0, 18.8) \\
- & near $\downarrow$ & 0\% [0, 39] & 33\% [10, 70] \\
+\multirow{2}{*}{\texttt{orange}} & margin (mm) $\uparrow$ & 18.0 (17.0, 18.2) & 1.0 (1.0, 17.2) \\
+ & near ($\leq\!2$\,mm) $\downarrow$ & 0\% [0, 16] & 60\% [39, 78] \\
+\midrule
+\multirow{2}{*}{\texttt{mug}} & margin (mm) $\uparrow$ & 7.0 (5.0, 14.0) & 1.0 (1.0, 1.2) \\
+ & near ($\leq\!2$\,mm) $\downarrow$ & 15\% [5, 36] & 95\% [76, 99] \\
 \midrule
 \multirow{2}{*}{\texttt{wood\_block}} & margin (mm) $\uparrow$ & 12.0 (11.0, 13.0) & 1.0 (1.0, 1.0) \\
- & near $\downarrow$ & 0\% [0, 39] & 100\% [61, 100] \\
+ & near ($\leq\!2$\,mm) $\downarrow$ & 0\% [0, 16] & 90\% [70, 97] \\
 \midrule
-\multirow{2}{*}{\texttt{tennis\_ball}} & margin (mm) $\uparrow$ & 16.0 (15.2, 16.0) & 1.0 (1.0, 1.0) \\
- & near $\downarrow$ & 0\% [0, 39] & 100\% [61, 100] \\
-\midrule
-\multirow{2}{*}{\texttt{foam\_brick}} & margin (mm) $\uparrow$ & 11.5 (10.2, 12.0) & 1.0 (1.0, 1.0) \\
- & near $\downarrow$ & 0\% [0, 39] & 100\% [61, 100] \\
-\midrule
-\multirow{2}{*}{\textbf{all}} & margin (mm) $\uparrow$ & \textbf{13.5 (12.0, 16.0)} & 1.0 (1.0, 1.0) \\
- & near $\downarrow$ & \textbf{0\% [0, 11]} & 87\% [70, 95] \\
+\multirow{2}{*}{\textbf{all}} & margin (mm) $\uparrow$ & 11.0 (5.0, 16.0) & 1.0 (1.0, 1.0) \\
+ & near ($\leq\!2$\,mm) $\downarrow$ & 9\% [4, 17] & 86\% [77, 92] \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -183,24 +184,31 @@ is independent of contact parameterization---necessary here, as the baseline's
 contacts are forward-kinematics outputs carrying no local surface model.
 
 Table~\ref{tab:edge} reports the result: our contacts sit a median of
-\SI{13.5}{\milli\meter} from the nearest edge against \SI{1.0}{\milli\meter}, and
-none of our 30 fall within \SI{2}{\milli\meter} of an edge against 26 of 30.
-\SI{1.0}{\milli\meter} is the search step, so those contacts are on the edge, not
-near it. \texttt{017\_orange} is the control---a near-sphere presents no edge to
-seek, and is the one object where margins are comparable. Edge proximity predicts
-outcome: grasps that held sit a median of \SI{12.0}{\milli\meter} from an edge
-($n=18$) against \SI{1.0}{\milli\meter} for those that failed ($n=12$),
-$r = +0.574$. This is the mechanism behind~\cite{li2023frogger}'s ``yields unstable
-grasps in practice,'' measured.
+\SI{11.0}{\milli\meter} from the nearest edge against \SI{1.0}{\milli\meter}, and
+$9\%$ $[4,17]$ of ours fall within \SI{2}{\milli\meter} of an edge against $86\%$
+$[77,92]$. \SI{1.0}{\milli\meter} is the search step, so the baseline's contacts are
+on the edge, not near it, and its interquartile range is degenerate---the behavior is
+not a tail but the norm. Our own margin is object-dependent and smallest on the two
+objects with least usable face, \texttt{009\_gelatin\_box}
+(\SI{3.5}{\milli\meter}) and \texttt{025\_mug} (\SI{7.0}{\milli\meter}), which
+is where our $9\%$ originates. Edge proximity predicts outcome: grasps that held sit
+a median of \SI{7.0}{\milli\meter} from an edge ($n=33$) against
+\SI{1.0}{\milli\meter} for those that failed ($n=47$), a point-biserial correlation
+of $r = +0.389$ over 80 trials. This is the mechanism
+behind~\cite{li2023frogger}'s ``yields unstable grasps in practice,'' measured.
 
 \subsubsection{$\bar{\ell}^*$ is a weak predictor of success}
 
-Li et al.\ report $\bar{\ell}^*$ separating successes from failures only weakly. We
-reproduce this (pooled medians $0.87$ against $0.52$, $r = +0.317$) and sharpen it:
-the correlation is $r = +0.474$ for the baseline but $r = +0.170$ for ours, whose
-solutions are near-saturated ($0.88$ against $0.71$). A metric optimized by one
-method is not a neutral instrument for scoring another, and the edge margin of
-Table~\ref{tab:edge} predicts outcomes better than $\bar{\ell}^*$ does for either.
+Li et al.\ report $\bar{\ell}^*$ separating successes from failures only weakly.
+Pooled over both methods we find medians of $0.91$ against $0.44$
+($r = +0.593$), but the aggregate conceals a sharp asymmetry: the correlation is
+$r = +0.816$ for the baseline and $r = +0.365$ for ours. Successful grasps score
+$0.91$ under both methods; failures score $0.37$ under the baseline but $0.73$ under
+ours. $\bar{\ell}^*$ is the baseline's own objective, so its solutions spread along
+it and it tracks their outcomes closely; ours are near-saturated and it discriminates
+far less. A metric optimized by one method is therefore not a neutral instrument for
+scoring another---our failures are not low-$\bar{\ell}^*$ grasps, and no threshold on
+$\bar{\ell}^*$ would have predicted them.
 
 \subsubsection{Which mechanisms account for the difference}
 
@@ -230,6 +238,9 @@ scene; the baseline is a reimplementation, and one defect---contacts reported at
 fingertip site rather than the constrained pad point, displacing each by
 approximately \SI{10}{\milli\meter}---was found and corrected during this study,
 raising its success rate from $7\%$ to $35\%$. We cannot exclude further such
-defects, and the $25\%$ of baseline trials placing unreachable contacts is where we
+defects, and the $45\%$ of baseline trials placing unreachable contacts is where we
 would look first. Friction and robustness floor differ from the original work, and
-plan-time quantities are measured over 30 of the 200 trials.
+plan-time quantities are measured over 80 of the 160 trials. The object set is small
+and deliberately weighted toward hard cases, so the absolute rates are lower than a
+broader set would give and should be read as a paired comparison rather than as
+characteristic success rates.
