@@ -358,7 +358,72 @@ that is sign-expanded into 64 corners, and one LP per corner returns
 
 Infeasible on ANY corner returns `None`. What the caller then does **now differs by
 environment** — see the table below. `_gamma_stability_ceiling` clamps the result for
-simulator stability (~12 N on the tabletop).
+simulator stability (60 N on the tabletop — recalibrated 2026-09-14, see
+"gamma is newtons" below).
+
+### gamma is NEWTONS, by construction — and the controller used to break that
+
+`min_gamma_for_accel_lp` builds each cone vertex as `ncf = ncf * gamma`, and
+`solve_gamma_live` passes `ncf=[1.0]*n` (unit normal force per contact). So a solved
+gamma **is the per-contact internal normal force in newtons**: `gamma = 12` is a request
+for 12 N. `3D_minimum_NCF.py` states this directly — *"f_contact = f_manipulation +
+gamma * f_internal"*, and *"min_gamma: where minimum normal contact force = normal
+component of (min_gamma * f_internal)"*.
+
+`GraspController.internal_force_torques` violated that contract two ways. Both are FIXED
+as of 2026-09-14; `tests/test_gamma_scaling_invariance.py` and
+`tests/test_gamma_is_newtons.py` pin them.
+
+**(a) The equilibrium part was scaled along with the internal part.** The allocation
+splits as `f_c = pinv(G) w_des + N gamma_LP`, and only the second term is wrench-neutral
+(`G N = 0`). Scaling the whole vector by `gamma/cone_f_min` therefore commanded a net
+object wrench of `gamma/f_min` times `w_des` — with `support_weight=True` that is
+gravity. At `gamma = 12` with `cone_f_min = 0.5` (a 24x amplifier) the commanded support
+force on `036_wood_block` reached **171.6 N on a 7.15 N block**: the squeeze ejected the
+object (z 0.625 -> 0.978 m), tips drifted ~190 mm off the planned contacts, and measured
+contact force was **0.0 N on every seed** because nothing was left to touch.
+
+*Diagnostic value:* sweeping `finger_kp` 0.8 -> 80 left the measured force at exactly
+0.0 N throughout. **No PD gain can fix this** — the excess is a wrench applied to the
+OBJECT, not a torque the fingers oppose. A grasp failing with `fn == 0.0` and large tip
+drift should be checked against the object's weight BEFORE any gain is touched.
+
+**(b) The internal part was normalised by the wrong quantity.** The code divided by
+`cone_f_min`, assuming `|f_int| == cone_f_min`. It is not: `solve_gamma_cone` minimises
+the PEAK normal force subject to `f_min` at EVERY contact, so once `w_des != 0` the
+equilibrium part already loads one contact and the internal correction needed to bring
+the others up to `f_min` grows with `w_des`. Measured peak `|f_int|` against
+`f_min = 0.5`:
+
+| object weight | peak \|f_int\| | gamma inflation |
+|---|---|---|
+| 0.49 N (`014_lemon`) | 0.745 | 1.5x |
+| 0.95 N (`056_tennis_ball`) | 0.976 | 2.0x |
+| 3.73 N (`009_gelatin_box`) | 2.364 | 4.7x |
+| 7.15 N (`036_wood_block`) | 4.076 | 8.2x |
+
+The error **tracked object mass**, so no constant rescale could fix it — the normaliser
+itself had to change. `internal_force_torques` now divides `f_int` by its own peak normal
+component (`_peak_internal_normal`), so gamma means newtons at every mass. Measured tip
+force now tracks the command to ~15% (gamma 12 -> 10.3 N, 20 -> 17.0 N), where the block
+previously commanded 12 and measured ~55 N.
+
+**Stability ceiling recalibrated.** `GAMMA_STABILITY_REF_N` was `12.0`, chosen when a
+commanded gamma of 12 produced only ~6 N of real force — it was never a claim about
+newtons, so carrying it forward would have halved the usable squeeze. Re-measured on
+`036_wood_block` seed 2 through the full cycle: stable at gamma 6/12/20/27/40/60
+(5.4 -> 51.7 N measured), **diverged at 100** (~86 N, object thrown, dz -606 mm). Set to
+**60**, the largest validated — same rule as before. The solved gamma for this object
+(~27) now passes UNCLAMPED, which is the point: the clamp exists to stop the integrator
+exploding, and in honest units the statics answer sits well inside that limit.
+
+**Teleop was NOT re-measured.** `GAMMA_SAFETY_FACTOR = 5.0` and `GAMMA_FALLBACK = 250.0`
+in `kinova_leap_pick_place.py` were tuned in the old inflated units, so teleop will now
+squeeze 1.5-8x weaker on hardware. Scaling guidance is recorded in a comment at the
+constant: re-derive from `f_n >= m(g+a) / (n * mu * (1-margin))` rather than from the old
+number, and do NOT reintroduce a mass-dependent fudge (that is exactly what was removed).
+`GAMMA_FALLBACK` now reads as ~250 N per contact against a sim divergence point of ~86 N;
+it is a hardware-only path and was left unchanged rather than guessed at.
 
 `solve_gamma_live` generalizes to `n >= 2` contacts. The moment reference is the contact
 CENTROID, which reduces to the midpoint at n=2 so the measured 2-contact path is unchanged.
@@ -384,6 +449,8 @@ disagreement on the same contacts via the same LP**. Because the budget changed 
 | linear accel | `cfg.accel_budget_xyz` | `(20, 20, 20)` | `(0.5, 0.5, 0.5)` |
 | angular accel | `cfg.ang_accel_budget_xyz` | `(1, 1, 1)` | `(0.1, 0.1, 0.1)` |
 | LP infeasible | flags `wrench_feasible=False` | **aborts the grasp** | `GAMMA_FALLBACK = 2.0` |
+| gamma units | n/a (certificate only) | newtons (normalised) | newtons (normalised) |
+| stability ceiling | n/a | 60 N | 60 N (shared constant) |
 
 **The remaining verify-side gap is the `0.8 * mu` derate.** (`verify()`'s hardcoded `n=2`
 was the other half of this and is FIXED as of 2026-09-13 — it now certifies every contact
@@ -411,6 +478,28 @@ approach (kinematic replay) -> hold/settle -> GAP GATE -> squeeze ramp
   lift succeeds. Gaps over the gate are a PLANNER outcome, not a contact-tuning one.
 - **Squeeze ramp**: `internal_force_torques(scale)` ramped over `SQUEEZE_RAMP_S`.
   Unramped full force launches the object (measured 35 N -> box thrown 400 mm).
+- **`gamma_ref`** (default `1.0` on the tabletop): scales the finger PD gains by
+  `gamma/gamma_ref`, so the PD keeps a CONSTANT ratio of authority against the squeeze
+  rather than a constant absolute stiffness. The finger PD and the internal force act on
+  the same joints in opposition, and only their RATIO decides whether the tips stay on
+  the planned contacts. Pass `--gamma-ref 0` for the legacy absolute-gain behaviour.
+
+  **This is NOT made redundant by the newtons fix**, which is worth being precise about.
+  Normalising removed the mass-driven UNIT drift, but it did not make one absolute gain
+  sufficient, because how much PD authority a given geometry has against a given squeeze
+  still varies per grasp. `036_wood_block` seed 1 is the case: at the solved gamma 25.9
+  with absolute gains the object never moves and force tracks the command (16-20 N), yet
+  `|tau_int|` runs ~60x `|tau_pd|` and the tips creep 2 -> 15 mm off the contacts until
+  the grasp SLIDES off (`fn` 0.0). That is not integrator divergence, so the stability
+  ceiling is the wrong tool for it. With `gamma_ref=1.0` the same seed lifts (20.7/22.0 N).
+  Seed 2 of the same object does not need it. The old ceiling of 12 was masking seed 1 by
+  coincidence, not by design.
+
+  | mechanism | fixes |
+  |---|---|
+  | normalisation (`_peak_internal_normal`) | gamma's UNITS — mass-driven drift |
+  | `gamma_ref` | PD AUTHORITY PER GRASP — geometry-driven, independent of units |
+
 - **`set_transporting(True)`**: switches finger PD from CLOSING to HOLDING gains. These
   are opposite requirements — soft closing gains let the internal-force term win
   (kp 0.8->20 dropped grip 6.03->1.28 N), but a soft holding gain is back-driven by the
@@ -496,6 +585,28 @@ planned pre-contact posture, while index and thumb soften to 0.25 to let the squ
 | phases | approach -> hold -> squeeze -> lift -> transport -> release, scored by `TS.in_bin` |
 | artifacts | `out/tabletop/<tag>/<object>/`, incl. `seed<N>_planned.png` (planned pose before squeeze) |
 
+**Regenerated 2026-09-14** after the gamma normalisation fix (§5), `out/tabletop/default`,
+5 objects x 3 seeds, full pick/lift/transport/release, defaults (`gamma_ref = 1.0`).
+**10/15 lift_ok.** Commanded gamma and measured tip force now agree to ~15%, which is the
+point of the fix — before it, `036_wood_block` commanded 12 and measured ~55 N:
+
+| object | gamma | measured `fn` (N) | lift_ok |
+|---|---|---|---|
+| `014_lemon` s0/s1/s2 | 1.02-1.17 | 0.76-0.99 | 3/3 |
+| `056_tennis_ball` s0/s1/s2 | 2.13-2.44 | 1.88-2.32 | 3/3 |
+| `036_wood_block` s1/s2 | 25.9 | 20.7-22.2 | 2/2 |
+| `036_wood_block` s0 | 27.4 | — | gap abort (10.2/7.4 mm) |
+| `009_gelatin_box` s0 | 4.82 | 3.9 | 1/1 |
+| `009_gelatin_box` s1/s2 | — | — | `gamma_infeasible_no_grasp` |
+| `017_orange` s1 | 1.75 | 1.36-1.60 | 1/1 |
+| `017_orange` s0/s2 | 1.78 | index 0.0, thumb 1.69 | one-finger push (see §9) |
+
+All 5 failures are upstream of force control — two planning aborts, one IK gap abort, two
+one-finger placements. None are gamma-related. Caveat: `017_orange` s0 is a MARGINAL seed
+and has been observed passing (§9, §12); treat its cell as unstable, not as a fixed property.
+Before the fix the same set was 0/15 on the block, with the equilibrium bug suppressing
+force everywhere.
+
 Two scoring caveats specific to this env:
 - `TS.in_bin` tests the object **body origin** against `z >= 0.635` (the bin floor), so an
   object resting IN the bin only passes if it is tall enough to lift its origin clear.
@@ -577,6 +688,37 @@ works alone.
   1/8 over a larger draw). Still marginal: its volumetric centroid sits at 13.7 mm, so
   antipodal rays through the centroid put one contact near the table almost regardless of
   the floor. A side-approach seeding mode is the real fix.
+- **The IK aims at a bounding sphere; the gate measures true mesh distance.** These are
+  different quantities, and the residual between them is what parks fingertips short.
+  `_tip_radius` returns `max||V - site_local||` — a bounding sphere about the site, ~19.5 mm
+  on the LEAP tips — and the NLP targets `p + r_tip*n`. The pre-squeeze gate `_tip_gaps_mm`
+  instead uses `mj_geomDistance`, the true tip-MESH-to-object-hull distance. The pad's honest
+  directional extent is ~9.95 mm, so the isotropic target overshoots by ~5-6 mm. The MAX
+  radius is a deliberate choice (its own comment: contacts "hover on the SAFE side", since
+  penetration is unrecoverable for the squeeze while a small gap is not), so **the gate is
+  not misapplied — it is measuring the right thing, and the overshoot is what it catches.**
+
+  `directional_r_tip_refine` (ON by default via `for_gws_recommender`) is the compensation:
+  it recomputes the radius at the SOLVED q and re-runs the DLS IK. Measured firing on
+  `017_orange` seed 0: `r_iso=(19.4,19.5)mm -> r_dir=(13.4,13.5)mm ... ACCEPTED`. Note plain
+  `directional_r_tip` WITHOUT refine is a documented no-op under the production preset — at
+  `n_normal_relinearize=0` the only q available is the warm start, where the finger has not
+  yet turned to face the object (18.78 vs 19.47 mm, a 0.7 mm correction).
+
+  **Still open:** whether `r_dir ~13.4 mm` is itself over the true ~9.95 mm support. If so,
+  tightening it (or the 1 mm `directional_r_tip_margin_m` cushion) would move marginal seeds
+  off the boundary — but the margin exists to prevent penetration, so it is a real trade,
+  not a free win.
+- **Marginal seeds are not reproducible across processes.** `017_orange` seed 0 was observed
+  BOTH ways from the identical command, one object per process: twice as `lift_ok=True` with
+  both fingers loaded (1.65/1.75 N, gaps 2.88/2.30 mm), then reproducibly as a one-finger
+  failure (`fn` index 0.0, gaps 3.97/3.22 mm). A ~1 mm difference in planned gap flips the
+  seed between a two-finger pinch and a one-finger push. This is a narrower case than the
+  known "multi-object sweeps in one process are not deterministic" — these were single-object
+  processes. **Consequence for measurement:** a single run of a marginal seed is not evidence
+  about that seed, and per-seed pass/fail claims need repeats. It also means the ~5-6 mm
+  overshoot above does not merely shift gaps, it puts borderline grasps ON the boundary where
+  small solver variation decides the outcome.
 - **`in_bin` origin-height bug** (§7).
 - **Verify/execute gamma: the budget half is fixed, the friction half is not** (§5). The
   tabletop executor and the certificate now share one disturbance box, but `verify()` still
@@ -772,7 +914,13 @@ done.
 
 ## 12. Measurement hygiene
 
-- Re-running the SAME config is deterministic to the last digit (verified 3x).
+- Re-running the SAME config is USUALLY deterministic to the last digit (verified 3x),
+  **but do not rely on it for marginal seeds.** `017_orange` seed 0 was observed both as a
+  two-finger success and as a one-finger failure from the identical command, one object per
+  process, with the planned gap differing by ~1 mm (2.88 vs 3.97 mm) — see §9. Repeat a
+  marginal cell before reporting it; a single run of a seed sitting near the gate is not
+  evidence about that seed. (The separate, already-known rule still holds: run ONE OBJECT
+  PER PROCESS — multi-object sweeps in a single process are not deterministic at all.)
 - But changing `impratio` perturbs settling -> changes the plan -> can push a fingertip gap
   just over the 8 mm gate, producing a 0.0 N "failure" that is a PLANNER outcome. Check
   `phase_log` for `squeeze_aborted_no_contact` before attributing a zero-force cell to
