@@ -83,5 +83,12 @@
     <body name="rec2_body" mocap="true">
       <geom name="rec2" type="sphere" size="0.010" rgba="0.2 0.9 1 0.4" contype="0" conaffinity="0"/>
     </body>
+    <!-- rec3 = MIDDLE (orange), shown only when the object's pairing is a tripod
+         (models/grasp_finger_config.json per_object). At n=2 the planner returns
+         no p3 and the caller parks this marker out of view rather than leaving it
+         at a stale contact from a previous object. -->
+    <body name="rec3_body" mocap="true">
+      <geom name="rec3" type="sphere" size="0.010" rgba="1 0.55 0.1 0.4" contype="0" conaffinity="0"/>
+    </body>
   </worldbody>
 </mujoco>

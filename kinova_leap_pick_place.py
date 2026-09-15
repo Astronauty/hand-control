@@ -398,6 +398,30 @@ if __name__ == "__main__":
     if not _cfg_fingers:
         _arg_parser.error(f"--fingers {args.fingers!r}: no usable finger list")
     FINGER_SET = list(reversed(SLOT_ROLES))
+
+    def _rec_fingers_for(obj_id):
+        """Slot-ordered finger list for ONE object.
+
+        An explicit --fingers overrides everything (operator intent beats the
+        table). Otherwise the per_object map in models/grasp_finger_config.json
+        decides, falling back to its own default list. This is what lets a
+        tripod object and a pinch object coexist in the same scene -- the
+        module-level SLOT_ROLES is resolved once at startup with no object id
+        and cannot express that.
+        """
+        if args.fingers:
+            return list(SLOT_ROLES)
+        # load_finger_config returns RESOLVED slot site/geom names, not the role
+        # list, so read the role list from the file itself -- same file, same
+        # per_object key, no second source of truth.
+        try:
+            _raw = json.loads(
+                Path(_grasp_config_builder.FINGER_CONFIG_PATH).read_text())
+        except (OSError, ValueError):
+            return list(SLOT_ROLES)
+        _roles = ((_raw.get('per_object') or {}).get(obj_id)
+                  or _raw.get('fingers') or SLOT_ROLES)
+        return [r for r in _roles if isinstance(r, str)]
     print(f"[fingers] slots={SLOT_ROLES}  FINGER_SET={FINGER_SET}  "
           f"n_contacts={_cfg_fingers['n_contacts']}")
     if args.mode == 'rrt':          # deprecated alias
@@ -1660,6 +1684,45 @@ if __name__ == "__main__":
     # feasible boundary the LP computed (the trace then sits well inside it).
     # GAMMA_SAFETY_FACTOR = 50.0
     GAMMA_SAFETY_FACTOR = 5.0
+    #
+    # ---- SCALING THIS AFTER THE GAMMA NORMALISATION FIX (read before retuning) ----
+    #
+    # GraspController.internal_force_torques used to scale the cone-LP allocation by
+    # gamma/cone_f_min, which assumed the LP's INTERNAL part had magnitude cone_f_min.
+    # It does not -- it grows with the supported weight -- so the commanded force was
+    # inflated by a MASS-DEPENDENT factor (measured 1.5x on a 0.05 kg object up to 8.2x
+    # on a 0.73 kg one). It now normalises by the internal part's own peak normal
+    # force, so gamma means what scripts/3D_minimum_NCF.py always defined it to mean:
+    # the per-contact internal NORMAL FORCE IN NEWTONS (it solves with ncf=[1.0]*n).
+    #
+    # THIS FACTOR AND GAMMA_FALLBACK WERE TUNED IN THE OLD, INFLATED UNITS. They were
+    # never re-measured on hardware after the fix, so if teleop now squeezes too
+    # WEAKLY, that is expected and this is the knob -- the old effective force was
+    # roughly GAMMA_SAFETY_FACTOR * inflation(object mass) * gamma_solved, and the
+    # inflation term is now gone.
+    #
+    # How to rescale, in order of preference:
+    #   1. Re-derive from physics, not from the old number. gamma is newtons now, so
+    #      the required per-contact normal force is computable directly:
+    #          f_n >= m * (g + a_max) / (n_contacts * mu * (1 - margin))
+    #      Pick the factor that puts SAFETY_FACTOR * gamma_solved at or above that.
+    #      For the benchmark's 0.73 kg block at the 20 m/s^2 budget that is ~19 N,
+    #      against a solved gamma of ~27 -- i.e. 1.0x is already sufficient there and
+    #      5x is now genuinely 5x the requirement rather than a units correction.
+    #   2. If empirical retuning is preferred, sweep this the way
+    #      benchmarks/ycb_grasp/pick_and_place.py --gamma does, and read MEASURED tip
+    #      force rather than the commanded value -- under the fix those now agree to
+    #      within ~15% (gamma 12 -> 10.3 N measured, 20 -> 17.0 N), so the commanded
+    #      number is finally a usable proxy.
+    #   3. Do NOT reintroduce a mass-dependent fudge here to recover the old forces.
+    #      That is what was just removed; it makes the factor mean different things on
+    #      different objects and is why a gain tuned on one object failed on another.
+    #
+    # GAMMA_FALLBACK (250.0, above) is used only when the LP reports the geometry
+    # cannot resist the box at all. In the new units that is ~250 N per contact --
+    # far beyond anything measured stable in sim (the sim benchmark diverged at ~86 N
+    # on a 0.73 kg object). It is a hardware-only path and was not re-measured here,
+    # but it should be re-derived from the formula in (1) rather than trusted.
 
 
 
@@ -2957,14 +3020,35 @@ if __name__ == "__main__":
         print("[seed-viz] file sink needs --trial-log for the output dir; file save disabled.")
         _SEED_VIZ_FILE = False
     _REC_INTERVAL_S = 2.0     # fixed re-solve cadence (NLP solve ~0.5-2s, runs in a thread)
-    _REC_NC         = 5       # planner seeds per solve (was 3; ~60% per-seed IK-convergence
-                              # -> 5 seeds gives ~99% chance of >=1 converged vs 3 seeds' ~94%.
-                              # No warm-start, so no seed is wasted on a boundary-jammed re-seed.)
+    # SEEDS PER SOLVE. One, not five. n_seeds is the number of full NLP solves the
+    # recommender runs per re-solve, and the over-generated candidate pool is now
+    # ranked by a screen that actually discriminates: patch extent (min over the
+    # pair) with a DLS reachability filter and a 3-site tiebreak. The old ranking
+    # was the DLS residual alone, which does not separate candidates -- on
+    # 036_wood_block all ten span 25.1-27.4mm while their patch extents span
+    # 102.6-183.0mm -- so five solves were buying a best-of-N over a list ordered
+    # by noise. Ranking first and solving once is ~5x less work per recommendation,
+    # which is what makes the 2s cadence comfortable rather than tight.
+    #
+    # TRADE, stated: there is no cost-ranked fallback if the single winner solves
+    # badly. The per-seed IK-convergence argument for 5 (~99% vs ~94% chance of at
+    # least one converged) still holds in principle; it is accepted here because the
+    # recommender re-solves every _REC_INTERVAL_S anyway, so a bad solve costs one
+    # cycle rather than the grasp. Raise this if live trials show dropped
+    # recommendations.
+    _REC_NC         = 1
+    _REC_RANK_POOL  = 5       # candidates GENERATED per solve, then ranked; only the
+                              # winner reaches the NLP (cfg.seed_dls_rank_pool).
     REC_REACH_TOL_MM = 15.0   # lock-in IK residual above which a rec is flagged unreachable
     _rec1_mocap = int(model.body_mocapid[
         mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'rec1_body')])
     _rec2_mocap = int(model.body_mocapid[
         mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'rec2_body')])
+    # THIRD contact marker (middle, orange). Resolved defensively: a scene XML
+    # predating rec3 returns -1 from mj_name2id, and every write below is guarded
+    # on >= 0 so an older scene still runs with two markers instead of raising.
+    _rec3_bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, 'rec3_body')
+    _rec3_mocap = int(model.body_mocapid[_rec3_bid]) if _rec3_bid >= 0 else -1
     _REC_HIDDEN = np.array([10.0, 10.0, 10.0])   # park markers off-scene when idle
     _cat_planners     = {}      # obj_idx -> MultiStartGraspPlanner3D (lazy)
     _cat_planner_lock = threading.Lock()
@@ -3146,7 +3230,19 @@ if __name__ == "__main__":
                 # here is what keeps plan and execution on the SAME fingers -- omitting
                 # it would leave the recommender on the config default while the
                 # controller followed --fingers, i.e. the inverse of the old bug.
-                fingers=list(SLOT_ROLES),
+                # PER-OBJECT PAIRING. SLOT_ROLES is resolved ONCE at startup with no
+                # object id, so passing it here pinned every object in the scene to
+                # one finger count. models/grasp_finger_config.json's per_object map
+                # is the authority: tripod for the box-like objects (009_gelatin_box,
+                # 036_wood_block), pinch for the spheroids and the mug. An explicit
+                # --fingers still wins, since parse_fingers returns non-None only
+                # when the operator passed one.
+                fingers=_rec_fingers_for(o['name']),
+                # ONE NLP from a RANKED pool (see _REC_NC / _REC_RANK_POOL). The pool
+                # is over-generated and ordered by patch extent before a single solve
+                # runs, so this is 'seed once, pick the best candidate' rather than
+                # 'solve five and pick the best result'.
+                seed_dls_rank_pool=_REC_RANK_POOL,
                 # w_ik 0.70 -> 5.0 (wrench_feasibility tuning, preserved via the builder's
                 # overrides): the keyframe convergence sweep showed the baseline
                 # alignment:reachability ratio (~14:1) starved the IK term; w_ik=5.0 lifts
@@ -3458,9 +3554,19 @@ if __name__ == "__main__":
         if _cand is not None and _fresh:
             data.mocap_pos[_rec1_mocap] = _cand['p1']
             data.mocap_pos[_rec2_mocap] = _cand['p2']
+            # p3 exists only for a TRIPOD pairing. At n=2 the key is absent (not
+            # None-valued), so park the marker rather than leaving it on the last
+            # tripod object's third contact -- a stale marker reads as a live
+            # recommendation.
+            if _rec3_mocap >= 0:
+                _p3 = _cand.get('p3')
+                data.mocap_pos[_rec3_mocap] = (
+                    _p3 if _p3 is not None else _REC_HIDDEN)
         else:
             data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
             data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
+            if _rec3_mocap >= 0:
+                data.mocap_pos[_rec3_mocap] = _REC_HIDDEN
         return _cand
 
     def _emit_lockin_figure(obj_idx, cand):
@@ -4111,6 +4217,7 @@ if __name__ == "__main__":
             _rec_ik_result.clear()
         if _rec1_mocap >= 0: data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
         if _rec2_mocap >= 0: data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
+        if _rec3_mocap >= 0: data.mocap_pos[_rec3_mocap] = _REC_HIDDEN
         _last_sim_time = 0.0
         if _dp_trigger is not None:  _dp_trigger.reset()
         if _cat_trigger is not None: _cat_trigger.reset()
@@ -4597,6 +4704,8 @@ if __name__ == "__main__":
                             _rec_ik_result.clear()
                         data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
                         data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
+                        if _rec3_mocap >= 0:
+                            data.mocap_pos[_rec3_mocap] = _REC_HIDDEN
                         _last_sim_time = 0.0
                         print("[teleop] RESET — robot + objects home, tracking FROZEN. "
                               "Press 8 to set the offset (capture your current hand pose).")
@@ -4950,6 +5059,8 @@ if __name__ == "__main__":
                         _teleop_damping_zeroed = False   # re-zero on the next teleop entry
                         data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
                         data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
+                        if _rec3_mocap >= 0:
+                            data.mocap_pos[_rec3_mocap] = _REC_HIDDEN
                         q_start = data.qpos[:N_ROBOT].copy()
                         q_plan_hold = q_start.copy()
                         _plan_result.clear()
@@ -5557,6 +5668,8 @@ if __name__ == "__main__":
                         active_tgt = _prox_idx + 1        # targets[0] is home
                         data.mocap_pos[_rec1_mocap] = _REC_HIDDEN
                         data.mocap_pos[_rec2_mocap] = _REC_HIDDEN
+                        if _rec3_mocap >= 0:
+                            data.mocap_pos[_rec3_mocap] = _REC_HIDDEN
                         _push_rec_status('held', objects[_prox_idx]['name'])
                         q_start = data.qpos[:N_ROBOT].copy()
                         q_plan_hold = q_start.copy()
@@ -5864,6 +5977,27 @@ if __name__ == "__main__":
                         # softened to close, and never took part in the
                         # CLOSING/HOLDING switch.
                         active_joint_slices=finger_joint_slices(model, FINGER_SET),
+                        # PD AUTHORITY PER GRASP. Orthogonal to GAMMA_SAFETY_FACTOR
+                        # above: that sets how hard to squeeze, this keeps the finger
+                        # PD's authority AGAINST that squeeze constant. The PD and the
+                        # internal force act on the same joints in opposition and only
+                        # their RATIO decides whether the tips stay on the planned
+                        # contacts, so an absolute gain that works at gamma 1 is
+                        # overwhelmed at gamma 27. Measured on the benchmark
+                        # (036_wood_block seed 1): with absolute gains |tau_int| runs
+                        # ~60x |tau_pd|, the tips creep 2 -> 15mm off the contacts and
+                        # the grasp slides off at fn = 0.0; at gamma_ref = 1.0 the same
+                        # seed lifts. Not integrator divergence, so the stability
+                        # ceiling is the wrong tool for it.
+                        #
+                        # 1.0 matches the benchmark, where the gamma units are the same
+                        # newtons after the normalisation fix (see the GAMMA_SAFETY
+                        # note above). Teleop's gamma_live is GAMMA_SAFETY_FACTOR x
+                        # larger than the benchmark's solved gamma for the same object,
+                        # so the fingers are scaled correspondingly harder here -- which
+                        # is the intent: the squeeze is 5x, so the PD holding against it
+                        # must be too.
+                        gamma_ref=1.0,
                         obj_contact_provider=_grasp_provider)
                     # Grasp controller is now executing: clear the approach visualizations —
                     # the RRT path trace (ghost capsules) and the achieved-contact markers
