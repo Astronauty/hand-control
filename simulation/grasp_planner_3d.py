@@ -8022,6 +8022,7 @@ class MultiStartGraspPlanner3D:
                     log.warning(f"[seed {i+1}] third-contact seeding failed: {_e_c3}")
 
             # ── Run NLP (warm-started from the pre-check LP's γ and cone y's) ──
+            _seed_t0 = time.perf_counter()
             r = self._planner.solve(_q_ref_seed, obj_pos,
                                     p1_init=seed['p1'],
                                     p2_init=seed['p2'],
@@ -8032,6 +8033,11 @@ class MultiStartGraspPlanner3D:
                                         else None),
                                     gamma_init=g_pre,
                                     y_by_corner_init=y_by_corner_pre)
+            # Per-seed wall time, so GRASP_PROFILE (and the status line) can attribute the
+            # total across seeds — a non-converged seed burning the full max_iter budget is
+            # the usual cause of a slow multi-seed solve.
+            if isinstance(r, dict):
+                r['solve_ms'] = (time.perf_counter() - _seed_t0) * 1e3
 
             # ── Post-solve diagnostics ────────────────────────────────────────
             sdf_p1 = sdf_p2 = float('nan')

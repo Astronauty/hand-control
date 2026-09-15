@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import mujoco
 from scipy.ndimage import gaussian_filter1d
@@ -110,6 +112,13 @@ class RRTPlanner:
             [model.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE for g in self._obj_geoms]))[0]
         self._fg_index   = {g: i for i, g in enumerate(self._finger_geoms)}
         self._og_index   = {g: j for j, g in enumerate(self._obj_geoms)}
+        # Per-geom type + half-extents for the PHANTOM-0.0 verification (see _is_free):
+        # mj_geomDistance's GJK returns spurious 0.0 for well-separated BOX-BOX pairs at
+        # near-face-parallel poses. When a flagged pair is box-box, we cross-check with an
+        # analytic OBB-vs-OBB lower bound (separating-axis on the 6 face normals); if the
+        # geoms are clearly apart, the mj 0.0 is a phantom and the pair is not a real hit.
+        self._geom_type = model.geom_type.copy()
+        self._geom_size = model.geom_size.copy()
         # Per-pair clearance matrix — the vectorized counterpart of _pair_clearance,
         # rebuilt by plan() and updated in place by _endpoint_grace.
         self._rebuild_clearance_matrix()
@@ -148,7 +157,72 @@ class RRTPlanner:
             lb[:, k]  = (P_f - P_o[k]) @ n_hat - self._rb_f
         return lb
 
+    def admissibility(self, q_start, q_goal, pair_clearance=None):
+        """Diagnostic: replicate plan()'s setup (rebuild clearance + endpoint grace) and
+        report whether each endpoint is collision-free, plus the first blocking (finger,
+        object) geom pair and its distance for a failing endpoint. Does NOT plan — a cheap
+        pre-flight so 'RRT failed' can be attributed to an in-collision goal/start (the
+        multi-hull-clearance bug's signature) vs a genuine narrow-passage planning failure.
+        Returns a dict; leaves _pair_clearance/_clr_mat set up as plan() would (harmless)."""
+        self._pair_clearance = dict(pair_clearance or {})
+        self._rebuild_clearance_matrix()
+        self._endpoint_grace(q_start)
+        self._endpoint_grace(q_goal)
+
+        def _probe(q):
+            self._data.qpos[:self._n_robot] = q
+            mujoco.mj_kinematics(self.model, self._data)
+            lb = self._pair_lower_bounds()
+            fromto = np.zeros(6)
+            worst = None
+            for i, j in zip(*np.nonzero(lb < self._clr_mat)):
+                fg, og = int(self._fg_arr[i]), int(self._og_arr[j])
+                d = mujoco.mj_geomDistance(self.model, self._data, fg, og, 10.0, fromto)
+                if d < self._clr_mat[i, j]:
+                    if worst is None or d < worst[2]:
+                        worst = (fg, og, float(d), float(self._clr_mat[i, j]))
+            return worst
+
+        w_s, w_g = _probe(q_start), _probe(q_goal)
+
+        def _name(gid):
+            return mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid) or gid
+
+        def _pack(w):
+            if w is None:
+                return None
+            return {'finger': _name(w[0]), 'obj': _name(w[1]),
+                    'dist_m': round(w[2], 5), 'need_m': round(w[3], 5)}
+
+        return {'start_free': w_s is None, 'goal_free': w_g is None,
+                'start_block': _pack(w_s), 'goal_block': _pack(w_g)}
+
+    def _obb_separation(self, ga, gb):
+        """Conservative lower bound on the distance between two BOX geoms (ga, gb) at the
+        current self._data pose, via the separating-axis theorem on the 6 face normals (3
+        per box). For each candidate axis, project both boxes' half-extents and compare
+        against the centre-offset along that axis; the largest positive gap over all 6 axes
+        is a valid lower bound on the true OBB distance (0 if none separates). Used ONLY to
+        reject mj_geomDistance's box-box phantom 0.0 — a lower bound can only ever mark a
+        pair as MORE separated, never falsely clear a real collision."""
+        d = self._data
+        ca = d.geom_xpos[ga]; Ra = d.geom_xmat[ga].reshape(3, 3); ha = self._geom_size[ga]
+        cb = d.geom_xpos[gb]; Rb = d.geom_xmat[gb].reshape(3, 3); hb = self._geom_size[gb]
+        t = cb - ca
+        best = 0.0
+        for R, h in ((Ra, ha), (Rb, hb)):
+            for k in range(3):
+                axis = R[:, k]
+                # projected radius of each box onto this axis = sum |axis·(box axis)|*half
+                ra = np.sum(np.abs(Ra.T @ axis) * ha)
+                rb = np.sum(np.abs(Rb.T @ axis) * hb)
+                gap = abs(float(t @ axis)) - (ra + rb)
+                if gap > best:
+                    best = gap
+        return best
+
     def _is_free(self, q):
+        _t0 = time.perf_counter()
         self._data.qpos[:self._n_robot] = q   # only set robot DOFs; objects stay at snapshot
         mujoco.mj_kinematics(self.model, self._data)
         # Broadphase: one vectorized pass over all pairs; the exact query below runs only
@@ -158,11 +232,32 @@ class RRTPlanner:
         # exempted finger may touch but can never sweep through the object.
         lb = self._pair_lower_bounds()
         fromto = np.zeros(6)
+        result = True
+        _BOX = mujoco.mjtGeom.mjGEOM_BOX
         for i, j in zip(*np.nonzero(lb < self._clr_mat)):
-            if mujoco.mj_geomDistance(self.model, self._data, int(self._fg_arr[i]),
-                                      int(self._og_arr[j]), 10.0, fromto) < self._clr_mat[i, j]:
-                return False
-        return True
+            fg, og = int(self._fg_arr[i]), int(self._og_arr[j])
+            d = mujoco.mj_geomDistance(self.model, self._data, fg, og, 10.0, fromto)
+            if d < self._clr_mat[i, j]:
+                # PHANTOM-0.0 REJECTION: mj_geomDistance's GJK spuriously returns ~0 for
+                # well-separated BOX-BOX pairs near face-parallel (verified live: a palm box
+                # 35cm above the table slab reported 0.0 while analytic distance was 347mm —
+                # freezing the RRT). For a box-box pair reporting ~0, verify with the analytic
+                # OBB separating-axis lower bound; if the boxes are clearly apart it's a
+                # phantom, not a collision. The lower bound only ever declares MORE
+                # separation, so this can never mask a genuine overlap.
+                if (d <= 1e-6 and self._geom_type[fg] == _BOX
+                        and self._geom_type[og] == _BOX
+                        and self._obb_separation(fg, og) > max(self._clr_mat[i, j], 1e-3)):
+                    continue   # phantom — treat as free for this pair
+                result = False
+                break
+        # Diagnostic accounting (see plan()): total collision-check time + call count, so a
+        # SPEED failure (per-check cost dominating on mesh/SDF geoms) is separable from a
+        # CONNECTIVITY failure. Guarded on the attr so pre-plan() calls don't error.
+        if hasattr(self, "_isfree_n"):
+            self._isfree_ms += (time.perf_counter() - _t0) * 1e3
+            self._isfree_n += 1
+        return result
 
     def _wrap_diff(self, d):
         """Wrap the circular-joint components of a difference vector into [-pi, pi] (the
@@ -255,12 +350,53 @@ class RRTPlanner:
         return path
 
     def _smooth(self, path):
-        for _ in range(self.n_smooth):
+        """Shortcut-smooth the raw path. RRT-Connect raw paths can be long and convoluted
+        (an unbalanced search grows one tree to ~1000 nodes, so the extracted path threads
+        through many of them). A fixed 100 random shortcuts barely dents such a path — the
+        result stayed convoluted. Two upgrades:
+          1. A GREEDY forward pass: from each anchor, connect to the FARTHEST reachable
+             later waypoint in one shot, then continue from there. One O(n·checks) sweep
+             collapses most of the detour deterministically (not luck-of-the-draw i/j).
+          2. Then the random shortcut polish, its budget scaled to the (now-short) path,
+             to clean up whatever the greedy pass left."""
+        if len(path) <= 2:
+            return path
+
+        # --- greedy forward shortcut: farthest CONTIGUOUS reachable jump per anchor ---
+        # Forward scan (not far-end backtrack): from anchor i, advance j while edge i->j+1
+        # stays free; jump to the last free j, repeat. ~O(n) checks. One pass can stall at a
+        # tricky mid-path spot (a single blocked edge caps the jump), leaving many short
+        # segments — so run forward+reverse passes ALTERNATELY to convergence: a reverse
+        # pass shortcuts what the forward pass's stall left behind. This is what collapses a
+        # genuinely convoluted RRT path (start_tree in the hundreds) to a near-straight one.
+        def _forward(p):
+            out = [p[0]]; i = 0; n = len(p)
+            while i < n - 1:
+                j = i + 1
+                while j + 1 < n and self._edge_free(p[i], p[j + 1]):
+                    j += 1
+                out.append(p[j]); i = j
+            return out
+
+        prev_len = None
+        for _ in range(8):                      # converges in 1-3 passes in practice
+            path = _forward(path)
+            path = list(reversed(_forward(list(reversed(path)))))
+            if prev_len is not None and len(path) >= prev_len:
+                break                            # no further collapse
+            prev_len = len(path)
+            if len(path) <= 2:
+                break
+
+        # --- random shortcut polish: catches non-contiguous shortcuts the greedy passes
+        # (which only join along the existing order) can't. Budget scaled to path length.
+        budget = max(self.n_smooth, 20 * len(path))
+        for _ in range(budget):
             if len(path) <= 2:
                 break
             i = np.random.randint(0, len(path) - 1)
             j = np.random.randint(i + 1, len(path))
-            if self._edge_free(path[i], path[j]):
+            if j - i >= 2 and self._edge_free(path[i], path[j]):
                 path = path[: i + 1] + path[j:]
         return path
 
@@ -351,7 +487,73 @@ class RRTPlanner:
         a_nodes, a_arr, a_par = s_nodes, s_arr, s_par
         b_nodes, b_arr, b_par = g_nodes, g_arr, g_par
 
-        for _ in range(self.max_iter):
+        # Diagnostics (read by callers after plan()): distinguishes a SPEED failure (few
+        # iterations reached before the time/iter budget, per-check cost dominating) from a
+        # CONNECTIVITY failure (all iters ran, trees grew large but never met — a narrow
+        # passage). _isfree_ms/_isfree_n time the collision check that dominates cost.
+        self.last_iters = 0
+        self._isfree_ms = 0.0
+        self._isfree_n = 0
+        self.first_step_block = None   # diagnostic: why the first extension is rejected
+
+        # DIAGNOSTIC: probe one steered step from each root toward the other root and, if it
+        # is rejected, name the first blocking (finger/arm geom, object/obstacle geom) pair.
+        # A tree frozen at 1 node means every _extend is 'trapped' — this says exactly which
+        # collision pair does it (e.g. a curling finger hitting the object, or arm vs table).
+        try:
+            _probe_from, _probe_to = q_start, q_goal
+            _q_step = self._steer(_probe_from, _probe_to)
+            if not self._is_free(_q_step):
+                self._data.qpos[:self._n_robot] = _q_step
+                mujoco.mj_kinematics(self.model, self._data)
+                lb = self._pair_lower_bounds(); _ft = np.zeros(6); _worst = None
+                for i, j in zip(*np.nonzero(lb < self._clr_mat)):
+                    fg, og = int(self._fg_arr[i]), int(self._og_arr[j])
+                    d = mujoco.mj_geomDistance(self.model, self._data, fg, og, 10.0, _ft)
+                    if d < self._clr_mat[i, j] and (_worst is None or d < _worst[2]):
+                        _worst = (fg, og, float(d))
+                if _worst is not None:
+                    _nm = lambda g: mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, g) or g
+                    fg, og = _worst[0], _worst[1]
+                    # PHANTOM CHECK: mj_geomDistance box-box can spuriously return ~0 for
+                    # well-separated pairs (GJK instability). Cross-check against the TRUE
+                    # geometry: the finger geom's world center, the object/obstacle box's
+                    # world AABB, and the analytic point-to-box distance from the finger
+                    # center to that box. If mj says ~0 but the finger center is clearly
+                    # outside the box (analytic dist >> 0), it's a phantom, not a real hit.
+                    fc = self._data.geom_xpos[fg].copy()
+                    oc = self._data.geom_xpos[og].copy()
+                    os_ = self.model.geom_size[og].copy()
+                    otype = int(self.model.geom_type[og])
+                    # box surface distance from finger center (box frame), if og is a box
+                    analytic = None
+                    if otype == mujoco.mjtGeom.mjGEOM_BOX:
+                        R = self._data.geom_xmat[og].reshape(3, 3)
+                        loc = R.T @ (fc - oc)                 # finger center in box frame
+                        outside = np.maximum(np.abs(loc) - os_, 0.0)
+                        analytic = float(np.linalg.norm(outside))  # >0 iff center outside box
+                    self.first_step_block = {
+                        'finger': _nm(fg), 'obj': _nm(og),
+                        'mj_dist_mm': round(_worst[2] * 1e3, 2),
+                        'analytic_center_to_box_mm': (round(analytic * 1e3, 2)
+                                                      if analytic is not None else None),
+                        'finger_xyz': [round(v, 3) for v in fc],
+                        'obj_box_center': [round(v, 3) for v in oc],
+                        'obj_box_half': [round(v, 3) for v in os_],
+                    }
+                    _ph = (analytic is not None and _worst[2] < 1e-4 and analytic > 0.02)
+                    print(f"[RRT] first step blocked: {_nm(fg)} vs {_nm(og)}  "
+                          f"mj={_worst[2]*1e3:.1f}mm  "
+                          f"analytic(center->box)={'?' if analytic is None else f'{analytic*1e3:.1f}mm'}"
+                          f"{'  <-- PHANTOM (mj lies)' if _ph else ''}")
+                    print(f"       finger_xyz={self.first_step_block['finger_xyz']}  "
+                          f"box_center={self.first_step_block['obj_box_center']}  "
+                          f"half={self.first_step_block['obj_box_half']}")
+        except Exception:
+            import traceback; traceback.print_exc()
+
+        for _n_it in range(self.max_iter):
+            self.last_iters = _n_it + 1
             # Goal-biased sampling: with probability goal_bias, pull toward the opposite
             # tree's root rather than a random config — the main driver of convergence on
             # high-DOF chains where pure-random sampling rarely lands near the other tree.
@@ -375,8 +577,22 @@ class RRTPlanner:
                     # Unwrap circular joints FIRST (removes the 2pi jump where the two trees
                     # meet) so the subsequent linear densify/smooth take the short arc.
                     raw = self._unwrap_path(path_s + path_g)
-                    path = self._gauss_smooth(self._densify(self._smooth(raw)))
-                    print(f"[RRT] Found path: {len(path)} waypoints")
+                    _sc = self._smooth(raw)          # shortcut path (pre-densify)
+                    path = self._gauss_smooth(self._densify(_sc))
+                    self.last_start_tree = len(s_nodes)
+                    self.last_goal_tree = len(g_nodes)
+                    # Convolution diagnostics on the SHORTCUT path (arm joints only): a
+                    # straight path has ratio ~1.0; >1 means the shortcut left detours.
+                    _a = np.array(_sc)[:, :self._n_plan]
+                    _seg = float(np.linalg.norm(np.diff(_a, axis=0), axis=1).sum()) if len(_a) > 1 else 0.0
+                    _straight = float(np.linalg.norm(_a[-1] - _a[0])) if len(_a) > 1 else 0.0
+                    self.last_raw_wp = len(raw)
+                    self.last_shortcut_wp = len(_sc)
+                    self.last_conv_ratio = round(_seg / _straight, 3) if _straight > 1e-6 else None
+                    print(f"[RRT] Found path: {len(path)} wp "
+                          f"(raw={len(raw)} -> shortcut={len(_sc)} -> densified={len(path)}; "
+                          f"conv={self.last_conv_ratio}x; {self.last_iters} iters, "
+                          f"{self._isfree_n} checks, {self._isfree_ms/1e3:.1f}s)")
                     return path
 
             # Swap so both trees grow at roughly equal rates.
@@ -384,5 +600,13 @@ class RRTPlanner:
             a_arr,   b_arr   = b_arr,   a_arr
             a_par,   b_par   = b_par,   a_par
 
-        print(f"[RRT] Failed after {self.max_iter} iterations")
+        # Record final tree sizes so the caller can tell CONNECTIVITY failure (both trees
+        # grew large but never met) from a STUCK-goal-tree failure (goal tree ~1 node — it
+        # can't take a single valid step out of the grasp pose).
+        self.last_start_tree = len(s_nodes)
+        self.last_goal_tree = len(g_nodes)
+        _avg = (self._isfree_ms / self._isfree_n) if self._isfree_n else 0.0
+        print(f"[RRT] Failed after {self.max_iter} iters — trees start={len(s_nodes)} "
+              f"goal={len(g_nodes)}; {self._isfree_n} collision-checks, "
+              f"{self._isfree_ms/1e3:.1f}s in checks ({_avg:.3f}ms avg)")
         return None
