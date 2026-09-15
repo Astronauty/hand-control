@@ -1,62 +1,31 @@
 \subsection{Comparison against analytic grasp synthesis}
 \label{sec:frogger}
 
-\subsubsection{The min-weight metric, and how our formulation differs}
-\label{sec:minweight}
+\subsubsection{Relation to our formulation}
+\label{sec:frogger-relation}
 
-Both our planner and FRoGGeR~\cite{li2023frogger} score a grasp by the
-\emph{min-weight metric}. Let $W(q) \in \mathbb{R}^{6 \times m}$ be the primitive
-wrench matrix at configuration $q$, each column the object-frame wrench
-$[\boldsymbol{\tau}; \mathbf{f}]$ produced by a unit normal force along one generator
-of one contact's linearized friction cone, so that $m = n_c s$ for $n_c$ contacts and
-an $s$-sided cone. The metric is the value of
-%
-\begin{equation}
-\ell^*(q) \;=\; \max_{\boldsymbol{\alpha},\,\beta} \; \beta
-\quad \text{s.t.} \quad
-W(q)\boldsymbol{\alpha} = \mathbf{0}, \;\;
-\mathbf{1}^\top\boldsymbol{\alpha} = 1, \;\;
-\boldsymbol{\alpha} \ge \beta\mathbf{1},
-\label{eq:minweight}
-\end{equation}
-%
-with the normalized form $\bar{\ell}^* = m\,\beta$ comparable across cone sizes.
-Here $\boldsymbol{\alpha}$ is a convex combination of primitive wrenches that cancels
-to zero net wrench and $\beta$ is its smallest weight, so $\beta > 0$ holds exactly
-when the origin lies interior to the wrench hull---force closure---and its magnitude
-measures how robustly. Crucially $\boldsymbol{\alpha}$ is \emph{not} constrained
-non-negative: out of closure the optimum has $\beta < 0$ with some
-$\alpha_j < 0$, which is the correct value and keeps \eqref{eq:minweight} smoothly
-climbable rather than infeasible. This is what makes $\ell^*$ a usable objective
-where the Ferrari--Canny $\epsilon$ metric, whose gradient vanishes at closure, is
-not.
-
-The two methods use \eqref{eq:minweight} differently, and the difference is the
-subject of this comparison. FRoGGeR solves it as an inner problem to optimality at
-every iterate and maximizes $\ell^*(q)$ as its \emph{sole} objective, subject to a
-hard floor $\bar{\ell}^* \ge k_\ell$, with $q$ the only decision variable and
+Both planners score a grasp by the min-weight metric \eqref{eq:minweight}, so the
+comparison isolates how that metric is \emph{used} rather than which quantity is
+optimized. FRoGGeR solves \eqref{eq:minweight} as an inner problem to optimality at
+every iterate and maximizes it as the sole objective under a hard floor
+$m\beta^\star \ge k_\ell$, with the configuration as the only decision variable and
 contacts pinned to the surface by an equality on the forward kinematics. We instead
-\emph{embed} \eqref{eq:minweight}: $\boldsymbol{\alpha}$ and $\beta$ enter the
-nonlinear program as ordinary decision variables alongside $q$ and a two-degree-of-freedom
-surface coordinate per contact, with $W\boldsymbol{\alpha} = \mathbf{0}$ and
-$\mathbf{1}^\top\boldsymbol{\alpha} = 1$ as constraints, and $-\beta$ enters a
-weighted objective beside inverse-kinematics, regularization, and wrench-cone terms.
-The solver's KKT system then couples $\beta$ to $q$ and the contact coordinates
-directly, giving exact gradients without differentiating through a nested solve.
+embed it (Sec.~\ref{sec:closure}): $\bm{\alpha}$ and $\beta$ are program variables
+beside $\bm{q}$ and the patch coordinates $\bm{t}_i$, its equalities are constraints
+of \eqref{eq:nlp}, and $J_{\mathrm{gws}}$ is one weighted term among the placement,
+regularization and wrench-cone costs.
 
-The embedding buys robustness to initialization and costs metric convergence, and we
-report both. Because $\beta$ is one weighted term among several rather than the whole
-objective---and is outvoted at the margin, the inverse-kinematics term carrying the
-dominant placement gradient---$\beta$ equals the min-weight value only at
-convergence of the whole program. Re-solving \eqref{eq:minweight} exactly on the same
-$W$ at our returned iterate leaves a median optimality gap of $7.4 \times 10^{-3}$,
-nonzero on every solve measured, where FRoGGeR's inner problem closes it exactly by
-construction. Conversely, opposition between contacts is expressed in our objective
-and need not be supplied by the seed: FRoGGeR's \eqref{eq:minweight}-only objective
-contains no such preference, which is why its sampler pre-opens the fingers to the
-object's bounding-box width and why the authors report performance to be
-``highly sensitive to the sampled initial conditions.'' Our planner runs from a fixed
-home configuration with no sampler.
+The embedding trades metric convergence for robustness to initialization, and we
+report both directions. Because $\beta$ is one term rather than the whole objective,
+it attains the min-weight value only at convergence of the full program: re-solving
+\eqref{eq:minweight} exactly on the returned $\bm{W}$ leaves a median optimality gap
+of $7.4\times10^{-3}$, nonzero on every solve measured, where an inner solve closes it
+by construction. Conversely, opposition between contacts is expressed in our objective
+through $J_{\mathrm{align}}$ and $J_{\mathrm{gws}}$ and need not be supplied by the
+seed. A \eqref{eq:minweight}-only objective contains no such preference, which is why
+FRoGGeR's sampler pre-opens the fingers to the object's bounding-box width and why the
+authors report performance to be ``highly sensitive to the sampled initial
+conditions''; our planner runs from a fixed home configuration with no sampler.
 
 \subsubsection{Protocol}
 
@@ -212,24 +181,16 @@ $\bar{\ell}^*$ would have predicted them.
 
 \subsubsection{Which mechanisms account for the difference}
 
-Three components bear on the gap, each measured on \texttt{036\_wood\_block} unless
-noted. \textbf{Curvature is fitted to local mesh vertices rather than the SDF
-Hessian}, whose second derivative is global: mid-face where $\kappa = 0$, the Hessian
-reports up to \SI{9.05}{\per\meter} sourced from a corner \SI{50}{\milli\meter} away,
-and fake curvature of $-12.33$ collapsed a trust region to \SI{4.6}{\milli\meter} on
-a face with \SI{104}{\milli\meter} of usable surface. \textbf{Each contact carries
-explicit trust-region bounds}, sized per axis by marching outward until the
-paraboloid surrogate departs from the true signed distance by a tolerance, with
-bounds set by measured divergence distinguished from those merely reaching the search
-cap; this is where the margins of Table~\ref{tab:edge} originate, and a uniform
-corner shrink was needed to bring patch error from \SI{8.78}{\milli\meter} under its
-\SI{4}{\milli\meter} tolerance. \textbf{The commanded internal force is a
-task-specific certificate re-solved on achieved geometry}---an acceleration budget
-expanded into a force and torque box with gravity re-datumed about the contact
-centroid, infeasibility returning no grasp rather than a fabricated force---and its
-allocation is cone-constrained rather than sign-anchored, which on an asymmetric
-three-contact grasp gives normal forces of $[1.000, 1.000, 1.000]\,\si{\newton}$
-where sign-anchoring gives $[1.213, 0.047, 0.325]\,\si{\newton}$.
+Three components of Sec.~\ref{sec:method} bear on the gap. Fitting curvature to local
+mesh vertices rather than to the Hessian of the signed-distance field
+(Sec.~\ref{sec:contact-param}) avoids the spurious curvature a global field reports
+near an unrelated feature, which otherwise collapses the trust region on a flat face.
+The per-axis trust region \eqref{eq:trust}, which bounds each patch by where the
+surrogate departs from the true surface and distinguishes a measured boundary from an
+unprobed one, is what produces the edge margins of Table~\ref{tab:edge}. And the
+run-time squeeze is a task-specific certificate re-solved on achieved geometry rather
+than a program output, with the cone-constrained allocation \eqref{eq:cone-lp} keeping
+every contact loaded inside an inscribed friction cone.
 
 \subsubsection{Limitations}
 
