@@ -175,6 +175,31 @@ def _fmt_eps(v):
     return "--" if v is None else f"{1e3 * v:.2f}e-3"
 
 
+def _fingers_for_object(obj_id, fingers):
+    """Slot-ordered finger list for ONE object.
+
+    An explicit --fingers wins (operator intent beats the table). Otherwise the
+    per_object map in models/grasp_finger_config.json decides, falling back to
+    its default list. Without this the benchmark fell back to the module-level
+    SLOT_ROLES, which is resolved at IMPORT from the config default and cannot
+    see per_object -- so every object ran at thumb+index and the tripod
+    assignments were silently ignored. Mirrors _rec_fingers_for in
+    kinova_leap_pick_place.py so plan and execution agree in both harnesses.
+    """
+    parsed = _parse_fingers(fingers)
+    if parsed:
+        return list(parsed)
+    import json as _json
+    from simulation.grasp_config_builder import FINGER_CONFIG_PATH as _FCP
+    try:
+        raw = _json.loads(Path(_FCP).read_text())
+    except (OSError, ValueError):
+        return list(SLOT_ROLES)
+    roles = ((raw.get('per_object') or {}).get(obj_id)
+             or raw.get('fingers') or SLOT_ROLES)
+    return [r for r in roles if isinstance(r, str)]
+
+
 def _obj_hull_geom_ids(model, body_name):
     """Every collision-hull geom id of one object. Concave YCB objects are
     V-HACD decompositions (065-a_cups: 35 hulls), and a gap/contact test against
@@ -499,7 +524,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         _ov = plan_override(
             body_name=body_name, model=model, data=data, info=info,
             cfg_kw=dict(cfg_kw),
-            fingers=(_parse_fingers(fingers) or list(SLOT_ROLES)),
+            fingers=_fingers_for_object(object_id, fingers),
             seed=seed, pos=pos, q_home=q_home)
         # An arm may return a THIRD element: a result it already solved. FRoGGeR's
         # synthesis loop draws seeds until one yields a feasible grasp, so the
@@ -519,7 +544,14 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                                   cfg_kw.pop("obj_clearance_by_geom"),
                                   accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
                                   ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
-                                  fingers=fingers,
+                                  # RESOLVED per object, not the raw --fingers.
+                                  # Passing `fingers` (None when the flag is
+                                  # absent) let the PLANNER fall back to the
+                                  # config's DEFAULT list while the executor had
+                                  # already resolved per_object, so a tripod
+                                  # object planned 2 contacts and execution then
+                                  # died binding 3 slots to them.
+                                  fingers=_fingers_for_object(object_id, fingers),
                                   **cfg_kw)
         q_start = None
 
@@ -580,7 +612,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
     # built from _FSET so the squeeze monitors the fingers the NLP actually planned
     # for. Reading the module global here was the bug: it is resolved at import from
     # the config default and never sees --fingers.
-    _SLOTS = _parse_fingers(fingers) or list(SLOT_ROLES)
+    _SLOTS = _fingers_for_object(object_id, fingers)
     _FSET = list(reversed(_SLOTS))
     print(f"[fingers] slots={_SLOTS}  monitored order={_FSET}")
     tip_site_ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, FINGER_TIP_SITES[f])
