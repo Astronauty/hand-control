@@ -254,8 +254,8 @@ def _ball(c, r, n=22):
 
 
 def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
-                 box=None, scale=1.0, box_col="#238b45", alpha_w=None,
-                 axis_len=None):
+                 box=None, scale=1.0, box_col="#6a3d9a", alpha_w=None,
+                 axis_len=None, lim=None):
     """Convex hull of wrench columns in one 3-D subspace.
 
     ball  : draw the largest origin-centred ball inside the hull (Ferrari-Canny).
@@ -275,30 +275,6 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
         pass
 
     _pts = [P, np.zeros((1, 3))]
-    if alpha_w is not None:
-        # THE MIN-WEIGHT METRIC. beta = min(alpha) from
-        #     max beta  s.t.  W alpha = 0,  sum(alpha) = 1,  alpha >= beta
-        # so beta is carried by ONE column -- argmin(alpha) -- and that column
-        # is what the LP is pushing up. Marked here rather than drawn as a
-        # length: beta is a property of the WEIGHTS and has no radius in wrench
-        # space (unlike Ferrari-Canny, which does).
-        #
-        # NOT the vertex closest to the origin, which is a different column:
-        # measured here argmin(alpha) = 6 while argmin|w_i| = 4 in 6D (10 in
-        # force, 1 in torque), and corr(alpha, |w|) = 0.19. A column gets a
-        # small weight because of its DIRECTION relative to the others in
-        # W alpha = 0, not its length -- the four shortest columns (|w| = 1.004)
-        # are the soft-finger torsion ones and carry middling alpha.
-        aw = np.asarray(alpha_w, float)
-        _kb = int(np.argmin(aw))
-        _v = P[_kb]
-        ax.plot([_v[0]], [_v[1]], [_v[2]], "o", ms=5.0, color=col_hi,
-                mec="k", mew=0.6, zorder=10)
-        ax.plot(*zip(np.zeros(3), _v), "-", color=col_hi, lw=1.0, zorder=9)
-        _tp = _v * 1.17
-        ax.text(_tp[0], _tp[1], _tp[2], r"$\beta$", fontsize=AXLAB_PT,
-                color=col_hi, ha="center", va="center", zorder=11)
-
     if box is not None:
         b = np.asarray(box, float)
         sgn = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1)
@@ -310,7 +286,9 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
             ax.plot(*zip(C[i], C[j]), "-", color=box_col, lw=0.65, zorder=7)
         _pts.append(C)
 
-    _lim = np.vstack(_pts)
+    # SHARED LIMITS between (b) and (c) when given: the two panels only compare
+    # if one unit of length means the same thing in both.
+    _lim = np.vstack(_pts) if lim is None else np.asarray(lim, float)
     if axlab is not None:
         # PER-AXIS arm length: these hulls are strongly anisotropic, so one
         # global radius buries the arm along a wide direction and leaves the
@@ -335,34 +313,39 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
         ax.set_title(title, fontsize=TITLE_PT, pad=-4)
 
 
-def panel_b(fig, gs, W, alpha, beta):
-    """(b) GRASP WRENCH SPACE, split into its force and torque subspaces.
+def panel_b(fig, gs, W, alpha, beta, box_f=None, box_t=None, lim_f=None,
+            lim_t=None):
+    """(b) GRASP WRENCH SPACE at unit internal force, V(1).
 
     W is 6 x 6n and the wrench set lives in R^6, so it cannot be drawn directly.
     Projecting onto (fx,fy,fz) and (tx,ty,tz) is the honest reduction, and the
-    two need their OWN axes: the torque rows run 9-15x the force rows on this
-    grasp, so a shared scale collapses the force hull to a dot.
+    two need their own axes: the torque rows run 9-15x the force rows here, so
+    a shared scale collapses the force hull to a dot.
 
     ROW ORDER checked against the code, not assumed: build_W's _col() returns
     ca.vertcat(tau, f_O), so rows 0-2 are TORQUE and rows 3-5 are FORCE.
 
-    The shaded ball is the largest origin-centred ball inside each hull -- the
-    Ferrari-Canny epsilon restricted to that subspace. Force closure is the
-    origin being INTERIOR, so a visible ball is the certificate.
+    The TASK BOX is drawn here too, at the SAME scale and axis limits as panel
+    (c). That is the whole b->c story in one comparison: the box does NOT fit
+    inside V(1) and DOES fit inside V(gamma). Measured, the force inradius goes
+    1.0000 -> 4.3330 (exactly gamma) against a 4.0876 N box corner, so the unit
+    grasp cannot resist the disturbance and the scaled one can. An annotation
+    marking beta was tried instead and dropped: beta is a property of the
+    WEIGHTS and says nothing about this scaling.
     """
     sub = gs.subgridspec(2, 1, hspace=0.0)
     Wa = np.asarray(W, float)
     ax_f = fig.add_subplot(sub[0, 0], projection="3d")
     _wrench_hull(ax_f, Wa[3:, :].T, "", "#6baed6", "#2171b5",
-                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), alpha_w=alpha)
+                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), box=box_f, lim=lim_f)
     ax_t = fig.add_subplot(sub[1, 0], projection="3d")
     _wrench_hull(ax_t, Wa[:3, :].T, "", "#c7e9c0", "#238b45",
-                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), alpha_w=alpha)
+                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), box=box_t, lim=lim_t, box_col="#6a3d9a")
     return ax_f
 
 
-def panel_c(fig, gs, W, gamma, abox, angbox, mass, inertia,
-            ang_display=None):
+def panel_c(fig, gs, W, gamma, box_f=None, box_t=None, lim_f=None,
+            lim_t=None):
     """(c) GAMMA SCALING against the task disturbance box.
 
     Cone vertices scale LINEARLY in the internal force, V(gamma) = gamma * V(1),
@@ -381,27 +364,12 @@ def panel_c(fig, gs, W, gamma, abox, angbox, mass, inertia,
     g = float(gamma)
     ax_f = fig.add_subplot(sub[0, 0], projection="3d")
     _wrench_hull(ax_f, Wa[3:, :].T, "", "#fdd0a2", "#d94801",
-                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), scale=g,
-                 box=float(mass) * np.asarray(abox, float))
+                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), scale=g, box=box_f,
+                 lim=lim_f)
     ax_t = fig.add_subplot(sub[1, 0], projection="3d")
     _wrench_hull(ax_t, Wa[:3, :].T, "", "#fdd0a2", "#d94801",
                  axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), scale=g,
-                 box=np.asarray(inertia, float) * np.asarray(
-                     ang_display if ang_display is not None else angbox, float),
-                 box_col="#238b45")
-    # ang_display: the TRUE angular budget is 1 rad/s^2, which on this object
-    # (principal inertia ~1.3e-4 kg m^2) gives a 2.25e-4 N m box against a
-    # 0.79 N m gamma-scaled hull -- 5255x smaller, i.e. sub-pixel at the origin.
-    # That is the real measurement and it is the finding: FORCE sets gamma here
-    # (4.33 N hull inradius against a 4.09 N box corner) while torque has three
-    # orders of slack. For the FIGURE ONLY, --ang-display inflates the angular
-    # budget so the box is visible as a shape; it changes nothing the solver
-    # computed and must be stated in the caption when used.
-    # NOTE the torque box is ~2.2e-4 N m against a 0.279 N m scaled hull, i.e.
-    # three orders of magnitude inside it -- it collapses to a point at the
-    # origin at any shared scale. That is the finding, not a rendering bug:
-    # FORCE is what sets gamma on this grasp (4.33 N hull inradius against a
-    # 4.09 N box corner), and the caption should say so.
+                 box=box_t, lim=lim_t)
     return ax_f
 
 
@@ -422,7 +390,7 @@ def _iso(ax, P, elev=30, azim=-60):
     # azim ~138, which puts the handle BEHIND the cup -- rejected on the render.
     # (30, -60) shows the hole with both cones still reading as cones.
     ax.view_init(elev=elev, azim=azim)
-    try: ax.set_box_aspect(None, zoom=1.52)
+    try: ax.set_box_aspect(None, zoom=1.60)
     except TypeError: pass
 
 
@@ -468,19 +436,29 @@ def main():
     # Taller and tighter: (b)/(c) are 2-row subgrids, so the old 0.30 aspect
     # left each hull in a sliver. wspace 0 -- the panels carry their own
     # whitespace from the 3D axes' margins, so any grid spacing is additive.
-    fig = plt.figure(figsize=(COL_IN, COL_IN * 0.52))
+    # Boxes and axis limits computed ONCE and shared by (b) and (c): the
+    # comparison only reads if a unit of length is the same in both panels.
+    _ang = ((args.ang_display,) * 3 if args.ang_display else a[5])
+    _box_f = float(a[3]) * np.asarray(a[4], float)
+    _box_t = np.asarray(_inertia, float) * np.asarray(_ang, float)
+    _Wf, _Wt = np.asarray(r["gws_W"], float)[3:, :].T, np.asarray(r["gws_W"], float)[:3, :].T
+    _g = float(cap["gamma"])
+    _lim_f = np.vstack([_Wf * _g, -_Wf * _g, _box_f, -_box_f])
+    _lim_t = np.vstack([_Wt * _g, -_Wt * _g, _box_t, -_box_t])
+    fig = plt.figure(figsize=(COL_IN, COL_IN * 0.44))
     gs = GridSpec(1, 3, figure=fig, wspace=0.0)
     import traceback
     for _nm, _fn in (("a", lambda: panel_a(fig, gs[0, 0], pl, pl._planner.model,
                                           pl._planner.data, r)),
                      ("b", lambda: panel_b(fig, gs[0, 1], r["gws_W"],
                                           np.asarray(r["gws_alpha"]).flatten(),
-                                          float(r["gws_beta"]))),
-                     ("c", lambda: panel_c(fig, gs[0, 2], r["gws_W"], cap["gamma"],
-                                          a[4], a[5], a[3], _inertia,
-                                          ang_display=(
-                                              (args.ang_display,) * 3
-                                              if args.ang_display else None)))):
+                                          float(r["gws_beta"]),
+                                          box_f=_box_f, box_t=_box_t,
+                                          lim_f=_lim_f, lim_t=_lim_t)),
+                     ("c", lambda: panel_c(fig, gs[0, 2], r["gws_W"],
+                                          cap["gamma"],
+                                          box_f=_box_f, box_t=_box_t,
+                                          lim_f=_lim_f, lim_t=_lim_t))):
         try:
             _fn()
         except Exception:
@@ -492,12 +470,10 @@ def main():
                 label="index"),
          Line2D([], [], ls="", marker="x", ms=4.0, color="k", mew=1.0,
                 label="ray origin (volumetric centroid)"),
-         Line2D([], [], ls="", marker="s", ms=3.0, color="#238b45", mec="k",
+         Line2D([], [], ls="", marker="s", ms=3.0, color="#6a3d9a", mec="k",
                 mew=0.3,
                 label=r"task box  $m\mathbf{a}$ / $\mathbf{I}\boldsymbol{\alpha}$"),
-         Line2D([], [], ls="-", marker="o", ms=4.0, color="#2171b5", lw=1.0,
-                mec="k", mew=0.5,
-                label=r"$\beta = \min_i \alpha_i$  (min-weight column)")]
+         ]
     fig.legend(handles=h, loc="lower center", ncol=4, frameon=False,
                fontsize=LEG_PT, handletextpad=0.25, columnspacing=1.1,
                bbox_to_anchor=(0.5, -0.02))
@@ -505,17 +481,24 @@ def main():
     # is about. The per-plot titles were dropped -- the axis labels say which
     # subspace each hull is -- but the columns still need naming.
     for _x, _s in ((0.17, "(a) seeding"),
-                   (0.50, "(b) grasp wrench space"),
-                   (0.84, r"(c) $\gamma$ scaling vs task box")):
-        fig.text(_x, 0.955, _s, fontsize=TITLE_PT, ha="center", va="bottom")
+                   (0.50, r"(b) wrench set $V(1)$"),
+                   (0.84, r"(c) $V(\gamma)=\gamma\,V(1)$")):
+        fig.text(_x, 0.965, _s, fontsize=TITLE_PT, ha="center", va="bottom")
+    # The task box stated as the physical quantities it is, so the reader can
+    # check the arithmetic: m*a per axis, its corner, and the gamma that covers
+    # it. Without these the green/purple wireframe is an abstract shape.
+    _mm, _aa = float(a[3]), float(np.asarray(a[4], float)[0])
+    _bf = _mm * _aa
     fig.text(0.5, 1.005,
-             rf"{args.object.replace('_',' ')}    "
-             rf"$\beta$ = {float(r['gws_beta']):.3f}  "
-             rf"($\sum\alpha = 1$),    $\gamma$ = {cap['gamma']:.2f} N",
+             rf"{args.object.replace('_',' ')}:  $m$ = {_mm:.3f} kg,  "
+             rf"$a$ = {_aa:.0f} m/s$^2$  $\Rightarrow$  "
+             rf"$m a$ = {_bf:.2f} N/axis ({np.linalg.norm([_bf]*3):.2f} N corner);   "
+             rf"$\beta$ = {float(r['gws_beta']):.3f},  "
+             rf"$\gamma$ = {cap['gamma']:.2f} N",
              fontsize=TITLE_PT, ha="center", va="bottom")
     # top < 1 leaves the suptitle its own band; the panel titles sit at
     # pad=-2 inside their axes, so without this the two collide.
-    fig.subplots_adjust(left=0.0, right=1.0, top=0.955, bottom=0.05)
+    fig.subplots_adjust(left=0.0, right=1.0, top=0.97, bottom=0.035)
     out = Path(args.out or (REPO / "figures" /
                f"pipeline_{args.object}_s{args.seed}.pdf"))
     fig.savefig(out, format="pdf", dpi=600, bbox_inches="tight")
