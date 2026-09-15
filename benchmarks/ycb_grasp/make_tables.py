@@ -47,12 +47,20 @@ def exec_table(rows, n_contacts=2, mu=2.0):
                r"the convention of Li et al. $\uparrow$/$\downarrow$ denote whether "
                r"higher or lower is better. Pick success uses the shaky-pickup "
                r"criteria; \emph{held} additionally requires every fingertip to "
-               r"still carry load at the end of the lift.}" % (n_contacts, mu))
+               r"still carry load at the end of the lift. Rates are over all cells, "
+               r"not over those reaching the lift. \emph{FRoGGeR's low lift rate "
+               r"is an artifact of our port, not of their method}: their (7d) pins a "
+               r"fixed body-frame pad point to the surface, which on our fingertip "
+               r"leaves the pad 8--11\,mm clear of the object, and our executor's "
+               r"pre-squeeze gap gate rejects it. Their arm additionally draws 20 "
+               r"synthesis attempts against our single solve from a fixed home "
+               r"pose.}" % (n_contacts, mu))
     out.append(r"\label{tab:execution}")
-    out.append(r"\begin{tabular}{lccccc}")
+    out.append(r"\begin{tabular}{lcccccc}")
     out.append(r"\toprule")
-    out.append(r"method & \% planned $\uparrow$ & \% pick success $\uparrow$ & "
-               r"\% held $\uparrow$ & normalized $\bar{\ell}^*$ $\uparrow$ & "
+    out.append(r"method & \% planned $\uparrow$ & \% reached lift $\uparrow$ & "
+               r"\% pick success $\uparrow$ & \% held $\uparrow$ & "
+               r"normalized $\bar{\ell}^*$ $\uparrow$ & "
                r"time per grasp (s) $\downarrow$ \\")
     out.append(r"\midrule")
     for a in arms:
@@ -60,13 +68,19 @@ def exec_table(rows, n_contacts=2, mu=2.0):
         planned = [r for r in g if not r.get("plan_failed")
                    and r.get("l_bar") is not None]
         lifted = [r for r in g if "lift_done" in (r.get("phase_log") or "")]
+        # Success rates are quoted OVER ALL CELLS, not over the ones that happened
+        # to reach the lift. Conditioning on reaching it turns an arm that aborts
+        # 11 of 15 grasps into "25% success", which reads as a modest gap rather
+        # than the attrition it is. The "reached lift" column carries that
+        # attrition explicitly so neither reading is hidden.
         ps = sum(1 for r in lifted if r.get("pick_success"))
         lo = sum(1 for r in lifted if r.get("lift_ok"))
-        out.append("%s & %s & %s & %s & %s & %s \\\\" % (
+        out.append("%s & %s & %s & %s & %s & %s & %s \\\\" % (
             ARM_LABEL.get(a, a),
             _frac(len(planned), len(g)),
-            _frac(ps, len(lifted)),
-            _frac(lo, len(lifted)),
+            _frac(len(lifted), len(g)),
+            _frac(ps, len(g)),
+            _frac(lo, len(g)),
             _miqr([r.get("l_bar") for r in planned], "%.2f"),
             _miqr([r.get("t_total_s") for r in g], "%.1f")))
     out.append(r"\bottomrule")
