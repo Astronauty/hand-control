@@ -2160,7 +2160,7 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     # NO DOUBLE-COUNTING WITH bound_inset. This clip runs BEFORE the inset and
     # only ever MOVES A SIDE INWARD (min/max against the existing value), so the
     # inset that follows measures its reserve against the already-clipped room:
-    # _inset_for reads `_room = min(|lo|,|hi|)` from these post-clip values, and
+    # _cut reads each SIDE's own room from these post-clip values, and
     # its bound_keep_frac cap therefore applies to the real remaining room. The
     # two are sequential shrinks of the same interval, not two independent
     # subtractions of the same margin -- an axis clipped to the face edge then
@@ -2319,25 +2319,45 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     if bound_inset > 0.0:
         _keep = min(max(float(bound_keep_frac), 0.0), 1.0)
 
-        def _inset_for(kappa: float, lo: float, hi: float) -> float:
-            # CURVED axis: no inset at all. The paraboloid bends with the surface
-            # and the SDF-error search already shrank it where the fit degrades.
-            if float(kappa) != 0.0:
-                return 0.0
-            # PLANAR axis: the constant, capped so each side keeps _keep of itself.
-            # Capped per-SIDE (the tighter of the two) rather than on the total
-            # width, so the asymmetry the four searches measured is preserved --
-            # a side with 4mm of room cannot be handed the same absolute cut as
-            # the 90mm side opposite it.
-            _room = min(abs(lo), abs(hi))
-            return min(bound_inset, (1.0 - _keep) * _room) if _room > 0.0 else 0.0
+        def _cut(side_room: float) -> float:
+            """Crease reserve for ONE side of one axis, in metres.
 
-        _in0 = _inset_for(kappa0, t_lo_0, t_hi_0)
-        _in1 = _inset_for(kappa1, t_lo_1, t_hi_1)
-        t_lo_0 = min(t_lo_0 + _in0, 0.0)
-        t_hi_0 = max(t_hi_0 - _in0, 0.0)
-        t_lo_1 = min(t_lo_1 + _in1, 0.0)
-        t_hi_1 = max(t_hi_1 - _in1, 0.0)
+            APPLIES TO CURVED AXES TOO. This used to return 0.0 whenever
+            kappa != 0, reasoning that "the paraboloid bends with the surface
+            and the SDF-error search already shrank it where the fit degrades".
+            That fails for the case the inset exists to cover: the SDF criterion
+            asks whether the paraboloid still MATCHES the surface, and on a
+            curved object the answer stays yes right up to a rim or lip -- the
+            fit tracks the curvature until the surface ENDS. Same blind spot it
+            has on a box face, which is why bound_inset was introduced;
+            curvature hides it rather than removing it. Measured:
+            017_orange/014_lemon/009_gelatin_box carry kappa 19-47 and were
+            getting NO reserve on any axis.
+
+            TRULY PER-SIDE. The cap previously came from
+                _room = min(abs(lo), abs(hi))
+            i.e. ONE cut sized by the TIGHTER side and applied to BOTH -- the
+            opposite of what its comment claimed. Spending the tight side's
+            allowance on the wide side leaves the wide end under-reserved.
+            Measured on 025_mug slot 1: bounds [-34.39, +45.33]mm, so each side
+            lost 10mm and the contact still solved to t0 = +45.33, PINNED
+            exactly at the wide bound -- which on that patch is the mug's RIM.
+            The thumb then pressed straight down on the lip (outward normal
+            [-0.115, 0.303, 0.946], i.e. +z) while the other fingers pushed
+            sideways, and solve_gamma_live correctly refused the grasp.
+
+            Each side now reserves against ITS OWN room, so a 4mm side is capped
+            by its own 4mm and a 90mm side by its own 90mm.
+            """
+            _r = abs(float(side_room))
+            return min(bound_inset, (1.0 - _keep) * _r) if _r > 0.0 else 0.0
+
+        _lo0_cut = _cut(t_lo_0); _hi0_cut = _cut(t_hi_0)
+        _lo1_cut = _cut(t_lo_1); _hi1_cut = _cut(t_hi_1)
+        t_lo_0 = min(t_lo_0 + _lo0_cut, 0.0)
+        t_hi_0 = max(t_hi_0 - _hi0_cut, 0.0)
+        t_lo_1 = min(t_lo_1 + _lo1_cut, 0.0)
+        t_hi_1 = max(t_hi_1 - _hi1_cut, 0.0)
         # WARN when an axis still collapsed. With bound_keep_frac < 1 this should
         # be unreachable for a planar axis -- the cap leaves keep_frac of each
         # side -- so reaching it means the axis had essentially NO measured room
