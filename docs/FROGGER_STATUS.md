@@ -31,11 +31,14 @@ feasible grasp (IQR 1-6), and ours needs a median of 2 (IQR 1-6). That quantity 
 not tuned for — it falls out of the loop — so landing on theirs indicates the
 implementation behaves like the method.
 
-**Qualification 1: no execution scoring yet.** `benchmarks/ycb_grasp/shaky_pickup.py`
-implements their test but is not wired into the benchmark and has never run against a
-live grasp. FRoGGeR's headline claim is 78.8% PICK SUCCESS; `l_bar*` is only a proxy,
-and their own data shows it is noisy (0.61 for successes against 0.47 for failures).
-Nothing measured so far speaks to their actual claim.
+**Qualification 1: execution scoring now exists; the frogger arm mostly does not
+reach it.** `benchmarks/ycb_grasp/frogger_exec_bench.py` (2026-09-14) runs their shaky
+pickup against live grasps through the shared executor. Pilot result, 2 objects x 3
+seeds: `ours` reached the squeeze 6/6, `frogger` **1/6**, with five cells aborting at
+the gap gate on fingertip gaps of 8-11.5 mm -- the `frogger_pad_offset_m` of 0.011.
+Their (7d) pins a FIXED body-frame pad point to the surface while the gate measures the
+real tip-geom surface, so the solve is satisfied with the hand a centimetre away, and
+`l_bar*` reports +0.9996 on a grasp nobody is holding. See FROGGER_BENCH §9.
 
 **Qualification 2: solve times are not comparable.** Ours 2.4 s, frogger 17.5 s, but
 most of that is failing cells burning the full 60 s synthesis budget, which our
@@ -110,11 +113,17 @@ False in the preset too — see §4.
 
 ## 5. Not done
 
-1. **Execution scoring.** `shaky_pickup.py` written, not wired, never run. This is the
-   only thing that addresses their headline claim.
+1. **A pick-success RATE.** Execution scoring is wired (FROGGER_BENCH §9), but the
+   frogger arm reaches the lift in 1/6 pilot cells, so there is no rate to quote yet.
+   The pad-offset/gap-gate mismatch in §9.1 is the blocker, and it is a REACHABILITY
+   defect, not a grasp-quality one. Note also that their displacement-only criteria
+   scored a one-finger carry as a success (§9.2), so `pick_success` must be read
+   alongside `lift_ok`.
 2. **`n >= 3`.** The tripod sampler places three fingers and the solve leaves the floor
-   (+0.078), but the result is not a good grasp. Blocks the gelatin box's return and
-   any comparison at their contact count.
+   (+0.078), but the result is not a good grasp. Blocks the gelatin box's return, any
+   comparison at their contact count, AND the Ferrari-Canny `epsilon` column, which is
+   undefined at n = 2 (a pinch's wrench set is rank-5-of-6, so it contains no 6-ball --
+   FROGGER_BENCH §9.4).
 3. **Remaining finite-differenced paths.** The collision gradient is analytic; other
    callbacks are not, which is part of the remaining solve-time gap.
 

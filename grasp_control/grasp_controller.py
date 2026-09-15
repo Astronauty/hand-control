@@ -19,6 +19,17 @@ from grasp_control.grasp_map import SpatialGraspMapComputer
 from grasp_control.force_control import GraspForceAllocator
 
 
+def _peak_internal_normal(f_int, n_contacts, contact_dof=3):
+    """Largest per-contact NORMAL component of a stacked contact-force vector.
+
+    Contact frames in this repo put the inward normal in col0, and G's columns are
+    built in those same frames, so each contact's normal component is element 0 of
+    its own block. Used to normalise the internal force to unit peak normal, which
+    is what makes gamma mean newtons (see internal_force_torques)."""
+    f_int = np.asarray(f_int, float)
+    return max(abs(float(f_int[contact_dof * k])) for k in range(n_contacts))
+
+
 class GraspController:
     def __init__(self, model, n_robot, tip_site_ids, obj_site_ids, obj_body_id,
                  kp, kd, gamma=5.0, squeeze_pd_scale=1.0, transport_pd_scale=1.0,
@@ -26,7 +37,8 @@ class GraspController:
                  support_weight=False, pad_offsets=None,
                  grasp_map_computer=None, allocator=None,
                  obj_contact_provider=None, cone_gamma=True,
-                 cone_mu=0.7, cone_f_min=0.5, cone_margin=0.2):
+                 cone_mu=0.7, cone_f_min=0.5, cone_margin=0.2,
+                 gamma_ref=None, nullspace_tracking=False):
         """
         Args:
             model: MjModel.
@@ -45,11 +57,19 @@ class GraspController:
                 Used for NLP-recommended contacts that track the object body via
                 stored object-local offsets rather than authored sites.
             kp, kd: (n_robot,) PD gains for the q_target hold.
-            gamma: internal squeeze force scale (null-space weight); negate if
+            gamma: internal squeeze force -- the per-contact internal NORMAL force
+                in NEWTONS on the cone_gamma path, which normalises the null-space
+                force to unit peak normal before scaling. That is the contract
+                scripts/3D_minimum_NCF.py defines and solve_gamma_live solves
+                against, so a solved gamma can be commanded directly. (On the
+                sign-anchor fallback path it remains a raw null-space weight, since
+                that path has no cone solve to normalise against.) Negate if the
                 fingers pull apart (the inward_dirs anchor should prevent that).
             squeeze_pd_scale: multiplier on kp/kd over active_joint_slices while
                 squeezing — lower it (e.g. 0.25) if the finger PD fights the
-                squeeze and measured contact force falls short of gamma/sqrt(2).
+                squeeze and the measured contact force falls short of the
+                commanded gamma (which is now in newtons; the old 'gamma/sqrt(2)'
+                rule of thumb predates the normalisation fix).
             transport_pd_scale: multiplier used INSTEAD once set_transporting(True)
                 is called — i.e. while the grasp is bearing load rather than
                 closing. Defaults to 1.0 (full gains), because a softened finger
@@ -67,6 +87,21 @@ class GraspController:
                 correction anchors the centroid onto the object surface, a constant
                 phantom error that biases the fingers inward instead of only
                 countering true tangential slip.
+            gamma_ref: the gamma that kp/kd were tuned at. When set, the finger
+                gains are additionally scaled by gamma/gamma_ref, so the PD keeps
+                a CONSTANT ratio of authority against the internal force instead
+                of being a constant absolute stiffness. This is what makes a gain
+                tuned once survive a change in gamma (e.g. a new disturbance
+                budget); see effective_gains for the measured failure boundary.
+                None (default) keeps the legacy absolute-gain behaviour.
+            nullspace_tracking: apply FRoGGeR's eq. (18) projector
+                (I - Jh^T (Jh^T)^dagger) to the TRACKING torque while squeezing, so
+                tracking cannot push the fingertips across the object's surface.
+                Their stated purpose is that applying the tracking torques "does not
+                change the contact positions between the hand and object". Scoped to
+                the finger columns so the arm jog is unaffected, matching their note
+                that the projection leaves the arm torques alone. Default False:
+                every existing result was measured without it.
             grasp_map_computer / allocator: injected for testability.
         """
         self.model = model
@@ -101,6 +136,11 @@ class GraspController:
         self.cone_f_min  = float(cone_f_min)
         self.cone_margin = float(cone_margin)
         self.last_cone_info = None
+        # Gamma the kp/kd above were tuned at. None = absolute gains (legacy).
+        self.gamma_ref = None if gamma_ref is None else float(gamma_ref)
+        # FRoGGeR eq. (18): project the tracking torque out of the hand
+        # Jacobian's range while squeezing. Off by default -- see compute().
+        self.nullspace_tracking = bool(nullspace_tracking)
 
         self.q_target = None
         self.squeeze = False
@@ -162,11 +202,56 @@ class GraspController:
         tuning above -- that measurement was of grip force DURING the squeeze,
         which is a different quantity from force RETENTION under load.
 
+        GAMMA-REFERENCED SCALING (gamma_ref). Both tunings above were measured at
+        one squeeze magnitude, so they are really ratios masquerading as absolute
+        gains. The finger PD and the internal force act on the SAME joints in
+        opposition:
+
+            tau_finger = kp * (q_target - q)  +  J^T (R f_c)
+                         \______ PD ______/     \___ squeeze ___/
+
+        and |f_c| scales with gamma. Only their RATIO decides whether the tips stay
+        on the planned contacts, so a gain that is right at one gamma is wrong by
+        that same factor at another.
+
+        Measured on 036_wood_block seed 2 (after the equilibrium-scaling fix but
+        BEFORE the gamma normalisation, so these gammas are in the old inflated
+        units), lift_ok at squeeze_pd_scale=1.0:
+
+            gamma   kp=0.8   kp=3.0   kp=20.0
+              1.0     ok       --        --
+              4.0     ok       --        --
+              8.0     ok       ok        --
+             12.0   FAIL       ok        ok
+
+        Setting gamma_ref pins the ratio: gains are multiplied by gamma/gamma_ref,
+        so the PD keeps constant authority against the squeeze.
+
+        STILL NEEDED AFTER THE NORMALISATION FIX, for a reason worth being precise
+        about. Normalising made gamma mean newtons, which removed the mass-driven
+        unit drift -- but it did NOT make one absolute finger gain sufficient,
+        because how much PD authority a given geometry has against a given squeeze
+        still varies per grasp. 036_wood_block seed 1 is the case: at the solved
+        gamma=25.9 with absolute gains the object never moves and the force tracks
+        the command (16-20 N), yet |tau_int| runs ~60x |tau_pd| and the tips creep
+        2 -> 15 mm off the planned contacts until the grasp slides off (fn 0.0).
+        With gamma_ref=1.0 the same seed lifts at that gamma (20.7/22.0 N). Seed 2
+        of the same object does not need it. So this is about PD authority per
+        grasp, not about gamma's units -- which is why fixing the units did not
+        retire it.
+        Left None the behaviour is exactly as before, so existing callers and
+        their tuned constants are unaffected.
+
         Public so callers that hand-roll their own PD (e.g.
         kinova_leap_pick_place's GRASP phase) get the same gains compute() uses.
         """
         scale = (self.transport_pd_scale if self.transporting
                  else self.squeeze_pd_scale if self.squeeze else 1.0)
+        # Track the commanded squeeze magnitude, so a gain tuned at gamma_ref
+        # keeps the same authority at any other gamma.
+        if self.gamma_ref is not None:
+            g_cmd = float(np.max(np.atleast_1d(self.allocator.gamma)))
+            scale *= max(g_cmd, 1e-9) / self.gamma_ref
         if scale == 1.0:
             return self.kp, self.kd
         kp, kd = self.kp.copy(), self.kd.copy()
@@ -198,12 +283,57 @@ class GraspController:
         kp, kd = self.effective_gains()
         tau[:n] = kp * (self.q_target - data.qpos[:n]) + kd * (0 - data.qvel[:n])
 
+        # FRoGGeR's eq. (18) structure: the TRACKING term is projected into the null
+        # space of the hand Jacobian before the contact-force term is added, so
+        # "applying them does not change the contact positions between the hand and
+        # object" (their App. B). Our tracking PD is otherwise free to push along
+        # directions that move the fingertips across the object's surface, which is
+        # what the squeeze then has to fight -- hence squeeze_pd_scale, which solves
+        # the same problem by weakening tracking everywhere rather than only where
+        # it conflicts.
+        #
+        # Off by default: every existing tabletop result was measured without it,
+        # and the projector changes the hold's behaviour, not just its numbers.
+        if self.squeeze and self.nullspace_tracking:
+            tau[:n] = self._project_out_contact_dirs(data, tau[:n])
+
         if self.squeeze:
             tau[:n] += self.internal_force_torques(data)
 
         # Gravity/bias compensation for the robot chain only.
         tau[:n] += data.qfrc_bias[:n]
         return tau
+
+    def _project_out_contact_dirs(self, data, tau_n):
+        """(I - Jh^T (Jh^T)^dagger) tau -- FRoGGeR's eq. (18) projector.
+
+        Jh stacks the fingertip translational Jacobians of the GRASPING fingers
+        (3*n_contacts x n_robot). Left-multiplying by the projector removes exactly
+        the component of the tracking torque that would produce fingertip motion,
+        leaving everything orthogonal to it untouched.
+
+        Scoped to the FINGER columns (active_joint_slices). The paper notes "this
+        projection does not affect the arm torques at all" -- true for them because
+        Jh there is the HAND Jacobian and the arm lives outside it. Our J_list is
+        built over all n_robot columns, so the arm columns would otherwise be
+        projected too, which would fight the resolved-rate jog that carries the
+        object. Restricting the projector to the finger columns reproduces their
+        intent on our kinematics.
+        """
+        import numpy as _np
+        n = self.n_robot
+        cols = _np.concatenate([_np.arange(a, b)
+                                for (a, b) in self.active_joint_slices])
+        Jh = _np.zeros((3 * len(self.tip_site_ids), len(cols)))
+        for k, sid in enumerate(self.tip_site_ids):
+            Jk = _np.zeros((3, self.model.nv))
+            mj.mj_jacSite(self.model, data, Jk, None, sid)
+            Jh[3 * k:3 * k + 3, :] = Jk[:3, cols]
+        JhT = Jh.T                                   # (len(cols) x 3*nc)
+        P = _np.eye(len(cols)) - JhT @ _np.linalg.pinv(JhT)
+        out = _np.array(tau_n, float)
+        out[cols] = P @ out[cols]
+        return out
 
     def slip_correction_torques(self, data, kp=200.0, f_max=10.0):
         """Anchor each fingertip to its object contact site:
@@ -291,9 +421,32 @@ class GraspController:
         # frames put the inward normal in col0, and G's columns are built in those
         # same frames, so the per-contact normal is [1,0,0] by construction.
         #
-        # gamma_scale carries the caller's commanded squeeze magnitude: the LP
-        # returns the MINIMUM in-cone force (peak normal = cone_f_min), and the
-        # configured gamma scales it up to the force actually wanted.
+        # gamma carries the caller's commanded squeeze magnitude. The LP returns a
+        # MINIMAL in-cone allocation whose peak normal force is cone_f_min, and
+        # gamma says how hard to actually squeeze.
+        #
+        # Only the INTERNAL (null-space) part may be scaled. f_c splits as
+        #
+        #     f_c = pinv(G) w_des  +  N gamma_LP
+        #           \__________/     \________/
+        #            equilibrium       internal
+        #
+        # and only the second term is wrench-neutral (G N = 0). The first term is
+        # what holds the object in equilibrium -- with support_weight it IS the
+        # object's weight -- so multiplying the WHOLE vector by gamma/f_min (as
+        # this did) commands a net object wrench gamma/f_min times gravity. At the
+        # post-budget-change gamma=12 on 036_wood_block that is a 24x amplifier:
+        # the commanded support force became 171.6 N on a 7.15 N block and the
+        # squeeze ejected it (object z 0.625 -> 0.978 m, tips drifting ~190 mm off
+        # the planned grasp, measured contact force 0.0 N because nothing was left
+        # to touch). No PD gain can oppose that -- it is a wrench applied to the
+        # OBJECT, not a torque the fingers fight: sweeping finger_kp 0.8 -> 80 at
+        # gamma=12 left the measured force at exactly 0.0 N throughout.
+        #
+        # Scaling only the null-space term keeps G f_c == w_des for every gamma, so
+        # the equilibrium the allocation was solved for is invariant to the squeeze
+        # magnitude, and gamma means "peak INTERNAL normal force (N)" -- a physical
+        # unit that does not shift when the disturbance budget changes.
         f_c = None
         if self.cone_gamma:
             _g_cmd = float(np.max(np.atleast_1d(self.allocator.gamma)))
@@ -303,8 +456,29 @@ class GraspController:
                 mu=self.cone_mu, f_min=self.cone_f_min, margin=self.cone_margin)
             self.last_cone_info = _info
             if _gam is not None:
-                _f_min_used = max(self.cone_f_min, 1e-9)
-                f_c = scale * (_g_cmd / _f_min_used) * np.asarray(_info['f_c'], float)
+                _f_eq = np.linalg.pinv(G) @ w_des        # equilibrium part: never scaled
+                _f_int = np.asarray(_info['f_c'], float) - _f_eq   # == N @ gamma_LP
+                # NORMALISE the internal part to UNIT peak normal force, so gamma
+                # multiplies a unit vector and therefore IS the commanded peak
+                # internal normal force in newtons -- the contract
+                # scripts/3D_minimum_NCF.py defines and solve_gamma_live solves
+                # against (it passes ncf=[1.0]*n; see _peak_internal_normal).
+                #
+                # This replaces dividing by cone_f_min, which assumed
+                # |f_int| == cone_f_min. It is not: solve_gamma_cone minimises the
+                # PEAK normal force subject to f_min at EVERY contact, so once
+                # w_des != 0 the equilibrium part already loads one contact and the
+                # internal correction needed to bring the others up to f_min grows
+                # with w_des. Measured peak |f_int| against an f_min of 0.5:
+                # 0.745 / 0.976 / 2.364 / 4.076 N at object weights 0.49 / 0.95 /
+                # 3.73 / 7.15 N. Dividing by f_min therefore under-normalised by a
+                # factor that TRACKED OBJECT MASS, inflating gamma 1.5x (014_lemon)
+                # to 8.2x (036_wood_block) -- which is why the block commanded ~98 N
+                # of internal force at gamma=12 and measured ~55 N where friction
+                # needs ~19 N. See tests/test_gamma_is_newtons.py.
+                _pk = _peak_internal_normal(_f_int, len(contacts))
+                if _pk > 1e-9:
+                    f_c = scale * (_f_eq + _g_cmd * (_f_int / _pk))
         if f_c is None:
             # Fall back to the sign-anchor path: either cone_gamma is off, or the
             # LP found no compressive in-cone force for this geometry (which is a

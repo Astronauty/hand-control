@@ -10,6 +10,13 @@
   "fingers": ["thumb", "index"],
 
   "per_object": {
-    "_comment": "Overrides the default list for one YCB id, e.g. \"036_wood_block\": [\"thumb\", \"index\", \"middle\"]. Empty by default -- add an entry only where measurement justifies it."
+    "_comment": "Overrides the default list for one YCB id. Read by load_finger_config() and consulted by BOTH the benchmark and the live teleop, so an object grasps the same way in either. Shape drives the choice: a SPHEROID is fully constrained by an antipodal pinch and a third contact only adds a finger to collide with, while a BOX has flat faces where the third contact buys a real off-axis moment arm.",
+
+    "_comment_measured": "MEASURED 2026-09-14, 6 objects x 3 seeds x 2 arms, full execution, force-closure criterion (every finger loaded + real lift). Tripod 3/3 on 009_gelatin_box and 3/3 on 036_wood_block; tripod 0/3 on all three spheroids (014_lemon, 017_orange, 056_tennis_ball) where the pinch is 3/3, 3/3, 3/3. The spheroids still reach the bin at n=3 (5/9) but as a CAGING grasp with one finger unloaded -- task success without force closure.",
+
+    "_comment_mug": "025_mug is left on the PINCH. It is the one object that fails both ways (1/3 either arm) and its failure is upstream of the finger count: the seeder puts the thumb contact on the RIM, pressing straight down (outward normal +z) while the other fingers push sideways, and solve_gamma_live correctly refuses that geometry. Adding a finger does not fix a contact that is in the wrong place.",
+
+    "036_wood_block": ["thumb", "index", "middle"],
+    "009_gelatin_box": ["thumb", "index", "middle"]
   }
 }

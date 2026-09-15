@@ -69,6 +69,8 @@ from kinova_common.constants import (FINGER_CODE, FINGER_SET,                   
                                      finger_joint_slices)
 from kinova_common.grasp_plots import write_grasp_plots                         # noqa: E402
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
+from simulation.epsilon_metric import (epsilon_quality,                        # noqa: E402
+                                       epsilon_subspace)
 from simulation.grasp_config_builder import (parse_fingers as _parse_fingers,    # noqa: E402
                                              for_gws_recommender,
                                              for_ablation_default,
@@ -158,6 +160,45 @@ NCF_ACCEL_BUDGET_XYZ = (JOG_ACCEL_BUDGET_MPS2,) * 3
 NCF_ANG_ACCEL_BUDGET = (1.0, 1.0, 1.0)
 JOG_VEL_MAX_MPS = 0.3           # teleop's JOG_VEL peak-speed cap (m/s)
 
+# The shaky protocol's own lift height, imported rather than restated so the
+# lift_ok threshold and the executed trajectory cannot drift apart.
+from ycb_grasp.shaky_pickup import LIFT_HEIGHT_M as SHAKY_LIFT_M   # noqa: E402
+
+
+def _fmt_eps(v):
+    """Epsilon in the paper's units (x1e3), or a marker when it is undefined.
+
+    None is NOT formatted as 0: at n=2 the wrench set is rank-deficient and
+    epsilon does not exist, which is a different statement from "epsilon is zero"
+    (a grasp exactly on the closure boundary). See simulation/epsilon_metric.py.
+    """
+    return "--" if v is None else f"{1e3 * v:.2f}e-3"
+
+
+def _fingers_for_object(obj_id, fingers):
+    """Slot-ordered finger list for ONE object.
+
+    An explicit --fingers wins (operator intent beats the table). Otherwise the
+    per_object map in models/grasp_finger_config.json decides, falling back to
+    its default list. Without this the benchmark fell back to the module-level
+    SLOT_ROLES, which is resolved at IMPORT from the config default and cannot
+    see per_object -- so every object ran at thumb+index and the tripod
+    assignments were silently ignored. Mirrors _rec_fingers_for in
+    kinova_leap_pick_place.py so plan and execution agree in both harnesses.
+    """
+    parsed = _parse_fingers(fingers)
+    if parsed:
+        return list(parsed)
+    import json as _json
+    from simulation.grasp_config_builder import FINGER_CONFIG_PATH as _FCP
+    try:
+        raw = _json.loads(Path(_FCP).read_text())
+    except (OSError, ValueError):
+        return list(SLOT_ROLES)
+    roles = ((raw.get('per_object') or {}).get(obj_id)
+             or raw.get('fingers') or SLOT_ROLES)
+    return [r for r in roles if isinstance(r, str)]
+
 
 def _obj_hull_geom_ids(model, body_name):
     """Every collision-hull geom id of one object. Concave YCB objects are
@@ -186,7 +227,7 @@ def _jog_steps(distance_m, speed_mps, dt):
 
 def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
             obj_bid=None, tip_geom_ids=None, obj_gid=None, label="jog",
-            finger_set=None):
+            finger_set=None, obj_geom_ids=None):
     """Resolved-rate DLS jog driven by a per-step world-frame palm twist.
 
     Same singularity-robust pattern as pick_from_floor._run_lift_jog (JOG_SING_EPS
@@ -238,7 +279,8 @@ def _jog_to(model, data, ctrl, q_cmd, v6_fn, n_steps, _sync, palm_bid,
         _sync()
 
         if tip_geom_ids is not None and obj_gid is not None:
-            f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+            f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                     obj_geom_ids=obj_geom_ids)
             for fname, force in zip(_fset, f):
                 if force <= 1e-6:
                     contact_lost[fname] = True
@@ -263,9 +305,28 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                    quad_sym_normals=False, seed_rank_pool=1, backend=None,
                    impratio=None, gamma_override=None,
                    squeeze_pd_scale=0.25, finger_kp=0.8, finger_kd=0.05,
+                   gamma_ref=1.0,
                    lift_speed=LIFT_SPEED_MPS, transport_speed=TRANSPORT_SPEED_MPS,
-                   contact_profile="stock", fingers=None, force_execute=False):
-    """Plan + execute one grasp on one object, then carry it to the bin."""
+                   contact_profile="stock", fingers=None, force_execute=False,
+                   release_open_frac=0.5,
+                   lift_mode="standard", plan_override=None,
+                   nullspace_tracking=False, gap_tol_m=None):
+    """Plan + execute one grasp on one object, then carry it to the bin.
+
+    lift_mode : "standard" (default) runs this benchmark's own 12 cm lift, scored
+        by `lift_ok`. "shaky" substitutes FRoGGeR's execution test -- 10 cm in 1 s,
+        hold 1.5 s, 3 mm sinusoid in all axes -- and additionally reports
+        `pick_success` under their failure criteria. Only the LIFT changes; every
+        earlier phase is identical, so the two modes are comparable up to the lift.
+
+    plan_override : optional callable supplying (cfg, q_start) for an ALTERNATE
+        planner arm, so it can be executed and scored down this same path. Called
+        with keywords (body_name, model, data, info, cfg_kw, fingers, seed, pos,
+        q_home); `cfg_kw` carries this benchmark's assembled knobs for the arm to
+        extend. Return q_start=None to keep the HOME start. None (default) uses
+        `for_gws_recommender` from HOME, which is what every existing tabletop
+        result was measured with -- that path is unchanged.
+    """
     rng = np.random.default_rng(seed)
     t_build = time.time()
     model, data, info = TS.build([object_id], impratio=impratio)
@@ -446,13 +507,53 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
     # models/grasp_finger_config.json holds for this object (or its default list).
     # ORDER MATTERS: slot 1 anchors the antipodal seed march. The preset applies it
     # with setdefault, so every CLI/env override above still wins.
-    cfg = for_gws_recommender(body_name,
-                              cfg_kw.pop("arm_geom_names"),
-                              cfg_kw.pop("obj_clearance_by_geom"),
-                              accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
-                              ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
-                              fingers=fingers,
-                              **cfg_kw)
+    # PLAN OVERRIDE: let a caller supply the config and the start pose, so an
+    # ALTERNATE PLANNER ARM can be executed down this same path. Everything after
+    # the solve -- gamma, squeeze, lift, scoring -- is then shared by construction,
+    # which is the property a between-arm execution comparison needs. Without this
+    # the preset and the HOME start are hardcoded, so only `ours` was executable
+    # and the FRoGGeR arm stopped at the planner.
+    #
+    # The hook takes the assembled cfg_kw so an arm inherits this benchmark's tuned
+    # seeding/solver knobs and overrides only what its formulation requires.
+    if plan_override is not None:
+        # PARSED slot list, not the raw comma-string `fingers` arrives as. The
+        # override needs the same ordered role list `_SLOTS` is built from below;
+        # handing it the string made `FINGER_TIP_SITES[r]` iterate CHARACTERS
+        # (KeyError: 't').
+        _ov = plan_override(
+            body_name=body_name, model=model, data=data, info=info,
+            cfg_kw=dict(cfg_kw),
+            fingers=_fingers_for_object(object_id, fingers),
+            seed=seed, pos=pos, q_home=q_home)
+        # An arm may return a THIRD element: a result it already solved. FRoGGeR's
+        # synthesis loop draws seeds until one yields a feasible grasp, so the
+        # accepted grasp belongs to a specific attempt; re-solving from a re-drawn
+        # seed does NOT reproduce it (measured: contacts 345-484 mm from the hand
+        # where the accepted attempt had them on the object). Executing the
+        # accepted result directly is the only faithful reading of their protocol.
+        _pre_res = None
+        if isinstance(_ov, tuple) and len(_ov) == 3:
+            cfg, q_start, _pre_res = _ov
+        else:
+            cfg, q_start = _ov
+    else:
+        _pre_res = None
+        cfg = for_gws_recommender(body_name,
+                                  cfg_kw.pop("arm_geom_names"),
+                                  cfg_kw.pop("obj_clearance_by_geom"),
+                                  accel_budget_xyz=NCF_ACCEL_BUDGET_XYZ,
+                                  ang_accel_budget_xyz=NCF_ANG_ACCEL_BUDGET,
+                                  # RESOLVED per object, not the raw --fingers.
+                                  # Passing `fingers` (None when the flag is
+                                  # absent) let the PLANNER fall back to the
+                                  # config's DEFAULT list while the executor had
+                                  # already resolved per_object, so a tripod
+                                  # object planned 2 contacts and execution then
+                                  # died binding 3 slots to them.
+                                  fingers=_fingers_for_object(object_id, fingers),
+                                  **cfg_kw)
+        q_start = None
 
     log_dir = None
     if out_dir is not None:
@@ -467,9 +568,19 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
     # (qref_restart_sigma_*). Leaving this unset made every --seed produce a
     # byte-identical trajectory, which silently turned a 3-seed sweep into one
     # sample repeated three times.
+    #
+    # A plan_override arm may supply its own start pose: FRoGGeR's (7a) has no IK
+    # or alignment term, so nothing in its objective prefers opposed contacts --
+    # that preference lives entirely in its heuristic sampler, which is why the
+    # paper describes the sampler as part of the method. Starting it from HOME
+    # would handicap it for a reason unrelated to the formulation under test.
     planner = MultiStartGraspPlanner3D(model, data, cfg, log_dir=log_dir, seed=seed)
     t0 = time.time()
-    res = planner.solve(q_home, np.asarray(pos, float), max_seeds=cfg.n_seeds)
+    if _pre_res is not None:
+        res = _pre_res                      # the attempt synthesis accepted
+    else:
+        res = planner.solve(np.asarray(q_home if q_start is None else q_start, float),
+                            np.asarray(pos, float), max_seeds=cfg.n_seeds)
     t_solve = time.time() - t0
     print(f"[plan] status={res.get('status')} rs={res.get('return_status')} "
           f"iterations={res.get('iterations')}  ({t_solve * 1e3:.0f}ms)")
@@ -501,7 +612,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
     # built from _FSET so the squeeze monitors the fingers the NLP actually planned
     # for. Reading the module global here was the bug: it is resolved at import from
     # the config default and never sees --fingers.
-    _SLOTS = _parse_fingers(fingers) or list(SLOT_ROLES)
+    _SLOTS = _fingers_for_object(object_id, fingers)
     _FSET = list(reversed(_SLOTS))
     print(f"[fingers] slots={_SLOTS}  monitored order={_FSET}")
     tip_site_ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE, FINGER_TIP_SITES[f])
@@ -601,6 +712,35 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
               f"n1.n2={float(_n1 @ _n2):+.3f} "
               f"span={np.linalg.norm(np.asarray(res['p2'], float) - np.asarray(res['p1'], float)) * 1000:.1f}mm")
 
+    # FERRARI-CANNY EPSILON, the quality column FRoGGeR's Table I reports next to
+    # the normalized min-weight metric. Scored from `rec_local` -- the SAME contact
+    # geometry the gamma certificate is solved on, in the same object frame with the
+    # same inward-normal convention -- so the two numbers cannot describe different
+    # grasps. At a FIXED gamma=1.0 by design: epsilon scales linearly in gamma, so
+    # scoring at each run's own solved gamma would confound grasp geometry with how
+    # hard that run decided to squeeze. See simulation/epsilon_metric.py.
+    #
+    # Expect `degenerate` at n=2: a pinch's wrench set is rank-5-of-6 and contains
+    # no 6-ball. That is a structural property of two contacts, not a failure, and
+    # it is why the paper's epsilon column is a four-finger number.
+    try:
+        _eps = epsilon_quality([p for p, _ in rec_local],
+                              [R for _, R in rec_local],
+                              [float(model.geom_friction[
+                                  planner._planner._obj_gid, 0])] * len(rec_local),
+                              gamma=1.0)
+        result["epsilon"] = _eps.get("epsilon")
+        result["epsilon_degenerate"] = _eps.get("degenerate")
+        result["epsilon_force_sub"] = epsilon_subspace(
+            [p for p, _ in rec_local], [R for _, R in rec_local],
+            [float(model.geom_friction[planner._planner._obj_gid, 0])] * len(rec_local),
+            gamma=1.0, which="force")
+        print(f"[plan] epsilon={_fmt_eps(result['epsilon'])} "
+              f"(degenerate={result['epsilon_degenerate']}, "
+              f"force-subspace={_fmt_eps(result['epsilon_force_sub'])})")
+    except Exception as _e:
+        print(f"[plan] epsilon scoring failed: {_e}")
+
     gamma_live = _solve_gamma(model, data, obj_bid, R_WO, rec_local,
                               planner._planner._obj_gid, tip_geom_ids,
                               gamma_override)
@@ -631,6 +771,9 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         model, N_ROBOT, tip_site_ids=tip_site_ids, obj_site_ids=None,
         obj_body_id=obj_bid, kp=Kp, kd=Kd,
         gamma=gamma_live, squeeze_pd_scale=squeeze_pd_scale, support_weight=True,
+        # FRoGGeR eq. (18)'s tracking projector; off unless asked for. See
+        # GraspController.nullspace_tracking.
+        nullspace_tracking=nullspace_tracking,
         pad_offsets=[pad_offset[f] for f in _FSET],
         # Cone-constrained gamma: solve null-space weights so EVERY contact is
         # compressive and in-cone, not just the sign-anchor contact. mu comes from
@@ -638,6 +781,18 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         # carries the planner's own 0.8x safety margin via cone_margin.
         cone_mu=float(model.geom_friction[planner._planner._obj_gid, 0]),
         cone_margin=0.2, cone_f_min=0.5,
+        # Keep the finger PD's authority against the squeeze CONSTANT as gamma
+        # moves (see GraspController.effective_gains). finger_kp/kd were tuned
+        # when solved gamma was ~0.5; without this a budget change silently
+        # rescales the PD/squeeze ratio, and the tuning no longer means anything.
+        #
+        # Defaults to 1.0 (ON) because gamma now VARIES ACROSS OBJECTS in this
+        # benchmark -- measured: lemon ~1.0, orange ~1.8, tennis ball ~2.4,
+        # gelatin box ~4.8, wood block clamped at 12.0. One absolute finger gain
+        # cannot be right across a 12x spread; at the top of it the block's
+        # squeeze overwhelmed the PD and the grasp failed on every seed. The
+        # light objects sit near gamma_ref so their behaviour barely moves.
+        gamma_ref=gamma_ref,
         # Finger-gain slices for THIS run's fingers. The default is hardcoded to
         # index+thumb, so a tripod's middle finger kept full stiff gains while the
         # other two were softened to close -- it never took part in the
@@ -700,10 +855,23 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         result["phase_log"].append("approach_done")
         # PLANNED GRASP POSE: the hand where the NLP put it, before any squeeze
         # moves the object. Same far-side camera as the video.
+        #
+        # FRAME THE HAND, NOT THE OBJECT ORIGIN. lookat=pos aimed at the free
+        # joint's origin, which for YCB meshes sits at the object's BASE, not
+        # its centroid. At the planned pose the hand is above the object, so the
+        # taller the object the further the palm rode above the top of the
+        # frame -- the 036_wood_block renders clipped the hand off entirely at
+        # every seed while the lemon/ball (short, origin near the contact) were
+        # fine. Centre on the palm/object midpoint and widen dist with the
+        # vertical span so the whole hand is in frame for any object height.
         if out_dir is not None:
             try:
+                _p_palm = data.xpos[palm_bid].copy()
+                _mid = 0.5 * (np.asarray(pos, float) + _p_palm)
+                _vspan = float(abs(_p_palm[2] - pos[2]))
+                _pdist = max(0.7, 2.2 * _vspan + 0.35)
                 render(model, data, str(Path(out_dir) / f"seed{seed}_planned.png"),
-                       lookat=pos, dist=0.7, azim=_cam_azim, elev=-25)
+                       lookat=_mid, dist=_pdist, azim=_cam_azim, elev=-25)
             except Exception as _e:
                 print(f"[exec] planned-pose render failed: {_e}")
 
@@ -717,10 +885,29 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
 
         gaps = _tip_gaps_mm(model, data, tip_geom_ids, obj_gid, obj_geom_ids=obj_gids)
         result["tip_gaps_mm"] = dict(zip(_FSET, gaps))
-        if any(g > CONTACT_GAP_TOL_M * 1000 for g in gaps):
+        # PER-ARM gap tolerance. The 8 mm default is sized for THIS solver's r_tip
+        # convention, where the IK target is the MAX tip-mesh offset and the
+        # "safe" solution deliberately leaves up to ~4-5 mm for the squeeze to
+        # close. A FRoGGeR-style arm parks the pad further out by construction:
+        # its (7d) pins a FIXED body-frame point (site + pad_offset*pad_axis) to
+        # the surface, and wherever the contact is off that axis the real geom
+        # surface lies beyond it -- measured 8-11 mm on this fingertip, whose
+        # off-axis angle at the solution is 11-25 deg.
+        #
+        # Raising the gate for that arm is NOT weakening the check: the squeeze
+        # still has to close the gap and the post-lift force test still has to
+        # pass, so a grasp that is merely far away still fails, just later and
+        # with a measured reason instead of being refused a chance. The gate's
+        # purpose -- catching an IK that converged nowhere near the object -- is
+        # preserved, since the failures it was written for are hundreds of mm out.
+        _gap_tol_mm = (gap_tol_m if gap_tol_m is not None
+                       else CONTACT_GAP_TOL_M) * 1000
+        if any(g > _gap_tol_mm for g in gaps):
             result["gap_check_failed"] = True
             if not force_execute:
-                print(f"[exec] ABORT before SQUEEZE — gap too large: {result['tip_gaps_mm']}")
+                print(f"[exec] ABORT before SQUEEZE — gap too large: "
+                      f"{result['tip_gaps_mm']} (tol {_gap_tol_mm:.1f} mm)")
+                result["gap_tol_mm"] = _gap_tol_mm
                 result["phase_log"].append("squeeze_aborted_no_contact")
                 return res, result
             # --force-execute: carry on so the recorded video SHOWS the failure
@@ -735,6 +922,9 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         # SQUEEZE: ramp the internal force in.
         ctrl.set_squeeze(True)
         n_ramp = max(int(SQUEEZE_RAMP_S / model.opt.timestep), 1)
+        _f_peak = np.zeros(len(tip_geom_ids))
+        _n_force_samples = 0
+        _n_all_loaded = 0
         # PFF_DRIFT_TRACE=1 decomposes the squeeze: how big the internal-force
         # torque is against the PD torque that is supposed to hold the planned
         # posture, and how far each fingertip actually travels from where the
@@ -782,19 +972,39 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                     _rows.append(f"{_FSET[_k]}: |pd|={np.abs(_t_pd[_lo:_hi]).max():.3f} "
                                  f"|int|={np.abs(_t_int[_lo:_hi]).max():.3f} "
                                  f"drift={_dr[_k]:.1f}mm")
-                _f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+                _f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                             obj_geom_ids=obj_gids)
                 _op = data.xpos[obj_bid]
                 _fc = ctrl.last_f_c_W
                 print(f"[drift] i={i:4d} scale={min(1.0, i / n_ramp):.2f}  "
                       + "  ".join(_rows) + f"  fn={np.round(_f, 2).tolist()}"
                       + f"  obj={np.round(_op, 3).tolist()}"
                       + f"  |f_c|={np.round(np.linalg.norm(_fc, axis=1), 2).tolist()}")
+            _f_now = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                          obj_geom_ids=obj_gids)
+            _f_peak = np.maximum(_f_peak, _f_now)
+            _n_force_samples += 1
+            _n_all_loaded += int(all(v > 0.0 for v in _f_now))
             if os.environ.get("PFF_SQUEEZE_TRACE") and i % 100 == 0:
                 _g = _tip_gaps_mm(model, data, tip_geom_ids, obj_gid, obj_gids)
-                _f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+                _f = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                             obj_geom_ids=obj_gids)
                 print(f"[squeeze] i={i:4d} scale={scale:.2f} "
                       f"gap={np.round(_g, 2).tolist()} f={np.round(_f, 2).tolist()}")
-        f_meas = _measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+        f_meas = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                      obj_geom_ids=obj_gids)
+        # PEAK over the whole ramp alongside the final instant. The reported
+        # value was a single sample at the end of the squeeze, which cannot tell
+        # "this finger never touched" from "this finger was loaded and then the
+        # object shifted". Measured on the three rounded objects at n=3, the
+        # zero-force finger is zero in 1007 of 1007 samples, so the distinction
+        # did not change those verdicts -- but the metric should not depend on
+        # that being true. squeeze_forces_peak_N is what a force-closure check
+        # should read; squeeze_forces_N stays the end-of-ramp state.
+        result["squeeze_forces_peak_N"] = dict(
+            zip(_FSET, np.round(_f_peak, 3).tolist()))
+        result["squeeze_all_loaded_frac"] = round(float(_n_all_loaded)
+                                                  / max(_n_force_samples, 1), 4)
         # _FSET, not the global: these are the MEASURED per-fingertip forces and
         # mislabelling them would report the middle finger's load under 'index'.
         result["squeeze_forces_N"] = dict(zip(_FSET, np.round(f_meas, 3).tolist()))
@@ -808,10 +1018,38 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
 
         # LIFT: straight up, clear of the table.
         dt = model.opt.timestep
-        n_lift = _jog_steps(LIFT_DISTANCE_M, lift_speed, dt)
-        q_cmd, lost_lift = _jog_to(
-            model, data, ctrl, q_cmd, lambda i: np.array([0, 0, lift_speed, 0, 0, 0.]),
-            n_lift, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="lift", finger_set=_FSET)
+        if lift_mode == "shaky":
+            # FRoGGeR's execution test (their Sec. IV), which is what produces the
+            # paper's "% pick success" column. Replaces ONLY the lift jog: approach,
+            # settle, gap gate and squeeze ramp above are unchanged, because that
+            # sequence is measured and tuned (SOLVER_STATE sec 6) and re-deriving it
+            # would inject differences unrelated to the grasp under test.
+            #
+            # Scored by THEIR criteria (>30 deg rotation, >7.5 cm deviation) AND by
+            # this benchmark's own lift_ok below. Both are kept because they answer
+            # different questions and neither subsumes the other: their test can pass
+            # on a grasp that never really loaded the fingers (the object simply did
+            # not move much), which is the phantom-success mode lift_ok's force gate
+            # exists to catch.
+            from ycb_grasp import shaky_pickup as SP
+            _sh = SP.run_shaky_pickup(
+                model, data, ctrl, q_cmd, _jog_to, _sync, palm_bid, obj_bid,
+                tip_geom_ids=tip_geom_ids, obj_gid=obj_gid, finger_set=_FSET,
+                synth_time_s=float(result.get("t_solve_s", 0.0)))
+            q_cmd = _sh.pop("q_cmd", q_cmd)
+            lost_lift = _sh.pop("contact_lost", {})
+            result["pick_success"] = _sh["success"]
+            result["pick_fail_reason"] = _sh["fail_reason"]
+            result["pick_max_rot_deg"] = round(_sh["max_rot_deg"], 2)
+            result["pick_max_dev_m"] = round(_sh["max_dev_m"], 4)
+            print(f"[shaky] success={_sh['success']} reason={_sh['fail_reason']} "
+                  f"max_rot={_sh['max_rot_deg']:.1f}deg "
+                  f"max_dev={1e3 * _sh['max_dev_m']:.1f}mm")
+        else:
+            n_lift = _jog_steps(LIFT_DISTANCE_M, lift_speed, dt)
+            q_cmd, lost_lift = _jog_to(
+                model, data, ctrl, q_cmd, lambda i: np.array([0, 0, lift_speed, 0, 0, 0.]),
+                n_lift, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="lift", finger_set=_FSET, obj_geom_ids=obj_gids)
         result["lift_obj_dz_mm"] = (float(data.xpos[obj_bid][2]) - obj_z0) * 1000
         result["lift_contact_lost"] = lost_lift
         # SUCCESS TEST (see LIFT_OK_MIN_FRAC above). Both halves are required:
@@ -823,10 +1061,16 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         #             is sticky: it latches on the first momentary unload and so
         #             cannot say whether the grasp RECOVERED. Both numbers are
         #             kept in the result so either reading stays available.
-        _f_end = (_measured_tip_forces(model, data, tip_geom_ids, obj_gid)
+        _f_end = (_measured_tip_forces(model, data, tip_geom_ids, obj_gid,
+                                             obj_geom_ids=obj_gids)
                   if (tip_geom_ids is not None and obj_gid is not None) else [])
         result["lift_final_forces_N"] = dict(zip(_FSET, np.round(_f_end, 4).tolist()))
-        _rose = result["lift_obj_dz_mm"] >= LIFT_OK_MIN_FRAC * LIFT_DISTANCE_M * 1000
+        # Against the distance THIS mode actually commanded. The shaky protocol
+        # lifts 10 cm (their number), not LIFT_DISTANCE_M's 12 cm, and scoring it
+        # against the larger figure would fail grasps that tracked the commanded
+        # trajectory perfectly.
+        _cmd_lift_m = (SHAKY_LIFT_M if lift_mode == "shaky" else LIFT_DISTANCE_M)
+        _rose = result["lift_obj_dz_mm"] >= LIFT_OK_MIN_FRAC * _cmd_lift_m * 1000
         _held = bool(_f_end) and all(f > LIFT_OK_MIN_FORCE_N for f in _f_end)
         result["lift_ok"] = bool(_rose and _held)
         result["phase_log"].append("lift_done")
@@ -846,13 +1090,37 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                 model, data, ctrl, q_cmd,
                 lambda i: np.array([dirn[0] * transport_speed,
                                     dirn[1] * transport_speed, 0, 0, 0, 0.]),
-                n_tr, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="transport", finger_set=_FSET)
+                n_tr, _sync, palm_bid, obj_bid, tip_geom_ids, obj_gid, label="transport", finger_set=_FSET, obj_geom_ids=obj_gids)
             result["transport_contact_lost"] = lost_tr
             result["phase_log"].append("transport_done")
 
-            # RELEASE: stop squeezing and let the object settle into the bin.
+            # RELEASE: stop squeezing AND actively open the fingers.
             ctrl.set_squeeze(False)
             ctrl.set_transporting(False)
+            # Dropping the squeeze is not the same as letting go. The PD setpoint
+            # is still q_target -- the GRASP pose -- so the fingers hold their
+            # closed shape and the object is released only if gravity can pull it
+            # free. That works for a lemon and fails for anything the hand can
+            # wedge: measured on 025_mug 2-finger, seeds 1 and 2 finish at
+            # z = 0.805 / 0.810 against a bin floor of 0.630, i.e. ~180mm up,
+            # still on the hand, and `release_done` is appended regardless.
+            #
+            # Blend the GRASPING fingers' joints toward q_home rather than adding
+            # a constant offset: the joint sign that opens a finger is NOT shared
+            # across fingers (measured: +0.3 rad on every grasping joint EXTENDS
+            # the index, tip-to-palm 117.9 -> 122.2mm, while CURLING the thumb,
+            # 148.2 -> 129.9mm), so a uniform delta closes half the hand. q_home
+            # holds index and thumb at 0.0 -- the open pose -- so interpolating
+            # toward it opens each finger in its own correct direction.
+            # Only the fingers named by --fingers move; the arm keeps its
+            # transport pose so the object is dropped where it was carried.
+            if release_open_frac > 0.0:
+                _q_open = np.array(q_target, float)
+                _f = float(np.clip(release_open_frac, 0.0, 1.0))
+                for _lo, _hi in finger_joint_slices(model, _FSET):
+                    _q_open[_lo:_hi] = ((1.0 - _f) * np.asarray(q_target, float)[_lo:_hi]
+                                        + _f * np.asarray(q_home, float)[_lo:_hi])
+                ctrl.set_target(_q_open)
             # PEAK RELEASE VELOCITY — the fling metric. contact_tuning.py scores
             # every contact setting on BOTH grasp force AND this number, because
             # the two trade off along the same axis and optimizing either alone
@@ -1018,6 +1286,15 @@ def main():
                     help="finger PD multiplier DURING the squeeze ramp. Lower lets the "
                          "internal-force term win against the finger PD; too low and the "
                          "measured force falls short of the commanded gamma.")
+    ap.add_argument("--release-open-frac", type=float, default=0.5,
+                    help="how far to open the GRASPING fingers toward q_home at "
+                         "release, 0..1 (0 = legacy: hold the grasp pose and let "
+                         "gravity do it). Dropping the squeeze alone leaves the PD "
+                         "holding the closed shape, which wedges wide objects -- "
+                         "025_mug finished ~180mm above the bin floor, still on "
+                         "the hand. 0.5 is measured best: it unwedges without the "
+                         "extra release impulse a full open imparts (1.0 costs "
+                         "014_lemon its in_bin).")
     ap.add_argument("--force-execute", action="store_true",
                     help="run the squeeze/lift even when the pre-squeeze gap check "
                          "fails or gamma is infeasible, so the FAILURE is visible in "
@@ -1045,6 +1322,12 @@ def main():
                          "value is a bounding sphere around an elongated pad, so it "
                          "parks the tip ~9.5mm proud of the surface; this flag exists "
                          "to A/B that slack against the directional default.")
+    ap.add_argument("--gamma-ref", type=float, default=1.0,
+                    help="gamma that --finger-kp/--finger-kd were tuned at. The finger "
+                         "PD gains are scaled by gamma/gamma_ref, so the PD keeps "
+                         "constant authority against the squeeze as gamma changes (e.g. "
+                         "after a disturbance-budget change). Pass 0 for the legacy "
+                         "absolute-gain behaviour.")
     ap.add_argument("--finger-kp", type=float, default=0.8)
     ap.add_argument("--finger-kd", type=float, default=0.05)
     ap.add_argument("--lift-speed", type=float, default=LIFT_SPEED_MPS,
@@ -1052,6 +1335,21 @@ def main():
                          "eases in/out over JOG_RAMP_S, so this is the cruise speed.")
     ap.add_argument("--transport-speed", type=float, default=TRANSPORT_SPEED_MPS,
                     help=f"lateral carry speed m/s (default {TRANSPORT_SPEED_MPS})")
+    ap.add_argument("--nullspace-tracking", action="store_true",
+                    help="apply FRoGGeR's eq. (18) projector to the tracking torque "
+                         "while squeezing, so tracking cannot move the fingertips "
+                         "across the object surface. Their Allegro has 16 hand DOFs "
+                         "against a rank-12 Jh; our 2-contact LEAP has 8 against "
+                         "rank 6, so the projector discards ~55%% of finger tracking "
+                         "authority here (measured) -- expect a weaker hold, not "
+                         "just a cleaner one.")
+    ap.add_argument("--lift-mode", choices=["standard", "shaky"], default="standard",
+                    help="standard (default): this benchmark's 12cm lift, scored by "
+                         "lift_ok. shaky: FRoGGeR's execution test (Sec. IV) -- 10cm "
+                         "in 1s, hold 1.5s, 3mm sinusoid in all axes from t+0.25s -- "
+                         "additionally scored by their failure criteria (>30deg "
+                         "rotation, >7.5cm deviation). This is what produces the "
+                         "paper's '% pick success' column.")
     OP.add_out_args(ap, OP.TABLETOP)
     args = ap.parse_args()
 
@@ -1089,6 +1387,7 @@ def main():
         args.object, args.seed, n_seeds=args.n_seeds, n_relin=args.n_relin,
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
         fingers=args.fingers, force_execute=args.force_execute,
+        release_open_frac=args.release_open_frac,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
         directional_r_tip=args.directional_r_tip,
         sdf_err_tol=args.sdf_err_tol, bound_inset=args.bound_inset,
@@ -1098,8 +1397,12 @@ def main():
         seed_rank_pool=args.seed_rank_pool,
         impratio=args.impratio, gamma_override=args.gamma,
         squeeze_pd_scale=args.squeeze_pd_scale,
+        # --gamma-ref 0 opts back out to absolute gains.
+        gamma_ref=(args.gamma_ref or None),
         finger_kp=args.finger_kp, finger_kd=args.finger_kd,
         lift_speed=args.lift_speed, transport_speed=args.transport_speed,
+        lift_mode=args.lift_mode,
+        nullspace_tracking=args.nullspace_tracking,
         contact_profile=args.contact_profile)
     print("\n=== RESULT ===")
     for k, v in result.items():

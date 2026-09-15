@@ -113,6 +113,14 @@ normal derived from it, and §8.4a shows the surrogate term is ~1/16 of the disa
 
 ### 3.3 Task-specific wrench certification
 
+**Qualified 2026-09-14 after reading their App. B.** The contrast below holds for the
+PLANNER's `k_l` floor, which is genuinely task-agnostic. It does NOT hold for their
+CONTROLLER: eq. (18)'s contact-force QP tracks a desired wrench
+`^O w_des = R_OB(^B w_grav + ^B w_err)` whose `w_err` is a live PD error wrench on the
+object's own pose (`k_p,err = 50`, `k_d,err = 5`, `k_R,err = 50`, `k_omega,err = 5`),
+with a minimum normal force `F_min^n = 1.0 N`. That is task-specific in the same
+sense our `gamma` LP is. See FROGGER_BENCH §10bis.
+
 `solve_gamma_live` certifies against an explicit disturbance box (`m*a` force box, `I*alpha`
 torque box, gravity re-datumed about the contact centroid) and returns the internal-force
 scale `gamma` needed. FRoGGeR's `k_l` is task-agnostic. A task-specific certificate is
@@ -373,3 +381,75 @@ collision 1e-3, force closure 1e-5). This solver exposes a single constraint
 tolerance, so matching them requires scaling each constraint so that one tolerance
 means the right thing for each -- e.g. dividing the surface residual by 5e-4 and the
 collision residual by 1e-3. Not yet done.
+
+---
+
+## 8. Seeding requirements: what each method needs from its initial guess
+
+Added 2026-09-14, after reading their App. C and measuring both arms. This is a real
+axis of difference and it was not previously stated anywhere.
+
+### 8.1 FRoGGeR's objective carries no opposition, so its sampler must
+
+(7a) is `max l*(q)` and nothing else. There is no IK term, no alignment term, no
+posture prior. Nothing in the objective prefers contacts on OPPOSITE sides of the
+object over contacts bunched on one side, because `l*` is computed from whatever
+wrench matrix the current contacts produce -- a same-side configuration simply scores
+badly rather than being pushed apart.
+
+The preference therefore lives entirely in the SAMPLER (App. C step 1): the palm's
+y-axis -- their finger-SPREAD direction, under x = outward normal / z = toward
+fingers -- is aligned to an OBB axis, and the fingers are pre-opened to that edge's
+width, so the pre-shape BRACKETS the object before any optimization runs.
+
+They report this is load-bearing, not a convenience:
+
+> "the overall performance of both FRoGGeR and the baseline was **highly sensitive to
+> the sampled initial conditions**. For instance, **if the initial width of the
+> fingertips was not guided by object bounding boxes, both methods suffered in terms
+> of runtime and grasp quality**, as enforcing surface constraints became harder."
+
+And the loop is part of the method: resample-until-feasible, a median of 3 solves
+(IQR 1-6) per accepted grasp, 20 attempts inside a 60 s budget. Their 99.4%
+convergence is a property of THAT LOOP, not of one solve.
+
+### 8.2 Ours needs none of it, and that is the difference worth reporting
+
+`for_gws_recommender` carries `w_ik` and `w_align` alongside `w_gws`. Opposition is
+in the OBJECTIVE, so the solve can create it rather than having to inherit it. The
+measured consequence is that our arm runs from a FIXED HOME POSE with no sampler at
+all, one solve per cell, and still lands opposed.
+
+Measured (FROGGER_BENCH §10bis.6), cosine between contact normals, -1 = opposed:
+
+| | seed | solved |
+|---|---|---|
+| frogger, `017_orange` s0 | -1.000 | -1.000 |
+| frogger, `017_orange` s1 | -0.996 | **+0.974** |
+| frogger, `036_wood_block` s1 | -0.758 | **+0.989** |
+
+Their arm is handed a well-opposed seed and the solve DESTROYS it on 5 of 6 cells.
+Ours is handed nothing -- HOME, the same pose every time -- and does not need to be.
+
+**The honest framing.** This is not "our objective is better than theirs at
+optimizing `l*`"; theirs is better at that by construction (§2.2). It is that a
+multi-term objective is ROBUST TO ITS INITIALIZATION in a way a single-term one is
+not, and robustness to the initial guess is a property their own paper cares about
+(they chose a coarse sampler deliberately, "as our goal is to evaluate FRoGGeR's
+robustness to the quality of the initial guess").
+
+The cost of ours is the one §2.2 already records: `w_gws = 5.0` against `w_ik = 0.70`
+means `beta` is outvoted and our `lp_gap` is nonzero on 18/18 solves, where theirs is
+exactly 0. **Neither arm dominates.** Ours buys seeding robustness and pays in metric
+convergence; theirs buys an exactly-converged metric and pays in seed sensitivity.
+
+### 8.3 Fair-comparison consequence
+
+A single-attempt frogger run is NOT their protocol and understates them badly:
+measured on `017_orange` seed 0, `l_bar*` -7.15 at `--max-attempts 1` against +0.939
+with the synthesis loop enabled, and the cell goes from aborting to reaching the
+lift. Any table quoting their arm must run `--max-attempts 20`, and must say so.
+
+Conversely, the comparison should state that `ours` is given ONE solve from HOME
+against their 20 attempts from a tuned sampler -- which is a handicap on our side
+that the numbers do not show.

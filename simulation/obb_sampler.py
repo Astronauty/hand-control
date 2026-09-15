@@ -12,6 +12,19 @@ preference lives entirely in the SEED: the palm is aligned to an OBB axis and th
 fingers are pre-separated by that axis's width, so the hand starts straddling the
 object and beta only has to refine what the seed already got structurally right.
 
+This is THEIR design, stated as such, not an inference. The paper reports that
+"if the initial width of the fingertips was not guided by object bounding boxes,
+both methods suffered in terms of runtime and grasp quality", so the width step is
+load-bearing for the method rather than a convenience.
+
+MEASURED (docs/FROGGER_BENCH.md §10bis.6): this sampler DOES deliver the opposed
+start -- seed tip_dot -0.59 to -1.00 across 6 cells -- and the SOLVE then loses it
+on 5 of 6, ending at +0.14 to +0.998. The remaining defect is downstream of seeding.
+
+Score opposition about the OBB CENTRE. The YCB body origin sits at the object's BASE
+(40.4 mm below the centre on 017_orange), and measuring from it reports genuinely
+opposed seeds as same-side. `_seg_dist` below already uses the OBB centre.
+
 Our own arm supplies the same preference through `w_align` and `w_ik`, which the
 frogger arm zeroes to match (7a). Measured consequence of zeroing them without this
 sampler (017_orange seed 0, tripod): the solve returned all three contacts on one side

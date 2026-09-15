@@ -83,7 +83,7 @@ DEFAULT_OBJECTS = ["036_wood_block", "017_orange", "014_lemon",
 
 
 def _build_cfg(arm, object_id, body_name, rgeoms, obj_geom0, *,
-               n_seeds, max_iter, fingers, k_l, sdf_normals):
+               n_seeds, max_iter, fingers, k_l, sdf_normals, sdf_surface=True):
     """Config for one arm. Everything not listed is shared by construction --
     both presets route through for_gws_recommender, so seeding, collision,
     trust region and solver backend are identical."""
@@ -112,6 +112,7 @@ def _build_cfg(arm, object_id, body_name, rgeoms, obj_geom0, *,
               if any(f"_{c}_" in g for c in codes) and ("ds" in g or "tip" in g)]
         return for_frogger(body_name, rgeoms, clearance_by_geom(rgeoms),
                            k_l=k_l, sdf_normals=sdf_normals,
+                           sdf_surface=sdf_surface,
                            finger_obj_geoms=fo, **common, **cfg_kw)
     return for_gws_recommender(body_name, rgeoms, clearance_by_geom(rgeoms),
                                **common, **cfg_kw)

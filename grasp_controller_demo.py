@@ -179,8 +179,11 @@ if __name__ == "__main__":
                         help="object index: " + ", ".join(
                             f"{i}={body}" for i, (_, body) in enumerate(OBJECT_DEFS)))
     parser.add_argument('--gamma', type=float, default=5.0,
-                        help="internal squeeze force scale (null-space weight); "
-                             "per-contact force ~ gamma/sqrt(2) for a 2-contact pinch")
+                        help="internal squeeze force: the per-contact internal NORMAL "
+                             "force in newtons. The controller normalises the "
+                             "null-space force to unit peak normal, so gamma is a "
+                             "force, not an arbitrary weight (the old "
+                             "'~gamma/sqrt(2) per contact' rule predates that fix).")
     parser.add_argument('--dls-only', action='store_true',
                         help="skip the collision-aware SQP refinement (debug only)")
     parser.add_argument('--arm-kp', type=float, default=40.0,

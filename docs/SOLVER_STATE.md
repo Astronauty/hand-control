@@ -7,9 +7,9 @@ term, a constraint, or the way an environment calls the planner, update this fil
 same commit.
 
 Last verified against: `simulation/grasp_planner_3d.py`, `simulation/grasp_config_builder.py`,
-`kinova_common/{wrench,constants}.py`, `grasp_control/grasp_controller.py`,
+`kinova_common/{wrench,constants}.py`, `grasp_control/{grasp_controller,force_control}.py`,
 `benchmarks/ycb_grasp/{pick_from_floor,pick_and_place}.py`, `kinova_leap_pick_place.py`
-— 2026-09-12.
+— 2026-09-14.
 
 **Two JSON config files feed `GraspConfig3D`**, both read by `grasp_config_builder` and
 both applied as DEFAULTS, so an explicit CLI flag or `PFF_*` env var still wins
@@ -43,9 +43,9 @@ seed generation  ->  local surface fit  ->  NLP (per Picard stage)  ->  post-pro
 
 The NLP's internal `gamma` is **not** what gets executed. See §5.
 
-The bracketed steps run only at `n_contacts >= 3` (the `tripod` pairing). That path is
-**planner-side only today** — the NLP solves for a third contact, but nothing downstream
-consumes it. See §10.
+The bracketed steps run only at `n_contacts >= 3` (the `tripod` pairing). `pick_and_place.py`
+consumes the third contact; the other two environments do not. It does not yet EXECUTE —
+contact 3 collapses onto contact 2 in every measured cell. See §10.
 
 ---
 
@@ -103,12 +103,15 @@ Changed in `d9d2a16`, and the old behaviour invited a specific misreading:
   appear to sit outside its own trust region. The rebuild remains the fallback for records
   with no stage frame (rejected seeds never reached a stage).
 
-**Consequence worth knowing:** because the deterministic seed goes in first and usually
-wins the ranking, varying the planner's `seed` produces NO variation on rigid symmetric
-objects (measured: wood block identical across seeds 0/1/2), and only mild variation on
-spheres/cups. `seed` is plumbed through `MultiStartGraspPlanner3D(..., seed=)`; the
-per-seed `q_ref` jitter (`qref_restart_sigma_arm/hand`) is 0.0 by default, so the RNG's
-only live effect is `_seed_pair`'s march directions.
+**Consequence worth knowing:** `seed` is plumbed through
+`MultiStartGraspPlanner3D(..., seed=)`; the per-seed `q_ref` jitter
+(`qref_restart_sigma_arm/hand`) is 0.0 by default, so the RNG's only live effect is
+`_seed_pair`'s march directions. That is still enough to move the result: **the earlier
+claim that varying `seed` produces NO variation on rigid symmetric objects is FALSE** and
+is corrected here. Measured at `2bcfae3`, `036_wood_block` tripod across seeds 0/1/2 gives
+`gamma_min` 34.06 / 44.75 / 59.73 and `014_lemon` 4.94 / 1.28 / 1.70. The deterministic
+minor-axis seed goes in first and often wins, but the random candidates that fill the rest
+of the `n_seeds` budget do change the pool it is ranked against.
 
 ### The third contact (`n_contacts >= 3`)
 
@@ -355,7 +358,72 @@ that is sign-expanded into 64 corners, and one LP per corner returns
 
 Infeasible on ANY corner returns `None`. What the caller then does **now differs by
 environment** — see the table below. `_gamma_stability_ceiling` clamps the result for
-simulator stability (~12 N on the tabletop).
+simulator stability (60 N on the tabletop — recalibrated 2026-09-14, see
+"gamma is newtons" below).
+
+### gamma is NEWTONS, by construction — and the controller used to break that
+
+`min_gamma_for_accel_lp` builds each cone vertex as `ncf = ncf * gamma`, and
+`solve_gamma_live` passes `ncf=[1.0]*n` (unit normal force per contact). So a solved
+gamma **is the per-contact internal normal force in newtons**: `gamma = 12` is a request
+for 12 N. `3D_minimum_NCF.py` states this directly — *"f_contact = f_manipulation +
+gamma * f_internal"*, and *"min_gamma: where minimum normal contact force = normal
+component of (min_gamma * f_internal)"*.
+
+`GraspController.internal_force_torques` violated that contract two ways. Both are FIXED
+as of 2026-09-14; `tests/test_gamma_scaling_invariance.py` and
+`tests/test_gamma_is_newtons.py` pin them.
+
+**(a) The equilibrium part was scaled along with the internal part.** The allocation
+splits as `f_c = pinv(G) w_des + N gamma_LP`, and only the second term is wrench-neutral
+(`G N = 0`). Scaling the whole vector by `gamma/cone_f_min` therefore commanded a net
+object wrench of `gamma/f_min` times `w_des` — with `support_weight=True` that is
+gravity. At `gamma = 12` with `cone_f_min = 0.5` (a 24x amplifier) the commanded support
+force on `036_wood_block` reached **171.6 N on a 7.15 N block**: the squeeze ejected the
+object (z 0.625 -> 0.978 m), tips drifted ~190 mm off the planned contacts, and measured
+contact force was **0.0 N on every seed** because nothing was left to touch.
+
+*Diagnostic value:* sweeping `finger_kp` 0.8 -> 80 left the measured force at exactly
+0.0 N throughout. **No PD gain can fix this** — the excess is a wrench applied to the
+OBJECT, not a torque the fingers oppose. A grasp failing with `fn == 0.0` and large tip
+drift should be checked against the object's weight BEFORE any gain is touched.
+
+**(b) The internal part was normalised by the wrong quantity.** The code divided by
+`cone_f_min`, assuming `|f_int| == cone_f_min`. It is not: `solve_gamma_cone` minimises
+the PEAK normal force subject to `f_min` at EVERY contact, so once `w_des != 0` the
+equilibrium part already loads one contact and the internal correction needed to bring
+the others up to `f_min` grows with `w_des`. Measured peak `|f_int|` against
+`f_min = 0.5`:
+
+| object weight | peak \|f_int\| | gamma inflation |
+|---|---|---|
+| 0.49 N (`014_lemon`) | 0.745 | 1.5x |
+| 0.95 N (`056_tennis_ball`) | 0.976 | 2.0x |
+| 3.73 N (`009_gelatin_box`) | 2.364 | 4.7x |
+| 7.15 N (`036_wood_block`) | 4.076 | 8.2x |
+
+The error **tracked object mass**, so no constant rescale could fix it — the normaliser
+itself had to change. `internal_force_torques` now divides `f_int` by its own peak normal
+component (`_peak_internal_normal`), so gamma means newtons at every mass. Measured tip
+force now tracks the command to ~15% (gamma 12 -> 10.3 N, 20 -> 17.0 N), where the block
+previously commanded 12 and measured ~55 N.
+
+**Stability ceiling recalibrated.** `GAMMA_STABILITY_REF_N` was `12.0`, chosen when a
+commanded gamma of 12 produced only ~6 N of real force — it was never a claim about
+newtons, so carrying it forward would have halved the usable squeeze. Re-measured on
+`036_wood_block` seed 2 through the full cycle: stable at gamma 6/12/20/27/40/60
+(5.4 -> 51.7 N measured), **diverged at 100** (~86 N, object thrown, dz -606 mm). Set to
+**60**, the largest validated — same rule as before. The solved gamma for this object
+(~27) now passes UNCLAMPED, which is the point: the clamp exists to stop the integrator
+exploding, and in honest units the statics answer sits well inside that limit.
+
+**Teleop was NOT re-measured.** `GAMMA_SAFETY_FACTOR = 5.0` and `GAMMA_FALLBACK = 250.0`
+in `kinova_leap_pick_place.py` were tuned in the old inflated units, so teleop will now
+squeeze 1.5-8x weaker on hardware. Scaling guidance is recorded in a comment at the
+constant: re-derive from `f_n >= m(g+a) / (n * mu * (1-margin))` rather than from the old
+number, and do NOT reintroduce a mass-dependent fudge (that is exactly what was removed).
+`GAMMA_FALLBACK` now reads as ~250 N per contact against a sim divergence point of ~86 N;
+it is a hardware-only path and was left unchanged rather than guessed at.
 
 `solve_gamma_live` generalizes to `n >= 2` contacts. The moment reference is the contact
 CENTROID, which reduces to the midpoint at n=2 so the measured 2-contact path is unchanged.
@@ -381,6 +449,8 @@ disagreement on the same contacts via the same LP**. Because the budget changed 
 | linear accel | `cfg.accel_budget_xyz` | `(20, 20, 20)` | `(0.5, 0.5, 0.5)` |
 | angular accel | `cfg.ang_accel_budget_xyz` | `(1, 1, 1)` | `(0.1, 0.1, 0.1)` |
 | LP infeasible | flags `wrench_feasible=False` | **aborts the grasp** | `GAMMA_FALLBACK = 2.0` |
+| gamma units | n/a (certificate only) | newtons (normalised) | newtons (normalised) |
+| stability ceiling | n/a | 60 N | 60 N (shared constant) |
 
 **The remaining verify-side gap is the `0.8 * mu` derate.** (`verify()`'s hardcoded `n=2`
 was the other half of this and is FIXED as of 2026-09-13 — it now certifies every contact
@@ -408,11 +478,78 @@ approach (kinematic replay) -> hold/settle -> GAP GATE -> squeeze ramp
   lift succeeds. Gaps over the gate are a PLANNER outcome, not a contact-tuning one.
 - **Squeeze ramp**: `internal_force_torques(scale)` ramped over `SQUEEZE_RAMP_S`.
   Unramped full force launches the object (measured 35 N -> box thrown 400 mm).
+- **`gamma_ref`** (default `1.0` on the tabletop): scales the finger PD gains by
+  `gamma/gamma_ref`, so the PD keeps a CONSTANT ratio of authority against the squeeze
+  rather than a constant absolute stiffness. The finger PD and the internal force act on
+  the same joints in opposition, and only their RATIO decides whether the tips stay on
+  the planned contacts. Pass `--gamma-ref 0` for the legacy absolute-gain behaviour.
+
+  **This is NOT made redundant by the newtons fix**, which is worth being precise about.
+  Normalising removed the mass-driven UNIT drift, but it did not make one absolute gain
+  sufficient, because how much PD authority a given geometry has against a given squeeze
+  still varies per grasp. `036_wood_block` seed 1 is the case: at the solved gamma 25.9
+  with absolute gains the object never moves and force tracks the command (16-20 N), yet
+  `|tau_int|` runs ~60x `|tau_pd|` and the tips creep 2 -> 15 mm off the contacts until
+  the grasp SLIDES off (`fn` 0.0). That is not integrator divergence, so the stability
+  ceiling is the wrong tool for it. With `gamma_ref=1.0` the same seed lifts (20.7/22.0 N).
+  Seed 2 of the same object does not need it. The old ceiling of 12 was masking seed 1 by
+  coincidence, not by design.
+
+  | mechanism | fixes |
+  |---|---|
+  | normalisation (`_peak_internal_normal`) | gamma's UNITS — mass-driven drift |
+  | `gamma_ref` | PD AUTHORITY PER GRASP — geometry-driven, independent of units |
+
 - **`set_transporting(True)`**: switches finger PD from CLOSING to HOLDING gains. These
   are opposite requirements — soft closing gains let the internal-force term win
   (kp 0.8->20 dropped grip 6.03->1.28 N), but a soft holding gain is back-driven by the
   load and bleeds normal force. See `grasp_controller.effective_gains`.
 - **Jogs**: resolved-rate DLS, `JOG_SING_EPS = 0.02`, `JOG_LAM_MAX = 0.05`.
+
+### The squeeze force: cone-constrained, not sign-anchored
+
+`internal_force_torques` allocates `f_c = pinv(G) @ w_des + null(G) @ gamma`. **How `gamma`
+is chosen changed in `daf4207`, and the old rule was only ever correct at n=2.**
+
+`allocate()` (the fallback) orients each null-space basis vector using the FIRST non-None
+`inward_dirs` entry and then breaks. With 2 antipodal contacts `null(G)` is 1-D, so that one
+sign IS the answer. With 3 contacts the null space is 3-D and a uniform gamma over an
+arbitrary SVD basis lands anywhere in it — **nothing holds the non-anchor contacts
+compressive.** Measured on an asymmetric tripod: sign-anchor normal forces
+`[1.213, 0.047, 0.325] N` vs cone-solve `[1.000, 1.000, 1.000] N`.
+
+`solve_gamma_cone()` (default, `cone_gamma=True`) replaces it with an LP in `(gamma, t)`:
+
+```
+min  t   s.t.  f_k . n_k >= f_min      compressive, EVERY contact
+               f_k . n_k <= t          t = peak normal force
+               f_k . e_ki <= mu_eff * f_k . n_k    8-facet pyramid, per contact
+```
+
+The pyramid is **inscribed** (`mu_eff = mu * cos(pi/8) * (1 - margin)`), so feasibility
+implies feasibility for the true circular cone, not merely for the approximation. The LP
+returns the MINIMUM in-cone force (peak normal = `cone_f_min`); the caller's commanded
+`gamma` then scales it up, so `cone_f_min` sets the shape and `gamma` sets the magnitude.
+
+**Infeasible returns `None` rather than a fabricated gamma** — three near-parallel normals
+genuinely cannot squeeze. The controller then falls back to the sign-anchor path, which is
+sound at n=2 and is the only path when `cone_gamma=False`.
+
+Regression at n=2: `017_orange` thumb+index unchanged through the switch (lift 119.11 mm,
+contacts held), with squeeze forces RISING 1.20/1.19 -> 1.65/1.61 N as the cone solve
+distributes load more evenly.
+
+### `active_joint_slices` must match the run's fingers
+
+`effective_gains()` and `slip_correction_torques()` both gate on these slices, and the
+`GraspController` default is hardcoded `((7, 11), (19, 23))` — LEAP index and thumb. At
+three fingers the middle finger's joints (11..14) fall outside both, so **it never
+participates in the CLOSING/HOLDING switch at all**: it keeps full stiff gains, pinned at its
+planned pre-contact posture, while index and thumb soften to 0.25 to let the squeeze close.
+
+`constants.finger_joint_slices(model, fingers)` derives the slices from the model's own
+`leap_<code>_*` joint names. thumb+index reproduces `((7, 11), (19, 23))` exactly.
+**Only `pick_and_place.py` calls it** — see §9.
 
 ---
 
@@ -428,6 +565,7 @@ approach (kinematic replay) -> hold/settle -> GAP GATE -> squeeze ramp
 | object friction | mu = 0.6 (per `pick_from_floor`'s own gamma comment; not re-queried live) |
 | gamma budget | `ACCEL_BUDGET_XYZ = (0.5,)*3`, `ANG_ACCEL_BUDGET = (0.1,)*3` — **not** migrated to the shared 20 m/s^2 box the tabletop and teleop now share (§5) |
 | LP infeasible | falls back to `GAMMA_FALLBACK = 2.0` (the tabletop aborts instead) |
+| controller | `GraspController` **defaults**: `cone_mu = 0.7` (vs the scene's own 0.6) and the hardcoded `((7,11),(19,23))` gain slices — neither is passed (§9) |
 | phases | approach -> hold -> squeeze -> lift. **No transport, no bin.** |
 | artifacts | `out/floor/<tag>/<object>/` |
 
@@ -443,8 +581,31 @@ approach (kinematic replay) -> hold/settle -> GAP GATE -> squeeze ramp
 | gamma budget | `(20,20,20) m/s^2` / `(1,1,1) rad/s^2`, shared with teleop and with the certificate (§5) |
 | LP infeasible | **aborts the grasp** — no fallback constant |
 | finger pairing | `--pairing {thumb_index,thumb_middle,tripod}`, default from `models/grasp_finger_config.json`. **Steers the PLANNER only** (§10) |
+| controller | the only env that configures it: `cone_mu` from the LIVE geom friction, `cone_margin = 0.2`, `cone_f_min = 0.5`, and `finger_joint_slices(model, _FSET)` (§6) |
 | phases | approach -> hold -> squeeze -> lift -> transport -> release, scored by `TS.in_bin` |
 | artifacts | `out/tabletop/<tag>/<object>/`, incl. `seed<N>_planned.png` (planned pose before squeeze) |
+
+**Regenerated 2026-09-14** after the gamma normalisation fix (§5), `out/tabletop/default`,
+5 objects x 3 seeds, full pick/lift/transport/release, defaults (`gamma_ref = 1.0`).
+**10/15 lift_ok.** Commanded gamma and measured tip force now agree to ~15%, which is the
+point of the fix — before it, `036_wood_block` commanded 12 and measured ~55 N:
+
+| object | gamma | measured `fn` (N) | lift_ok |
+|---|---|---|---|
+| `014_lemon` s0/s1/s2 | 1.02-1.17 | 0.76-0.99 | 3/3 |
+| `056_tennis_ball` s0/s1/s2 | 2.13-2.44 | 1.88-2.32 | 3/3 |
+| `036_wood_block` s1/s2 | 25.9 | 20.7-22.2 | 2/2 |
+| `036_wood_block` s0 | 27.4 | — | gap abort (10.2/7.4 mm) |
+| `009_gelatin_box` s0 | 4.82 | 3.9 | 1/1 |
+| `009_gelatin_box` s1/s2 | — | — | `gamma_infeasible_no_grasp` |
+| `017_orange` s1 | 1.75 | 1.36-1.60 | 1/1 |
+| `017_orange` s0/s2 | 1.78 | index 0.0, thumb 1.69 | one-finger push (see §9) |
+
+All 5 failures are upstream of force control — two planning aborts, one IK gap abort, two
+one-finger placements. None are gamma-related. Caveat: `017_orange` s0 is a MARGINAL seed
+and has been observed passing (§9, §12); treat its cell as unstable, not as a fixed property.
+Before the fix the same set was 0/15 on the block, with the equilibrium bug suppressing
+force everywhere.
 
 Two scoring caveats specific to this env:
 - `TS.in_bin` tests the object **body origin** against `z >= 0.635` (the bin floor), so an
@@ -527,12 +688,53 @@ works alone.
   1/8 over a larger draw). Still marginal: its volumetric centroid sits at 13.7 mm, so
   antipodal rays through the centroid put one contact near the table almost regardless of
   the floor. A side-approach seeding mode is the real fix.
+- **The IK aims at a bounding sphere; the gate measures true mesh distance.** These are
+  different quantities, and the residual between them is what parks fingertips short.
+  `_tip_radius` returns `max||V - site_local||` — a bounding sphere about the site, ~19.5 mm
+  on the LEAP tips — and the NLP targets `p + r_tip*n`. The pre-squeeze gate `_tip_gaps_mm`
+  instead uses `mj_geomDistance`, the true tip-MESH-to-object-hull distance. The pad's honest
+  directional extent is ~9.95 mm, so the isotropic target overshoots by ~5-6 mm. The MAX
+  radius is a deliberate choice (its own comment: contacts "hover on the SAFE side", since
+  penetration is unrecoverable for the squeeze while a small gap is not), so **the gate is
+  not misapplied — it is measuring the right thing, and the overshoot is what it catches.**
+
+  `directional_r_tip_refine` (ON by default via `for_gws_recommender`) is the compensation:
+  it recomputes the radius at the SOLVED q and re-runs the DLS IK. Measured firing on
+  `017_orange` seed 0: `r_iso=(19.4,19.5)mm -> r_dir=(13.4,13.5)mm ... ACCEPTED`. Note plain
+  `directional_r_tip` WITHOUT refine is a documented no-op under the production preset — at
+  `n_normal_relinearize=0` the only q available is the warm start, where the finger has not
+  yet turned to face the object (18.78 vs 19.47 mm, a 0.7 mm correction).
+
+  **Still open:** whether `r_dir ~13.4 mm` is itself over the true ~9.95 mm support. If so,
+  tightening it (or the 1 mm `directional_r_tip_margin_m` cushion) would move marginal seeds
+  off the boundary — but the margin exists to prevent penetration, so it is a real trade,
+  not a free win.
+- **Marginal seeds are not reproducible across processes.** `017_orange` seed 0 was observed
+  BOTH ways from the identical command, one object per process: twice as `lift_ok=True` with
+  both fingers loaded (1.65/1.75 N, gaps 2.88/2.30 mm), then reproducibly as a one-finger
+  failure (`fn` index 0.0, gaps 3.97/3.22 mm). A ~1 mm difference in planned gap flips the
+  seed between a two-finger pinch and a one-finger push. This is a narrower case than the
+  known "multi-object sweeps in one process are not deterministic" — these were single-object
+  processes. **Consequence for measurement:** a single run of a marginal seed is not evidence
+  about that seed, and per-seed pass/fail claims need repeats. It also means the ~5-6 mm
+  overshoot above does not merely shift gaps, it puts borderline grasps ON the boundary where
+  small solver variation decides the outcome.
 - **`in_bin` origin-height bug** (§7).
 - **Verify/execute gamma: the budget half is fixed, the friction half is not** (§5). The
   tabletop executor and the certificate now share one disturbance box, but `verify()` still
   derates friction to `0.8 * mu` and the floor benchmark still uses its own small budget.
-- **The tripod is not wired past the NLP** (§10) — the planner solves a third contact that
-  no consumer reads.
+- **The tripod is wired but does not work** (§10) — `pick_and_place.py` reads `p3`, but
+  contact 3 collapses onto contact 2 in 15/15 measured cells and the arm executes 0/15.
+- **Only the tabletop configures the controller.** `pick_from_floor.py` and
+  `kinova_leap_pick_place.py` construct `GraspController` without `cone_mu`/`cone_margin`/
+  `cone_f_min` or `active_joint_slices`, so both silently take the defaults: `cone_mu = 0.7`
+  and the hardcoded index+thumb gain slices (§6). Two consequences, unequal in severity:
+  - The friction default is **benign today**: `mu_eff = 0.7*cos(pi/8)*0.8 = 0.517` against
+    the floor scene's true 0.6, i.e. conservative. It is still a number that does not track
+    its scene, and would become optimistic for any object with mu < 0.52.
+  - The **gain-slice default is a real defect** for any run with more than two fingers, and
+    it is the exact bug `daf4207` fixed for the tabletop without propagating. Neither env
+    runs 3 fingers today, so it is latent rather than active.
 - **`thumb_middle` is the weaker pinch.** All ten measured cells certify wrench-feasible,
   but `gamma_min` rises on every object vs `thumb_index`, and on `036_wood_block` by 4.9x
   (3.08 -> 14.93 N against a 25 N ceiling). Its "converged" solver status there is not a
@@ -578,22 +780,46 @@ What does **not** see it yet:
   `_SLOTS` against the contact list so slots map to fingers positionally at n=2 or n=3.
   `pick_from_floor.py` and `kinova_leap_pick_place.py` are still 2-contact.
   **But three-finger execution does not WORK yet.** Measured 5 objects x 3 seeds, full
-  execution, CLEAN TREE at `7827ec3`: 2-finger 9/14 true grasps (one cell excluded as a
-  physics blow-up), 3-finger **1/15** (8/15 abort before squeeze). The n=3 arm is
-  BIT-IDENTICAL between the dirty and clean trees (all 15 cells, beta and gamma_min).
-  Every 3-finger plan certifies `wrench_feasible=True`, so this is not a metric failure.
-  Two causes, both measured:
-  (a) contact 3 COLLAPSES onto contact 2 — EXACTLY coincident, not merely close: the n=3
-      contacts figure's pairwise separations read `1-2 69mm  1-3 69mm  2-3 0mm` on
-      `017_orange` seed 0, supplying no off-axis moment arm;
-  (b) every fingertip misses its target by 13-21 mm, giving 19-33 mm squeeze gaps against
-      the 8 mm gate.
+  execution, CLEAN TREE at `2bcfae3`: 2-finger **10/15** true grasps, 3-finger **0/15**.
+  All 30 cells completed (exit 0); no cell blew up and none carries a negative beta, so
+  none is excluded from the means. The tabletop block of `models/scene_objects.json` is
+  byte-identical to `7827ec3`, so this is code drift, not scene drift.
+  Two n=3 failure modes, neither a metric failure:
+  (a) `squeeze_aborted_no_contact` (11 cells) — the tripod arrives ONE FINGER FIRST. In
+      11 of 12 cells one fingertip is already touching (gap ~0, often slightly negative)
+      while another is 12-48 mm away; `017_orange` s0 reads
+      `middle -0.02mm, index 24.5mm, thumb 3.2mm`. The gap gate fires, the squeeze never
+      starts, and no force fields are written at all.
+  (b) `gamma_infeasible_no_grasp` (3 cells, all `009_gelatin_box`) — `solve_gamma_live`
+      finds no gamma that resists the disturbance box and aborts BEFORE squeeze. These are
+      the only cells in either arm with `wrench_feasible: False`; the 2-finger grasp on the
+      same object and seeds certifies feasible. **This mode is NEW** — it is absent from the
+      `7827ec3` table. `daf4207` (cone squeeze) predates `7827ec3`, so the cone solve is not
+      the new variable.
+  **Contact 3 collapses onto contact 2 in 15/15 cells, EXACTLY coincident.** Read off the
+  pairwise-separation suptitle: `2-3 0mm` on every object and every seed, with `1-3` equal
+  to `1-2` throughout (54-103 mm). The NLP is solving a two-contact problem and reporting
+  it as three; the third contact supplies no off-axis moment arm, which is the only reason
+  it exists. A doubled contact is not an infeasible one, which is why these plans still
+  certify `wrench_feasible=True`.
   This happens under BOTH patch branches: `c3_own_patch=True` still collapses (6.4 mm) and
   still aborts, so the shared trust region is NOT the cause — look at the seeding/objective.
-  On the CLEAN tree the two arms solve at comparable speed (2-finger 4.87 s, 3-finger
-  5.58 s mean); the dirty tree's apparent "n=3 is 2x faster" was a property of that tree,
-  not the formulation. Full table:
-  `benchmarks/ycb_grasp/out/tabletop/clean_7827ec3/RESULTS_2v3_finger.md`.
+  **The CONTROLLER is ruled out too, and measurably so.** On `017_orange` seed 0, every
+  tripod config from effective kp 0.2 to 16 aborts with `squeeze_aborted_no_contact` — the
+  fingertips never get close enough to squeeze, so gains are irrelevant to this failure. On
+  the same object and seed the 2-contact grasp lifts 119 mm, and raising ITS gains actively
+  breaks it (eff kp >= 4.0: contact lost, 0 N, no lift), exactly as `effective_gains`'
+  docstring predicts. The soft-PD-plus-internal-force design is deliberate and correct; the
+  tripod's problem is upstream in contact PLACEMENT. The cone allocator (§6) and the
+  gain-slice fix landed in the same commit and neither moved the tripod — they were
+  prerequisites for it working at all, not the fix.
+  The two arms solve at comparable speed (2-finger 5.41 s mean over its 10 true grasps,
+  3-finger 2.8-9.5 s per cell). **Do not claim n=3 is faster** — an earlier dirty-tree
+  reading of "2x faster" was a property of that tree, not the formulation.
+  `036_wood_block`'s 2-finger blow-up is FIXED by `d9d2a16`: beta -0.1937 / dz -1356 mm at
+  `7827ec3`, now beta +0.0615 / dz 0 mm.
+  Full table (gitignored, regenerate by re-running the sweep):
+  `benchmarks/ycb_grasp/out/tabletop/default/RESULTS_2v3_finger.md`.
 - **`FINGER_SET` is import-time**, derived from the pairing file's `default`. So `--pairing`
   steers the PLANNER only; **plan-only sweeps are meaningful, execution runs with a
   non-default pairing are not.** `SLOT_ROLES` was added so the controller maps an NLP slot to
@@ -639,9 +865,36 @@ Hessian — 0/21; `hessian_approximation=exact` fails outright, 0 Lagrangian Hes
 evaluations, the constraints are not twice-differentiable here), and `max_iter=300` still
 hits `Maximum_Iterations_Exceeded` every time.
 
-`n_seeds` 5->3 is safe because of `seed_dls_rank_pool=3`: candidates are already ordered by
-DLS-IK arm reachability, so seeds 4-5 were the worst of the pool. Dropping them was
-bit-identical on `014_lemon` and `056_tennis_ball` at 40% less time.
+`n_seeds` 5->3 was justified by `seed_dls_rank_pool=3` ordering candidates by DLS-IK arm
+reachability, so seeds 4-5 were "the worst of the pool". Dropping them was bit-identical on
+`014_lemon` and `056_tennis_ball` at 40% less time, which stands as an empirical result.
+**But the stated reason does not hold: DLS residual does NOT predict grasp quality.**
+Measured at `f173ee0`, 5 objects, 3 DLS-ranked candidates each, all solved so realised NLP
+cost is known:
+
+| object | DLS residuals (mm) | rank of the DLS-BEST candidate by cost |
+|---|---|---|
+| `017_orange` | 45.3 / 55.2 / 56.1 | 2 of 3 |
+| `014_lemon` | 24.9 / 26.3 / 29.4 | 2 of 3 |
+| `056_tennis_ball` | 25.7 / 29.5 / 30.6 | **3 of 3** |
+| `036_wood_block` | 23.8 / 25.1 / 25.3 | **3 of 3** |
+| `009_gelatin_box` | 26.6 / 26.8 / 26.9 | **3 of 3** |
+
+The DLS-best candidate was cost-best in **0 of 5** objects and was WORST in 3 of 5. On
+`056_tennis_ball` it did not even converge (`best-effort`, `wrench_ok=False`) while the
+DLS-worst candidate converged at cost 4.45. If anything the correlation is mildly negative.
+
+This is structural, not noise: `_dls_residual` scores whether the ARM CAN REACH a contact
+pair; `cost`/`gamma_min` score whether the CONTACTS RESIST WRENCHES. Reachability does not
+imply force quality, and the residuals barely separate anyway (`009_gelatin_box` spans
+0.3 mm across its three candidates). It is the same mistake the "one seed per object"
+caveat below already records twice.
+
+**Consequence: DLS pre-ranking cannot replace multi-start.** Ranking N candidates and
+solving only the top one would have picked a non-converging grasp on `056_tennis_ball`.
+The DLS screen earns its place as a reachability FILTER (it rejected 7 of 10 candidates
+here) but cannot ORDER the survivors by quality -- only the NLP does that, and ranking by
+realised cost means paying for one NLP per candidate.
 
 **Backend: IPOPT kept.** SQP+OSQP was compared under an identical NLP (`use_slsqp` touches
 only which plugin `Opti` gets, plus a log label; every cost term, constraint, bound and seed
@@ -661,7 +914,13 @@ done.
 
 ## 12. Measurement hygiene
 
-- Re-running the SAME config is deterministic to the last digit (verified 3x).
+- Re-running the SAME config is USUALLY deterministic to the last digit (verified 3x),
+  **but do not rely on it for marginal seeds.** `017_orange` seed 0 was observed both as a
+  two-finger success and as a one-finger failure from the identical command, one object per
+  process, with the planned gap differing by ~1 mm (2.88 vs 3.97 mm) — see §9. Repeat a
+  marginal cell before reporting it; a single run of a seed sitting near the gate is not
+  evidence about that seed. (The separate, already-known rule still holds: run ONE OBJECT
+  PER PROCESS — multi-object sweeps in a single process are not deterministic at all.)
 - But changing `impratio` perturbs settling -> changes the plan -> can push a fingertip gap
   just over the 8 mm gate, producing a 0.0 N "failure" that is a PLANNER outcome. Check
   `phase_log` for `squeeze_aborted_no_contact` before attributing a zero-force cell to

@@ -1,0 +1,107 @@
+\subsection{Comparison against analytic grasp synthesis}
+\label{sec:frogger}
+
+We compare against FRoGGeR~\cite{li2023frogger}, which maximizes the min-weight
+metric $\bar{\ell}^*$ as its sole objective under a hard floor
+$\bar{\ell}^* \ge k_\ell$. Both planners run in one simulator and share the scene,
+seeding pool, collision model, execution stack, and scoring instruments; only the
+planner differs. Five YCB objects, 20 seeds per object per method, two fingertip
+contacts, 200 executed trials, scored by FRoGGeR's shaky-pickup protocol (lift
+\SI{10}{\centi\meter} in \SI{1}{\second}, hold \SI{1.5}{\second},
+\SI{3}{\milli\meter} sinusoidal perturbation in all axes; failure on $>30^\circ$
+rotation or $>\SI{7.5}{\centi\meter}$ deviation). The baseline runs its own
+resample-until-feasible protocol (20 attempts, \SI{60}{\second}) from its
+bounding-box sampler; ours takes a single solve from a fixed home configuration, an
+asymmetry favoring the baseline.
+
+Three deviations limit comparability: we simulate at $\mu=2.0$ rather than $0.7$,
+so $\bar{\ell}^*$ is comparable between methods here but not to absolute values
+in~\cite{li2023frogger}; we use two contacts against their four, for which
+$k_\ell=0.3$ was calibrated; and a two-contact wrench matrix is rank-5-of-6, so the
+Ferrari--Canny $\epsilon$ metric is undefined and we omit it rather than report a
+degenerate value.
+
+\subsubsection{Execution}
+
+Table~\ref{tab:execution-1col} reports per-object outcomes. Aggregated, our method
+reaches the lift on $100\%$ $[96,100]$ of trials against $75\%$ $[66,82]$, succeeds
+on $85\%$ $[77,91]$ against $35\%$ $[26,45]$, and holds---every fingertip still
+loaded at the end of the lift---on $82\%$ $[73,88]$ against $29\%$ $[21,39]$
+($95\%$ Wilson intervals, all separating without overlap).
+
+The deficit has two distinct sources: 25 of 100 baseline trials never reach the
+lift, their solves placing contacts a median of \SI{17.5}{\milli\meter} from the
+fingertip surface, and a further 40 grip the object and then lose it. Conditioned on
+reaching the lift the baseline succeeds on $47\%$ against our $85\%$, so a single
+rate conflates a reachability failure with a grasp-quality one. The modes differ in
+kind---ours rotation-dominated (12 against 3), the expected limit of a pinch that
+cannot resist torque about the line through its contacts; the baseline's
+deviation-dominated (28 against 12), the object not held at all. Both methods fail
+on \texttt{036\_wood\_block}, which demands $\gamma\approx\SI{26}{\newton}$ against
+\SIrange{1}{2}{\newton} elsewhere and drives baseline solves to the
+\SI{60}{\newton} stability ceiling; we read this as the two-contact limit rather
+than a formulation difference.
+
+\subsubsection{Edge-seeking}
+
+Li et al.\ identify edge-seeking---contacts migrating to surface discontinuities,
+where the friction cone falls away on both sides---as the dominant failure mode of
+both their method and their baseline, and leave it to future work without proposing
+a metric. We supply one: for each contact, the geodesic distance along the surface
+to the nearest point where the normal turns more than $30^\circ$, searched along 16
+tangent directions with reprojection at each step. It queries the mesh directly and
+so is independent of contact parameterization---necessary here, as the baseline's
+contacts are forward-kinematics outputs with no local surface model.
+
+Our contacts sit a median of \SI{13.5}{\milli\meter} from the nearest edge against
+\SI{1.0}{\milli\meter}, and none of our 30 fall within \SI{2}{\milli\meter} of an
+edge against 26 of 30 (Table~\ref{tab:edge-1col}); \SI{1.0}{\milli\meter} is the
+search step, so those contacts are on the edge, not near it. \texttt{017\_orange} is
+the control---a near-sphere presents no edge to seek, and is the one object where
+margins are comparable. Edge proximity predicts outcome: grasps that held sit a
+median of \SI{12.0}{\milli\meter} from an edge ($n=18$) against
+\SI{1.0}{\milli\meter} for those that failed ($n=12$), $r=+0.574$. This is the
+mechanism behind~\cite{li2023frogger}'s ``yields unstable grasps in practice,''
+measured.
+
+\subsubsection{$\bar{\ell}^*$ is a weak predictor of success}
+
+Li et al.\ report $\bar{\ell}^*$ separating successes from failures only weakly. We
+reproduce this (pooled medians $0.87$ against $0.52$, $r=+0.317$) and sharpen it:
+the correlation is $r=+0.474$ for the baseline but $r=+0.170$ for ours, whose
+solutions are near-saturated ($0.88$ against $0.71$). A metric optimized by one
+method is not a neutral instrument for scoring another, and the edge margin predicts
+outcomes better than $\bar{\ell}^*$ does for either.
+
+\subsubsection{Which mechanisms account for the difference}
+
+Three components bear on the gap, each measured on
+\texttt{036\_wood\_block} unless noted. \textbf{Curvature is fitted to local mesh
+vertices rather than the SDF Hessian}, whose second derivative is global: mid-face
+where $\kappa=0$, the Hessian reports up to \SI{9.05}{\per\meter} sourced from a
+corner \SI{50}{\milli\meter} away, and fake curvature of $-12.33$ collapsed a trust
+region to \SI{4.6}{\milli\meter} on a face with \SI{104}{\milli\meter} of usable
+surface. \textbf{Each contact carries explicit trust-region bounds}, sized per axis
+by marching outward until the paraboloid surrogate departs from the true SDF by a
+tolerance, with bounds set by measured divergence distinguished from those merely
+reaching the search cap; this is where the margins of
+Table~\ref{tab:edge-1col} originate, and a uniform corner shrink was needed to bring
+patch error from \SI{8.78}{\milli\meter} under its \SI{4}{\milli\meter} tolerance.
+\textbf{The commanded internal force is a task-specific certificate re-solved on
+achieved geometry}---an acceleration budget expanded into a force and torque box with
+gravity re-datumed about the contact centroid, infeasibility returning no grasp
+rather than a fabricated force---and its allocation is cone-constrained rather than
+sign-anchored, which on an asymmetric three-contact grasp gives normal forces of
+$[1.000,1.000,1.000]\,\si{\newton}$ where sign-anchoring gives
+$[1.213,0.047,0.325]\,\si{\newton}$.
+
+\subsubsection{Limitations}
+
+The comparison is asymmetric in ways that favor us. Our planner is tuned on this
+scene; the baseline is a reimplementation, and one defect---contacts reported at the
+fingertip site rather than the constrained pad point, displacing each by
+approximately \SI{10}{\milli\meter}---was found and corrected during this study,
+raising its success rate from $7\%$ to $35\%$. We cannot exclude further such
+defects, and the $25\%$ of baseline trials placing unreachable contacts is where we
+would look first. Friction, contact count, and floor all differ from the original
+work, and plan-time quantities are measured over 30 of the 200 trials.

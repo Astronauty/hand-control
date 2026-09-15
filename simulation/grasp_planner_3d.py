@@ -2160,7 +2160,7 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     # NO DOUBLE-COUNTING WITH bound_inset. This clip runs BEFORE the inset and
     # only ever MOVES A SIDE INWARD (min/max against the existing value), so the
     # inset that follows measures its reserve against the already-clipped room:
-    # _inset_for reads `_room = min(|lo|,|hi|)` from these post-clip values, and
+    # _cut reads each SIDE's own room from these post-clip values, and
     # its bound_keep_frac cap therefore applies to the real remaining room. The
     # two are sequential shrinks of the same interval, not two independent
     # subtractions of the same margin -- an axis clipped to the face edge then
@@ -2178,7 +2178,39 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
         _V = np.asarray(mesh_entry["verts"], float)
         _d = _V - np.asarray(seed_l, float).reshape(1, 3)
         _FACE_BAND = 2.0e-3      # m; a vertex further off the plane is another face
-        _on_face = np.abs(_d @ np.asarray(n_l_unit, float).reshape(3)) <= _FACE_BAND
+        _off = _d @ np.asarray(n_l_unit, float).reshape(3)
+        _on_face = np.abs(_off) <= _FACE_BAND
+        # IS IT ACTUALLY A FACE? The band test alone cannot tell a flat face from
+        # the tangent CAP of a ROUNDED surface: every smooth object has vertices
+        # within 2mm of its own tangent plane, and clipping to those measures
+        # CURVATURE while reporting it as face extent. Measured on 017_orange
+        # (a sphere, no face anywhere): 119 of 5528 vertices land in the band with
+        # an in-plane radius of 12.7mm, which clipped the patch to 32.7mm -- and
+        # that clip, not sdf_err_tol, was the sole binding constraint (loosening
+        # the tolerance 8x past saturation changed nothing, toggling this changed
+        # 32.7 -> 103.4mm). It is why the tripod could never reach its 45.4mm
+        # index-middle pitch: the cap forbade the spacing before the NLP started.
+        #
+        # A band of depth b on a sphere of radius R has in-plane radius
+        # r = sqrt(2Rb - b^2), so R_implied = r^2/(2b) recovers the radius --
+        # bounded and small for a curved patch, enormous for a planar one
+        # (a plane's band is limited only by where the face ends). MEASURED
+        # separation, seed 0, three contacts per object:
+        #     017_orange 40-45mm | 014_lemon 43mm | 056_tennis_ball 37-46mm
+        #     009_gelatin_box 367-568mm | 036_wood_block 6616-10913mm
+        # Rounded objects report their own radius; faces are 8x-240x larger. The
+        # threshold sits in that empty gap and is deliberately nearer the curved
+        # end, so an ambiguous patch keeps the clip (the conservative direction --
+        # it preserves d9d2a16's crease guard, whose whole purpose is to stop a
+        # contact parking on an edge).
+        _FACE_MIN_R = 0.15       # m; R_implied below this is curvature, not a face
+        if int(_on_face.sum()) >= 3:
+            _dfb = _d[_on_face]
+            _rip = float(np.linalg.norm(
+                _dfb - np.outer(_off[_on_face], np.asarray(n_l_unit, float).reshape(3)),
+                axis=1).max())
+            if (_rip * _rip) / (2.0 * _FACE_BAND) < _FACE_MIN_R:
+                _on_face = np.zeros_like(_on_face)
         if int(_on_face.sum()) >= 3:
             _df = _d[_on_face]
             for _ax, _nm in ((axis0_l, 0), (axis1_l, 1)):
@@ -2287,25 +2319,45 @@ def _mesh_quadratic_contact_ca(opti, seed_world: np.ndarray, seed_normal_out: np
     if bound_inset > 0.0:
         _keep = min(max(float(bound_keep_frac), 0.0), 1.0)
 
-        def _inset_for(kappa: float, lo: float, hi: float) -> float:
-            # CURVED axis: no inset at all. The paraboloid bends with the surface
-            # and the SDF-error search already shrank it where the fit degrades.
-            if float(kappa) != 0.0:
-                return 0.0
-            # PLANAR axis: the constant, capped so each side keeps _keep of itself.
-            # Capped per-SIDE (the tighter of the two) rather than on the total
-            # width, so the asymmetry the four searches measured is preserved --
-            # a side with 4mm of room cannot be handed the same absolute cut as
-            # the 90mm side opposite it.
-            _room = min(abs(lo), abs(hi))
-            return min(bound_inset, (1.0 - _keep) * _room) if _room > 0.0 else 0.0
+        def _cut(side_room: float) -> float:
+            """Crease reserve for ONE side of one axis, in metres.
 
-        _in0 = _inset_for(kappa0, t_lo_0, t_hi_0)
-        _in1 = _inset_for(kappa1, t_lo_1, t_hi_1)
-        t_lo_0 = min(t_lo_0 + _in0, 0.0)
-        t_hi_0 = max(t_hi_0 - _in0, 0.0)
-        t_lo_1 = min(t_lo_1 + _in1, 0.0)
-        t_hi_1 = max(t_hi_1 - _in1, 0.0)
+            APPLIES TO CURVED AXES TOO. This used to return 0.0 whenever
+            kappa != 0, reasoning that "the paraboloid bends with the surface
+            and the SDF-error search already shrank it where the fit degrades".
+            That fails for the case the inset exists to cover: the SDF criterion
+            asks whether the paraboloid still MATCHES the surface, and on a
+            curved object the answer stays yes right up to a rim or lip -- the
+            fit tracks the curvature until the surface ENDS. Same blind spot it
+            has on a box face, which is why bound_inset was introduced;
+            curvature hides it rather than removing it. Measured:
+            017_orange/014_lemon/009_gelatin_box carry kappa 19-47 and were
+            getting NO reserve on any axis.
+
+            TRULY PER-SIDE. The cap previously came from
+                _room = min(abs(lo), abs(hi))
+            i.e. ONE cut sized by the TIGHTER side and applied to BOTH -- the
+            opposite of what its comment claimed. Spending the tight side's
+            allowance on the wide side leaves the wide end under-reserved.
+            Measured on 025_mug slot 1: bounds [-34.39, +45.33]mm, so each side
+            lost 10mm and the contact still solved to t0 = +45.33, PINNED
+            exactly at the wide bound -- which on that patch is the mug's RIM.
+            The thumb then pressed straight down on the lip (outward normal
+            [-0.115, 0.303, 0.946], i.e. +z) while the other fingers pushed
+            sideways, and solve_gamma_live correctly refused the grasp.
+
+            Each side now reserves against ITS OWN room, so a 4mm side is capped
+            by its own 4mm and a 90mm side by its own 90mm.
+            """
+            _r = abs(float(side_room))
+            return min(bound_inset, (1.0 - _keep) * _r) if _r > 0.0 else 0.0
+
+        _lo0_cut = _cut(t_lo_0); _hi0_cut = _cut(t_hi_0)
+        _lo1_cut = _cut(t_lo_1); _hi1_cut = _cut(t_hi_1)
+        t_lo_0 = min(t_lo_0 + _lo0_cut, 0.0)
+        t_hi_0 = max(t_hi_0 - _hi0_cut, 0.0)
+        t_lo_1 = min(t_lo_1 + _lo1_cut, 0.0)
+        t_hi_1 = max(t_hi_1 - _hi1_cut, 0.0)
         # WARN when an axis still collapsed. With bound_keep_frac < 1 this should
         # be unreachable for a planar axis -- the cap leaves keep_frac of each
         # side -- so reaching it means the axis had essentially NO measured room
@@ -2626,6 +2678,16 @@ def build_W_ca(p1, p2, R1_param, R2_param, obj_center_np, obj_R_np, mu,
     return ca.horzcat(*cols)
 
 
+# Slack on the bounding-sphere lower-bound test that detects a phantom
+# mj_geomDistance result. The bound ||c1-c2|| - rb1 - rb2 is exact in real
+# arithmetic but is itself computed in floating point from geom_xpos and
+# geom_rbound, and MuJoCo's own distance carries solver tolerance, so a real
+# query may sit a hair below it without being phantom. 1e-9 m is far below any
+# geometric scale here (the tightest margin in play is the 1 mm safety clearance)
+# and far above that float noise.
+_GEOM_DIST_PHANTOM_TOL = 1e-9   # m
+
+
 class _ExactGeomDistanceJacCallback(ca.Callback):
     """d(exact distance)/dq by FRoGGeR's eq. (8), from the witness points.
 
@@ -2648,6 +2710,11 @@ class _ExactGeomDistanceJacCallback(ca.Callback):
       * A pair culled as distant gets a zero gradient, matching their broadphase
         treatment -- beyond the cutoff the constraint is inactive and its gradient
         carries no information.
+
+    One degeneracy the paper does not have, because it is MuJoCo's: 3.3.x's GJK can
+    return a phantom 0.0 for well-separated pairs. That corrupts the DIRECTION of
+    this gradient, not just its size, so every query is bounded below by the
+    bounding-sphere distance -- see the comment in `eval`.
     """
 
     def __init__(self, name, model, geom_id, obj_gids, n_robot, obj_qpos=None,
@@ -2686,9 +2753,35 @@ class _ExactGeomDistanceJacCallback(ca.Callback):
 
         # The binding pair is the nearest hull; only it constrains the solution, so
         # only its gradient is nonzero (the min over hulls is what the value returns).
-        best_d, best_og = float("inf"), None
+        #
+        # BOUNDING-SPHERE GUARD, matching _ExactGeomDistanceCallback.eval. MuJoCo
+        # 3.3.x's GJK can return a phantom 0.0 for well-SEPARATED convex pairs
+        # (ulp-sensitive; see scripts/rrt_planner.py and the guard in
+        # kinova_leap_pick_place._guarded_geom_dist). Here that is worse than a bad
+        # VALUE: a phantom 0.0 both flips `sign` (0.0 is not < 0, but a phantom
+        # NEGATIVE would) and, decisively, hands back WITNESS POINTS from a bogus
+        # query -- so n_AB points somewhere arbitrary and the gradient DIRECTION is
+        # wrong, not merely its magnitude. A wrong direction steers the solve;
+        # a wrong magnitude only scales a step.
+        #
+        # The exact distance can never be below ||c1-c2|| - rb1 - rb2, so the bound
+        # does double duty: pairs already clear of the cutoff skip the query
+        # outright (their gradient is zero anyway -- the paper's broadphase cull),
+        # and a returned distance BELOW the bound is impossible and therefore
+        # phantom, so the pair is skipped rather than trusted.
+        best_d, best_og, best_ft = float("inf"), None, None
         for og in self._obj_gids:
+            lb = (float(np.linalg.norm(d.geom_xpos[og] - d.geom_xpos[self._gid]))
+                  - float(m.geom_rbound[self._gid]) - float(m.geom_rbound[og]))
+            if lb > self._cutoff:
+                continue                             # provably culled; no query
             dist = mj.mj_geomDistance(m, d, self._gid, og, self._cutoff, self._fromto)
+            if dist < lb - _GEOM_DIST_PHANTOM_TOL:
+                # Below a bound it cannot physically be below: phantom. Skipping
+                # leaves this hull out of the min, which is the conservative
+                # choice -- a spurious zero would otherwise capture `best` (it is
+                # smaller than every real distance) and own the gradient.
+                continue
             if dist < best_d:
                 best_d, best_og = dist, og
                 best_ft = self._fromto.copy()
@@ -3645,12 +3738,30 @@ class UVAtlasConfig:
     # fingertip such that the forward kinematics were fixed" (App. B-F), at 60 deg
     # tilted toward the palm from the very tip of each finger.
     #
-    # The LEAP tip site sits at the tip GEOM's centre (measured 0.0-0.1 mm off
-    # geom_xpos) and that geom is a box of half-extents ~11 x 12 x 17 mm, so the pad
-    # surface along pad_axis is roughly one half-extent out. 0.011 m is that value;
-    # it is a fixed body-frame quantity, which is the property their sentence
+    # The LEAP tip site sits at the tip GEOM's centre (measured 0.05 mm off
+    # geom_xpos on both thumb and index). 0.011 was an ESTIMATE -- "roughly one
+    # half-extent" of the tip geom's ~11 x 12 x 17 mm bounding box. MEASURED against
+    # the tip mesh's actual vertices, the pad surface along pad_axis is:
+    #
+    #     thumb (leap_th_tip)  9.96 mm      index (leap_if_tip)  9.95 mm
+    #
+    # (52-vertex collision meshes, support distance max(V - site) . pad_axis taken
+    # in the world frame at the settled pose.) The estimate overshot the real pad
+    # surface by 1.05 mm, which placed the constraint point OUTSIDE the fingertip
+    # and biased every frogger solve to park the hand that much further off the
+    # object. 0.00995 m is the measured value, common to both tips to within
+    # 0.01 mm.
+    #
+    # It remains a FIXED body-frame quantity, which is the property their sentence
     # requires, unlike an offset along the object's own surface normal.
-    frogger_pad_offset_m:   float = 0.011
+    #
+    # This corrects the constant, NOT the mechanism. The constraint point lies on
+    # the pad surface only along pad_axis; measured 13.4 mm from the nearest tip
+    # vertex, it is inside no other direction. When the contact is off-axis -- and
+    # (7a) has no alignment term to prevent that -- the real geom surface is
+    # further out than this offset, which is the residual the executor's gap gate
+    # sees. See docs/FROGGER_BENCH.md §9.1.
+    frogger_pad_offset_m:   float = 0.00995
 
     # Per-constraint tolerances, FRoGGeR's Table III (App. B-F):
     #     joint 1e-2, surface contact 5e-4, collision 1e-3, force closure 1e-5.
@@ -3965,6 +4076,13 @@ class MultiStartConfig:
     # the surface while fingertip geoms stop 3-9mm short. Costs one DLS solve
     # per candidate (milliseconds) against a multi-second NLP per seed.
     seed_dls_rank_pool: int = 1
+    # DLS-IK residual (m) above which a candidate is rejected as UNREACHABLE.
+    # Used as a FILTER only -- the surviving candidates are ranked by patch
+    # extent, because the residual was measured not to predict grasp quality
+    # (0/5 objects; docs/SOLVER_STATE.md 11). Generous by design: it is meant to
+    # drop pairs the arm plainly cannot get to, not to express a preference.
+    # Set to inf to disable the filter and rank the whole pool.
+    seed_dls_reject_m: float = 0.060
     seed_kappa_max_reject: float = 150.0
 
     # Vertical room the SEED gate requires under a contact, in metres. None
@@ -5045,9 +5163,28 @@ class GraspPlanner3D:
                 # The FK callbacks are the same ones the IK cost uses, so the
                 # fingertip position entering W is the position the hand actually
                 # reaches, by construction rather than by penalty.
-                _p1 = _tp1_fk
-                _p2 = _tp2_fk
-                if _has_c3 and _tp3_fk is not None:
+                # THE CONTACT IS THE PAD POINT, NOT THE SITE. The surface equality
+                # below pins `site + pad_offset*pad_axis` to s(p)=0, because that is
+                # the fixed fingertip point their App. B-F specifies. Reporting the
+                # SITE as the contact then describes a point ~pad_offset OUTSIDE the
+                # object: measured +9.51/+9.74 mm on 017_orange and +9.66/+9.23 mm on
+                # 014_lemon against a constraint that holds to ~0.
+                #
+                # Everything downstream believed it -- W's wrench columns, the gamma
+                # certificate and the executor's contact frames were all built at a
+                # point floating off the surface, and the executed grasp opened
+                # ~2*pad_offset too wide (contact separation 91 mm across a 73 mm
+                # orange, 70 mm across a 58 mm lemon) and closed on air.
+                #
+                # Same expression as the constraint, so the two cannot drift.
+                _pa_r = np.asarray(cfg.pad_axis, float)
+                _pa_r = _pa_r / (np.linalg.norm(_pa_r) + 1e-12)
+                _po = float(cfg.frogger_pad_offset_m)
+                _p1 = _tp1_fk + _po * _thumb_pad_cb(_q)
+                _p2 = _tp2_fk + _po * _index_pad_cb(_q)
+                if _has_c3 and _tp3_fk is not None and _middle_pad_cb is not None:
+                    _p3 = _tp3_fk + _po * _middle_pad_cb(_q)
+                elif _has_c3 and _tp3_fk is not None:
                     _p3 = _tp3_fk
             elif _is_mesh and cfg.sdf_surface_contact:
                 # FRoGGeR (7d): free 3-vectors pinned by s(p) = 0. No trust region
@@ -5236,13 +5373,32 @@ class GraspPlanner3D:
             # solve has already moved away from -- the same inconsistency the
             # wrench frame had before quadratic_symbolic_normals. Falls back to
             # the frozen -d*_lp whenever the surrogate isn't active.
-            _n1_in_sym_cost = _n2_in_sym_cost = None
+            _n1_in_sym_cost = _n2_in_sym_cost = _n3_in_sym_cost = None
             if (cfg.quadratic_symbolic_normals and _is_mesh
                     and cfg.use_quadratic_contact
                     and _t1_frame is not None and _t2_frame is not None
                     and _t1_var is not None and _t2_var is not None):
                 _n1_in_sym_cost = _quadratic_inward_normal_ca(_t1_var, _t1_frame, obj_R_np)
                 _n2_in_sym_cost = _quadratic_inward_normal_ca(_t2_var, _t2_frame, obj_R_np)
+                # SLOT 3 was the only contact left on its FROZEN SEED normal, and it
+                # is the one that moves furthest. Measured seed-normal vs true normal
+                # at the solved contact, seed 0: slot 3 is worst on every object --
+                # 60.5 deg on 017_orange, 61.1 on 056_tennis_ball, 71.2 on
+                # 009_gelatin_box, i.e. a target displaced r_tip*|dn| = 14.7-22.7mm
+                # from the correct one. That is the whole 18-20mm the IK-only
+                # ablation stalls at (every other cost term zeroed and the tips STILL
+                # do not close, while a selective-damped DLS reaches 0.4mm on the same
+                # contacts), because a stale normal does not weaken the term -- it
+                # relocates its MINIMUM. 036_wood_block is the control: planar, drift
+                # 2.3 deg, offset 0.8mm, and the only object where ik_only improved.
+                #
+                # Under the default c3_own_patch=False, _t3_frame IS _t2_frame, so
+                # this evaluates the SAME paraboloid at contact 3's own coordinate --
+                # which is exactly the point: the two contacts sit at different t on
+                # one patch and therefore have different normals.
+                if _has_c3 and _t3_var is not None and _t3_frame is not None:
+                    _n3_in_sym_cost = _quadratic_inward_normal_ca(
+                        _t3_var, _t3_frame, obj_R_np)
 
             # Per-consumer ablation: each sub-flag can veto the symbolic normal
             # for ONE consumer while the others keep it (None = follow master).
@@ -5304,8 +5460,15 @@ class GraspPlanner3D:
                 _r3_ik = float(
                     (cfg.r_middle if cfg.r_middle is not None else cfg.r_index)
                     if r3_override is None else r3_override)
-                _n3_out_ik = ca.DM(np.asarray(
-                    d3_lp if d3_lp is not None else _n3_seed_out, float))
+                # Same per-consumer veto as slots 1 and 2 (_sym_pair): None or True
+                # follows the master switch, False forces the frozen seed normal.
+                _n3_ik_s = (_n3_in_sym_cost
+                            if (_n3_in_sym_cost is not None
+                                and cfg.quad_sym_normals_iktgt is not False)
+                            else None)
+                _n3_out_ik = (-_n3_ik_s if _n3_ik_s is not None
+                              else ca.DM(np.asarray(
+                                  d3_lp if d3_lp is not None else _n3_seed_out, float)))
                 _tp3_tgt = _p3 + _r3_ik * _n3_out_ik
                 _d3_sq = ca.sumsqr(_tp3 - _tp3_tgt)   # m²
 
@@ -7414,13 +7577,61 @@ class MultiStartGraspPlanner3D:
             _d.qpos[act_idx] = np.asarray(q_ref, float)[:len(act_idx)]
             _t1 = s['p1s'] + cfg.r_thumb * (-s['n1_in'])
             _t2 = s['p2s'] + cfg.r_index * (-s['n2_in'])
-            self._planner._dls_ik.solve(
-                model, _d, [self._planner._thumb_sid, self._planner._index_sid],
-                [_t1, _t2], q_bias=q_ref, null_gain=0.3)
+            # THIRD SITE at n>=3. Scoring only thumb+index makes this screen
+            # structurally blind to the finger that actually fails: measured on
+            # 009_gelatin_box, the pair ranked best by patch extent put thumb and
+            # index at -0.02/-0.08mm and the MIDDLE finger 31.4mm off its contact
+            # at 0.0N. No weighting of a 2-site residual can see that.
+            #
+            # The pair seed carries no p3s here (_seed_third_contact runs much
+            # later, per seed), so a PROVISIONAL third contact is generated for
+            # scoring only. It is not stored on the seed and does not preempt the
+            # real c3 selection -- it exists so the pair can be judged on whether
+            # a third finger could reach anything from it.
+            _sids = [self._planner._thumb_sid, self._planner._index_sid]
+            _tgts = [_t1, _t2]
+            if (int(getattr(cfg, 'n_contacts', 2)) >= 3
+                    and self._planner._middle_sid is not None):
+                try:
+                    _c3_probe = _seed_third_contact(
+                        s, geom_type, geom_size, obj_center_np, obj_R_np, self._rng,
+                        mesh_entry=self._mesh_entry, n_fan=3, fan_half_deg=40.0,
+                        strategy=str(getattr(cfg, 'c3_seed_strategy', 'fan')),
+                        prefer_outer=cfg.seed_prefer_outer_surface)
+                except Exception:
+                    _c3_probe = []
+                _best3 = None
+                for _cand in (_c3_probe or []):
+                    if _reachable_contact(_cand['p3s'], _ground_z, _r_tip_min):
+                        _best3 = _cand
+                        break
+                if _best3 is not None:
+                    _r_mf = float(cfg.r_middle if cfg.r_middle is not None
+                                  else cfg.r_index)
+                    _sids.append(self._planner._middle_sid)
+                    _tgts.append(_best3['p3s'] + _r_mf * (-_best3['n3_in']))
+            # SELECTIVE DAMPING for the ranking solve. The shipped damping=0.01
+            # with null_gain=0.3 makes I - J^+ J a poor projector, so the posture
+            # bias leaks into the task direction and the solve stalls far from a
+            # reachable target -- measured, a 20mm target converges to 8.29mm at
+            # damping=0.01 vs 0.06mm at 1e-4, and the warm-start residuals this
+            # screen shares ran 15-47mm where a selective-damped solve reached
+            # sub-2mm. A screen that cannot tell "unreachable" from "my IK gave
+            # up" is not measuring reachability. Selective damping damps only the
+            # near-singular directions, so the well-conditioned ones keep full
+            # accuracy and the residual means what it says. Built once and cached.
+            _rank_ik = getattr(self, '_rank_dls_ik', None)
+            if _rank_ik is None:
+                _rank_ik = SpatialIKSolver(
+                    n_robot=len(act_idx), selective_damping=True, sigma0=0.05)
+                self._rank_dls_ik = _rank_ik
+            _rank_ik.solve(model, _d, _sids, _tgts, q_bias=q_ref, null_gain=0.3)
             mj.mj_kinematics(model, _d)
+            # WORST site, not the mean: a pair is only as reachable as the finger
+            # that cannot get there, which is the whole point of adding site 3.
             return float(max(
-                np.linalg.norm(_d.site_xpos[self._planner._thumb_sid] - _t1),
-                np.linalg.norm(_d.site_xpos[self._planner._index_sid] - _t2)))
+                np.linalg.norm(_d.site_xpos[_sid] - _tg)
+                for _sid, _tg in zip(_sids, _tgts)))
 
         seeds, attempts, rejected = [], 0, 0
         # Per-seed REJECT record, so a paired diagnostic can draw the seeds the
@@ -7618,6 +7829,57 @@ class MultiStartGraspPlanner3D:
             _assign_seed_by_finger(s, _live_th, _live_if)
             _pool.append(s)
 
+        def _patch_extent_score(s) -> float:
+            """Usable trust-region size for a seed PAIR, in metres. Larger is better.
+
+            WHY THIS AND NOT THE DLS RESIDUAL. The DLS screen answers "can the arm
+            reach this pair", which is necessary but was measured NOT to predict
+            grasp quality: over 5 objects, 3 DLS-ranked candidates each, all
+            solved, the DLS-best candidate was cost-best in 0/5 and WORST in 3/5,
+            and on 056_tennis_ball it did not converge at all while the DLS-worst
+            candidate converged cleanly (see docs/SOLVER_STATE.md 11). The
+            residuals barely separate either -- 009_gelatin_box spans 0.3mm across
+            its three candidates, which is not a ranking signal.
+
+            Patch extent is a signal we have separately measured to BIND: the
+            IPOPT multipliers at the solution put the patch trust-region bounds in
+            the top three active constraints on every one of the five objects
+            (lambda 24-347), i.e. the contacts run to the edge of their
+            paraboloid. A seed whose patch is thin gives the optimizer no room
+            before it hits that wall.
+
+            MIN over the two contacts, not the product or the mean: a pinch is
+            only as good as its WORSE patch, and a thin-and-wide pair is exactly
+            the failure being screened out. Returns 0.0 for any pair whose patch
+            cannot be built, which sorts it last.
+            """
+            if not (geom_type == _GEOM_TYPE_MESH
+                    and self._planner._mesh_entry is not None
+                    and cfg.use_quadratic_contact):
+                return 0.0
+            _diags = []
+            for _pk, _nk, in (('p1s', 'n1_in'), ('p2s', 'n2_in')):
+                try:
+                    _n_out = -np.asarray(s[_nk], float)
+                    _throw = ca.Opti()
+                    _, _, _, _fr = _mesh_quadratic_contact_ca(
+                        _throw, np.asarray(s[_pk], float), _n_out,
+                        obj_center_np, obj_R_np, self._planner._mesh_entry,
+                        t_bound_max=cfg.quadratic_t_bound_max,
+                        sdf_err_tol=cfg.quadratic_sdf_err_tol,
+                        mesh_fit=cfg.quadratic_mesh_fit,
+                        mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
+                        mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
+                        bound_inset=cfg.quadratic_bound_inset,
+                        extent_clip=cfg.quadratic_extent_clip,
+                        bound_keep_frac=cfg.quadratic_bound_keep_frac)
+                    _s0 = float(_fr['t_hi_0']) - float(_fr['t_lo_0'])
+                    _s1 = float(_fr['t_hi_1']) - float(_fr['t_lo_1'])
+                    _diags.append(float(np.hypot(_s0, _s1)))
+                except Exception:
+                    return 0.0
+            return min(_diags) if _diags else 0.0
+
         if _rank_random and (_pool or _minor_pool):
             # Best-reachable first, with the MINOR-AXIS seed in the same pool
             # (chart-pair seeds are already DLS-ranked upstream and keep their
@@ -7627,18 +7889,54 @@ class MultiStartGraspPlanner3D:
             # arm reaches it equally well, and loses only when some random
             # candidate is measurably more reachable.
             _rank_pool = [(-1, _s) for _s in _minor_pool] + list(enumerate(_pool))
-            _scored = sorted(((_dls_residual(_s), _i, _s)
-                              for _i, _s in _rank_pool), key=lambda t: t[:2])
+            # TWO-STAGE: DLS is a reachability FILTER, patch extent is the RANK.
+            # Candidates the arm cannot reach are dropped outright (the screen the
+            # DLS residual is actually good at); the survivors are then ordered by
+            # the quantity measured to bind the solve. If the filter would empty
+            # the pool it is skipped rather than failing the solve -- a badly
+            # reachable grasp still beats no grasp, and the NLP gets the final say.
+            _dls_all = [(_dls_residual(_s), _i, _s) for _i, _s in _rank_pool]
+            _keep = [x for x in _dls_all
+                     if x[0] <= float(cfg.seed_dls_reject_m)]
+            if not _keep:
+                _keep = _dls_all
+            _n_filtered = len(_dls_all) - len(_keep)
+            # Sort by DESCENDING patch extent, with the DLS residual as a
+            # TIEBREAK and the minor-axis index (-1) breaking an exact tie after
+            # that. Patch extent is quantised to 1mm for the comparison: raw
+            # floats almost never tie, so an un-quantised key would make the
+            # tiebreak dead code. 1mm is below the scale that separates
+            # candidates (80mm spread measured on 036_wood_block) and above
+            # float noise.
+            #
+            # CAUTION about what the tiebreak can and cannot do: _dls_residual
+            # solves for the THUMB and INDEX sites only -- there is no middle
+            # site in its target list -- so it is structurally blind to the
+            # third finger's reach. It cannot rescue the n=3 failure mode where
+            # a large-patch pair is picked and the MIDDLE finger then cannot get
+            # there (measured on 009_gelatin_box: middle 31.4mm off its contact
+            # at 0.0N while thumb and index sat at -0.02/-0.08mm). Ranking by
+            # patch alone cost that object 3/3 -> 1/3 at n=3; the tiebreak only
+            # separates pairs the patch score already calls equal.
+            _scored = sorted(((_r, _i, _s) for _r, _i, _s in _keep),
+                             key=lambda x: (-round(_patch_extent_score(x[2]) * 1e3),
+                                            x[0], x[1]))
             _minor_rank = next((_k for _k, (_r, _i, _s) in enumerate(_scored)
                                 if _i == -1), None)
-            log.info(f"[seed_gen] DLS-ranked {len(_pool)} random"
+            _ext = [_patch_extent_score(_s) for _r, _i, _s in _scored]
+            log.info(f"[seed_gen] {len(_pool)} random"
                      f"{' + 1 minor-axis' if _minor_pool else ''} candidates; "
-                     f"residuals {_scored[0][0]*1e3:.1f}..{_scored[-1][0]*1e3:.1f}mm, "
+                     f"DLS filter dropped {_n_filtered} over "
+                     f"{float(cfg.seed_dls_reject_m)*1e3:.0f}mm; "
+                     f"ranked by PATCH EXTENT "
+                     f"{(max(_ext) if _ext else 0.0)*1e3:.1f}.."
+                     f"{(min(_ext) if _ext else 0.0)*1e3:.1f}mm, "
                      f"keeping best {max(n_seeds - len(seeds), 0)}"
                      + (f"; minor-axis ranked {_minor_rank + 1}/{len(_scored)}"
                         if _minor_rank is not None else ""))
             self.last_seed_rank_table = [
-                dict(dls_res_mm=_r * 1e3, accepted=(_k < max(n_seeds - len(seeds), 0)))
+                dict(dls_res_mm=_r * 1e3, patch_extent_mm=_ext[_k] * 1e3,
+                     accepted=(_k < max(n_seeds - len(seeds), 0)))
                 for _k, (_r, _i, _s) in enumerate(_scored)
             ]
             for _r, _i, _s in _scored:

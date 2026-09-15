@@ -1219,3 +1219,630 @@ because it failed, which moves a rate by construction; the honest statement is t
 the port converges at 93% on objects a two-finger pinch can physically grasp, and
 that the excluded object is the test case for the `n >= 3` path. It should return
 when that path works.
+
+---
+
+## 9. Execution scoring (2026-09-14): pick success, epsilon, and a gap-gate wall
+
+Qualification 1 of `FROGGER_STATUS.md` §1 is now closed: the paper's shaky pickup
+runs against live grasps. Two new instruments, both additive:
+
+- **`simulation/epsilon_metric.py`** — Ferrari-Canny `epsilon`, the classical quality
+  FRoGGeR SCORES with, as distinct from `l_bar*`, the relaxation they OPTIMIZE.
+  Verified against closed form on a 4-contact cross grasp (`eps = 2*mu*r` exactly,
+  7/7 across mu, r and gamma); `tests/test_epsilon_metric.py`, 5/5 passing.
+- **`benchmarks/ycb_grasp/frogger_exec_bench.py`** — plans with either arm and
+  EXECUTES through `pick_and_place`'s measured approach/settle/gap-gate/squeeze path,
+  with FRoGGeR's lift-and-shake substituted for the lift. `run_pick_place` grew a
+  `plan_override` hook (cfg + start pose) because it previously hardcoded
+  `for_gws_recommender` and a HOME start, so only `ours` was executable.
+
+### 9.1 Pilot result, 2 objects x 3 seeds x 2 arms
+
+`n = 2` (thumb+index), scene friction `mu = 2.0`, single solve, `k_l = 0.3`.
+
+| | ours | frogger |
+|---|---|---|
+| reached the squeeze | **6/6** | 1/6 |
+| pick success (of those that lifted) | 3/6 | 1/1 |
+| `lift_ok` (of those that lifted) | **3/6** | 0/1 |
+| median `l_bar*` | +0.945 | +0.398 |
+| median wall-clock | 12.7 s | 3.7 s |
+
+**The headline is the second row, and it is not a metric difference.** Five of six
+frogger cells never reached the squeeze:
+
+| cell | abort | fingertip gap (mm) |
+|---|---|---|
+| orange s0 | gap too large | index 8.54, thumb 11.56 |
+| orange s2 | wrench-infeasible | -- (`l_bar*` = -10.30) |
+| block s0 | gap too large | index 10.80, thumb 11.14 |
+| block s1 | gap too large | index 8.15, thumb 8.87 |
+| block s2 | gap too large | index 0.97, thumb 10.34 |
+
+The gaps cluster at 8-11.5 mm, which is `frogger_pad_offset_m` (0.011). That is the
+mechanism, not a coincidence. Their (7d) constrains `site + 11 mm * pad_axis` to the
+surface — a FIXED body-frame point, which is the faithful reading of their sentence
+and is already documented at `grasp_planner_3d.py:3705`. The executor's gap gate
+measures the ACTUAL tip-geom surface, and the LEAP tip is a box of half-extents
+~11 x 12 x 17 mm, so along any direction that is not the pad axis the real surface
+sits further out than the 11 mm the constraint assumed. The solve is satisfied; the
+hand is still a centimetre away.
+
+`l_bar*` cannot see this. Orange s0 reports **+0.9996**, essentially the ceiling of
+1.0, with the fingertips 8.5 and 11.6 mm off the object. A metric computed on
+contact points that the hand does not reach is measuring a grasp nobody is holding —
+the same class of defect as §7.1's 5th cone vertex, caught here only because the
+grasp was executed.
+
+### 9.2 Their criteria can score a one-finger carry as a success
+
+`frogger | 017_orange | seed 1` passed the shaky pickup — object rose 97.8 mm,
+rotated 2.5 deg, deviated 1.5 mm, all well inside their thresholds — while the index
+finger's measured force at the final step was **0.0 N**. The object was carried on
+the thumb alone.
+
+Their criteria are displacement-only and cannot detect this: an object that tracks
+the palm neither rotates nor deviates, however few fingers are actually loaded.
+`lift_ok`'s force gate does detect it, which is why both are reported and why
+`pick_success` alone should not be quoted from this harness. This is the
+`release_done != grasped` failure class in a new place.
+
+### 9.3 What this does and does not establish
+
+Does: the execution path is wired, both arms run through one shared executor, and
+the frogger arm's dominant failure mode on this hand is a REACHABILITY mismatch at
+the pad-offset constraint rather than a grasp-quality deficit.
+
+Does not: `n = 2` is not their configuration (four Allegro fingers), `mu = 2.0` is
+not their friction, and 12 cells is a pilot. The 3/6 vs 1/1 success comparison rests
+on one frogger cell that reached the lift and should not be quoted as a rate. The
+6/6 vs 1/6 squeeze-reach difference is the result worth carrying forward.
+
+### 9.4 The epsilon column is empty at n = 2, by construction
+
+All 12 cells report `epsilon` degenerate. A two-contact pinch's wrench set is
+rank-5-of-6 — it resists no torque about the line through its contacts — so it
+contains no origin-centred 6-ball and Ferrari-Canny `epsilon` does not exist. This is
+the same structural fact that gates `project_grasp_axis_torque` in the gamma
+certificate, and it is why the paper's `epsilon` column is a FOUR-finger number.
+Reporting 0.0 would have been wrong in a specific way: it reads as "closure, but
+weak" rather than "not defined".
+
+The force-subspace fallback is also uninformative at this scene's friction: it
+saturates at exactly 1.0 for any `mu >= 1` (measured 0.667 / 1.000 / 1.000 / 1.000 at
+mu = 0.5 / 1 / 2 / 4), because the normal direction is bounded by the normal force
+while the tangential extent grows with mu. **`epsilon` becomes measurable only when
+the `n >= 3` path works**, which makes it one more thing blocked on that path.
+
+### 9.5 Running it
+
+```bash
+cd benchmarks
+# the pilot above
+uv run python -m ycb_grasp.frogger_exec_bench \
+    --objects 017_orange,036_wood_block --seeds 0,1,2
+
+# our own 12 cm lift instead of their shaky one
+uv run python -m ycb_grasp.frogger_exec_bench --lift-mode standard
+```
+
+`--mu` is deliberately NOT plumbed here and exits with a message: `run_pick_place`
+builds its own scene, so accepting the flag would have run at 2.0 while labelling the
+output 0.7. Use the plan-only harness for the paper's friction regime.
+
+---
+
+## 10bis. Appendix B: their controller, read at last (2026-09-14)
+
+§9 was written believing the paper specified no control law. **It does** -- App. B,
+"Controller Implementation Details," which had not been read. Correcting that record
+here, because it changes what our squeeze mechanism should be compared against.
+
+### 10bis.1 What they actually do
+
+Their control law (18):
+
+```
+tau = Jh^T R_BC F_C*  +  (I - Jh^T (Jh^T)^dagger) tau_joint
+```
+
+**Term 1 -- commanded contact forces**, from a QP solved online:
+
+```
+minimize_{F_C}  ||G F_C - (-^O w_des)||^2
+s.t.  Lambda_i F_C,i <= 0                       (pyramidal friction cones)
+      F_C,i^n >= F_min^n                        (minimum normal force)
+      tau_lb - tau_joint,h <= J_i^T R_BC F_C,i <= tau_ub - tau_joint,h
+```
+
+with **`F_min^n = 1.0 N`** (0.25 N under 0.01 kg). The desired wrench is
+`^O w_des = R_OB(^B w_grav + ^B w_err)`, gravity plus a PD **error wrench on the
+OBJECT's pose**: `k_p,err = 50`, `k_d,err = 5`, `k_R,err = 50`, `k_omega,err = 5`.
+
+**Term 2 -- tracking, null-space projected.** `tau_joint = tau_grav + tau_track`;
+arm at `K_p,arm = 500 I`, `K_d,arm = diag(1,1,1,1,0.1,0.1,0.1)` via Drake's
+differential IK; hand a **pure proportional** term
+`tau_hand = -k_p,hand (q_h - q_h*)` with **`k_p,hand = 5`**. The projector's stated
+purpose: applying these "does not change the contact positions between the hand and
+object." They note it "does not affect the arm torques at all."
+
+### 10bis.2 Consequences for this benchmark
+
+- **Their squeeze is COMMANDED, not emergent.** An earlier reading here guessed the
+  -3 mm interpenetration allowance was the force-generation mechanism. It is not:
+  force comes from the QP, and `F_min^n = 1.0 N` is a floor they set explicitly.
+- **Directly comparable to ours.** Their 1.0 N floor against our measured squeeze of
+  1.62 / 1.61 N on `017_orange` -- the same order, a comparison we could not make
+  before.
+- **FROGGER_COMPARISON §3.3 needs qualifying.** It records theirs as task-agnostic
+  and ours as task-specific. True of the PLANNER's `k_l` floor; NOT true of their
+  CONTROLLER, whose `w_err` is a live task-specific wrench like our `gamma` LP.
+- **Their hand gain is tiny and projected** (`k_p,hand = 5`), so tracking cannot
+  fight the force command. Our `squeeze_pd_scale = 0.25` pursues the same end by
+  weakening tracking globally instead of only where it conflicts.
+
+### 10bis.3 The projector is implemented; it does not transfer cleanly
+
+`GraspController(nullspace_tracking=True)` applies
+`(I - Jh^T (Jh^T)^dagger)` to the tracking torque while squeezing, scoped to the
+FINGER columns so the arm jog is untouched (their own note says the projection
+leaves arm torques alone). Verified: the component of tracking torque lying in
+`range(Jh^T)` drops from 4.46 to **5.9e-14**, the operator is idempotent to 4.0e-15,
+and arm columns are bit-identical.
+
+**But the DOF budget does not transfer.** Their Allegro has 16 hand DOFs against a
+rank-12 `Jh` (4 contacts). Our 2-contact LEAP has **8 finger DOFs against rank 6**,
+a null space of dimension 2, so the projector discards a measured **~55%** of finger
+tracking authority (mean surviving fraction 0.449 over 500 random torques).
+
+Measured end to end, `--lift-mode shaky`:
+
+| | baseline | nullspace |
+|---|---|---|
+| `017_orange` s0 squeeze (N) | 1.622 / 1.605 | **1.696 / 1.693** |
+| `017_orange` s0 shake deviation | **1.2 mm** | 2.2 mm |
+| `017_orange` s0 pick / lift_ok | OK / True | OK / True |
+| `036_wood_block` s0-s2 | 0/3 | 0/3 |
+
+Squeeze force rises slightly (tracking no longer fights it, which is the projector's
+purpose) and shake tracking degrades slightly (55% less authority). The block fails
+3/3 either way -- that is a grasp failure, not a control-law one.
+
+**Verdict: correct, faithful, and not a fix.** Worth keeping as an ablation and
+reporting as a DOF-budget finding -- eq. (18) assumes a hand with DOFs to spare, and
+a 2-contact pinch on an 8-DOF finger set does not have them. Default stays off.
+
+### 10bis.4 The pad constant, corrected and honestly inconclusive
+
+`frogger_pad_offset_m` was `0.011`, an ESTIMATE ("roughly one half-extent" of the tip
+geom's bounding box). Measured against the 52-vertex tip meshes, the pad surface
+along `pad_axis` is **9.96 mm** (thumb) / **9.95 mm** (index), site-to-geom-centre
+0.05 mm. Corrected to **0.00995**.
+
+The old value was wrong, so the correction stands on its own terms. It did **not**
+improve execution. Plan-only A/B, `thumb,index`, same seeds (`max_iter` 80; repeated
+at 400 with the same pattern, so this is not an iteration-budget artifact):
+
+| cell | 0.011 | 0.00995 |
+|---|---|---|
+| `017_orange` s0/s1/s2 | +0.998 / +0.935 / +0.976 | +0.995 / +0.933 / +0.949 |
+| `036_wood_block` s0 | -21.07 INFEAS | -1.74 INFEAS |
+| `036_wood_block` s1 | **+0.431** (gamma 35.98) | **-14.73 INFEAS** |
+| `036_wood_block` s2 | +0.302 (gamma 41.53) | +0.453 (gamma 23.99) |
+
+wrench-feasible 4/6 -> 3/6. The orange is unmoved; the block swings in both
+directions. Every cell exits `best-effort`/`Maximum_Iterations_Exceeded`, so the
+solve is landing in different basins rather than responding smoothly to a 1 mm
+change. **Report the constant as corrected, not as an improvement.**
+
+### 10bis.5 Why the frogger cells abort wrench-infeasible
+
+Traced on `036_wood_block` seed 1: `n1_in . n2_in = +0.989` -- the two contacts point
+the SAME direction, 8.5 degrees apart, 125 mm apart on a 107 mm object.
+`solve_gamma_live` is right to refuse it; no squeeze force holds two same-side
+contacts.
+
+This is §14.3's same-side collapse at `n = 2` (it was recorded at `n = 3`, dots
++0.914 / +0.966 / +0.931).
+
+### 10bis.6 Their sampler DOES enforce opposition, and ours reproduces it
+
+Checked against the paper (Sec. IV, App. C step 1, Fig. 4 caption), because an
+earlier note here implied opposition was simply absent from their method. It is not:
+
+> "(1) from the oriented bounding box of the object ... choose an axis with which to
+> align the palm's **y-axis** up to sign and **use the width of this box edge to fix
+> an initial guess for the separation of the hand's fingers**"
+
+Their palm convention (App. C) is x = outward normal, z = toward the fingers, y =
+right-handed -- so the y-axis IS the finger-spread direction. Aligning it to an OBB
+axis and opening the fingers to that edge's width makes the pre-shape BRACKET the
+object. Axis choice is weighted by side length (`a/(a+b+c)`), "motivated by
+observations of preferred human grasps".
+
+They state the mechanism is load-bearing:
+
+> "the overall performance of both FRoGGeR and the baseline was **highly sensitive to
+> the sampled initial conditions**. For instance, **if the initial width of the
+> fingertips was not guided by object bounding boxes, both methods suffered in terms
+> of runtime and grasp quality**, as enforcing surface constraints became harder."
+
+So opposition lives in the SAMPLER by design, not in (7a). The method is sampler +
+refinement as a unit, and criticizing (7a) for lacking an alignment term misreads it.
+
+**Our port reproduces this correctly.** Measured, `thumb,index`, opposition as the
+cosine between tip directions from the OBB CENTRE (-1 = perfectly opposed):
+
+| cell | seed `tip_dot` | solved `n1.n2` |
+|---|---|---|
+| `017_orange` s0 | **-1.000** | **-1.000** (kept) |
+| `017_orange` s1 | **-0.996** | +0.974 |
+| `017_orange` s2 | **-0.914** | +0.138 |
+| `036_wood_block` s0 | **-0.605** | +0.798 |
+| `036_wood_block` s1 | **-0.758** | +0.989 |
+| `036_wood_block` s2 | **-0.592** | +0.998 |
+
+**Every seed starts opposed; the SOLVE destroys it on 5 of 6.** That relocates the
+defect: it is not a seeding failure, and the sampler is not at fault. The solve walks
+a well-opposed start to a same-side configuration, which is what needs explaining.
+
+Note every one of these cells exits `best-effort` / `Maximum_Iterations_Exceeded`
+(§10bis.4), so a plausible reading is that the iterate is simply mid-flight rather
+than at any optimum of (7a) -- a hypothesis §10bis.4's `max_iter = 400` run does not
+support, and which the next investigation should settle before any claim is made
+about their objective.
+
+**MEASUREMENT HAZARD, found the hard way.** Scoring opposition about
+`data.xpos[bid]` gives entirely wrong answers: the YCB body origin sits at the
+object's BASE, 40.4 mm below the OBB centre on `017_orange`. Doing so made every
+seed read as same-side (`tip_dot` +0.12 to +0.28) when the same seeds are in fact
+-0.91 to -1.00 about the true centre, and briefly produced the conclusion that the
+sampler was broken. The sampler's own `_seg_dist` was right all along -- it scores
+against the OBB centre. Use the OBB centre (or `vol_centroid`), never the body
+origin.
+
+---
+
+## 11bis. Edge-seeking, measured (2026-09-14)
+
+FRoGGeR names edge-seeking as the dominant failure mode of BOTH arms, attributes it
+to the metric preferring large moment arms, states it "yields unstable grasps in
+practice", and lists combating it as future work: "we hope to develop methods to
+combat edge-seeking behavior." **They give no metric for it.**
+`benchmarks/ycb_grasp/edge_seeking.py` supplies one.
+
+### 11bis.1 Two metrics, and why the obvious one is not comparable
+
+**Patch-bound margin** (`contact_edge_margins`): the distance from the solved contact
+to the nearest trust-region bound that was set by MEASURED SDF divergence, using the
+RAW (pre-inset) bound and skipping axes parked at `quadratic_t_bound_max` -- exactly
+the test `w_edge_margin`'s own hinge applies. Exact, free, and reads data each solve
+already records.
+
+**It is not usable for the comparison.** The frogger arm sets
+`frogger_fk_contacts=True`: its contacts are FK outputs pinned by (7d), with no local
+parameterization and therefore no bounds. Measured: `quad1_frame` is None on 15/15
+frogger solves. Reporting that as "no edge nearby" would credit their arm for a
+measurement never taken.
+
+**Geodesic margin** (`geodesic_edge_margin`), the comparable one: from the contact,
+step outward along 16 tangent directions, reprojecting to the surface each step,
+until the surface NORMAL turns more than 30 degrees from its value at the contact.
+The distance when that first happens, minimized over directions, is the margin.
+Asks the MESH, so it is identical for both arms regardless of representation.
+
+### 11bis.2 Result: 5 objects x 3 seeds, n = 2, plan-only
+
+| | ours | frogger |
+|---|---|---|
+| median geodesic margin | **12.0 mm** | 1.0 mm |
+| IQR | (11.0, 15.5) | (1.0, 8.0) |
+| worst grasp | 8.0 mm | 1.0 mm |
+| **contacts within 2 mm of an edge** | **0 / 30** | **20 / 30** |
+
+Per object (median over 3 seeds, mm):
+
+| object | ours | frogger |
+|---|---|---|
+| `014_lemon` | 12.0 | 1.0 |
+| `017_orange` | 18.0 | 17.0 |
+| `036_wood_block` | 11.0 | 1.0 |
+| `056_tennis_ball` | 15.0 | 1.0 |
+| `061_foam_brick` | 11.0 | 1.0 |
+
+Consistent on 4 of 5. `017_orange` is the exception and the informative one: a
+sphere has no edges, so neither arm can seek one and both sit ~17-18 mm from the
+nearest 30-degree normal turn. The separation appears exactly where edges exist.
+
+1.0 mm is the search STEP, so frogger's contacts are on the edge, not near it.
+
+### 11bis.3 What this does and does not establish
+
+Does: on this object set, at n = 2, the frogger arm places 2/3 of its contacts within
+2 mm of a measured surface boundary and ours places none. That is the behaviour the
+paper describes and does not quantify, measured on a shared object set with one
+representation-free metric.
+
+Does not: it is a PLAN-ONLY property and does not by itself show edge-seeking causes
+the execution failures. The mechanism is plausible (a contact on a crease has a
+friction cone falling off two faces) but untested here; pairing these margins with
+`frogger_exec_bench` outcomes is the test.
+
+Nor does it isolate WHICH of our mechanisms is responsible. `quadratic_bound_inset`
+(10 mm, active) is the obvious candidate and roughly matches the observed separation,
+`w_edge_margin` is OFF by default, and the patch parameterization confines contacts
+to a fitted trust region in the first place. An ablation over those three would
+attribute it; this measurement only establishes that the difference exists.
+
+---
+
+## 12bis. Ferrari-Canny epsilon at n = 3 (2026-09-14)
+
+§9.4 recorded epsilon as unmeasurable at n = 2 (a pinch's wrench set is rank-5-of-6,
+so it contains no origin-centred 6-ball) and blocked on the n >= 3 path. That path
+now runs: `--fingers thumb,index,middle` plans, `verify()` certifies, and
+`epsilon_quality` returns `degenerate=False`. The column is unblocked.
+
+**But the values say the tripod is not a real tripod.** Plan-only, `ours`, 5 objects
+x 3 seeds, mu_opt = 0.8*2.0, gamma = 1.0:
+
+| object | seed 0 | seed 1 | seed 2 |
+|---|---|---|---|
+| `017_orange` | 2.84e-3 | 1.34e-3 | 1.63e-3 |
+| `061_foam_brick` | 27.36e-3 | 1.45e-3 | 21.66e-3 |
+| `036_wood_block` | **-1.1e-16** | **-1.1e-16** | **-1.1e-16** |
+| `014_lemon` | **-3.6e-17** | **-3.6e-17** | **-3.6e-17** |
+| `056_tennis_ball` | **-4.2e-17** | **-2.8e-17** | **-2.4e-17** |
+
+Nine of fifteen cells are zero to machine precision: the origin lies exactly ON a
+facet of the grasp wrench set, which is the boundary of force closure, not its
+interior. `verify()` reports `wrench_feasible=True` on all fifteen.
+
+The two are not in conflict. `verify()`'s `gamma` LP asks whether a specific
+disturbance BOX can be resisted at some finite internal force; epsilon asks for the
+largest ball in EVERY direction at gamma = 1. A wrench set that is a thin sliver --
+wide where the task needs it, zero-thickness elsewhere -- passes the first and scores
+zero on the second.
+
+The sliver is the known n = 3 defect. §10bis measured contacts 2 and 3 at 4.0 mm
+apart on `017_orange` (17.2 mm on one seed) and 25.8 mm on `036_wood_block`, against
+68-90 mm from contact 1 -- so the "tripod" is geometrically a pinch with a doubled
+finger, and a doubled contact adds no independent wrench directions. The three
+objects reporting exact zeros are precisely the ones where the two contacts are
+closest.
+
+**Do not report an epsilon median from this.** A median over nine machine-precision
+zeros ("-0.00e-3") describes the collapse, not the method. Epsilon is now instrumented
+and correct -- it is the n = 3 CONTACT PLACEMENT that is not ready. Fixing the
+collapse, not the metric, is what unblocks this column, and epsilon is now the
+sharpest available test of whether a fix worked: it goes from ~0 to positive exactly
+when the third contact becomes independent.
+
+---
+
+## 13bis. Edge-seeking PREDICTS execution failure (2026-09-14)
+
+§11bis measured edge margins plan-only and said explicitly it "does NOT by itself
+show that edge-seeking causes failure. Pair it with execution outcomes... which is
+the comparison the paper's 'yields unstable grasps in practice' claim actually
+needs." Done, joining the 30 edge cells to the 30 execution cells by
+(arm, object, seed):
+
+| | median edge margin | n |
+|---|---|---|
+| grasps that held (`lift_ok`) | **12.0 mm** | 13 |
+| grasps that failed | **1.0 mm** | 17 |
+
+Point-biserial correlation between edge margin and success: **r = +0.51** over 30
+trials. FRoGGeR states edge-seeking "yields unstable grasps in practice" and gives no
+measurement; this is that claim, measured.
+
+### 13bis.1 The executor is not the difference
+
+Squeeze force at the hold is effectively IDENTICAL between arms -- 1.62/1.61 N on
+`017_orange` for both -- and the frogger arm's commanded `gamma` is equal or higher
+than ours (1.92 vs 1.67; 31.2 vs 25.3 on the block). So the failures are not an
+executor that is treating the two arms differently, and there is no squeeze setting
+left to tune. What differs is WHERE THE CONTACTS ARE.
+
+### 13bis.2 Two settings tried, neither helps
+
+| setting | result |
+|---|---|
+| `--k-l 0.5` (stricter floor than their 0.3) | 0/4 lifts, object never rises |
+| `--patch-contacts` (our patch instead of their (7d) FK contacts) | WORSE: gaps of 100 mm, i.e. no contact at all, at `l_bar* = +0.98` |
+
+`--patch-contacts` reproduces the failure `for_frogger`'s own docstring records: free
+contacts reach the hand only through an IK cost, and the frogger preset zeroes every
+cost but `beta`, so the optimizer places contacts the hand cannot reach (measured
+1211/1315/1259 mm in the original note). **Their FK-contact formulation (7d) is
+load-bearing**, and the confound it introduces on our fingertip cannot be removed by
+turning it off.
+
+### 13bis.3 Standing state of the execution comparison
+
+`ours` 12/15 pick success against `frogger` 1/15 (10/15 reaching the lift after the
+gap-gate fix). That number is NOT yet a clean method comparison and should not be
+published as one: it still contains our pad-offset geometry, which their (7d)
+assumes differs from ours by a fixed body-frame offset and which measurably does not.
+
+What IS clean and publishable is §11bis + this section: their method places 2/3 of
+its contacts within 2 mm of an edge where ours places none, and edge proximity
+predicts execution failure at r = +0.51. That is a mechanism, measured end to end, for
+a failure mode the paper names and leaves open.
+
+---
+
+## 14bis. The frogger arm reported the SITE as its contact (2026-09-14)
+
+§13bis reported the frogger arm at 1/15 pick success and said the number was not a
+clean method comparison. It was not, and the reason was a defect in this port, now
+fixed.
+
+### 14bis.1 The bug
+
+Under `frogger_fk_contacts` the surface equality (7d) is applied to the PAD POINT,
+`site + pad_offset * pad_axis`, which is the fixed fingertip point their App. B-F
+specifies. But `_p1`/`_p2` were assigned `_tp1_fk`/`_tp2_fk` -- the tip SITE. The
+constraint held one point to the surface while the solver REPORTED a different one,
+`pad_offset` away along the pad axis.
+
+Measured at the solution, SDF at the reported contact (0 = on surface):
+
+| | p1 | p2 |
+|---|---|---|
+| `017_orange` | **+9.51 mm** | **+9.74 mm** |
+| `014_lemon` | **+9.66 mm** | **+9.23 mm** |
+
+against a constraint satisfied to ~0. Everything downstream believed the reported
+point: W's wrench columns, the `gamma` certificate, and the executor's contact
+frames were all built at a location floating ~10 mm off the object.
+
+The visible consequence was a grasp opened about `2*pad_offset` too wide --
+contact separation 91 mm across a 73 mm orange, 70 mm across a 58 mm lemon -- so the
+fingers closed on air. This is what the failure videos show: the object is left on
+the table while the palm completes its 100 mm lift, giving the near-uniform
+`max_dev` of 98.6-100.8 mm in §13bis.
+
+### 14bis.2 It was not diagnosable from the metric
+
+`l_bar*` was +0.94 on exactly these cells. The min-weight metric is computed from
+the wrench matrix, which was assembled at the floating points, so it described a
+geometrically excellent grasp of a phantom object 10 mm larger than the real one.
+Nothing in the planner could see the error; it took executing the grasp, measuring
+the contact separation against the object's own width, and then querying the SDF at
+the reported contact.
+
+This is the same class as §7.1's 5th cone vertex and §9.1's gap-gate finding: a
+quantity that is internally consistent and externally wrong.
+
+### 14bis.3 Effect
+
+After the fix, SDF at the reported contact is +0.00 mm on both objects, and on the
+4 cells measured so far:
+
+| | before | after |
+|---|---|---|
+| fingertip gap at the hold | 6.4-9.3 mm | **~0.0 mm** |
+| squeeze force | 1.3-1.7 N | **2.0 N** |
+| lifts | 0/4 | **3/4** |
+
+`ours` is unaffected and verified bit-identical (`017_orange` seed 0,
+`gamma_min = 1.8735697484057219`, object rose 118.9 mm) -- the branch is inside
+`cfg.frogger_fk_contacts`.
+
+**Every frogger execution number recorded before this fix is void**, including
+§13bis's 1/15 and the r = +0.51 correlation, which was computed over those runs.
+The edge-seeking margins in §11bis are PLAN-ONLY and were computed from `p1`/`p2`,
+so they are affected too and must be re-measured.
+
+### 14bis.4 Re-measured after the fix
+
+All §13bis numbers re-run. `ours` unchanged (it never used the broken branch).
+
+| | pre-fix | post-fix |
+|---|---|---|
+| frogger reached lift | 10/15 | **12/15** |
+| frogger pick success | 1/15 | **6/15** |
+| frogger median `l_bar*` | +0.53 | +0.59 |
+| ours pick success | 12/15 | 12/15 (unchanged) |
+
+**The gap gate no longer needs raising.** `--gap-tol-m 0.014` was added to stop the
+8 mm gate rejecting frogger grasps; with contacts reported correctly the gaps are
+0-2.6 mm and the shared 8 mm gate passes them. The default is back to None (= the
+same gate as `ours`), since raising it now would only mask real failures. The three
+remaining aborts are genuine: 40-50 mm gaps, i.e. contacts the arm cannot reach.
+
+**The edge-seeking result is unchanged.** Re-measured on corrected contacts: ours
+median 12.0 mm (IQR 11.0-15.5) against frogger 1.0 mm (IQR 1.0-1.0). The plan-only
+margins did not move, which is expected -- the offset displaced both contacts along
+their own pad axes, roughly normal to the surface, so distance ALONG the surface to
+the nearest edge was largely preserved.
+
+**The correlation strengthened.** Edge margin against `lift_ok` over the corrected
+30 cells:
+
+| | median edge margin | n |
+|---|---|---|
+| held | **12.0 mm** | 18 |
+| failed | **1.0 mm** | 12 |
+
+r = **+0.574** (pre-fix +0.512). So the causal claim in §13bis survives the defect
+that voided the execution rates it was computed alongside.
+
+### 14bis.5 Where the arms now differ, per object
+
+| object | ours pick | frogger pick |
+|---|---|---|
+| `017_orange` | 3/3 | **3/3** |
+| `056_tennis_ball` | 3/3 | **0/3** |
+| `014_lemon` | 3/3 | 1/3 |
+| `061_foam_brick` | 3/3 | 1/3 |
+| `036_wood_block` | **0/3** | 1/3 |
+
+The orange is a tie at 3/3, and the block is the one object where the frogger arm
+does better. This is a real comparison now rather than a port artifact, but at 3
+seeds per cell the per-object Wilson intervals are wide ([6, 79] for 1/3) and
+overlapping -- no per-object claim is supported yet. The aggregate (ours 80% [55, 93]
+against frogger 40% [20, 64]) is the only interval that separates.
+
+---
+
+## 15bis. 20 seeds per object (2026-09-15)
+
+FRoGGeR's own protocol is 20 grasps per object. 5 objects x 20 seeds x 2 arms = 200
+executed cells, after the §14bis fix, on an identical 8 mm gap gate for both arms.
+
+| | ours | frogger |
+|---|---|---|
+| reached lift | **100% [96, 100]** | 75% [66, 82] |
+| pick success | **85% [77, 91]** | 35% [26, 45] |
+| held | **82% [73, 88]** | 29% [21, 39] |
+| median `l_bar*` | **0.87** (0.71, 0.94) | 0.52 (0.34, 0.83) |
+
+Wilson 95% intervals. The aggregate intervals separate with no overlap on all three
+rates, which the 3-seed run could not establish.
+
+### 15bis.1 Per object
+
+| object | ours pick | frogger pick |
+|---|---|---|
+| `014_lemon` | 100% [84, 100] | 40% [22, 61] |
+| `017_orange` | 100% [84, 100] | 70% [48, 85] |
+| `036_wood_block` | **25% [11, 47]** | **10% [3, 30]** |
+| `056_tennis_ball` | 100% [84, 100] | 20% [8, 42] |
+| `061_foam_brick` | 100% [84, 100] | 35% [18, 57] |
+
+**Two readings from the 3-seed run were sampling noise and are corrected here.**
+
+- `017_orange` looked like a TIE (3/3 both). At 20 seeds it is 100% against 70%.
+- `036_wood_block` looked like the one object where the frogger arm WINS (0/3
+  against 1/3). At 20 seeds ours is ahead, 25% against 10%. Both are poor: the block
+  is the object neither method grasps reliably at n = 2, and it is the only cell
+  where our own rate falls below 100%.
+
+This is the case for running their 20 and not our 3. Nothing about the aggregate
+moved much (80/40 at 3 seeds against 85/35 at 20), but two per-object conclusions
+inverted.
+
+### 15bis.2 `held` is consistently below `pick`, on BOTH arms
+
+82% against 85% for ours, 29% against 35% for frogger. Those gaps are grasps that
+satisfy FRoGGeR's displacement criteria while a fingertip has unloaded -- the
+phantom-success mode §9.2 found on one cell, now visible as a systematic few percent
+on both methods. It is a property of THEIR CRITERIA, not of either implementation,
+and it is the reason both columns are reported.
+
+### 15bis.3 The remaining frogger aborts are genuine
+
+25 frogger cells never reached the lift. Gap at abort: median 17.5 mm, min 8.6 mm,
+max 100 mm (the sentinel for no contact found). These are not the systematic
+~10 mm pad offset §14bis fixed -- they are solves that placed contacts the arm
+cannot reach.
+
+### 15bis.4 Edge-seeking correlation is unchanged
+
+The edge sweep covers seeds 0-2, so the join is over those 30 cells: held median
+12.0 mm (n=18) against failed 1.0 mm (n=12), r = **+0.574**. Extending the edge
+sweep to 20 seeds would tighten this and is the obvious next measurement.

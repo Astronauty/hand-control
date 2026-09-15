@@ -80,7 +80,8 @@ sys.path.insert(0, str(REPO / "benchmarks"))
 
 from grasp_control import GraspController                                       # noqa: E402
 from grasp_control import object_uv_atlas as oua                                # noqa: E402
-from kinova_common.constants import FINGER_CODE, FINGER_SET, FINGER_TIP_SITES   # noqa: E402
+from kinova_common.constants import (FINGER_CODE, FINGER_SET,                    # noqa: E402
+                                     FINGER_TIP_SITES, finger_joint_slices)
 from kinova_common.wrench import solve_gamma_live                               # noqa: E402
 from kinova_common.video import (H264Writer, VideoRecorder,                     # noqa: E402,F401
                                  VIDEO_FPS, VIDEO_H, VIDEO_W)
@@ -270,13 +271,25 @@ def make_object_contact_provider(rec_local, obj_body_id):
 # VideoRecorder` call sites keep working.
 
 
-def _measured_tip_forces(model, data, tip_geom_ids, obj_geom_id):
+def _measured_tip_forces(model, data, tip_geom_ids, obj_geom_id,
+                         obj_geom_ids=None):
+    """Normal force (N) on each fingertip from the object, one per tip_geom_id.
+
+    obj_geom_ids : every collision hull of the object. Matching only
+        obj_geom_id silently reads 0 N for a finger touching any OTHER hull,
+        which on a V-HACD decomposition is most of the object -- 025_mug
+        compiles to 44 hulls, so 43 of them were invisible to this. Same
+        argument as _tip_gaps_mm, which already takes the full list. Defaults
+        to [obj_geom_id], reproducing the old single-hull behaviour.
+    """
+    gids = set(obj_geom_ids) if obj_geom_ids else {obj_geom_id}
     totals = [0.0] * len(tip_geom_ids)
     f6 = np.zeros(6)
     for i in range(data.ncon):
         c = data.contact[i]
         for k, tg in enumerate(tip_geom_ids):
-            if {c.geom1, c.geom2} == {tg, obj_geom_id}:
+            if ((c.geom1 == tg and c.geom2 in gids)
+                    or (c.geom2 == tg and c.geom1 in gids)):
                 mj.mj_contactForce(model, data, i, f6)
                 totals[k] += abs(f6[0])
     return totals
@@ -430,7 +443,37 @@ def _tip_gaps_mm(model, data, tip_geom_ids, obj_geom_id, obj_geom_ids=None):
 # tracking commanded gamma linearly (0.95 N -> 6.03 N) rather than blowing up.
 # 12 N was the largest tested; the ceiling is set there rather than higher
 # because nothing above it has been validated.
-GAMMA_STABILITY_REF_N = 12.0
+#
+# RECALIBRATED after the gamma normalisation fix (GraspController.
+# internal_force_torques now divides the internal force by its own peak normal
+# instead of by cone_f_min, so gamma finally means NEWTONS -- see
+# tests/test_gamma_is_newtons.py). The measurement quoted above was taken in the
+# OLD inflated units, where a commanded gamma of 12 produced only ~6 N of actual
+# contact force on this object; the number was never a claim about newtons, so
+# carrying 12.0 forward would have silently HALVED the usable squeeze.
+#
+# Re-measured on 036_wood_block through the full pick/lift/transport cycle, in
+# the new units (measured tip force in brackets):
+#
+#   seed 2:  6 [ 5.4 N] ok | 12 [10.3 N] ok | 20 [17.0 N] ok | 27 [23.1 N] ok
+#           40 [34.5 N] ok | 60 [51.7 N] ok | 100 [86.5 N] DIVERGED (dz -606 mm)
+#   seed 1: 12 [12.9 N] ok | 14 [13.9 N] FAIL | 18, 25.9 FAIL (fn 0.0)
+#
+# THIS CEILING IS NOT WHAT BOUNDS seed 1. Its failure is not integrator
+# divergence: at gamma=18 the object never moves (z held at 0.625 for the whole
+# ramp) and the measured force tracks the command (16-20 N) -- what fails is that
+# |tau_int| runs ~60x |tau_pd| and the tips creep 2 -> 15 mm off the planned
+# contacts during the squeeze, so the grasp slides rather than explodes. That is
+# the PD/squeeze RATIO, which is what gamma_ref fixes (with gamma_ref=1.0 seed 1
+# lifts at the full solved gamma=25.9, 20.7/22.0 N). The old ceiling of 12 was
+# masking it by coincidence, not by design.
+#
+# So: 60 is the largest value validated against the INTEGRATOR (the failure this
+# ceiling is for), measured on seed 2 where the PD is not the binding constraint.
+# Objects whose grasp geometry gives the PD less authority need gamma_ref, not a
+# lower ceiling -- a ceiling low enough to protect seed 1 would also throw away
+# the headroom seed 2 demonstrably has.
+GAMMA_STABILITY_REF_N = 60.0
 # Contact time constant (s) the reference value was measured at -- the softer
 # side of the tip/object pair in that scene (the object's 0.02s).
 GAMMA_STABILITY_REF_TAU = 0.02
@@ -684,6 +727,18 @@ def run_pick(object_id, seed, n_seeds=1, n_relin=None, gws=False, w_gws=5.0,
         obj_body_id=obj_bid, kp=Kp, kd=Kd,
         gamma=gamma_live, squeeze_pd_scale=0.25, support_weight=True,
         pad_offsets=[pad_offset[f] for f in FINGER_SET],
+        # Cone-constrained gamma: solve null-space weights so EVERY contact is
+        # compressive and in-cone, not just the sign-anchor contact. mu is the
+        # SAME live-model value solve_gamma_live was sized against above -- the
+        # controller default (0.7) understates the scene's objects (mu 1.2-2.0),
+        # so gamma and the cone constraint disagreed about friction.
+        cone_mu=mu_c[0],
+        cone_margin=0.2, cone_f_min=0.5,
+        # Finger-gain slices for THIS run's fingers, derived from the model.
+        # The default is hardcoded to index+thumb, so any third/fourth finger
+        # kept full stiff gains while the others softened to close, and never
+        # took part in the CLOSING/HOLDING switch.
+        active_joint_slices=finger_joint_slices(model, FINGER_SET),
         obj_contact_provider=make_object_contact_provider(rec_local, obj_bid))
 
     # Reset to the RANDOM start config (q0), not q_target -- the whole point is
