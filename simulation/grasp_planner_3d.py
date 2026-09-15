@@ -3451,6 +3451,69 @@ class CostWeights:
     # Set to a float (e.g. 1e4) to opt into the slack-relaxed formulation.
     # w_slack:  float | None = None
     w_slack:  float = 1
+    # Pairwise contact SEPARATION (n_contacts >= 3 only; a pinch has no pair
+    # beyond 1-2 and is bit-identical at any value). One-sided squared hinge:
+    # zero once every pair is at least contact_min_sep_m apart, so a grasp that
+    # already separates its contacts sees NO gradient from this and is unchanged.
+    #
+    # THIS IS THE TERM WHOSE ABSENCE CAUSED THE COLLAPSE. Nothing else in the
+    # NLP -- objective or constraint -- keeps two contacts apart; the seed
+    # position and set_initial were the only things holding them, and the
+    # optimizer is free to leave both. w_span does NOT serve this role and
+    # cannot be tuned into it: logdet(W W^T + dI) is 6x6 and a DUPLICATED
+    # contact leaves it FULL RANK 6 (the rank comes from the other contacts),
+    # so a total collapse costs ~0.72 of logdet (measured) against a w_ik term
+    # that is genuinely cheaper to satisfy when two fingers target one point.
+    # Measured consequence: contact 3 exactly coincident with contact 2 in 15/15
+    # cells at n=3, and contact 4 onto contact 3 in 3/3 four-contact cells --
+    # all still certifying wrench_feasible=True, because a doubled contact is
+    # not an infeasible one.
+    #
+    # A PENALTY, not a hard constraint, and deliberately: the patch is often
+    # genuinely too small to hold another contact (measured max_chord < min_sep
+    # on 9 of 18 cells), and a hard >= would make those solves INFEASIBLE rather
+    # than returning the best available grasp. The hinge degrades to "as
+    # separated as this patch allows", which is both the useful answer and a
+    # visible one -- a contact pinned at the patch boundary is a patch-size
+    # report, where a collapsed contact looked like a healthy grasp.
+    w_sep:    float = 0.0
+    # HARD variant of the same separation requirement: instead of (or as well as)
+    # pricing a shortfall, forbid it outright with |p_i - p_j|^2 >= d^2 per pair.
+    #
+    # Trade-off, and it is a real one rather than a preference:
+    #   * The hinge cannot GUARANTEE separation -- it competes with w_ik and can
+    #     be outbid, which is exactly how the original collapse happened. It
+    #     always returns an answer.
+    #   * The hard constraint guarantees it, but makes the NLP INFEASIBLE when
+    #     the patch cannot hold the contacts that far apart -- and that is the
+    #     COMMON case here, not an edge case: measured max_chord < min_sep on 9
+    #     of 18 four-finger cells. An infeasible solve returns a best-effort
+    #     iterate that may violate the constraint anyway, or nothing.
+    # Both may be enabled together: the constraint defines the feasible set and
+    # the hinge shapes the descent INSIDE it, which is the usual way to help an
+    # interior-point method find a constrained region it starts outside of.
+    sep_hard: bool  = False
+    # WHICH hard constraint, when sep_hard is on:
+    #   'ball' -- |p_i - p_j|^2 >= d^2, one scalar NONCONVEX constraint per pair.
+    #       Excludes a disc: the pair may sit at any BEARING, which is what a fan
+    #       of seeds around a shared patch actually wants. Admits 87.8% of a
+    #       +/-30mm patch (measured by sampling).
+    #   'box'  -- per-AXIS separation on the primal variables directly, applied
+    #       as an ORDERING: t_j[k] - t_i[k] >= d on the patch axis k with the
+    #       most seed separation. This is LINEAR in the decision variables --
+    #       the cheapest thing IPOPT can be handed, with an exactly-zero Hessian
+    #       contribution and no nonconvexity at all -- but it is strictly
+    #       stronger than necessary, because separation along one axis implies
+    #       euclidean separation while the converse is false. Measured: admits
+    #       30.6% of the same patch, i.e. it forbids nearly 3x as much of the
+    #       reachable region, including placements that are perfectly well
+    #       separated diagonally.
+    # The ordering is what keeps 'box' smooth. |t_j[k] - t_i[k]| >= d is a
+    # DISJUNCTION (either side), which an NLP cannot express without a binary;
+    # fixing the sign from the seed turns it into one linear inequality, at the
+    # cost of forbidding the solver from ever swapping the two contacts' order
+    # along that axis.
+    sep_hard_mode: str = 'ball'
     q_scale:  float = 1.0
 
 
@@ -4455,6 +4518,21 @@ class GraspConfig3D:
     # coincident). 12 mm is one LEAP pad extent, so two pads at this separation
     # are just touching rather than overlapping.
     c4_min_sep_m:      float = 0.012
+    # Separation (m) the NLP's w_sep hinge drives toward, for EVERY pair of
+    # contacts. DELIBERATELY NOT c4_min_sep_m: that one screens fourth-contact
+    # SEEDS and answers "is this candidate worth ranking", while this one shapes
+    # the SOLVE and answers "how far apart should the solver hold them". They
+    # want to move independently -- the seed screen can afford to be strict
+    # (a rejected candidate costs nothing, another bearing is tried) where the
+    # solve floor cannot (it competes with w_ik on every iteration).
+    #
+    # 12 mm is one LEAP pad extent along the contact direction (10.8 mm,
+    # measured -- see _tip_support_along), so two pads at this separation are
+    # just touching rather than overlapping. It is a floor on PAD OVERLAP, not
+    # an attempt to reach the 45.4 mm rest-pose finger pitch: the fingers curl
+    # independently and need not sit one base pitch apart, which is the whole
+    # reason a shared patch works for two fingertips at all.
+    contact_min_sep_m: float = 0.012
     r_thumb:  float | None = None
     r_index:  float | None = None
     r_middle: float | None = None
@@ -4485,6 +4563,7 @@ class GraspConfig3D:
         self.c4_own_patch       = kwargs.pop('c4_own_patch', False)
         self.c4_patch_offset_m  = kwargs.pop('c4_patch_offset_m', 0.015)
         self.c4_min_sep_m       = kwargs.pop('c4_min_sep_m', 0.012)
+        self.contact_min_sep_m  = kwargs.pop('contact_min_sep_m', 0.012)
         self.r_thumb  = kwargs.pop('r_thumb', None)
         self.r_index  = kwargs.pop('r_index', None)
         self.r_middle = kwargs.pop('r_middle', None)
@@ -4510,6 +4589,7 @@ class GraspConfig3D:
                         ('joint_limits', 'wrench_constraint', 'max_iter', 'fixed_contacts',
                          'n_contacts', 'c3_seed_strategy', 'c3_own_patch', 'c3_patch_offset_m',
                          'c4_seed_strategy', 'c4_own_patch', 'c4_patch_offset_m', 'c4_min_sep_m',
+                         'contact_min_sep_m',
                          'r_thumb', 'r_index', 'r_middle', 'r_ring'))
         return f'GraspConfig3D({groups}, {top})'
 
@@ -4532,6 +4612,7 @@ class GraspConfig3D:
         if name in _GRASP_CFG_GROUPS or name in (
             'joint_limits', 'wrench_constraint', 'max_iter', 'fixed_contacts', 'n_contacts', 'c3_seed_strategy', 'c3_own_patch', 'c3_patch_offset_m',
             'c4_seed_strategy', 'c4_own_patch', 'c4_patch_offset_m', 'c4_min_sep_m',
+            'contact_min_sep_m',
             'r_thumb', 'r_index', 'r_middle', 'r_ring',
         ):
             object.__setattr__(self, name, value)
@@ -5967,6 +6048,169 @@ class GraspPlanner3D:
                         _cost_edge = _cost_edge + _excess**2
                 _cost = _cost + cfg.w_edge_margin * _cost_edge
 
+            # ── Pairwise contact SEPARATION (w_sep) ───────────────────────
+            # One-sided squared hinge per pair: zero once the pair is at least
+            # contact_min_sep_m apart, growing as the squared shortfall below it.
+            # Same shape and the same reasoning as w_edge_margin above -- a
+            # finite price rather than a hard >= , so an object whose patch
+            # genuinely cannot hold another contact returns the best grasp
+            # available instead of turning the problem infeasible. Measured:
+            # max_chord < min_sep on 9 of 18 four-finger cells, i.e. the
+            # infeasible case is the COMMON one, not an edge case.
+            #
+            # TWO TIERS, because the right metric differs:
+            #
+            #  (a) SAME-PATCH pairs are compared in PATCH coordinates. The frame
+            #      (axis0_l, axis1_l, n_l) is ORTHONORMAL -- axes_l = T @ eigvecs
+            #      with both factors orthonormal (_principal_curvature_axes_np) --
+            #      so the true separation decomposes exactly as
+            #          |p(t) - p(s)|^2 = |dt|^2 + (h(t) - h(s))^2 >= |dt|^2
+            #      making |dt| an exact LOWER BOUND on the true distance. Using
+            #      it is therefore CONSERVATIVE: it can never admit an overlap it
+            #      believes is fine. Measured slack at 12mm: 0.0% on a flat face,
+            #      1.4% at sphere curvature (kappa 27.6), 6.3% at kappa 60. This
+            #      is the cheap tier -- 2 variables a side, no square root (whose
+            #      derivative is undefined at exactly the coincident point this
+            #      term exists to leave), and a constant Hessian.
+            #
+            #  (b) CROSS-PATCH pairs fall back to WORLD squared distance. Slot 1
+            #      always has its own patch, so its (t0,t1) are coordinates in a
+            #      DIFFERENT frame and are not comparable with slot 2's -- taking
+            #      their difference would subtract two unrelated bases and read as
+            #      a separation that does not exist.
+            #
+            # Squared distances throughout: |.|^2 >= d^2 is equivalent to
+            # |.| >= d for non-negative d, and avoids the sqrt entirely.
+            _cost_sep = None
+            if ((cfg.w_sep > 0.0 or cfg.sep_hard)
+                    and int(cfg.n_contacts) >= 3):
+                _dmin = float(cfg.contact_min_sep_m)
+                _d2   = _dmin * _dmin
+                _cost_sep = ca.DM(0.0)
+                _n_sep_pairs = 0
+
+                def _hinge(_sq):
+                    # (max(0, d^2 - |.|^2))^2 -- C^1, and identically zero with
+                    # zero GRADIENT once the pair is far enough apart, so a grasp
+                    # that already separates its contacts is untouched by this.
+                    #
+                    # KNOWN STATIONARY POINT, and why it is acceptable: squaring
+                    # the hinge makes the gradient vanish at EXACTLY zero
+                    # separation as well (d/dx of (d^2-x^2)^2 is -4x(d^2-x^2),
+                    # which is 0 at x=0), so two PERFECTLY coincident contacts
+                    # sit in a saddle this term alone cannot push apart. It
+                    # escapes from any nonzero separation -- measured gradient
+                    # -2.8e-5 at 1 nm, -2.8 at 0.1 mm, -27.6 at 1 mm -- and the
+                    # seeds this runs on start 13-21 mm apart, so the solver
+                    # never begins at the degenerate point. The alternative, a
+                    # non-squared hinge, is only C^0 at the threshold and trades
+                    # a saddle the seeding avoids for a kink every converged
+                    # grasp sits on.
+                    return ca.fmax(0.0, _d2 - _sq)**2
+
+                # Every contact this stage actually built, with the patch frame it
+                # rides (None => its own/no patch). Order is slot order.
+                # (world_expr, patch_var, patch_frame, INITIAL patch coord). The
+                # initial coordinate is what fixes the box mode's ordering, and it
+                # must be the value the solver actually STARTS from -- read back
+                # from the Opti via initial(), not re-derived, so it cannot drift
+                # from the set_initial calls in the contact-parameterization
+                # branches above.
+                def _t0_of(_tv):
+                    if _tv is None:
+                        return None
+                    try:
+                        return np.asarray(_opti.debug.value(
+                            _tv, _opti.initial()), float).ravel()
+                    except Exception:
+                        return None
+                _sep_slots = [(_p1, _t1_var, _t1_frame, _t0_of(_t1_var)),
+                              (_p2, _t2_var, _t2_frame, _t0_of(_t2_var))]
+                if _has_c3 and _p3 is not None:
+                    _sep_slots.append((_p3, _t3_var, _t3_frame, _t0_of(_t3_var)))
+                if _has_c4 and _p4 is not None:
+                    _sep_slots.append((_p4, _t4_var, _t4_frame, _t0_of(_t4_var)))
+                for _ia in range(len(_sep_slots)):
+                    for _ib in range(_ia + 1, len(_sep_slots)):
+                        _pa, _ta, _fa, _t0a = _sep_slots[_ia]
+                        _pb, _tb_, _fb, _t0b = _sep_slots[_ib]
+                        _seed_dt = (None if (_t0a is None or _t0b is None)
+                                    else np.asarray(_t0b, float) - np.asarray(_t0a, float))
+                        # `is` on purpose: the shared-patch branches assign the
+                        # SAME frame dict object to slots 3 and 4 as slot 2 has
+                        # (_t3_frame = _t2_frame), so identity is exactly the
+                        # "these coordinates are comparable" test. Two patches
+                        # fitted to equal values would still be different objects,
+                        # and would correctly fall through to the world metric.
+                        if (_ta is not None and _tb_ is not None
+                                and _fa is not None and _fa is _fb):
+                            _sq = ca.sumsqr(_ta - _tb_)
+                        elif _pa is not None and _pb is not None:
+                            _sq = ca.sumsqr(_pa - _pb)
+                        else:
+                            continue
+                        if cfg.w_sep > 0.0:
+                            _cost_sep = _cost_sep + _hinge(_sq)
+                        if cfg.sep_hard and str(cfg.sep_hard_mode) == 'box':
+                            # BOX: separation on the PRIMAL variables directly,
+                            # one LINEAR inequality per pair. Only available for
+                            # a same-patch pair -- t_i and t_j must be
+                            # coordinates in the SAME basis for their difference
+                            # to mean anything, which is the identical test the
+                            # metric choice above makes. A cross-patch pair has
+                            # no such basis and falls back to the ball form.
+                            if (_ta is not None and _tb_ is not None
+                                    and _fa is not None and _fa is _fb
+                                    and _seed_dt is not None):
+                                # Axis with the most SEED separation, and the
+                                # sign the seeds already have. Choosing the axis
+                                # by seed rather than fixing k=0 matters: on a
+                                # patch whose seeds differ almost entirely in t1,
+                                # forcing separation along t0 would demand a move
+                                # the grasp never wanted, and on a near-tie
+                                # either axis serves.
+                                _k = int(np.argmax(np.abs(_seed_dt)))
+                                if float(_seed_dt[_k]) >= 0.0:
+                                    _opti.subject_to(_tb_[_k] - _ta[_k] >= _dmin)
+                                else:
+                                    _opti.subject_to(_ta[_k] - _tb_[_k] >= _dmin)
+                            else:
+                                _opti.subject_to(_sq >= _d2)
+                        elif cfg.sep_hard:
+                            # BALL (default): |.|^2 >= d^2. Squared on both sides
+                            # -- equivalent to |.| >= d for non-negative d, and it
+                            # keeps the constraint polynomial, with no sqrt whose
+                            # derivative is undefined at exactly the coincident
+                            # point this is meant to exclude.
+                            _opti.subject_to(_sq >= _d2)
+                        _n_sep_pairs += 1
+                # Normalize by d^4 ONLY -- so ONE fully collapsed pair costs
+                # exactly 1.0, regardless of contact_min_sep_m or how many pairs
+                # exist. Do NOT average over pairs the way _cost_ik does.
+                #
+                # Averaging was tried first and is WRONG HERE, measurably. The IK
+                # term averages because every contact must be reached and the
+                # term means "how well reached ON AVERAGE"; separation is the
+                # opposite kind of quantity -- a single collapsed pair is a
+                # failed grasp no matter how well separated the other five are.
+                # Dividing by _n_sep_pairs diluted exactly that pair by 1/6 at
+                # n=4: measured on 036_wood_block seed 0 at w_sep=2.0, the three
+                # multi-start seeds converged to 10.35mm / 0.00mm / 53.88mm at
+                # costs 0.923 / 0.586 / 7.076, so the COLLAPSED solution won on
+                # total cost -- the diluted hinge was worth 0.333 against a 0.34
+                # gap it needed to close. Undiluted it is worth 2.0 there and the
+                # collapsed seed loses, which is the whole point of the term.
+                if _n_sep_pairs and cfg.w_sep > 0.0:
+                    _cost_sep = _cost_sep / (_d2 * _d2)
+                    _cost = _cost + cfg.w_sep * _cost_sep
+                else:
+                    _cost_sep = None      # hard-only: nothing added to the cost
+                if _n_sep_pairs:
+                    self.log.info(
+                        f"[{stage_label}|sep] {_n_sep_pairs} pair(s), "
+                        f"min_sep={_dmin*1e3:.1f}mm, "
+                        f"w_sep={cfg.w_sep:.2f}, hard={bool(cfg.sep_hard)}")
+
             # ── 1. Joint limits (vectorized) ──────────────────────────────
             if cfg.joint_limits:
                 _opti.subject_to(_opti.bounded(
@@ -6469,6 +6713,14 @@ class GraspPlanner3D:
                 'y':     cfg.w_y     * _cost_y,
                 'slack': _grad_w_slack,
             }
+            # The separation term earns a gradient row for the reason this whole
+            # block exists: the collapse is a question of which term WINS, not of
+            # which term is largest. w_sep vs w_ik here is the direct readout of
+            # whether the hinge actually out-pushes the IK term that prefers two
+            # fingers on one point. Only present when the term is active, so the
+            # n=2 report is unchanged.
+            if _cost_sep is not None:
+                _grad_terms['sep'] = cfg.w_sep * _cost_sep
             _grad_norm_exprs = {
                 name: ca.norm_2(ca.gradient(term, _opti.x))
                 for name, term in _grad_terms.items()
@@ -6510,10 +6762,12 @@ class GraspPlanner3D:
                 _named['edge']   = (cfg.w_edge_margin * locals()['_cost_edge']
                                     if cfg.w_edge_margin > 0.0 and '_cost_edge' in locals()
                                     else ca.DM(0.0))
+                _named['sep']    = (cfg.w_sep * _cost_sep
+                                    if _cost_sep is not None else ca.DM(0.0))
                 _wts = {'ik': cfg.w_ik, 'reg': cfg.w_reg, 'gamma': cfg.w_gamma,
                         'y': cfg.w_y, 'slack': (cfg.w_slack or 0.0),
                         'align': cfg.w_align, 'orient': cfg.orient_weight,
-                        'edge': cfg.w_edge_margin}
+                        'edge': cfg.w_edge_margin, 'sep': cfg.w_sep}
                 for _nm, _term in _named.items():
                     _acc = ca.DM(0.0)
                     for _zexpr, _tv in _z_dirs:
