@@ -12,7 +12,7 @@ strategy can win one while losing the other:
 Never score a cell on displacement alone: a 115 mm lift with a finger at 0.00 N
 is not a four-finger grasp.
 """
-import argparse, re
+import argparse, re, statistics
 from collections import defaultdict
 from pathlib import Path
 
@@ -70,23 +70,34 @@ def main():
     for r in rows:
         by[r["arm"]].append(r)
 
-    hdr = (f"{'arm':11s} {'n':>3s} {'ratio':>7s} {'worst':>7s} {'|worst|<20%':>11s} "
-           f"{'allLoaded':>9s} {'lift_ok':>7s} {'SUCCESS':>7s}")
+    hdr = (f"{'arm':11s} {'n':>3s} {'medRatio':>8s} {'IQR':>13s} {'worst':>7s} "
+           f"{'|worst|<20%':>11s} {'allLoaded':>9s} {'lift_ok':>7s} {'SUCCESS':>7s}")
     print(hdr); print("-" * len(hdr))
     order = sorted(by, key=lambda k: -sum(r["success"] for r in by[k]))
     for arm in order:
         rs = by[arm]
-        rat = [r["ratio"] for r in rs if r["ratio"] is not None]
+        # MEDIAN, not mean. The ratio is a quotient and its denominator goes
+        # near zero on the cells where the allocator commands almost nothing --
+        # measured 15.6 on 025_mug and 3.7 on 056_tennis_ball, which drags a
+        # mean of sane per-cell values (0.58-0.95) up to ~3.0 and makes every
+        # arm look like it triples the commanded force. The IQR is printed so
+        # the spread is visible rather than hidden behind one number.
+        rat = sorted(r["ratio"] for r in rs if r["ratio"] is not None)
         wor = [r["worst"] for r in rs if r["worst"] is not None]
         good = sum(1 for w in wor if abs(w) < 0.20)
+        _med = statistics.median(rat) if rat else float('nan')
+        _iqr = (f"[{rat[len(rat)//4]:.2f},{rat[3*len(rat)//4]:.2f}]"
+                if len(rat) >= 4 else "     -       ")
         print(f"{arm:11s} {len(rs):>3d} "
-              f"{(sum(rat)/len(rat) if rat else float('nan')):>7.3f} "
+              f"{_med:>8.3f} {_iqr:>13s} "
               f"{(sum(wor)/len(wor) if wor else float('nan')):>7.3f} "
               f"{good:>5d}/{len(wor):<5d} "
               f"{sum(r['all_loaded'] for r in rs):>9d} "
               f"{sum(r['lift_ok'] for r in rs):>7d} "
               f"{sum(r['success'] for r in rs):>7d}")
-    print("\nratio = delivered/commanded internal force, mean over the squeeze ramp")
+    print("\nmedRatio = delivered/commanded internal force, MEDIAN over cells")
+    print("  (mean is useless here: cells where the allocator commands ~0 N give")
+    print("   ratios of 3.7-25.7 and dominate it)")
     print("worst = worst per-finger relative error (-1.0 = a finger delivered nothing)")
     print("SUCCESS = every finger loaded AND a real lift")
     bad = [r for r in rows if r["exit"] not in (0, None)]
