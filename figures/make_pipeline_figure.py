@@ -287,29 +287,14 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
         for i, j in edges:
             ax.plot(*zip(C[i], C[j]), "-", color=box_col, lw=0.65, zorder=7)
         _pts.append(C)
-        # BOX LIMITS ON THE AXES. Three separate per-axis labels collided into
-        # an unreadable blob ("2.362.36") -- the box is small relative to the
-        # frame, so its three +half-extent points project within a few px of
-        # each other. ONE label on the longest axis instead, offset along that
-        # axis, with the full triple left to the suptitle.
-        if box_lab is not None:
-            _kmax = int(np.argmax(b))
-            _d = np.eye(3)[_kmax]
-            _q = b[_kmax] * _d
-            ax.plot([_q[0]], [_q[1]], [_q[2]], "o", ms=2.0, color=box_col,
-                    zorder=8)
-            # Offset AWAY from the box along its own axis and clear of the
-            # marker: a multiplicative bump alone is too small here because the
-            # box half-extent is a fraction of the frame, so the text landed on
-            # the dot it labels. Add a constant fraction of the FRAME instead.
-            # Offset along the UNIT axis direction by a fraction of the frame.
-            # An earlier version normalised _q and then multiplied by _q again,
-            # which is just _q scaled -- the text stayed on its own marker.
-            _step = 0.26 * float(np.abs(np.asarray(_lim0)).max())
-            _o = _q + _step * _d
-            ax.text(_o[0], _o[1], _o[2], box_lab.format(v=b[_kmax]),
-                    fontsize=TICK_PT, color=box_col, ha="center", va="center",
-                    zorder=11)
+        # NO IN-PLOT LIMIT LABEL. Three per-axis labels collided into a blob
+        # ("2.362.36"); a single label on the longest axis still ran into the
+        # wireframe, because that axis points back toward the box in this
+        # projection and the box is small relative to the frame -- there is no
+        # offset that clears both the marker and the box without leaving the
+        # axes. The suptitle already states both limits (ma = 2.36 N/axis,
+        # I alpha = 0.15 N m) with their inputs, which is the readable place
+        # for a number the reader wants to check rather than locate.
 
     # SHARED LIMITS between (b) and (c) when given: the two panels only compare
     # if one unit of length means the same thing in both.
