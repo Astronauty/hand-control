@@ -189,6 +189,7 @@ def panel_a(fig, gs, pl, model, data, res, max_tris=2600):
             ax.plot([p[0]], [p[1]], [p[2]], "o", ms=4.8, color=col,
                     mec="k", mew=0.5, zorder=6)
 
+    _cb = []            # contacts painted, for the exploded callout
     # cones on the SELECTED pair only
     if sel is not None and sel < len(acc):
         rec = SF._as_rec(acc[sel], True)
@@ -196,39 +197,13 @@ def panel_a(fig, gs, pl, model, data, res, max_tris=2600):
                                  ("p2s", "n2_in", C_IX, "index")):
             p, n = rec["seed"].get(pk), rec["seed"].get(nk)
             if p is None or n is None: continue
-            # The patch each contact is confined to: the paraboloid fitted at
-            # the seed over its MEASURED trust region. Same helper the seed
-            # figure uses (plot_seed_quadratic.quad_frame/draw_quadratic), so
-            # the two figures cannot disagree about what a patch is.
-            try:
-                _fr = SQ.quad_frame(sc, np.asarray(p, float),
-                                    np.asarray(n, float), sc["cfg"])
-                if _fr is not None:
-                    SQ.draw_quadratic(ax, sc, _fr, key, color=col,
-                                      alpha=0.42, depth_sort=True)
-            except Exception:
-                pass
-            facets, rim, gens, axis, head = _cone_faces(
-                np.asarray(p, float), np.asarray(n, float), view=_view_dir(ax))
-            _cc = matplotlib.colors.to_rgb(col)
-            _cone = Poly3DCollection(facets, linewidths=0.0)
-            # Explicit RGBA rather than facecolor + alpha: Poly3DCollection's 3D
-            # projection multiplies the face colour and raises when it is None.
-            _cone.set_facecolor((*_cc, 0.30))
-            _cone.set_edgecolor((*_cc, 0.0))
-            ax.add_collection3d(_cone)
-            # Rim outline reads the opening angle at column scale, where the
-            # shaded surface alone is too pale to.
-            ax.plot(rim[:, 0], rim[:, 1], rim[:, 2], "-", color=col,
-                    lw=0.7, zorder=7)
-            ax.plot(axis[:, 0], axis[:, 1], axis[:, 2], "-", color=col,
-                    lw=0.9, zorder=8)
-            _hd = Poly3DCollection(head, linewidths=0.0)
-            _hd.set_facecolor((*_cc, 1.0))
-            _hd.set_edgecolor((*_cc, 0.0))
-            ax.add_collection3d(_hd)
+            _paint_contact(ax, sc, np.asarray(p, float), np.asarray(n, float),
+                           col, key)
+            _cb.append((np.asarray(p, float), np.asarray(n, float), col, key))
     ax.plot([c[0]], [c[1]], [c[2]], "x", ms=4.5, color="k", mew=1.1, zorder=6)
     _iso(ax, V)
+    ax._callout_contacts = _cb
+    ax._callout_sc = sc
     # No axes title: the COLUMN title above the figure names this stage.
     # Both together read as two headings for one panel.
     return ax
@@ -321,88 +296,75 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
             ax.text(_tp[0], _tp[1], _tp[2], _lb, fontsize=AXLAB_PT,
                     color="0.25", ha="center", va="center", zorder=9)
     if title:
-        ax.set_title(title, fontsize=TITLE_PT, pad=-4)
+        ax._callout_contacts = _cb
+    ax.set_title(title, fontsize=TITLE_PT, pad=-4)
 
 
-def _magnifier(fig, host, P, col_lo, col_hi, lim, side="left",
-               frac=0.34, pad=0.012):
-    """Exploded-view magnifier: a circled copy of the hull, drawn at its own
-    scale, joined to the parent by two leader lines.
+def _paint_contact(ax, sc, p, n, col, key, patch=True):
+    """Draw ONE contact's quadratic patch, friction cone and normal arrow.
 
-    Panel (b) shares axis limits with (c) so the task box is directly
-    comparable -- that is the point of the panel -- but it leaves V(1) small.
-    The magnifier shows the same hull framed to itself.
-
-    Placed OUTSIDE the host axes (side='left'/'right'), not in a corner of it:
-    an earlier inset in the host's lower-right landed on the f_y / tau_y
-    labels. The circle is drawn in FIGURE coordinates so the leaders can run
-    between two different axes.
+    Factored out so the exploded callout re-renders the SAME geometry at a
+    different scale rather than a second, hand-matched copy of it.
     """
-    P = np.asarray(P, float)
-    bb = host.get_position()
-    r = min(bb.width, bb.height) * frac * 0.5
-    # Bubble in the white space outboard of the plot, raised so the leaders do
-    # not run along the x-axis arm.
-    cy = bb.y0 + bb.height * 0.70
-    cx = (bb.x0 - pad - r) if side == "left" else (bb.x1 + pad + r)
+    if patch:
+        try:
+            _fr = SQ.quad_frame(sc, p, n, sc["cfg"])
+            if _fr is not None:
+                SQ.draw_quadratic(ax, sc, _fr, key, color=col, alpha=0.42,
+                                  depth_sort=True)
+        except Exception:
+            pass
+    facets, rim, gens, axis, head = _cone_faces(p, n, view=_view_dir(ax))
+    _cc = matplotlib.colors.to_rgb(col)
+    _cone = Poly3DCollection(facets, linewidths=0.0)
+    _cone.set_facecolor((*_cc, 0.30))
+    _cone.set_edgecolor((*_cc, 0.0))
+    ax.add_collection3d(_cone)
+    ax.plot(rim[:, 0], rim[:, 1], rim[:, 2], "-", color=col, lw=0.7, zorder=7)
+    ax.plot(axis[:, 0], axis[:, 1], axis[:, 2], "-", color=col, lw=0.9, zorder=8)
+    _hd = Poly3DCollection(head, linewidths=0.0)
+    _hd.set_facecolor((*_cc, 1.0))
+    _hd.set_edgecolor((*_cc, 0.0))
+    ax.add_collection3d(_hd)
+    ax.plot([p[0]], [p[1]], [p[2]], "o", ms=4.0, color=col, mec="k", mew=0.5,
+            zorder=9)
 
-    # circle + leaders, in figure space
+
+def _contact_callout(fig, host, draw_fn, center_fig, src_r=0.028,
+                     bubble=(0.0, 0.0), r=0.085):
+    """Exploded callout: a circled ZOOM of one contact, on a black leader.
+
+    draw_fn(ax) paints the magnified content into a fresh 3D axes -- here the
+    friction cone and its quadratic patch, re-drawn at contact scale so the
+    cone's opening angle and the patch's extent are both legible. The parent
+    panel shows them at object scale, where a 26mm cone on a 90mm mug is small.
+
+    The circle, its source ring and the leaders are drawn in FIGURE coordinates
+    so they can sit outside the host axes; an inset inside the host lands on
+    its axis labels.
+    """
     import matplotlib.patches as mpatches
+    cx, cy = bubble
+    sx, sy = center_fig
     circ = mpatches.Circle((cx, cy), r, transform=fig.transFigure,
-                           facecolor="white", edgecolor=col_hi, lw=0.6,
-                           zorder=20)
+                           facecolor="white", edgecolor="k", lw=0.7, zorder=20)
     fig.patches.append(circ)
-    # SOURCE CIRCLE on the hull's ACTUAL projected position, not the axes
-    # centre: the hull sits high in the frame (the shared limits are set by the
-    # task box, which is larger), so a circle at the centre pointed the leaders
-    # at empty space. Project the hull's own points through the host's 3D
-    # transform and take their image-space centroid and radius.
-    try:
-        _pr = np.array([proj3d.proj_transform(*q, host.get_proj())[:2] for q in P])
-        _c2 = host.transData.transform(_pr)
-        _c2 = fig.transFigure.inverted().transform(_c2)
-        sx, sy = float(_c2[:, 0].mean()), float(_c2[:, 1].mean())
-        # The source-to-bubble RADIUS RATIO is what reads as magnification, so
-        # the source circle is capped well below the bubble. Sized to the hull
-        # but never more than 45% of the bubble; an uncapped 1.25x padding made
-        # the two circles equal and the callout read as two linked plots.
-        sr = min(float(np.abs(_c2 - [sx, sy]).max()) * 1.05, r * 0.45)
-    except Exception:
-        sx, sy = bb.x0 + bb.width * 0.5, bb.y0 + bb.height * 0.52
-        sr = min(bb.width, bb.height) * 0.12
-    src = mpatches.Circle((sx, sy), sr, transform=fig.transFigure,
-                          facecolor="none", edgecolor=col_hi, lw=0.5,
-                          alpha=0.9, zorder=20)
+    src = mpatches.Circle((sx, sy), src_r, transform=fig.transFigure,
+                          facecolor="none", edgecolor="k", lw=0.6, zorder=20)
     fig.patches.append(src)
-    # two tangent leaders, so it reads as an exploded callout rather than an
-    # arrow pointing at something
     d = np.hypot(cx - sx, cy - sy)
     if d > 1e-9:
         ux, uy = (cx - sx) / d, (cy - sy) / d
         nx, ny = -uy, ux
         for s in (+1.0, -1.0):
-            fig.add_artist(Line2D(
-                [sx + s * nx * sr, cx + s * nx * r],
-                [sy + s * ny * sr, cy + s * ny * r],
-                transform=fig.transFigure, color=col_hi, lw=0.5, alpha=0.9,
-                zorder=19))
-
-    ax = fig.add_axes([cx - r * 0.72, cy - r * 0.72, r * 1.44, r * 1.44],
+            fig.add_artist(Line2D([sx + s * nx * src_r, cx + s * nx * r],
+                                  [sy + s * ny * src_r, cy + s * ny * r],
+                                  transform=fig.transFigure, color="k",
+                                  lw=0.6, zorder=19))
+    ax = fig.add_axes([cx - r * 0.78, cy - r * 0.78, r * 1.56, r * 1.56],
                       projection="3d", zorder=21)
     ax.patch.set_alpha(0.0)
-    try:
-        from scipy.spatial import ConvexHull
-        h = ConvexHull(P)
-        _pc = Poly3DCollection([P[s] for s in h.simplices], linewidths=0.22)
-        _pc.set_facecolor((*matplotlib.colors.to_rgb(col_lo), 0.32))
-        _pc.set_edgecolor((*matplotlib.colors.to_rgb(col_hi), 0.95))
-        ax.add_collection3d(_pc)
-    except Exception:
-        pass
-    _iso(ax, np.vstack([P, np.zeros(3)]), elev=35.264, azim=45)
-    _m = float(np.abs(np.asarray(lim)).max()) / max(float(np.abs(P).max()), 1e-12)
-    fig.text(cx, cy - r - 0.004, rf"$\times${_m:.0f}", fontsize=TICK_PT,
-             color=col_hi, ha="center", va="top", zorder=21)
+    draw_fn(ax)
     return ax
 
 
@@ -429,17 +391,16 @@ def panel_b(fig, gs, W, alpha, beta, box_f=None, box_t=None, lim_f=None,
     sub = gs.subgridspec(2, 1, hspace=0.0)
     Wa = np.asarray(W, float)
     ax_f = fig.add_subplot(sub[0, 0], projection="3d")
+    # NO task box and NO shared limits here. Drawing the box in both panels
+    # made the comparison explicit but left V(1) at a quarter of the frame,
+    # since the shared limits are set by the LARGER of the two. (c) carries the
+    # containment story; (b) just shows the wrench set's shape, framed to
+    # itself. The gamma factor is stated in the suptitle either way.
     _wrench_hull(ax_f, Wa[3:, :].T, "", "#6baed6", "#2171b5",
-                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), box=box_f, lim=lim_f,
-                 box_col="#6a3d9a", box_lab=r"{v:.2f}")
+                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"))
     ax_t = fig.add_subplot(sub[1, 0], projection="3d")
     _wrench_hull(ax_t, Wa[:3, :].T, "", "#c7e9c0", "#238b45",
-                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), box=box_t,
-                 lim=lim_t, box_col="#6a3d9a", box_lab=r"{v:.2f}")
-    # Exploded magnifiers on the OUTBOARD side of each plot, where there is
-    # white space between panel (a) and panel (b).
-    _magnifier(fig, ax_f, Wa[3:, :].T, "#6baed6", "#2171b5", lim_f, side="left")
-    _magnifier(fig, ax_t, Wa[:3, :].T, "#c7e9c0", "#238b45", lim_t, side="left")
+                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"))
     return ax_f
 
 
