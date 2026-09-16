@@ -310,7 +310,10 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                    contact_profile="stock", fingers=None, force_execute=False,
                    release_open_frac=0.5,
                    lift_mode="standard", plan_override=None,
-                   nullspace_tracking=False, gap_tol_m=None):
+                   nullspace_tracking=False, gap_tol_m=None,
+                   sep_hard=False, min_sep_mm=22.0,
+                   squeeze_pd_per_finger=False, contact_gated_alloc=False,
+                   force_feedback_ki=0.0, advance_q_target=0.0):
     """Plan + execute one grasp on one object, then carry it to the bin.
 
     lift_mode : "standard" (default) runs this benchmark's own 12 cm lift, scored
@@ -552,6 +555,16 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                                   # object planned 2 contacts and execution then
                                   # died binding 3 slots to them.
                                   fingers=_fingers_for_object(object_id, fingers),
+                                  # Contact separation. Defaults OFF, so an
+                                  # untouched run is bit-identical to before
+                                  # (verified: 014_lemon n=2 and 036_wood_block
+                                  # n=3 reproduce gamma/beta/forces to every
+                                  # digit). sep_hard_mode is left at its 'ball'
+                                  # default and is NOT exposed here -- see the
+                                  # GraspConfig3D field for the measurement that
+                                  # settled it.
+                                  sep_hard=bool(sep_hard),
+                                  contact_min_sep_m=float(min_sep_mm) * 1e-3,
                                   **cfg_kw)
         q_start = None
 
@@ -594,6 +607,39 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         print("[plan] FAILED — no feasible grasp found.")
         result["phase_log"].append("plan_failed")
         return res, result
+
+    # Pairwise contact separations, printed for EVERY run at n>=3. The n=3 work
+    # established that a collapsed contact is invisible in every other number the
+    # plan reports -- it still certifies wrench_feasible, because a doubled
+    # contact is not an infeasible one -- and at n=4 three fingertips share one
+    # quadratic patch, so this is the measurement that says whether the patch was
+    # large enough. Also prints what the SEEDER proposed, so a collapse caused by
+    # the seeder can be told apart from one caused by the NLP.
+    _sol_pts = [(_k, np.asarray(res[_k], float).reshape(3))
+                for _k in ("p1", "p2", "p3", "p4") if res.get(_k) is not None]
+    if len(_sol_pts) >= 3:
+        _sep = "  ".join(
+            f"{_a[0][-1]}-{_b[0][-1]} {np.linalg.norm(_a[1] - _b[1]) * 1e3:5.1f}mm"
+            for _i, _a in enumerate(_sol_pts) for _b in _sol_pts[_i + 1:])
+        print(f"[contacts] solved separations: {_sep}")
+        _c4t = getattr(planner, "last_c4_rank_table", None)
+        if _c4t:
+            _acc = next((r for r in _c4t if r.get("accepted")), _c4t[0])
+            print(f"[contacts] c4 seed: {len(_c4t)} ranked, accepted "
+                  f"fan={_acc.get('fan_deg'):+.0f}deg "
+                  f"sep_c2={_acc.get('sep2_mm'):.1f}mm "
+                  f"sep_c3={_acc.get('sep3_mm'):.1f}mm "
+                  f"rf_dls={_acc.get('rf_dls_res_mm'):.1f}mm")
+        elif len(_sol_pts) < 4:
+            print("[contacts] c4 seed: NO viable candidate -- ran as a "
+                  f"{len(_sol_pts)}-contact grasp")
+        _pd = getattr(planner, "last_c4_patch_diag", None)
+        if _pd:
+            print(f"[contacts] c4 patch: half-extents "
+                  f"{'/'.join(f'{h:.1f}' for h in _pd['half_extents_mm'])}mm  "
+                  f"min={_pd['min_half_mm']:.1f}mm  fan_r={_pd['fan_r_mm']:.1f}mm  "
+                  f"max_chord={_pd['max_chord_mm']:.1f}mm  "
+                  f"min_sep={_pd['min_sep_mm']:.0f}mm")
 
     verify_info = planner._planner.verify(res)
     result["gamma_min"] = verify_info.get("gamma_min")
@@ -640,7 +686,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         # placement problem) or placed it sensibly and the IK failed to track it
         # (a kinematics problem). Printing both, plus the per-contact IK residual,
         # separates those.
-        _pts = [res.get("p1"), res.get("p2"), res.get("p3")]
+        _pts = [res.get("p1"), res.get("p2"), res.get("p3"), res.get("p4")]
         for _slot, _p in zip(_SLOTS, _pts):
             if _p is None:
                 continue
@@ -675,20 +721,48 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
     # contact 3's inward normal is taken from the same _geom_normal_np it wraps.
     _slot_pts = [np.asarray(res["p1"], float), np.asarray(res["p2"], float)]
     _slot_nrm = [n1_in, n2_in]
-    _p3_exec = res.get("p3")
-    if _p3_exec is not None and len(_SLOTS) >= 3:
-        _p3_exec = np.asarray(_p3_exec, float).reshape(3)
-        _n3_out = _geom_normal_np(
-            _p3_exec, int(model.geom_type[planner._planner._obj_gid]),
+    # Contacts 3 and 4 are bound the same way, in slot order. Written as a loop so
+    # a fifth slot would not need a third hand-written copy of this block.
+    for _key, _min_slots in (("p3", 3), ("p4", 4)):
+        _p_exec = res.get(_key)
+        if _p_exec is None or len(_SLOTS) < _min_slots:
+            continue
+        _p_exec = np.asarray(_p_exec, float).reshape(3)
+        _n_out = _geom_normal_np(
+            _p_exec, int(model.geom_type[planner._planner._obj_gid]),
             data.xpos[obj_bid].copy(), data.xmat[obj_bid].reshape(3, 3).copy(),
             model.geom_size[planner._planner._obj_gid].copy(),
             mesh_entry=planner._planner._mesh_entry)
-        _slot_pts.append(_p3_exec)
-        _slot_nrm.append(-np.asarray(_n3_out, float))
+        _slot_pts.append(_p_exec)
+        _slot_nrm.append(-np.asarray(_n_out, float))
+    # DEGRADE, don't fail, when the solve returned FEWER contacts than --fingers
+    # named. This used to raise, and that was right while the only way to get
+    # here was a planner/executor disagreement -- a bug. It is no longer the only
+    # way: the third- and fourth-contact seeders are both documented to return
+    # nothing rather than force an unreachable contact ("the tripod is an
+    # upgrade, not a precondition"), so a four-finger request on an object whose
+    # patch cannot separate a fourth contact legitimately yields three. Raising
+    # there threw away a perfectly good tripod AND the measurement of why the
+    # fourth contact was dropped -- the cells that most need to be looked at.
+    #
+    # Trailing slots are released: _SLOTS is positional and slot k is served by
+    # the k-th contact, so dropping the TAIL is the only reduction that keeps
+    # every remaining binding correct.
     if len(_slot_pts) < len(_SLOTS):
-        raise RuntimeError(
-            f"--fingers names {len(_SLOTS)} fingers but the solve returned "
-            f"{len(_slot_pts)} contacts; cannot bind slot -> finger.")
+        print(f"[fingers] solve returned {len(_slot_pts)} contacts for "
+              f"{len(_SLOTS)} named fingers ({','.join(_SLOTS)}) -- executing as "
+              f"a {len(_slot_pts)}-contact grasp with "
+              f"{','.join(_SLOTS[:len(_slot_pts)])}")
+        _SLOTS = _SLOTS[:len(_slot_pts)]
+        _FSET = list(reversed(_SLOTS))
+        tip_site_ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_SITE,
+                                      FINGER_TIP_SITES[f]) for f in _FSET]
+        tip_geom_ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM,
+                                      f"leap_{FINGER_CODE[f]}_tip") for f in _FSET]
+    elif len(_slot_pts) > len(_SLOTS):
+        _slot_pts = _slot_pts[:len(_SLOTS)]
+        _slot_nrm = _slot_nrm[:len(_SLOTS)]
+    result["n_contacts_executed"] = len(_slot_pts)
     by_p = {r: v for r, v in zip(_SLOTS, _slot_pts)}
     by_n = {r: v for r, v in zip(_SLOTS, _slot_nrm)}
     rec_local = [local_contact_frame(np.asarray(by_p[f], float),
@@ -771,6 +845,11 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         model, N_ROBOT, tip_site_ids=tip_site_ids, obj_site_ids=None,
         obj_body_id=obj_bid, kp=Kp, kd=Kd,
         gamma=gamma_live, squeeze_pd_scale=squeeze_pd_scale, support_weight=True,
+        squeeze_pd_per_finger=squeeze_pd_per_finger,
+        tip_geom_ids=tip_geom_ids, obj_geom_ids=obj_gids,
+        contact_gated_alloc=contact_gated_alloc,
+        force_feedback_ki=force_feedback_ki,
+        advance_q_target=advance_q_target,
         # FRoGGeR eq. (18)'s tracking projector; off unless asked for. See
         # GraspController.nullspace_tracking.
         nullspace_tracking=nullspace_tracking,
@@ -882,6 +961,12 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
             mj.mj_step(model, data)
             _sync()
         result["phase_log"].append("hold_settled")
+        # Diagnostic hook: a probe may be attached as pick_and_place._PROBE_DUMP
+        # to inspect per-finger contact state at the phase boundaries. Absent in
+        # normal runs, so this costs one attribute lookup.
+        _pd = globals().get("_PROBE_DUMP")
+        if _pd is not None:
+            _pd("hold", model, data, tip_geom_ids, obj_gids, _FSET, ctrl)
 
         gaps = _tip_gaps_mm(model, data, tip_geom_ids, obj_gid, obj_geom_ids=obj_gids)
         result["tip_gaps_mm"] = dict(zip(_FSET, gaps))
@@ -924,6 +1009,9 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         n_ramp = max(int(SQUEEZE_RAMP_S / model.opt.timestep), 1)
         _f_peak = np.zeros(len(tip_geom_ids))
         _n_force_samples = 0
+        _cmd_sum = np.zeros(len(tip_geom_ids))
+        _mes_sum = np.zeros(len(tip_geom_ids))
+        _n_track = 0
         _n_all_loaded = 0
         # PFF_DRIFT_TRACE=1 decomposes the squeeze: how big the internal-force
         # torque is against the PD torque that is supposed to hold the planned
@@ -983,6 +1071,19 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
             _f_now = _measured_tip_forces(model, data, tip_geom_ids, obj_gid,
                                           obj_geom_ids=obj_gids)
             _f_peak = np.maximum(_f_peak, _f_now)
+            # FORCE-TRACKING ACCURACY: what the allocator COMMANDED vs what the
+            # contacts actually delivered, sampled over the whole ramp. The
+            # controller is open-loop in force -- it applies f_c and never checks
+            # -- so without this a -18% error on a seated finger and a -100%
+            # error on a stalled one are indistinguishable downstream.
+            # Compared on the NORMAL component, which is what f_c[3k] is in the
+            # contact frame and what _measured_tip_forces reports.
+            _fc = getattr(ctrl, 'last_f_c', None)
+            if _fc is not None and len(_fc) >= 3 * len(_f_now):
+                _cmd_now = np.abs([float(_fc[3 * _k]) for _k in range(len(_f_now))])
+                _cmd_sum += _cmd_now
+                _mes_sum += np.asarray(_f_now, float)
+                _n_track += 1
             _n_force_samples += 1
             _n_all_loaded += int(all(v > 0.0 for v in _f_now))
             if os.environ.get("PFF_SQUEEZE_TRACE") and i % 100 == 0:
@@ -1001,6 +1102,20 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         # did not change those verdicts -- but the metric should not depend on
         # that being true. squeeze_forces_peak_N is what a force-closure check
         # should read; squeeze_forces_N stays the end-of-ramp state.
+        # Mean over the ramp, per finger, plus the aggregate ratio. Reported even
+        # when open-loop, so every arm is comparable on the same number.
+        if _n_track:
+            _cmd_mean = _cmd_sum / _n_track
+            _mes_mean = _mes_sum / _n_track
+            result["force_cmd_mean_N"]  = dict(zip(_FSET, np.round(_cmd_mean, 3).tolist()))
+            result["force_meas_mean_N"] = dict(zip(_FSET, np.round(_mes_mean, 3).tolist()))
+            result["force_track_ratio"] = round(
+                float(_mes_mean.sum() / max(_cmd_mean.sum(), 1e-9)), 4)
+            # Worst per-finger relative error -- the aggregate can look healthy
+            # while one finger delivers nothing.
+            _rel = [(_mes_mean[i] - _cmd_mean[i]) / _cmd_mean[i]
+                    for i in range(len(_cmd_mean)) if _cmd_mean[i] > 1e-6]
+            result["force_track_worst_rel"] = round(float(min(_rel)), 4) if _rel else None
         result["squeeze_forces_peak_N"] = dict(
             zip(_FSET, np.round(_f_peak, 3).tolist()))
         result["squeeze_all_loaded_frac"] = round(float(_n_all_loaded)
@@ -1009,6 +1124,12 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
         # mislabelling them would report the middle finger's load under 'index'.
         result["squeeze_forces_N"] = dict(zip(_FSET, np.round(f_meas, 3).tolist()))
         result["phase_log"].append("squeeze_done")
+        # Diagnostic hook: a probe may be attached as pick_and_place._PROBE_DUMP
+        # to inspect per-finger contact state at the phase boundaries. Absent in
+        # normal runs, so this costs one attribute lookup.
+        _pd = globals().get("_PROBE_DUMP")
+        if _pd is not None:
+            _pd("squeeze", model, data, tip_geom_ids, obj_gids, _FSET, ctrl)
         print(f"[squeeze] final={result['squeeze_forces_N']}")
 
         # Holding gains for everything that follows (see effective_gains).
@@ -1300,6 +1421,39 @@ def main():
                          "fails or gamma is infeasible, so the FAILURE is visible in "
                          "the recorded video instead of the clip ending at the abort. "
                          "Diagnostic only -- the run is still reported as failed.")
+    ap.add_argument("--contact-gated-alloc", action="store_true",
+                    help="build the grasp map G only from fingers ACTUALLY in "
+                         "contact, so the internal force is split over the grasp "
+                         "that exists rather than the one the plan hoped for")
+    ap.add_argument("--force-feedback-ki", type=float, default=0.0,
+                    help="integral gain on the per-finger force error "
+                         "(commanded minus measured normal). 0 = open loop, "
+                         "which is what the controller has always been")
+    ap.add_argument("--advance-q-target", type=float, default=0.0,
+                    help="re-datum a SEATED finger's PD target to where it "
+                         "actually is, so tracking stops pulling it back off the "
+                         "surface it just reached (any value > 0 enables)")
+    ap.add_argument("--squeeze-pd-per-finger", action="store_true",
+                    help="scale the squeeze-phase finger PD PER FINGER, by that "
+                         "finger's own |tau_int|/|tau_pd| ratio, instead of one "
+                         "global --squeeze-pd-scale. A finger already winning "
+                         "keeps full tracking authority; only one losing the "
+                         "standoff is softened, and only by its shortfall")
+    ap.add_argument("--sep-hard", action="store_true",
+                    help="require every pair of contacts to be at least "
+                         "--min-sep-mm apart, as a HARD NLP constraint. Without "
+                         "it nothing keeps two contacts apart and they collapse "
+                         "onto one point -- measured 15/15 cells at n=3 and 3/3 "
+                         "four-contact cells at n=4, all still certifying "
+                         "wrench_feasible because a doubled contact is not an "
+                         "infeasible one. Can make the solve infeasible on a "
+                         "patch too small to hold the contacts that far apart")
+    ap.add_argument("--min-sep-mm", type=float, default=22.0,
+                    help="separation floor (mm) for --sep-hard. Default 22 = the "
+                         "LEAP pad's FOOTPRINT on the object (30.1x22.2mm at the "
+                         "contact face), so two pads do not overlap. The earlier "
+                         "12 was measured off the contact-DIRECTION extent, which "
+                         "is the wrong axis for side-by-side pads")
     ap.add_argument("--fingers", default=None,
                     help="comma-separated fingers to grasp with, IN SLOT ORDER, e.g. "
                          "'thumb,middle' or 'thumb,index,middle'. Slot 1 anchors the "
@@ -1349,7 +1503,7 @@ def main():
                          "in 1s, hold 1.5s, 3mm sinusoid in all axes from t+0.25s -- "
                          "additionally scored by their failure criteria (>30deg "
                          "rotation, >7.5cm deviation). This is what produces the "
-                         "paper's '% pick success' column.")
+                         "paper's '%% pick success' column.")
     OP.add_out_args(ap, OP.TABLETOP)
     args = ap.parse_args()
 
@@ -1387,6 +1541,11 @@ def main():
         args.object, args.seed, n_seeds=args.n_seeds, n_relin=args.n_relin,
         view=args.view, out_dir=str(out_dir), do_transport=args.do_transport,
         fingers=args.fingers, force_execute=args.force_execute,
+        sep_hard=args.sep_hard, min_sep_mm=args.min_sep_mm,
+        squeeze_pd_per_finger=args.squeeze_pd_per_finger,
+        contact_gated_alloc=args.contact_gated_alloc,
+        force_feedback_ki=args.force_feedback_ki,
+        advance_q_target=args.advance_q_target,
         release_open_frac=args.release_open_frac,
         w_edge_margin=args.w_edge_margin, mesh_fit=args.mesh_fit,
         directional_r_tip=args.directional_r_tip,

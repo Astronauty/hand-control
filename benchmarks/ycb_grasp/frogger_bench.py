@@ -76,7 +76,13 @@ SYNTH_BUDGET_S = 60.0
 # It should return once the n >= 3 path works -- whether its failure is an n = 2
 # geometric limit or a port defect is exactly what that path would settle. Pass it
 # explicitly via --objects to run it.
-EXCLUDED_OBJECTS = {"009_gelatin_box": "flat (34 mm); fails all 20 attempts at n=2"}
+# REFUTED 2026-09-15. This held "009_gelatin_box: fails all 20 attempts at n=2",
+# measured before the pad-point fix (FROGGER_BENCH 14bis). Re-measured at 20 seeds
+# after it, OUR arm lifts 20/20 and picks 18/20 on that object -- it is among the
+# easier objects in the set, not an excluded one. (The frogger arm still struggles,
+# 3/20 lift, which is a property of that arm rather than of the object.) The list is
+# kept empty rather than deleted so the mechanism stays available.
+EXCLUDED_OBJECTS = {}
 
 DEFAULT_OBJECTS = ["036_wood_block", "017_orange", "014_lemon",
                    "056_tennis_ball", "061_foam_brick"]

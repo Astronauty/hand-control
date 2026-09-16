@@ -65,9 +65,11 @@ def _scene_from_planner(planner, model, data):
 def _as_rec(entry, ok):
     """One accept/reject table row -> the `rec` shape draw_seed_rays wants.
 
-    p3s/n3_in ride along when the row has them (a tripod seed that cleared the
-    third-contact fan). Absent at n=2, and the caller then draws two contacts --
-    never a fabricated third."""
+    p3s/n3_in and p4s/n4_in ride along when the row has them (a seed that cleared
+    the third- / fourth-contact fan). Absent below n=3 / n=4, and the caller then
+    draws only the contacts that exist -- never a fabricated one. The two are
+    INDEPENDENT: the fourth-contact seeder can come back empty on a seed whose
+    third contact was placed, so a row may carry p3s without p4s."""
     seed = dict(p1s=np.asarray(entry["p1s"], float),
                 p2s=np.asarray(entry["p2s"], float),
                 n1_in=np.asarray(entry["n1_in"], float),
@@ -77,6 +79,10 @@ def _as_rec(entry, ok):
         seed["p3s"] = np.asarray(entry["p3s"], float)
         seed["n3_in"] = np.asarray(entry["n3_in"], float)
         seed["p3"] = seed["p3s"]
+    if entry.get("p4s") is not None:
+        seed["p4s"] = np.asarray(entry["p4s"], float)
+        seed["n4_in"] = np.asarray(entry["n4_in"], float)
+        seed["p4"] = seed["p4s"]
     return dict(seed=seed, kind=entry.get("kind", "random"), ok=ok,
                 why=entry.get("why", "accepted"),
                 ray=dict(origin=None, u=None))
@@ -96,16 +102,21 @@ def _contacts_of(rec):
     out = [("thumb", s_["p1s"], s_["n1_in"]), ("index", s_["p2s"], s_["n2_in"])]
     if s_.get("p3s") is not None:
         out.append(("middle", s_["p3s"], s_["n3_in"]))
+    if s_.get("p4s") is not None:
+        out.append(("ring", s_["p4s"], s_["n4_in"]))
     return out
 
 
-_MIDDLE_COLOR = "#238b45"   # green -- distinct from thumb orange / index blue
+_MIDDLE_COLOR = "#238b45"   # green  -- distinct from thumb orange / index blue
+_RING_COLOR   = "#6a51a3"   # purple -- and distinct from all three above.
+                            # Matches plot_grasp_contacts.FINGER_COLORS[4], so a
+                            # contact keeps ONE colour across both figures.
 
 # One colour per finger, used for BOTH ends of that contact's story: the o at
 # the seed and the ^ at the NLP's converged position. Rejected seeds keep the
 # finger colours too -- the panel header already says the seed was rejected, so
 # recolouring everything red only destroys the finger encoding.
-_FINGER_COLORS = dict(SQ.FINGER_COLORS, middle=_MIDDLE_COLOR)
+_FINGER_COLORS = dict(SQ.FINGER_COLORS, middle=_MIDDLE_COLOR, ring=_RING_COLOR)
 
 
 def _FCOL(key):
@@ -124,8 +135,9 @@ def _overlay_solved(ax, solved, normals=None):
     p2 = solved.get("p2")
     if p1 is None or p2 is None:
         return
-    for key in ("thumb", "index", "middle"):
-        p = solved.get({"thumb": "p1", "index": "p2", "middle": "p3"}[key])
+    for key in ("thumb", "index", "middle", "ring"):
+        p = solved.get({"thumb": "p1", "index": "p2",
+                        "middle": "p3", "ring": "p4"}[key])
         if p is None:
             continue
         # Lifted off the surface for the same reason the seed o is -- the NLP
@@ -298,12 +310,20 @@ def _build_seed_figure(planner, model, data, title_extra="", res=None,
     sc = _scene_from_planner(planner, model, data)
     recs = [_as_rec(e, True) for e in acc] + [_as_rec(e, False) for e in rej]
     # Solved contacts, when the caller handed us the result. Only p1/p2 are
-    # required; p3 rides along at n_contacts>=3.
+    # required; p3/p4 ride along at n_contacts >= 3 / >= 4.
+    #
+    # p4 WAS MISSING HERE, which is why a four-contact solve drew only three
+    # solution triangles even though _overlay_solved handles all four and the
+    # legend listed 'ring'. The seed o was drawn (that comes from the seed
+    # tables, which do carry p4s) but its ^ was not, so the ring finger looked
+    # like a seed the NLP had thrown away -- the exact misreading the overlay
+    # exists to prevent. Written as a loop so a fifth slot cannot reintroduce it.
     _solved = None
     if res is not None and res.get("p1") is not None and res.get("p2") is not None:
         _solved = {"p1": res["p1"], "p2": res["p2"]}
-        if res.get("p3") is not None:
-            _solved["p3"] = res["p3"]
+        for _k in ("p3", "p4"):
+            if res.get(_k) is not None:
+                _solved[_k] = res[_k]
     # WINNER + ITS REAL PATCH FRAMES. solve() runs one NLP per accepted seed and
     # keeps the cost-ranked best; res['seed_index'] says which accepted seed
     # that was, and res['quad_frames'] carries the paraboloid frames that stage
@@ -357,9 +377,22 @@ def _build_seed_figure(planner, model, data, title_extra="", res=None,
     # ONE SHARED LEGEND. Finger role is carried by colour in every panel, and
     # marker shape separates the two ends of a contact's story (seed vs the
     # NLP's converged position), so a single key replaces every per-panel tag.
-    _has_mid = (bool(_solved) and _solved.get("p3") is not None) or any(
-        r["seed"].get("p3s") is not None for r in recs)
-    _keys = ["thumb", "index"] + (["middle"] if _has_mid else [])
+    # A slot earns a legend entry iff it appears SOMEWHERE on the figure -- as a
+    # seed o on any panel, or as the winner's solved ^. Checking both matters at
+    # n=4 for a reason that is the point of the figure: the fourth-contact seeder
+    # can come back empty, so a run configured for four fingers may draw a ring
+    # SOLUTION with no ring seed, or ring seeds on panels whose seed lost. Keying
+    # the legend off only one of the two would silently drop the marker the
+    # reader is trying to find.
+    def _slot_present(solved_key, seed_key):
+        return ((bool(_solved) and _solved.get(solved_key) is not None)
+                or any(r["seed"].get(seed_key) is not None for r in recs))
+
+    _keys = ["thumb", "index"]
+    if _slot_present("p3", "p3s"):
+        _keys.append("middle")
+    if _slot_present("p4", "p4s"):
+        _keys.append("ring")
     _h = [plt.Line2D([], [], color=_FCOL(k), marker="o", ls="none", ms=7,
                      mec="k", mew=0.4, label=k) for k in _keys]
     _h += [plt.Line2D([], [], color="0.35", marker="o", ls="none", ms=7,
@@ -402,20 +435,22 @@ def _stage_from_result(planner, model, data, res):
     injected into the frame copy as `t_sol`, matching how _iter_trace_quadratic_stages
     folds quad{ci}_t_sol into each contact frame from the npz.
 
-    Contact 3 is included on the same terms as 1 and 2, and is absent at n=2.
-    At c3_own_patch=False its frame IS contact 2's (the shared patch), so the two
-    panels draw the same rectangle -- deliberate, and the differing t_sol is what
-    shows whether contact 3 collapsed onto contact 2.
+    Contacts 3 and 4 are included on the same terms as 1 and 2, and are absent
+    below n=3 / n=4. At c3_own_patch / c4_own_patch = False their frames ARE
+    contact 2's (the shared patch), so those panels draw the same rectangle --
+    deliberate, and the differing t_sol is what shows whether a contact collapsed
+    onto another. With three fingertips sharing one patch at n=4 this is the
+    figure that answers whether the patch was big enough.
 
     Returns (V, F, stage) or None when the result carries no paraboloid frames
     (e.g. a primitive solved with face-pin contacts, or a non-quadratic solve)."""
     sc = _scene_from_planner(planner, model, data)
     f1, f2 = res.get("quad1_frame"), res.get("quad2_frame")
-    f3 = res.get("quad3_frame")
+    f3, f4 = res.get("quad3_frame"), res.get("quad4_frame")
     t1, t2 = res.get("t1_sol"), res.get("t2_sol")
-    t3 = res.get("t3_sol")
+    t3, t4 = res.get("t3_sol"), res.get("t4_sol")
     contact = {}
-    for ci, fr, ts in ((1, f1, t1), (2, f2, t2), (3, f3, t3)):
+    for ci, fr, ts in ((1, f1, t1), (2, f2, t2), (3, f3, t3), (4, f4, t4)):
         if fr is None:
             continue
         c = dict(fr)

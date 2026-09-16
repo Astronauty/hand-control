@@ -142,4 +142,17 @@ def finger_joint_slices(model, fingers=None):
                 .startswith(f'leap_{code}_')]
         if adrs:
             out.append((int(min(adrs)), int(max(adrs)) + 1))
-    return tuple(sorted(out))
+    # NOT sorted. The return order must match the CALLER's finger order, because
+    # every consumer that indexes a slice positionally pairs it with something
+    # built in that same order -- tip_site_ids, pad_offsets, the per-finger force
+    # vector. sorted() silently broke that pairing whenever the finger list was
+    # not already in joint-address order, which FINGER_SET never is: it is
+    # SLOT_ROLES reversed, so a 4-finger run asks for
+    # [ring, middle, index, thumb] and got back [index, middle, ring, thumb].
+    # Measured consequence: pick_and_place's drift trace zips
+    # active_joint_slices against _FSET and reported the INDEX finger's torques
+    # under 'ring' and vice versa.
+    #
+    # Nothing depended on the sort: GraspController's other uses concatenate all
+    # the slices (order-independent) or iterate them to scale gains (likewise).
+    return tuple(out)

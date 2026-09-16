@@ -1846,3 +1846,78 @@ cannot reach.
 The edge sweep covers seeds 0-2, so the join is over those 30 cells: held median
 12.0 mm (n=18) against failed 1.0 mm (n=12), r = **+0.574**. Extending the edge
 sweep to 20 seeds would tighten this and is the obvious next measurement.
+
+---
+
+## 16bis. Four-object set: mug and gelatin box (2026-09-15)
+
+Re-run on `036_wood_block`, `017_orange`, `025_mug`, `009_gelatin_box` -- a box, a
+near-sphere, a thin-walled concave object, and the flattest object in the set --
+20 seeds per object per method, 160 executed cells, plus an 80-cell edge sweep at
+10 seeds (against 30 previously).
+
+| | ours | frogger |
+|---|---|---|
+| reached lift | **89% [80, 94]** | 55% [44, 65] |
+| pick success | **66% [55, 76]** | 21% [14, 31] |
+| held | **58% [47, 68]** | 16% [10, 26] |
+
+Per object (pick):
+
+| object | ours | frogger |
+|---|---|---|
+| `017_orange` | 20/20 | 14/20 |
+| `009_gelatin_box` | **18/20** | 0/20 |
+| `025_mug` | 10/20 | 1/20 |
+| `036_wood_block` | 5/20 | 2/20 |
+
+### 16bis.1 The gelatin-box exclusion is REFUTED
+
+`EXCLUDED_OBJECTS` carried "009_gelatin_box: flat (34 mm); fails all 20 attempts at
+n=2" since the first sweeps. Re-measured after the pad-point fix, **our arm lifts
+20/20 and picks 18/20** -- it is among the EASIER objects here, behind only the
+orange. The original measurement was taken on the pre-fix frogger path and never
+re-verified against ours. `EXCLUDED_OBJECTS` is now empty.
+
+The frogger arm does still fail it (3/20 lift, 0/20 pick), so the object is hard for
+THAT arm. That is a property of the arm, not grounds for excluding the object.
+
+### 16bis.2 The mug works, and its thin walls show up in `held`, not in `pick`
+
+`025_mug` was flagged in TELEOP_MESH_RECOMMENDER_PLAN as needing hull-set treatment.
+That note concerns the TELEOP path, where `obj['id_geom']` resolves a single hull;
+`pick_and_place` already handles multi-hull objects via `_obj_hull_geom_ids`, and the
+mug compiles to 44 hulls and grasps. Ours picks 10/20.
+
+Its `held` is 6/20 against `pick` 10/20 -- the widest gap in the set. Four grasps
+satisfy the displacement criteria while a fingertip has unloaded, which is what a
+thin wall does to a pinch: the object tracks the palm without the grasp carrying it.
+
+### 16bis.3 Our edge margins are NOT uniformly large
+
+The previous 5-object set gave ours 0/30 contacts within 2 mm of an edge. On this
+harder set it is **7/80 (9% [4, 17])**, against the baseline's 69/80 (86% [77, 92]).
+The separation stands; the absolute claim does not, and the §11bis phrasing "none of
+our contacts" must not be carried forward.
+
+Ours is object-dependent -- median 18.0 mm on the orange, 12.0 on the block, but
+7.0 on the mug and **3.5 on the gelatin box**, the two objects with least usable
+face. A 34 mm-deep box does not offer much room to stay clear of an edge.
+
+The correlation is correspondingly weaker but now rests on 80 cells rather than 30:
+held median 7.0 mm (n=33) against failed 1.0 mm (n=47), **r = +0.389** (was +0.574
+at n=30).
+
+### 16bis.4 `l_bar*` separates the two arms much more sharply here
+
+| | success | failure | r |
+|---|---|---|---|
+| ours | 0.91 | 0.73 | **+0.365** |
+| frogger | 0.91 | 0.37 | **+0.816** |
+| pooled | 0.91 | 0.44 | +0.593 |
+
+Successes score 0.91 under both. Failures score 0.37 under the baseline but 0.73
+under ours -- so **our failures are not low-`l_bar*` grasps**, and no threshold on
+`l_bar*` would have predicted them. The baseline's r = +0.816 is much stronger than
+the +0.474 measured on the easier 5-object set, consistent with `l_bar*` being its
+own objective and its solutions spreading along it.

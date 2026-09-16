@@ -1164,6 +1164,103 @@ def _seed_third_contact(seed, geom_type, size, center, obj_mat, rng,
     return out
 
 
+class _C4Infeasible(Exception):
+    """The slot-2 patch is geometrically too small to hold a fourth contact at
+    the configured separation. Not an error: the caller drops to a tripod, which
+    is the same degrade-don't-fail rule a rejected seed already follows. Carried
+    as an exception only so the check can sit before the fan without duplicating
+    the fall-through path."""
+
+
+def _seed_fourth_contact(seed, geom_type, size, center, obj_mat,
+                         mesh_entry=None, n_fan=8, patch_frame=None,
+                         patch_offset_m=0.015, min_sep_m=0.012,
+                         prefer_outer=True, _frac_of_patch=0.8):
+    """Candidate FOURTH contacts for a four-finger grasp (cfg.n_contacts >= 4).
+
+    Deliberately narrower than _seed_third_contact: only the 'patch_offset'
+    strategy is offered. The other three that function documents are not merely
+    unmeasured here, they are inapplicable --
+
+      'kinematic' reads where a finger IS at the pinch pose, and the measurement
+        recorded in _seed_third_contact (SDF of the middle tip at a SOLVED n=2
+        grasp: +53 to +146 mm) applies at least as strongly to the ring finger,
+        which curls further from the pinch than the middle one does;
+      'tangent' walks a palm-frame direction that maps to an arbitrary world
+        direction -- it proposed sub-table contacts on every seed of every object;
+      'fan' places candidates at OBJECT scale with nothing tying them to the
+        patch, which is what produced the 183 mm tip-to-contact failure.
+
+    THE NEW CONSTRAINT, and the reason this is a separate function rather than a
+    slot-index parameter on the third-contact seeder: contact 4 must clear
+    contact 3 as well as contact 2. The third-contact seeder fans a full circle
+    about the patch origin and takes the best-ranked bearing; run twice, it would
+    happily return the same bearing twice, and a doubled contact certifies
+    wrench-feasible while adding no wrench column. That is not hypothetical --
+    it is the measured n=3 failure (contacts 2 and 3 EXACTLY coincident in 15/15
+    cells). So every candidate here is screened against BOTH already-placed
+    contacts at `min_sep_m`, and the fan is denser (8 bearings, not 5) to leave
+    the screen something to accept.
+
+    Returns a list of dicts, each the seed extended with 'p4'/'p4s'/'n4_in' and
+    'fan_deg'/'patch_t', ordered by descending separation from contact 3 -- the
+    caller re-ranks by DLS reachability, so this order only decides ties.
+
+    An empty return is NOT an error: the caller drops to a tripod, exactly as a
+    failed third-contact seed drops to a pinch.
+    """
+    if patch_frame is None:
+        return []
+    p2s = np.asarray(seed['p2s'], float)
+    p3s = seed.get('p3s')
+    p3s = np.asarray(p3s, float) if p3s is not None else None
+
+    _lo0, _hi0 = float(patch_frame['t_lo_0']), float(patch_frame['t_hi_0'])
+    _lo1, _hi1 = float(patch_frame['t_lo_1']), float(patch_frame['t_hi_1'])
+    # Same adaptive radius the third contact uses: sized from the SMALLEST of the
+    # four half-extents, because a full-circle fan clamps at the bearing of the
+    # tightest bound even when the other three are roomy. Clamping pins a contact
+    # ON the boundary, which makes it a near-duplicate wrench column.
+    _room = min(abs(_lo0), abs(_hi0), abs(_lo1), abs(_hi1))
+    _d = min(float(patch_offset_m), _frac_of_patch * _room)
+
+    out = []
+    for a in np.linspace(0.0, 2.0 * np.pi, max(int(n_fan), 1), endpoint=False):
+        _t0 = float(np.clip(_d * np.cos(a), _lo0, _hi0))
+        _t1 = float(np.clip(_d * np.sin(a), _lo1, _hi1))
+        if abs(_t0) < 1e-6 and abs(_t1) < 1e-6:
+            continue
+        p4s = _patch_point_np(patch_frame, _t0, _t1, center, obj_mat)
+        if p4s is None or not np.all(np.isfinite(p4s)):
+            continue
+        p4s = np.asarray(p4s, float)
+        # Separation screen against BOTH placed contacts. Contact 2 sits at the
+        # patch origin, so the fan radius alone does not guarantee clearance from
+        # it once _d has been shrunk to fit a tight patch.
+        _sep2 = float(np.linalg.norm(p4s - p2s))
+        _sep3 = (float(np.linalg.norm(p4s - p3s)) if p3s is not None else np.inf)
+        if _sep2 < float(min_sep_m) or _sep3 < float(min_sep_m):
+            continue
+        n4_in = -_geom_normal_np(p4s, geom_type, center, obj_mat, size,
+                                 mesh_entry=mesh_entry)
+        if not np.all(np.isfinite(n4_in)) or np.linalg.norm(n4_in) < 1e-9:
+            continue
+        cand = dict(seed)
+        cand['p4']      = p4s.copy()
+        cand['p4s']     = p4s
+        cand['n4_in']   = n4_in
+        cand['fan_deg'] = float(np.rad2deg(a))
+        cand['patch_t'] = (_t0, _t1)
+        cand['sep3_mm'] = (_sep3 * 1e3) if np.isfinite(_sep3) else None
+        cand['sep2_mm'] = _sep2 * 1e3
+        out.append(cand)
+    # Most-separated first: with the shared patch under pressure this is the axis
+    # along which candidates actually differ, and it is the quantity whose
+    # collapse the n=3 work identified as the failure.
+    out.sort(key=lambda c: -(c['sep3_mm'] if c['sep3_mm'] is not None else 0.0))
+    return out
+
+
 def _assign_seed_by_finger(seed, live_thumb, live_index):
     """Orient a seed's contact labels to the operator's actual hand: p1/p1s/n1_in is the
     THUMB seed, p2/p2s/n2_in the INDEX seed. _seed_pair labels the two contacts by a random
@@ -3362,6 +3459,69 @@ class CostWeights:
     # Set to a float (e.g. 1e4) to opt into the slack-relaxed formulation.
     # w_slack:  float | None = None
     w_slack:  float = 1
+    # Pairwise contact SEPARATION (n_contacts >= 3 only; a pinch has no pair
+    # beyond 1-2 and is bit-identical at any value). One-sided squared hinge:
+    # zero once every pair is at least contact_min_sep_m apart, so a grasp that
+    # already separates its contacts sees NO gradient from this and is unchanged.
+    #
+    # THIS IS THE TERM WHOSE ABSENCE CAUSED THE COLLAPSE. Nothing else in the
+    # NLP -- objective or constraint -- keeps two contacts apart; the seed
+    # position and set_initial were the only things holding them, and the
+    # optimizer is free to leave both. w_span does NOT serve this role and
+    # cannot be tuned into it: logdet(W W^T + dI) is 6x6 and a DUPLICATED
+    # contact leaves it FULL RANK 6 (the rank comes from the other contacts),
+    # so a total collapse costs ~0.72 of logdet (measured) against a w_ik term
+    # that is genuinely cheaper to satisfy when two fingers target one point.
+    # Measured consequence: contact 3 exactly coincident with contact 2 in 15/15
+    # cells at n=3, and contact 4 onto contact 3 in 3/3 four-contact cells --
+    # all still certifying wrench_feasible=True, because a doubled contact is
+    # not an infeasible one.
+    #
+    # A PENALTY, not a hard constraint, and deliberately: the patch is often
+    # genuinely too small to hold another contact (measured max_chord < min_sep
+    # on 9 of 18 cells), and a hard >= would make those solves INFEASIBLE rather
+    # than returning the best available grasp. The hinge degrades to "as
+    # separated as this patch allows", which is both the useful answer and a
+    # visible one -- a contact pinned at the patch boundary is a patch-size
+    # report, where a collapsed contact looked like a healthy grasp.
+    w_sep:    float = 0.0
+    # HARD variant of the same separation requirement: instead of (or as well as)
+    # pricing a shortfall, forbid it outright with |p_i - p_j|^2 >= d^2 per pair.
+    #
+    # Trade-off, and it is a real one rather than a preference:
+    #   * The hinge cannot GUARANTEE separation -- it competes with w_ik and can
+    #     be outbid, which is exactly how the original collapse happened. It
+    #     always returns an answer.
+    #   * The hard constraint guarantees it, but makes the NLP INFEASIBLE when
+    #     the patch cannot hold the contacts that far apart -- and that is the
+    #     COMMON case here, not an edge case: measured max_chord < min_sep on 9
+    #     of 18 four-finger cells. An infeasible solve returns a best-effort
+    #     iterate that may violate the constraint anyway, or nothing.
+    # Both may be enabled together: the constraint defines the feasible set and
+    # the hinge shapes the descent INSIDE it, which is the usual way to help an
+    # interior-point method find a constrained region it starts outside of.
+    sep_hard: bool  = False
+    # WHICH hard constraint, when sep_hard is on:
+    #   'ball' -- |p_i - p_j|^2 >= d^2, one scalar NONCONVEX constraint per pair.
+    #       Excludes a disc: the pair may sit at any BEARING, which is what a fan
+    #       of seeds around a shared patch actually wants. Admits 87.8% of a
+    #       +/-30mm patch (measured by sampling).
+    #   'box'  -- per-AXIS separation on the primal variables directly, applied
+    #       as an ORDERING: t_j[k] - t_i[k] >= d on the patch axis k with the
+    #       most seed separation. This is LINEAR in the decision variables --
+    #       the cheapest thing IPOPT can be handed, with an exactly-zero Hessian
+    #       contribution and no nonconvexity at all -- but it is strictly
+    #       stronger than necessary, because separation along one axis implies
+    #       euclidean separation while the converse is false. Measured: admits
+    #       30.6% of the same patch, i.e. it forbids nearly 3x as much of the
+    #       reachable region, including placements that are perfectly well
+    #       separated diagonally.
+    # The ordering is what keeps 'box' smooth. |t_j[k] - t_i[k]| >= d is a
+    # DISJUNCTION (either side), which an NLP cannot express without a binary;
+    # fixing the sign from the seed turns it into one linear inequality, at the
+    # cost of forbidding the solver from ever swapping the two contacts' order
+    # along that axis.
+    sep_hard_mode: str = 'ball'
     q_scale:  float = 1.0
 
 
@@ -4202,6 +4362,11 @@ class GeometryNames:
     # tier) but no SITE -- and a site is what the IK cost, the DLS reachability ranking
     # and the FK callbacks all target. Resolved only when n_contacts >= 3.
     middle_site: str = 'leap_mf_ds_tip'
+    # FOURTH load-bearing contact (cfg.n_contacts >= 4). Same story as middle_site
+    # one slot up: ring_geom already existed for the collision tier, but the IK
+    # cost, the DLS reachability rank and the FK callbacks all target a SITE.
+    # Resolved only when n_contacts >= 4.
+    ring_site:   str = 'leap_rf_ds_tip'
     thumb_geom:  str = 'leap_th_tip'
     index_geom:  str = 'leap_if_tip'
     middle_geom: str = 'leap_mf_tip'
@@ -4332,6 +4497,60 @@ class GraspConfig3D:
     #     15mm  cost 4.15/4.98/0.34  beta .039/.033/.041  all 3 fingers within 1.5mm
     #     30mm  cost 7.31/6.70/0.56  beta -.230/.043/.043
     c3_patch_offset_m: float = 0.015
+    # FOURTH contact (cfg.n_contacts >= 4). Contact 4 shares contact 2's patch on
+    # exactly the same terms contact 3 does -- see c3_own_patch for why sharing is
+    # the measured-better default, and note the argument gets STRONGER with a
+    # fourth finger, not weaker: an independent patch per finger multiplies the
+    # chance that one of them lands on a face the hand must re-approach.
+    #
+    # The sufficiency question the shared patch raises is now the binding one.
+    # Slot 2's patch has a measured MIN half-extent of 11.9-16.2 mm on the four
+    # curved objects (see _seed_third_contact's patch_offset branch), and
+    # _frac_of_patch=0.8 keeps seeds off the boundary, so the usable disc is
+    # ~9.5-13 mm in radius. At n=3 that disc holds two fingertips; at n=4 it must
+    # hold THREE, against a LEAP pad whose own contact-direction extent is
+    # ~10.8 mm. c4_patch_offset_m is therefore NOT independent of
+    # c3_patch_offset_m -- the two contacts are fanned to distinct bearings on the
+    # same disc (see _seed_fourth_contact), and if the disc cannot separate them
+    # the fourth contact degenerates into a near-duplicate wrench column, which is
+    # the -0.230 beta failure mode c3_patch_offset_m's own comment records.
+    c4_seed_strategy:  str   = 'patch_offset'
+    c4_own_patch:      bool  = False
+    c4_patch_offset_m: float = 0.015
+    # Minimum geodesic-ish separation (m) required between contact 4's seed and
+    # the already-placed contacts 2 and 3, enforced at SEED time. Without it the
+    # patch_offset fan will happily propose a bearing that lands on top of contact
+    # 3, and a doubled contact is not an infeasible one -- it certifies
+    # wrench-feasible while supplying no new wrench column, which is precisely the
+    # n=3 collapse this repo already measured (15/15 cells, contacts 2-3 exactly
+    # coincident). 12 mm is one LEAP pad extent, so two pads at this separation
+    # are just touching rather than overlapping.
+    c4_min_sep_m:      float = 0.012
+    # Separation (m) the NLP's w_sep hinge drives toward, for EVERY pair of
+    # contacts. DELIBERATELY NOT c4_min_sep_m: that one screens fourth-contact
+    # SEEDS and answers "is this candidate worth ranking", while this one shapes
+    # the SOLVE and answers "how far apart should the solver hold them". They
+    # want to move independently -- the seed screen can afford to be strict
+    # (a rejected candidate costs nothing, another bearing is tried) where the
+    # solve floor cannot (it competes with w_ik on every iteration).
+    #
+    # 22 mm, and the earlier 12 mm was measured off the WRONG AXIS. 12 mm came
+    # from the pad's extent ALONG THE CONTACT DIRECTION (10.8 mm) -- but two
+    # pads sitting side by side overlap according to their extent in the plane
+    # PERPENDICULAR to that, i.e. the pad's footprint on the object. Measured on
+    # the LEAP tip mesh, taking only vertices within 4 mm of the contact face:
+    # the footprint is 30.1 x 22.2 mm, so centres must be >= ~22 mm apart for
+    # the pads not to overlap. At 12 mm they visibly did.
+    #
+    # Still a floor on PAD OVERLAP, not an attempt to reach the 45.4 mm
+    # rest-pose finger pitch: the fingers curl independently and need not sit
+    # one base pitch apart, which is the whole reason a shared patch works for
+    # two fingertips at all.
+    #
+    # Measured at 22 mm: 036_wood_block and 003_cracker_box both still hold four
+    # separated contacts (3-4 at 22.0 and 44.0 mm), so the stricter floor costs
+    # nothing on the objects that support four fingers at all.
+    contact_min_sep_m: float = 0.022
     r_thumb:  float | None = None
     r_index:  float | None = None
     r_middle: float | None = None
@@ -4358,6 +4577,11 @@ class GraspConfig3D:
         self.c3_seed_strategy   = kwargs.pop('c3_seed_strategy', 'patch_offset')
         self.c3_own_patch       = kwargs.pop('c3_own_patch', False)
         self.c3_patch_offset_m  = kwargs.pop('c3_patch_offset_m', 0.015)
+        self.c4_seed_strategy   = kwargs.pop('c4_seed_strategy', 'patch_offset')
+        self.c4_own_patch       = kwargs.pop('c4_own_patch', False)
+        self.c4_patch_offset_m  = kwargs.pop('c4_patch_offset_m', 0.015)
+        self.c4_min_sep_m       = kwargs.pop('c4_min_sep_m', 0.012)
+        self.contact_min_sep_m  = kwargs.pop('contact_min_sep_m', 0.022)
         self.r_thumb  = kwargs.pop('r_thumb', None)
         self.r_index  = kwargs.pop('r_index', None)
         self.r_middle = kwargs.pop('r_middle', None)
@@ -4382,6 +4606,8 @@ class GraspConfig3D:
         top = ', '.join(f'{k}={getattr(self, k)!r}' for k in
                         ('joint_limits', 'wrench_constraint', 'max_iter', 'fixed_contacts',
                          'n_contacts', 'c3_seed_strategy', 'c3_own_patch', 'c3_patch_offset_m',
+                         'c4_seed_strategy', 'c4_own_patch', 'c4_patch_offset_m', 'c4_min_sep_m',
+                         'contact_min_sep_m',
                          'r_thumb', 'r_index', 'r_middle', 'r_ring'))
         return f'GraspConfig3D({groups}, {top})'
 
@@ -4403,6 +4629,8 @@ class GraspConfig3D:
         # flat dataclass.
         if name in _GRASP_CFG_GROUPS or name in (
             'joint_limits', 'wrench_constraint', 'max_iter', 'fixed_contacts', 'n_contacts', 'c3_seed_strategy', 'c3_own_patch', 'c3_patch_offset_m',
+            'c4_seed_strategy', 'c4_own_patch', 'c4_patch_offset_m', 'c4_min_sep_m',
+            'contact_min_sep_m',
             'r_thumb', 'r_index', 'r_middle', 'r_ring',
         ):
             object.__setattr__(self, name, value)
@@ -4509,6 +4737,12 @@ class GraspPlanner3D:
         self._middle_sid = (self._optional_site(c.middle_site)
                             if int(c.n_contacts) < 3
                             else self._require_site(c.middle_site))
+        # Fourth contact's site, on exactly the terms above one slot up: REQUIRED
+        # once n_contacts >= 4, resolved optionally below that so r_ring can be
+        # measured from it rather than from geom_rbound.
+        self._ring_sid   = (self._optional_site(c.ring_site)
+                            if int(c.n_contacts) < 4
+                            else self._require_site(c.ring_site))
         self._thumb_gid  = self._require_geom(c.thumb_geom)
         self._index_gid  = self._require_geom(c.index_geom)
         self._middle_gid = self._require_geom(c.middle_geom)
@@ -4576,7 +4810,11 @@ class GraspPlanner3D:
         # that target ~4mm off the surface. index and middle share mesh dataid 13, so
         # the corrected r_middle equals r_index exactly.
         c.r_middle = _tip_radius(self._middle_gid, self._middle_sid)
-        c.r_ring   = _tip_radius(self._ring_gid)
+        # Ring gets the SITE too, now that slot 4 resolves one. Before the four-finger
+        # arm this call passed no site and so took geom_rbound -- the same +4.2mm
+        # over-report the comment above records for the middle pad, and it would have
+        # fed _r4_ik exactly as the inflated r_middle fed _r3_ik.
+        c.r_ring   = _tip_radius(self._ring_gid, self._ring_sid)
         self.log.info(
             f"[tip_radius] r_thumb={c.r_thumb*1e3:.1f}mm  r_index={c.r_index*1e3:.1f}mm  "
             f"r_middle={c.r_middle*1e3:.1f}mm  r_ring={c.r_ring*1e3:.1f}mm  "
@@ -4614,6 +4852,13 @@ class GraspPlanner3D:
         # contact only (see _tip_support_along and the r3_override plumbing).
         self._middle_verts_sl = (_tip_verts_site_local(self._middle_gid, self._middle_sid)
                                  if self._middle_sid is not None else None)
+        # Fourth contact's pad, same terms again. The silent fallback in
+        # _tip_support_along is to the INDEX pad, which is not merely approximate
+        # here: it would apply the index tip's orientation-dependent support to a
+        # finger held at a different angle, i.e. the same one-contact asymmetry the
+        # comment above records, reintroduced one slot up.
+        self._ring_verts_sl = (_tip_verts_site_local(self._ring_gid, self._ring_sid)
+                               if self._ring_sid is not None else None)
 
         def _maybe_mocap(bname):
             bid = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, bname)
@@ -4812,12 +5057,14 @@ class GraspPlanner3D:
         """
         verts_sl = {'thumb':  self._thumb_verts_sl,
                     'index':  self._index_verts_sl,
-                    'middle': self._middle_verts_sl}.get(which, self._index_verts_sl)
+                    'middle': self._middle_verts_sl,
+                    'ring':   self._ring_verts_sl}.get(which, self._index_verts_sl)
         if verts_sl is None:
             return float(r_fallback)
         sid = {'thumb':  self._thumb_sid,
                'index':  self._index_sid,
-               'middle': self._middle_sid}.get(which, self._index_sid)
+               'middle': self._middle_sid,
+               'ring':   self._ring_sid}.get(which, self._index_sid)
         if sid is None:
             return float(r_fallback)
         d = self._tip_data
@@ -4839,6 +5086,8 @@ class GraspPlanner3D:
               d2:      np.ndarray | None = None,
               p3_init: np.ndarray | None = None,
               d3:      np.ndarray | None = None,
+              p4_init: np.ndarray | None = None,
+              d4:      np.ndarray | None = None,
               iter_callback=None,
               update_normals_in_callback: bool = False,
               gamma_init: float | None = None,
@@ -4858,6 +5107,13 @@ class GraspPlanner3D:
                   when cfg.n_contacts >= 3. Produced by _seed_third_contact.
                   None keeps the solve a 2-contact pinch, unchanged.
         d3      : outward face direction for p3, same convention as d1/d2.
+        p4_init : (3,)  optional FOURTH contact seed (ring finger), used only
+                  when cfg.n_contacts >= 4. Produced by _seed_fourth_contact.
+                  None keeps the solve at whatever n_contacts the other seeds
+                  support, unchanged -- a missing fourth seed DEGRADES to a
+                  tripod rather than failing, exactly as a missing third seed
+                  degrades to a pinch.
+        d4      : outward face direction for p4, same convention as d1/d2.
         gamma_init       : optional γ from the caller's pre-solver LP check
                             (min_gamma_for_accel_lp), used to warm-start the
                             embedded wrench-cone LP's γ variable instead of 1.0.
@@ -4941,6 +5197,7 @@ class GraspPlanner3D:
         # fallback position for a tripod's third finger, so absence simply means "solve
         # the 2-contact problem" rather than "invent a contact".
         p3_seed = (np.asarray(p3_init, float) if p3_init is not None else None)
+        p4_seed = (np.asarray(p4_init, float) if p4_init is not None else None)
 
         # UV-atlas CHART assignment — decided ONCE here from the initial seed,
         # held fixed for the whole solve (only the LOCAL neighborhood within
@@ -5006,6 +5263,24 @@ class GraspPlanner3D:
             _dls_sids.append(self._middle_sid)
             _dls_tgts.append(p3_seed + _r3_ws * _d3_ws)
             _mf_in_ws = True
+        # FOURTH contact joins on exactly the same argument: the ring finger's
+        # joints are as absent from a 3-site Jacobian as the middle finger's were
+        # from a 2-site one, so without this the NLP would start its 4-contact
+        # solve with the ring finger in an object-independent home curl.
+        _rf_in_ws = False
+        if (int(getattr(cfg, 'n_contacts', 2)) >= 4 and p4_seed is not None
+                and self._ring_sid is not None):
+            _d4_ws = (np.asarray(d4, float) if d4 is not None
+                      else _geom_normal_np(p4_seed, geom_type, obj_center_np, obj_R_np,
+                                           geom_size, mesh_entry=self._mesh_entry))
+            _r4_ws = float(cfg.r_ring if cfg.r_ring is not None else cfg.r_index)
+            if cfg.directional_r_tip:
+                _r4_ws = self._tip_support_along(
+                    'ring', q_ref, np.asarray(_d4_ws, float),
+                    _r4_ws) + float(cfg.directional_r_tip_margin_m)
+            _dls_sids.append(self._ring_sid)
+            _dls_tgts.append(p4_seed + _r4_ws * _d4_ws)
+            _rf_in_ws = True
         q_dls = self._dls_ik.solve(
             self.model, self._dls_data,
             _dls_sids, _dls_tgts,
@@ -5014,12 +5289,22 @@ class GraspPlanner3D:
 
         _err_th = float(np.linalg.norm(self._dls_data.site_xpos[self._thumb_sid] - _dls_tgt1))
         _err_if = float(np.linalg.norm(self._dls_data.site_xpos[self._index_sid] - _dls_tgt2))
+        # Index by the site's own position in the list, not a literal 2: with two
+        # optional contacts the middle target is at index 2 only when it is the
+        # third entry, and a rejected third seed at n_contacts=4 would make
+        # _dls_tgts[2] the RING target silently scored as the middle finger's.
         _err_mf = (float(np.linalg.norm(
-                       self._dls_data.site_xpos[self._middle_sid] - _dls_tgts[2]))
+                       self._dls_data.site_xpos[self._middle_sid]
+                       - _dls_tgts[_dls_sids.index(self._middle_sid)]))
                    if _mf_in_ws else None)
+        _err_rf = (float(np.linalg.norm(
+                       self._dls_data.site_xpos[self._ring_sid]
+                       - _dls_tgts[_dls_sids.index(self._ring_sid)]))
+                   if _rf_in_ws else None)
         self.log.info(
             f"[dls_ws] th={_err_th*1e3:.1f}mm  idx={_err_if*1e3:.1f}mm"
             + (f"  mid={_err_mf*1e3:.1f}mm" if _err_mf is not None else "  (2-site)")
+            + (f"  ring={_err_rf*1e3:.1f}mm" if _err_rf is not None else "")
             + f"  dt={1e3*(time.perf_counter()-_t_ws):.0f}ms")
 
         # ── Proximity pruning: arm geoms vs object for q_dls arm config ──────────────────────────
@@ -5069,12 +5354,18 @@ class GraspPlanner3D:
                        r2_override: float | None = None,
                        p3_ws: np.ndarray | None = None,
                        d3_lp: np.ndarray | None = None,
-                       r3_override: float | None = None) -> dict:
+                       r3_override: float | None = None,
+                       p4_ws: np.ndarray | None = None,
+                       d4_lp: np.ndarray | None = None,
+                       r4_override: float | None = None) -> dict:
             # p3_ws/d3_lp: the THIRD load-bearing contact (cfg.n_contacts >= 3).
             # None at n=2 -- every branch below that touches contact 3 is gated on
             # `_has_c3`, so the 2-contact problem built here is bit-identical to what
             # it was before the tripod work (verified: 014_lemon gamma_min and both
             # tip gaps unchanged to full precision).
+            # p4_ws/d4_lp: the FOURTH contact (cfg.n_contacts >= 4), gated the same
+            # way on `_has_c4`. The n=2 and n=3 problems are therefore unchanged by
+            # the four-finger work for the same structural reason.
 
             _t_stage_start = time.perf_counter()
             _uid = id(q_ws)
@@ -5083,6 +5374,13 @@ class GraspPlanner3D:
             # means no downstream branch can half-enable the tripod.
             _has_c3 = (int(cfg.n_contacts) >= 3 and p3_ws is not None
                        and self._middle_sid is not None)
+            # Same predicate one slot up. Note _has_c4 does NOT imply _has_c3 by
+            # construction, but every caller supplies the seeds in order and the
+            # fourth seeder needs contact 3's position to separate from it, so in
+            # practice a c4 without a c3 cannot arise; the branches below still read
+            # the two flags independently rather than assuming the implication.
+            _has_c4 = (int(cfg.n_contacts) >= 4 and p4_ws is not None
+                       and self._ring_sid is not None)
 
             # ── FK callbacks (analytic Jacobians via mj_jacSite) ───────────
             thumb_cb = _SitePositionCallbackAnalytic(
@@ -5094,6 +5392,10 @@ class GraspPlanner3D:
             middle_cb = (_SitePositionCallbackAnalytic(
                 f'gp3_mf_{_uid}', model, self._middle_sid, n_act, obj_qpos_snap)
                 if _has_c3 else None)
+            # Fourth contact's FK, on the same terms.
+            ring_cb = (_SitePositionCallbackAnalytic(
+                f'gp3_rf_{_uid}', model, self._ring_sid, n_act, obj_qpos_snap)
+                if _has_c4 else None)
 
             # Fingerpad-axis FK (R_tip(q) @ pad_axis in world) for the orient_weight cost —
             # only built when the term is active, since each adds a q-dependent rotational
@@ -5126,10 +5428,11 @@ class GraspPlanner3D:
             _tp1_fk = thumb_cb(_q)
             _tp2_fk = index_cb(_q)
             _tp3_fk = middle_cb(_q) if middle_cb is not None else None
+            _tp4_fk = ring_cb(_q) if ring_cb is not None else None
             # Pad-normal direction in WORLD as a function of q, for the fixed contact
             # point under frogger_fk_contacts. Same callback the orient_weight term
             # uses, built here whenever the FK-contact path needs it.
-            _thumb_pad_cb = _index_pad_cb = _middle_pad_cb = None
+            _thumb_pad_cb = _index_pad_cb = _middle_pad_cb = _ring_pad_cb = None
             if cfg.frogger_fk_contacts:
                 _pa = np.asarray(cfg.pad_axis, float)
                 _thumb_pad_cb = _SiteAxisCallbackAnalytic(
@@ -5140,9 +5443,24 @@ class GraspPlanner3D:
                     _middle_pad_cb = _SiteAxisCallbackAnalytic(
                         f'gp3_mf_pad_{_uid}', model, self._middle_sid, _pa, n_act,
                         obj_qpos_snap)
+                if _has_c4:
+                    _ring_pad_cb = _SiteAxisCallbackAnalytic(
+                        f'gp3_rf_pad_{_uid}', model, self._ring_sid, _pa, n_act,
+                        obj_qpos_snap)
             _is_mesh = (geom_type == _GEOM_TYPE_MESH and self._mesh_entry is not None)
             _t1_var = _t2_var = None   # set below iff a mesh 2-DOF contact var is built
             _t3_var = _p3 = _t3_bounds = _t3_frame = None   # third contact (n_contacts>=3)
+            _t4_var = _p4 = _t4_bounds = _t4_frame = None   # fourth contact (n_contacts>=4)
+            # Frozen OUTWARD seed normal for slot 4, defined HERE rather than only
+            # inside the own-patch branch. The slot-3 equivalent is set only in its
+            # own-patch branch, so the IK term's `else _n3_seed_out` fallback is a
+            # latent NameError on any path that reaches it with d3_lp None; slot 4
+            # does not reproduce that.
+            _n4_seed_out = (-np.asarray(d4_lp, float) if d4_lp is not None
+                            else (_geom_normal_np(p4_ws, geom_type, obj_center_np,
+                                                  obj_R_np, geom_size,
+                                                  mesh_entry=self._mesh_entry)
+                                  if p4_ws is not None else None))
             _t1_bounds = _t2_bounds = None   # set below iff use_quadratic_contact (per-axis trust region)
             _t1_frame = _t2_frame = None     # set below iff use_quadratic_contact (paraboloid params, for viz)
             if cfg.fixed_contacts:
@@ -5186,6 +5504,10 @@ class GraspPlanner3D:
                     _p3 = _tp3_fk + _po * _middle_pad_cb(_q)
                 elif _has_c3 and _tp3_fk is not None:
                     _p3 = _tp3_fk
+                if _has_c4 and _tp4_fk is not None and _ring_pad_cb is not None:
+                    _p4 = _tp4_fk + _po * _ring_pad_cb(_q)
+                elif _has_c4 and _tp4_fk is not None:
+                    _p4 = _tp4_fk
             elif _is_mesh and cfg.sdf_surface_contact:
                 # FRoGGeR (7d): free 3-vectors pinned by s(p) = 0. No trust region
                 # and no local surface model, so contacts are free to traverse the
@@ -5210,6 +5532,12 @@ class GraspPlanner3D:
                                 else np.asarray(p2_ws, float))
                     _p3 = _mesh_sdf_surface_contact_ca(
                         _opti, _p3_seed, obj_center_np, obj_R_np, self._mesh_entry)
+                if _has_c4:
+                    # Contact 4 gets its own free vector too, same reasoning.
+                    _p4_seed = (np.asarray(p4_ws, float) if p4_ws is not None
+                                else np.asarray(p2_ws, float))
+                    _p4 = _mesh_sdf_surface_contact_ca(
+                        _opti, _p4_seed, obj_center_np, obj_R_np, self._mesh_entry)
             elif _is_mesh and _p1_chart_id is not None:
                 # UV-atlas local-neighborhood parameterization: p1/p2 become 2-DOF
                 # expressions (offset in a plane fit to the seed's local mesh
@@ -5343,6 +5671,53 @@ class GraspPlanner3D:
                     _p3 = ca.DM(obj_center_np) + ca.DM(obj_R_np) @ _p3_l
                     _t3_bounds = _t2_bounds
                     _t3_frame  = _t2_frame
+                # FOURTH contact. Same two branches as contact 3, and the shared one
+                # is again the default -- but note what sharing now means: slot 2's
+                # single paraboloid carries THREE fingertips (2, 3 and 4), so its
+                # trust region is the binding resource for the whole grasp. See
+                # GraspConfig3D.c4_patch_offset_m for the measured half-extents and
+                # why that is the quantity to watch.
+                if _has_c4 and cfg.c4_own_patch:
+                    _t4_var, _p4, _t4_bounds, _t4_frame = _mesh_quadratic_contact_ca(
+                        _opti, np.asarray(p4_ws, float), _n4_seed_out,
+                        obj_center_np, obj_R_np, self._mesh_entry,
+                        t_bound_max=cfg.quadratic_t_bound_max,
+                        sdf_err_tol=cfg.quadratic_sdf_err_tol,
+                        mesh_fit=cfg.quadratic_mesh_fit,
+                        mesh_fit_radius=cfg.quadratic_mesh_fit_radius,
+                        mesh_fit_quad_gain_min=cfg.quadratic_mesh_fit_gain_min,
+                        bound_inset=cfg.quadratic_bound_inset,
+                        extent_clip=cfg.quadratic_extent_clip,
+                        bound_keep_frac=cfg.quadratic_bound_keep_frac)
+                elif _has_c4 and _t2_frame is not None:
+                    # SHARED patch, reconstructed inside contact 2's paraboloid by the
+                    # same identity contact 3 uses.
+                    _t4_var = _opti.variable(2)
+                    _opti.subject_to(_opti.bounded(_t2_frame['t_lo_0'], _t4_var[0],
+                                                   _t2_frame['t_hi_0']))
+                    _opti.subject_to(_opti.bounded(_t2_frame['t_lo_1'], _t4_var[1],
+                                                   _t2_frame['t_hi_1']))
+                    # Start at a DIFFERENT BEARING from contact 3, not merely a
+                    # different point. Contact 3 starts at (+0.5*t_hi_0, +0.5*t_hi_1),
+                    # i.e. the +/+ quadrant; starting contact 4 anywhere in that same
+                    # quadrant leaves the two initial points separated by a distance
+                    # the patch may not be able to maintain, and the n=3 collapse
+                    # (contacts 2 and 3 EXACTLY coincident in 15/15 measured cells)
+                    # shows this optimizer will happily drive two contacts together
+                    # when nothing holds them apart. The -/+ quadrant puts contact 4
+                    # roughly 90 degrees around the patch from contact 3 while keeping
+                    # both strictly inside the bounds.
+                    _opti.set_initial(_t4_var, np.array([0.5 * _t2_frame['t_lo_0'],
+                                                         0.5 * _t2_frame['t_hi_1']]))
+                    _h4 = -(_t2_frame['kappa0'] * _t4_var[0]**2
+                            + _t2_frame['kappa1'] * _t4_var[1]**2) / (2.0 * _t2_frame['grad_norm'])
+                    _p4_l = (ca.DM(_t2_frame['seed_l'])
+                             + _t4_var[0] * ca.DM(_t2_frame['axis0_l'])
+                             + _t4_var[1] * ca.DM(_t2_frame['axis1_l'])
+                             + _h4 * ca.DM(_t2_frame['n_l']))
+                    _p4 = ca.DM(obj_center_np) + ca.DM(obj_R_np) @ _p4_l
+                    _t4_bounds = _t2_bounds
+                    _t4_frame  = _t2_frame
             elif _is_mesh:
                 # Tangent-plane parameterization: p1/p2 become 2-DOF expressions
                 # (offset in the local tangent plane at the seed, reprojected
@@ -5373,7 +5748,7 @@ class GraspPlanner3D:
             # solve has already moved away from -- the same inconsistency the
             # wrench frame had before quadratic_symbolic_normals. Falls back to
             # the frozen -d*_lp whenever the surrogate isn't active.
-            _n1_in_sym_cost = _n2_in_sym_cost = _n3_in_sym_cost = None
+            _n1_in_sym_cost = _n2_in_sym_cost = _n3_in_sym_cost = _n4_in_sym_cost = None
             if (cfg.quadratic_symbolic_normals and _is_mesh
                     and cfg.use_quadratic_contact
                     and _t1_frame is not None and _t2_frame is not None
@@ -5399,6 +5774,12 @@ class GraspPlanner3D:
                 if _has_c3 and _t3_var is not None and _t3_frame is not None:
                     _n3_in_sym_cost = _quadratic_inward_normal_ca(
                         _t3_var, _t3_frame, obj_R_np)
+                # Slot 4 for the same reason, and with the same shared-frame note:
+                # under c4_own_patch=False, _t4_frame IS _t2_frame, so this evaluates
+                # that one paraboloid at contact 4's own coordinate.
+                if _has_c4 and _t4_var is not None and _t4_frame is not None:
+                    _n4_in_sym_cost = _quadratic_inward_normal_ca(
+                        _t4_var, _t4_frame, obj_R_np)
 
             # Per-consumer ablation: each sub-flag can veto the symbolic normal
             # for ONE consumer while the others keep it (None = follow master).
@@ -5471,6 +5852,22 @@ class GraspPlanner3D:
                                   d3_lp if d3_lp is not None else _n3_seed_out, float)))
                 _tp3_tgt = _p3 + _r3_ik * _n3_out_ik
                 _d3_sq = ca.sumsqr(_tp3 - _tp3_tgt)   # m²
+            # Fourth contact's IK term, built identically.
+            _d4_sq = None
+            if _has_c4 and _p4 is not None and ring_cb is not None:
+                _tp4   = _tp4_fk
+                _r4_ik = float(
+                    (cfg.r_ring if cfg.r_ring is not None else cfg.r_index)
+                    if r4_override is None else r4_override)
+                _n4_ik_s = (_n4_in_sym_cost
+                            if (_n4_in_sym_cost is not None
+                                and cfg.quad_sym_normals_iktgt is not False)
+                            else None)
+                _n4_out_ik = (-_n4_ik_s if _n4_ik_s is not None
+                              else ca.DM(np.asarray(
+                                  d4_lp if d4_lp is not None else _n4_seed_out, float)))
+                _tp4_tgt = _p4 + _r4_ik * _n4_out_ik
+                _d4_sq = ca.sumsqr(_tp4 - _tp4_tgt)   # m²
 
             # ── SDF for surface constraints ─────────────────────────────────
             if cfg.smooth_sdf:
@@ -5506,10 +5903,12 @@ class GraspPlanner3D:
             # at n=2 this is exactly the historical 0.5*(d1+d2), and a third contact does
             # not inflate the IK term relative to reg/align/gws (which would silently
             # re-tune every other weight).
-            if _d3_sq is not None:
-                _cost_ik = (_d1_sq + _d2_sq + _d3_sq) / (3.0 * _d_ref**2)
-            else:
-                _cost_ik  = 0.5 * (_d1_sq + _d2_sq) / _d_ref**2
+            # Written as an average over the terms PRESENT rather than a literal
+            # divisor per contact count, so slot 4 cannot silently re-tune w_ik the
+            # way a forgotten `3.0` would. n=2 reduces to the historical
+            # 0.5*(d1+d2) exactly, and n=3 to the previous /3.0.
+            _ik_terms = [t for t in (_d1_sq, _d2_sq, _d3_sq, _d4_sq) if t is not None]
+            _cost_ik = sum(_ik_terms[1:], _ik_terms[0]) / (len(_ik_terms) * _d_ref**2)
             _cost_reg = ca.sumsqr((_q - ca.DM(_q_reg)) / cfg.q_scale) / _n_dof
             _cost = cfg.w_ik * _cost_ik + cfg.w_reg * _cost_reg
 
@@ -5667,6 +6066,169 @@ class GraspPlanner3D:
                         _cost_edge = _cost_edge + _excess**2
                 _cost = _cost + cfg.w_edge_margin * _cost_edge
 
+            # ── Pairwise contact SEPARATION (w_sep) ───────────────────────
+            # One-sided squared hinge per pair: zero once the pair is at least
+            # contact_min_sep_m apart, growing as the squared shortfall below it.
+            # Same shape and the same reasoning as w_edge_margin above -- a
+            # finite price rather than a hard >= , so an object whose patch
+            # genuinely cannot hold another contact returns the best grasp
+            # available instead of turning the problem infeasible. Measured:
+            # max_chord < min_sep on 9 of 18 four-finger cells, i.e. the
+            # infeasible case is the COMMON one, not an edge case.
+            #
+            # TWO TIERS, because the right metric differs:
+            #
+            #  (a) SAME-PATCH pairs are compared in PATCH coordinates. The frame
+            #      (axis0_l, axis1_l, n_l) is ORTHONORMAL -- axes_l = T @ eigvecs
+            #      with both factors orthonormal (_principal_curvature_axes_np) --
+            #      so the true separation decomposes exactly as
+            #          |p(t) - p(s)|^2 = |dt|^2 + (h(t) - h(s))^2 >= |dt|^2
+            #      making |dt| an exact LOWER BOUND on the true distance. Using
+            #      it is therefore CONSERVATIVE: it can never admit an overlap it
+            #      believes is fine. Measured slack at 12mm: 0.0% on a flat face,
+            #      1.4% at sphere curvature (kappa 27.6), 6.3% at kappa 60. This
+            #      is the cheap tier -- 2 variables a side, no square root (whose
+            #      derivative is undefined at exactly the coincident point this
+            #      term exists to leave), and a constant Hessian.
+            #
+            #  (b) CROSS-PATCH pairs fall back to WORLD squared distance. Slot 1
+            #      always has its own patch, so its (t0,t1) are coordinates in a
+            #      DIFFERENT frame and are not comparable with slot 2's -- taking
+            #      their difference would subtract two unrelated bases and read as
+            #      a separation that does not exist.
+            #
+            # Squared distances throughout: |.|^2 >= d^2 is equivalent to
+            # |.| >= d for non-negative d, and avoids the sqrt entirely.
+            _cost_sep = None
+            if ((cfg.w_sep > 0.0 or cfg.sep_hard)
+                    and int(cfg.n_contacts) >= 3):
+                _dmin = float(cfg.contact_min_sep_m)
+                _d2   = _dmin * _dmin
+                _cost_sep = ca.DM(0.0)
+                _n_sep_pairs = 0
+
+                def _hinge(_sq):
+                    # (max(0, d^2 - |.|^2))^2 -- C^1, and identically zero with
+                    # zero GRADIENT once the pair is far enough apart, so a grasp
+                    # that already separates its contacts is untouched by this.
+                    #
+                    # KNOWN STATIONARY POINT, and why it is acceptable: squaring
+                    # the hinge makes the gradient vanish at EXACTLY zero
+                    # separation as well (d/dx of (d^2-x^2)^2 is -4x(d^2-x^2),
+                    # which is 0 at x=0), so two PERFECTLY coincident contacts
+                    # sit in a saddle this term alone cannot push apart. It
+                    # escapes from any nonzero separation -- measured gradient
+                    # -2.8e-5 at 1 nm, -2.8 at 0.1 mm, -27.6 at 1 mm -- and the
+                    # seeds this runs on start 13-21 mm apart, so the solver
+                    # never begins at the degenerate point. The alternative, a
+                    # non-squared hinge, is only C^0 at the threshold and trades
+                    # a saddle the seeding avoids for a kink every converged
+                    # grasp sits on.
+                    return ca.fmax(0.0, _d2 - _sq)**2
+
+                # Every contact this stage actually built, with the patch frame it
+                # rides (None => its own/no patch). Order is slot order.
+                # (world_expr, patch_var, patch_frame, INITIAL patch coord). The
+                # initial coordinate is what fixes the box mode's ordering, and it
+                # must be the value the solver actually STARTS from -- read back
+                # from the Opti via initial(), not re-derived, so it cannot drift
+                # from the set_initial calls in the contact-parameterization
+                # branches above.
+                def _t0_of(_tv):
+                    if _tv is None:
+                        return None
+                    try:
+                        return np.asarray(_opti.debug.value(
+                            _tv, _opti.initial()), float).ravel()
+                    except Exception:
+                        return None
+                _sep_slots = [(_p1, _t1_var, _t1_frame, _t0_of(_t1_var)),
+                              (_p2, _t2_var, _t2_frame, _t0_of(_t2_var))]
+                if _has_c3 and _p3 is not None:
+                    _sep_slots.append((_p3, _t3_var, _t3_frame, _t0_of(_t3_var)))
+                if _has_c4 and _p4 is not None:
+                    _sep_slots.append((_p4, _t4_var, _t4_frame, _t0_of(_t4_var)))
+                for _ia in range(len(_sep_slots)):
+                    for _ib in range(_ia + 1, len(_sep_slots)):
+                        _pa, _ta, _fa, _t0a = _sep_slots[_ia]
+                        _pb, _tb_, _fb, _t0b = _sep_slots[_ib]
+                        _seed_dt = (None if (_t0a is None or _t0b is None)
+                                    else np.asarray(_t0b, float) - np.asarray(_t0a, float))
+                        # `is` on purpose: the shared-patch branches assign the
+                        # SAME frame dict object to slots 3 and 4 as slot 2 has
+                        # (_t3_frame = _t2_frame), so identity is exactly the
+                        # "these coordinates are comparable" test. Two patches
+                        # fitted to equal values would still be different objects,
+                        # and would correctly fall through to the world metric.
+                        if (_ta is not None and _tb_ is not None
+                                and _fa is not None and _fa is _fb):
+                            _sq = ca.sumsqr(_ta - _tb_)
+                        elif _pa is not None and _pb is not None:
+                            _sq = ca.sumsqr(_pa - _pb)
+                        else:
+                            continue
+                        if cfg.w_sep > 0.0:
+                            _cost_sep = _cost_sep + _hinge(_sq)
+                        if cfg.sep_hard and str(cfg.sep_hard_mode) == 'box':
+                            # BOX: separation on the PRIMAL variables directly,
+                            # one LINEAR inequality per pair. Only available for
+                            # a same-patch pair -- t_i and t_j must be
+                            # coordinates in the SAME basis for their difference
+                            # to mean anything, which is the identical test the
+                            # metric choice above makes. A cross-patch pair has
+                            # no such basis and falls back to the ball form.
+                            if (_ta is not None and _tb_ is not None
+                                    and _fa is not None and _fa is _fb
+                                    and _seed_dt is not None):
+                                # Axis with the most SEED separation, and the
+                                # sign the seeds already have. Choosing the axis
+                                # by seed rather than fixing k=0 matters: on a
+                                # patch whose seeds differ almost entirely in t1,
+                                # forcing separation along t0 would demand a move
+                                # the grasp never wanted, and on a near-tie
+                                # either axis serves.
+                                _k = int(np.argmax(np.abs(_seed_dt)))
+                                if float(_seed_dt[_k]) >= 0.0:
+                                    _opti.subject_to(_tb_[_k] - _ta[_k] >= _dmin)
+                                else:
+                                    _opti.subject_to(_ta[_k] - _tb_[_k] >= _dmin)
+                            else:
+                                _opti.subject_to(_sq >= _d2)
+                        elif cfg.sep_hard:
+                            # BALL (default): |.|^2 >= d^2. Squared on both sides
+                            # -- equivalent to |.| >= d for non-negative d, and it
+                            # keeps the constraint polynomial, with no sqrt whose
+                            # derivative is undefined at exactly the coincident
+                            # point this is meant to exclude.
+                            _opti.subject_to(_sq >= _d2)
+                        _n_sep_pairs += 1
+                # Normalize by d^4 ONLY -- so ONE fully collapsed pair costs
+                # exactly 1.0, regardless of contact_min_sep_m or how many pairs
+                # exist. Do NOT average over pairs the way _cost_ik does.
+                #
+                # Averaging was tried first and is WRONG HERE, measurably. The IK
+                # term averages because every contact must be reached and the
+                # term means "how well reached ON AVERAGE"; separation is the
+                # opposite kind of quantity -- a single collapsed pair is a
+                # failed grasp no matter how well separated the other five are.
+                # Dividing by _n_sep_pairs diluted exactly that pair by 1/6 at
+                # n=4: measured on 036_wood_block seed 0 at w_sep=2.0, the three
+                # multi-start seeds converged to 10.35mm / 0.00mm / 53.88mm at
+                # costs 0.923 / 0.586 / 7.076, so the COLLAPSED solution won on
+                # total cost -- the diluted hinge was worth 0.333 against a 0.34
+                # gap it needed to close. Undiluted it is worth 2.0 there and the
+                # collapsed seed loses, which is the whole point of the term.
+                if _n_sep_pairs and cfg.w_sep > 0.0:
+                    _cost_sep = _cost_sep / (_d2 * _d2)
+                    _cost = _cost + cfg.w_sep * _cost_sep
+                else:
+                    _cost_sep = None      # hard-only: nothing added to the cost
+                if _n_sep_pairs:
+                    self.log.info(
+                        f"[{stage_label}|sep] {_n_sep_pairs} pair(s), "
+                        f"min_sep={_dmin*1e3:.1f}mm, "
+                        f"w_sep={cfg.w_sep:.2f}, hard={bool(cfg.sep_hard)}")
+
             # ── 1. Joint limits (vectorized) ──────────────────────────────
             if cfg.joint_limits:
                 _opti.subject_to(_opti.bounded(
@@ -5768,6 +6330,7 @@ class GraspPlanner3D:
             _R1_expr     = None   # set below iff a contact frame is actually needed
             _R2_expr     = None
             _R3_expr     = None   # third contact's frame (n_contacts >= 3 only)
+            _R4_expr     = None   # fourth contact's frame (n_contacts >= 4 only)
             # Contact frame [n_in|t1|t2] is needed by BOTH the wrench-cone LP
             # (gamma/y/s) and the GWS min-weight LP (alpha/beta) — they share the
             # same _friction_cone_verts/frame convention (see build_W_ca's
@@ -5826,6 +6389,15 @@ class GraspPlanner3D:
                             _R3_expr = _symbolic_contact_frame_ca(
                                 _quadratic_inward_normal_ca(_t3_var, _t3_frame, obj_R_np),
                                 smooth_blend=_smooth_frame)
+                    # Contact 4, same paraboloid at its own coordinate again.
+                    if _has_c4 and _t4_var is not None and _t4_frame is not None:
+                        if cfg.quad_tangent_frame:
+                            _R4_expr = _quadratic_contact_frame_ca(
+                                _t4_var, _t4_frame, obj_R_np)
+                        else:
+                            _R4_expr = _symbolic_contact_frame_ca(
+                                _quadratic_inward_normal_ca(_t4_var, _t4_frame, obj_R_np),
+                                smooth_blend=_smooth_frame)
                 elif use_sym_normals:
                     # Contact frame built as a CasADi MX expression of _p1/_p2.
                     # CasADi re-evaluates this at every eval_f / eval_grad_f call,
@@ -5841,6 +6413,10 @@ class GraspPlanner3D:
                     if _has_c3 and _p3 is not None:
                         _R3_expr = _symbolic_contact_frame_ca(
                             _sym_inward_normal_ca(_p3, geom_type, _c_dm, _Rt_dm, geom_size),
+                            smooth_blend=_smooth_frame)
+                    if _has_c4 and _p4 is not None:
+                        _R4_expr = _symbolic_contact_frame_ca(
+                            _sym_inward_normal_ca(_p4, geom_type, _c_dm, _Rt_dm, geom_size),
                             smooth_blend=_smooth_frame)
                 else:
                     # Default: contact frames as 3×3 parameter — frozen per NLP solve,
@@ -5866,6 +6442,15 @@ class GraspPlanner3D:
                         _opti.set_value(_R3_param,
                                         np.column_stack(_build_contact_frame_3d(_n3_in)))
                         _R3_expr = _R3_param
+                    if _has_c4 and p4_ws is not None:
+                        _n4_in = -(d4_lp if d4_lp is not None else
+                                   _geom_normal_np(p4_ws, geom_type, obj_center_np,
+                                                   obj_R_np, geom_size,
+                                                   mesh_entry=self._mesh_entry))
+                        _R4_param = _opti.parameter(3, 3)
+                        _opti.set_value(_R4_param,
+                                        np.column_stack(_build_contact_frame_3d(_n4_in)))
+                        _R4_expr = _R4_param
 
             if cfg.wrench_constraint:
                 # Grasp-axis torque projection. A 2-contact pinch geometrically CANNOT
@@ -5938,15 +6523,27 @@ class GraspPlanner3D:
                 # FRoGGeR's normal source: n = -grad s(p), evaluated at the PATCH
                 # point, so the 2-DOF parameterization and trust region are kept and
                 # only the normal changes. See GWSConfig.gws_sdf_normals.
-                _R1_gws, _R2_gws, _R3_gws = _R1_expr, _R2_expr, _R3_expr
+                _R1_gws, _R2_gws = _R1_expr, _R2_expr
+                _R3_gws, _R4_gws = _R3_expr, _R4_expr
                 if cfg.gws_sdf_normals:
+                    # Build the point list and remember WHICH slot each entry came
+                    # from, rather than indexing the result positionally. With two
+                    # optional contacts a bare `_sdf_frames[2]` is contact 3 only
+                    # when contact 3 is present -- at n_contacts=4 with a rejected
+                    # third seed it would be contact 4's frame assigned to slot 3.
+                    _sdf_pts, _sdf_slots = [_p1, _p2], [1, 2]
+                    if _has_c3 and _p3 is not None:
+                        _sdf_pts.append(_p3); _sdf_slots.append(3)
+                    if _has_c4 and _p4 is not None:
+                        _sdf_pts.append(_p4); _sdf_slots.append(4)
                     _sdf_frames = self._sdf_contact_frames_ca(
-                        [_p1, _p2] + ([_p3] if (_has_c3 and _p3 is not None) else []),
-                        obj_center_np, obj_R_np)
+                        _sdf_pts, obj_center_np, obj_R_np)
                     if _sdf_frames is not None:
-                        _R1_gws, _R2_gws = _sdf_frames[0], _sdf_frames[1]
-                        if len(_sdf_frames) > 2:
-                            _R3_gws = _sdf_frames[2]
+                        for _sl, _fr in zip(_sdf_slots, _sdf_frames):
+                            if   _sl == 1: _R1_gws = _fr
+                            elif _sl == 2: _R2_gws = _fr
+                            elif _sl == 3: _R3_gws = _fr
+                            else:          _R4_gws = _fr
                     else:
                         self.log.warning(
                             "[gws] gws_sdf_normals=True but no mesh SDF available for "
@@ -5957,16 +6554,26 @@ class GraspPlanner3D:
                 # no gradient pulling contact 3 anywhere useful -- which is half of
                 # why it collapsed onto contact 2. Reported three-finger betas from
                 # before this (-4.56, -4.87) were 2-contact numbers.
-                _gws_extra = ([(_p3, _R3_gws)]
-                              if (_has_c3 and _p3 is not None and _R3_gws is not None)
-                              else None)
+                # EVERY load-bearing contact, contact 4 included. A fourth contact
+                # omitted here would be exactly the defect the comment above
+                # records for contact 3: beta would be the tripod's min-weight and
+                # the solver would get no gradient pulling contact 4 anywhere
+                # useful, which is half of why contact 3 collapsed onto contact 2.
+                _gws_extra_l = []
+                if _has_c3 and _p3 is not None and _R3_gws is not None:
+                    _gws_extra_l.append((_p3, _R3_gws))
+                if _has_c4 and _p4 is not None and _R4_gws is not None:
+                    _gws_extra_l.append((_p4, _R4_gws))
+                _gws_extra = _gws_extra_l or None
                 _gws_W = build_W_ca(_p1, _p2, _R1_gws, _R2_gws,
                                     obj_center_np, obj_R_np, _mu, mu_t=_gws_mu_t,
                                     extra_contacts=_gws_extra)
-                if _has_c3 and _gws_extra is None:
+                _n_in_W = 2 + len(_gws_extra_l)
+                if int(cfg.n_contacts) > _n_in_W:
                     self.log.warning(
-                        "[gws] n_contacts>=3 but contact 3 has no frame/position this "
-                        "stage — beta is the 2-contact min-weight, not the tripod's.")
+                        f"[gws] n_contacts={int(cfg.n_contacts)} but only {_n_in_W} "
+                        f"contacts have a frame/position this stage — beta is the "
+                        f"{_n_in_W}-contact min-weight, not the configured grasp's.")
                 if cfg.frogger_bilevel_lp:
                     # FRoGGeR's bilevel form: the LP is solved to optimality inside
                     # the callback at every outer iterate, so `beta` here is l*(q)
@@ -6124,6 +6731,14 @@ class GraspPlanner3D:
                 'y':     cfg.w_y     * _cost_y,
                 'slack': _grad_w_slack,
             }
+            # The separation term earns a gradient row for the reason this whole
+            # block exists: the collapse is a question of which term WINS, not of
+            # which term is largest. w_sep vs w_ik here is the direct readout of
+            # whether the hinge actually out-pushes the IK term that prefers two
+            # fingers on one point. Only present when the term is active, so the
+            # n=2 report is unchanged.
+            if _cost_sep is not None:
+                _grad_terms['sep'] = cfg.w_sep * _cost_sep
             _grad_norm_exprs = {
                 name: ca.norm_2(ca.gradient(term, _opti.x))
                 for name, term in _grad_terms.items()
@@ -6165,10 +6780,12 @@ class GraspPlanner3D:
                 _named['edge']   = (cfg.w_edge_margin * locals()['_cost_edge']
                                     if cfg.w_edge_margin > 0.0 and '_cost_edge' in locals()
                                     else ca.DM(0.0))
+                _named['sep']    = (cfg.w_sep * _cost_sep
+                                    if _cost_sep is not None else ca.DM(0.0))
                 _wts = {'ik': cfg.w_ik, 'reg': cfg.w_reg, 'gamma': cfg.w_gamma,
                         'y': cfg.w_y, 'slack': (cfg.w_slack or 0.0),
                         'align': cfg.w_align, 'orient': cfg.orient_weight,
-                        'edge': cfg.w_edge_margin}
+                        'edge': cfg.w_edge_margin, 'sep': cfg.w_sep}
                 for _nm, _term in _named.items():
                     _acc = ca.DM(0.0)
                     for _zexpr, _tv in _z_dirs:
@@ -6355,6 +6972,9 @@ class GraspPlanner3D:
                             if _p3 is not None:
                                 _rec['p3'] = np.asarray(
                                     _opti.debug.value(_p3), float).flatten()
+                            if _p4 is not None:
+                                _rec['p4'] = np.asarray(
+                                    _opti.debug.value(_p4), float).flatten()
                             # Raw (u,v) decision-variable trajectory — mesh contacts only
                             # (_mesh_tangent_contact_ca / _mesh_uv_local_contact_ca both name
                             # their 2-DOF variable _t1_var/_t2_var; ground truth, cheaper and
@@ -6675,6 +7295,8 @@ class GraspPlanner3D:
                     # stages, and downstream consumers (verify, the wrench layer) need
                     # it to see the tripod at all.
                     'p3':         (_sol.value(_p3) if _p3 is not None else None),
+                    # Fourth contact, on the same terms (None below n=4).
+                    'p4':         (_sol.value(_p4) if _p4 is not None else None),
                     'cost':       float(_sol.value(_opti.f)),
                     'iterations': _sol.stats()['iter_count'],
                     'status':     'converged',
@@ -6716,7 +7338,7 @@ class GraspPlanner3D:
                     # Frames are numpy-only, so they serialize cleanly.
                     'quad_frames':   {
                         'thumb': _t1_frame, 'index': _t2_frame,
-                        'middle': _t3_frame,
+                        'middle': _t3_frame, 'ring': _t4_frame,
                     },
                     'grad_z':        _eval_grad_z(_sol.value),
                     # Paraboloid patch frames + solved surface offsets, carried on the RESULT
@@ -6740,6 +7362,14 @@ class GraspPlanner3D:
                     't3_sol':        (np.asarray(_sol.value(_t3_var), float)
                                       if (_t3_frame is not None
                                           and _t3_var is not None) else None),
+                    # Contact 4, same footing again. Under the shared patch
+                    # _t4_frame IS _t2_frame while t4_sol is contact 4's own
+                    # offset -- which is what makes contact 4 collapsing onto
+                    # contact 2 or 3 visible rather than invisible.
+                    'quad4_frame':   _t4_frame,
+                    't4_sol':        (np.asarray(_sol.value(_t4_var), float)
+                                      if (_t4_frame is not None
+                                          and _t4_var is not None) else None),
                 }
             except Exception as _e:
                 self.log.warning(f"GraspPlanner3D._run_stage({stage_label}): {_e}")
@@ -6759,6 +7389,7 @@ class GraspPlanner3D:
                         'p1':         _opti.debug.value(_p1),
                         'p2':         _opti.debug.value(_p2),
                         'p3':         (_opti.debug.value(_p3) if _p3 is not None else None),
+                        'p4':         (_opti.debug.value(_p4) if _p4 is not None else None),
                         'cost':       _opti.debug.value(_opti.f) if _st else None,
                         'iterations': (_st or {}).get('iter_count'),
                         'status':     'best-effort',
@@ -6785,12 +7416,25 @@ class GraspPlanner3D:
                                           if _t1_frame is not None else None),
                         't2_sol':        (np.asarray(_opti.debug.value(_t2_var), float)
                                           if _t2_frame is not None else None),
+                        # quad3/t3 were MISSING from this dict while present in the
+                        # converged one, so a best-effort tripod could not be drawn
+                        # or inspected for collapse -- exactly the run you most want
+                        # to look at. Added here with slot 4 rather than reproducing
+                        # the asymmetry one slot up.
+                        'quad3_frame':   _t3_frame,
+                        't3_sol':        (np.asarray(_opti.debug.value(_t3_var), float)
+                                          if (_t3_frame is not None
+                                              and _t3_var is not None) else None),
+                        'quad4_frame':   _t4_frame,
+                        't4_sol':        (np.asarray(_opti.debug.value(_t4_var), float)
+                                          if (_t4_frame is not None
+                                              and _t4_var is not None) else None),
                     }
                 except Exception as _e2:
                     self.log.error(f"GraspPlanner3D debug extraction: {_e2}")
                     _save_iter_npz('failed')
                     return {'success': False, 'q': None, 'p1': None, 'p2': None,
-                            'p3': None,
+                            'p3': None, 'p4': None,
                             'cost': None, 'iterations': None, 'status': 'failed',
                             'return_status': None,
                             'gamma_nlp': None, 'slack_norms': None, 'max_slack_norm': None,
@@ -6826,6 +7470,16 @@ class GraspPlanner3D:
             _d3_lp = (np.asarray(d3, float) if d3 is not None
                       else _geom_normal_np(p3_seed, geom_type, obj_center_np, obj_R_np,
                                            geom_size, mesh_entry=self._mesh_entry))
+        # FOURTH contact (cfg.n_contacts >= 4), bound on exactly the same terms.
+        # Gated on n_contacts >= 4 AND a seed being present, so a four-finger config
+        # whose fourth seed was rejected degrades to the tripod rather than failing.
+        _p4_ws = None
+        _d4_lp = None
+        if int(cfg.n_contacts) >= 4 and p4_seed is not None:
+            _p4_ws = p4_seed
+            _d4_lp = (np.asarray(d4, float) if d4 is not None
+                      else _geom_normal_np(p4_seed, geom_type, obj_center_np, obj_R_np,
+                                           geom_size, mesh_entry=self._mesh_entry))
         _tol_p_m   = 5e-4    # 0.5 mm position shift → converged
         _tol_deg   = 2.0     # 2° normal mismatch → normals are accurate enough
         _tol_r_m   = 5e-4    # 0.5 mm directional-r_tip shift → radius is self-consistent
@@ -6844,7 +7498,7 @@ class GraspPlanner3D:
             # -d*_lp is the OUTWARD direction: _d*_lp is the object's outward
             # surface normal used as the IK offset direction, and the pad extends
             # from the site back toward the finger, i.e. along -n_out.
-            _r1_ov = _r2_ov = _r3_ov = None
+            _r1_ov = _r2_ov = _r3_ov = _r4_ov = None
             if cfg.directional_r_tip:
                 _m = float(cfg.directional_r_tip_margin_m)
                 _r1_ov = self._tip_support_along('thumb', _q_ws, -_d1_lp, cfg.r_thumb) + _m
@@ -6860,10 +7514,16 @@ class GraspPlanner3D:
                     _r3_ov = self._tip_support_along(
                         'middle', _q_ws, -np.asarray(_d3_lp, float),
                         cfg.r_middle if cfg.r_middle is not None else cfg.r_index) + _m
+                # Contact 4, same treatment again.
+                if _d4_lp is not None:
+                    _r4_ov = self._tip_support_along(
+                        'ring', _q_ws, -np.asarray(_d4_lp, float),
+                        cfg.r_ring if cfg.r_ring is not None else cfg.r_index) + _m
                 self.log.info(
                     f"[S{_ri+1}|r_tip] directional thumb={_r1_ov*1e3:.2f}mm "
                     f"index={_r2_ov*1e3:.2f}mm"
                     + (f" middle={_r3_ov*1e3:.2f}mm" if _r3_ov is not None else "")
+                    + (f" ring={_r4_ov*1e3:.2f}mm" if _r4_ov is not None else "")
                     + f"  (isotropic {cfg.r_thumb*1e3:.2f}/"
                     f"{cfg.r_index*1e3:.2f}mm, margin {_m*1e3:.1f}mm)")
             res = _run_stage(_q_ws, _p1_ws, _p2_ws,
@@ -6875,8 +7535,9 @@ class GraspPlanner3D:
                              iter_callback=iter_callback,
                              update_normals_in_callback=update_normals_in_callback,
                              r1_override=_r1_ov, r2_override=_r2_ov,
-                             r3_override=_r3_ov,
-                             p3_ws=_p3_ws, d3_lp=_d3_lp)
+                             r3_override=_r3_ov, r4_override=_r4_ov,
+                             p3_ws=_p3_ws, d3_lp=_d3_lp,
+                             p4_ws=_p4_ws, d4_lp=_d4_lp)
             # Keep the cheapest stage result — relinearization has no descent guarantee.
             if (res.get('cost') is not None and
                     (not _best_res or res['cost'] < _best_res.get('cost', float('inf')))):
@@ -6961,6 +7622,11 @@ class GraspPlanner3D:
             if _p3_ws is not None and res.get('p3') is not None:
                 _p3_ws = np.asarray(res['p3'], float)
                 _d3_lp = _geom_normal_np(_p3_ws, geom_type, obj_center_np, obj_R_np,
+                                         geom_size, mesh_entry=self._mesh_entry)
+            # Contact 4 tracks identically.
+            if _p4_ws is not None and res.get('p4') is not None:
+                _p4_ws = np.asarray(res['p4'], float)
+                _d4_lp = _geom_normal_np(_p4_ws, geom_type, obj_center_np, obj_R_np,
                                          geom_size, mesh_entry=self._mesh_entry)
             if res.get('q') is not None:
                 _q_ws = np.asarray(res['q'])
@@ -7088,6 +7754,14 @@ class GraspPlanner3D:
         if self._has_markers:
             data_v.mocap_pos[self._cp1_mocap] = result['p1']
             data_v.mocap_pos[self._cp2_mocap] = result['p2']
+            # Contacts 3 and 4 when both the solve produced them AND the scene
+            # declares their markers. cp3/cp4 are absent from every scene XML
+            # today, so _maybe_mocap returns None and these are no-ops -- but the
+            # write is here so adding the bodies is the only step needed.
+            if self._cp3_mocap is not None and result.get('p3') is not None:
+                data_v.mocap_pos[self._cp3_mocap] = result['p3']
+            if self._cp4_mocap is not None and result.get('p4') is not None:
+                data_v.mocap_pos[self._cp4_mocap] = result['p4']
         mj.mj_forward(model, data_v)
 
         if self._obj_geom_type == _GEOM_TYPE_MESH:
@@ -7157,7 +7831,7 @@ class GraspPlanner3D:
                 # that hides the third contact's whole reason for existing (a real
                 # moment arm about the grasp axis).
                 _pts_v = [np.asarray(result[_k], float)
-                          for _k in ('p1', 'p2', 'p3')
+                          for _k in ('p1', 'p2', 'p3', 'p4')
                           if result.get(_k) is not None]
                 _n_v = len(_pts_v)
                 p1_np, p2_np = _pts_v[0], _pts_v[1]
@@ -7359,6 +8033,16 @@ class MultiStartGraspPlanner3D:
         # Per-seed THIRD-contact fan ranking (cfg.n_contacts >= 3): one row per
         # candidate with its fan angle and middle-finger DLS residual. Empty at n=2.
         self.last_c3_rank_table = []
+        # Same, one slot up: one row per fourth-contact candidate with its fan
+        # bearing, ring-finger DLS residual and its separations from contacts 2
+        # and 3. Empty below n=4. The separations are the diagnostic that answers
+        # whether the shared patch is big enough for a fourth finger.
+        self.last_c4_rank_table = []
+        # Slot-2 patch geometry as seen by the fourth-contact seeder: the half
+        # extents, the adaptive fan radius they imply, and the longest chord two
+        # fan bearings can be apart. Compare max_chord_mm against min_sep_mm to
+        # see whether the patch can hold a separated fourth contact AT ALL.
+        self.last_c4_patch_diag = None
         # Fingertip effective radii (r_thumb/r_index/r_middle/r_ring) are
         # measured from model geometry inside GraspPlanner3D.__init__ above —
         # nothing left to do here.
@@ -7961,6 +8645,10 @@ class MultiStartGraspPlanner3D:
         # built), so a row carries them only once that seed has been through the
         # fan -- which is exactly the condition under which the figure should draw
         # a middle-finger seed. Absent at n=2, and the figure draws two contacts.
+        # p4s/n4_in work identically and are BACK-FILLED by the fourth-contact
+        # block below (there is no p4s on the seed dict yet at this point), which
+        # is why neither is splatted here. The two are independent: a seed can
+        # carry p3s and not p4s when the fourth fan came back empty.
         self.last_seed_accept_table = [
             dict(kind=_s.get('kind', 'random'), why='accepted',
                  p1s=np.asarray(_s['p1s'], float).copy(),
@@ -8319,6 +9007,178 @@ class MultiStartGraspPlanner3D:
                 except Exception as _e_c3:
                     log.warning(f"[seed {i+1}] third-contact seeding failed: {_e_c3}")
 
+            # ── FOURTH contact (cfg.n_contacts >= 4) ──────────────────────────
+            # Gated on a third contact having actually been placed: contact 4 is
+            # screened for separation from contact 3, so seeding it against a
+            # seed that stayed 2-contact would drop the only screen that
+            # distinguishes it from contact 3. A four-finger config whose third
+            # seed failed therefore runs as whatever the third stage left, which
+            # is the same degrade-don't-fail rule the tripod already follows.
+            if (int(cfg.n_contacts) >= 4 and self._planner._ring_sid is not None
+                    and seed.get('p3s') is not None):
+                try:
+                    # PATCH SUFFICIENCY DIAGNOSTIC. At n=4 three fingertips share
+                    # contact 2's patch, so the patch's own half-extents and the
+                    # adaptive fan radius they imply are the quantities that decide
+                    # whether a fourth contact can exist at all. Logged for every
+                    # seed so an empty candidate list can be attributed to the patch
+                    # rather than guessed at.
+                    if _c3_patch_frame is not None:
+                        _pf = _c3_patch_frame
+                        _hl = [abs(float(_pf['t_lo_0'])), abs(float(_pf['t_hi_0'])),
+                               abs(float(_pf['t_lo_1'])), abs(float(_pf['t_hi_1']))]
+                        _room4 = min(_hl)
+                        _fanr = min(float(getattr(cfg, 'c4_patch_offset_m', 0.015)),
+                                    0.8 * _room4)
+                        log.info(
+                            f"[seed {i+1}] c4 patch: half-extents "
+                            f"{'/'.join(f'{h*1e3:.1f}' for h in _hl)}mm  "
+                            f"min={_room4*1e3:.1f}mm  fan_r={_fanr*1e3:.1f}mm  "
+                            f"min_sep={float(getattr(cfg, 'c4_min_sep_m', 0.012))*1e3:.0f}mm  "
+                            f"max_chord={2*_fanr*1e3:.1f}mm")
+                        self.last_c4_patch_diag = dict(
+                            half_extents_mm=[h * 1e3 for h in _hl],
+                            min_half_mm=_room4 * 1e3, fan_r_mm=_fanr * 1e3,
+                            max_chord_mm=2 * _fanr * 1e3,
+                            # The SOLVE's floor, which is what the feasibility
+                            # gate below compares max_chord against -- not the
+                            # seed screen's c4_min_sep_m. Reporting the screen's
+                            # made the diagnostic disagree with the decision it
+                            # was supposed to explain.
+                            min_sep_mm=float(getattr(cfg, 'contact_min_sep_m',
+                                                     0.022)) * 1e3)
+                    # AUTO-SELECT: can this patch hold a fourth contact AT ALL?
+                    # The seed fan sweeps a circle of radius fan_r about the
+                    # patch origin, so the furthest two bearings can be apart is
+                    # max_chord = 2*fan_r. If that is below the separation floor
+                    # the fingers need, NO bearing can satisfy it and every
+                    # candidate will be rejected -- running the fan, the
+                    # reachability gate and 8 DLS solves to discover that is
+                    # pure waste, and it reports as "no viable candidate" which
+                    # reads like a search failure rather than a geometric one.
+                    #
+                    # Checked against the SOLVE's floor (contact_min_sep_m), not
+                    # the seed screen's, because the solve is what ultimately has
+                    # to hold the contacts apart: a seed that clears the screen
+                    # but cannot clear the constraint buys nothing.
+                    _need = float(getattr(cfg, 'contact_min_sep_m', 0.022))
+                    if _c3_patch_frame is not None:
+                        _hl4 = [abs(float(_c3_patch_frame['t_lo_0'])),
+                                abs(float(_c3_patch_frame['t_hi_0'])),
+                                abs(float(_c3_patch_frame['t_lo_1'])),
+                                abs(float(_c3_patch_frame['t_hi_1']))]
+                        _chord = 2.0 * min(
+                            float(getattr(cfg, 'c4_patch_offset_m', 0.015)),
+                            0.8 * min(_hl4))
+                        if _chord < _need:
+                            log.info(
+                                f"[seed {i+1}] fourth contact: patch cannot hold one "
+                                f"(max_chord {_chord*1e3:.1f}mm < required "
+                                f"{_need*1e3:.0f}mm) -- staying at 3 contacts")
+                            raise _C4Infeasible()
+                    _c4_cands = _seed_fourth_contact(
+                        seed, geom_type, geom_size, obj_center_np, obj_R_np,
+                        mesh_entry=self._mesh_entry,
+                        n_fan=8,
+                        patch_frame=_c3_patch_frame,
+                        patch_offset_m=float(getattr(cfg, 'c4_patch_offset_m', 0.015)),
+                        min_sep_m=float(getattr(cfg, 'c4_min_sep_m', 0.012)),
+                        prefer_outer=cfg.seed_prefer_outer_surface)
+                    # Rank by the SAME DLS reachability screen the third contact
+                    # uses, scoring the RING site -- the finger that would fail.
+                    # Scoring only the first three sites would leave the screen
+                    # structurally blind to slot 4, which is the defect
+                    # 6dd34f6 fixed for slot 3.
+                    _c4_scored = []
+                    _sid4 = self._planner._ring_sid
+                    for _c in _c4_cands:
+                        if not _reachable_contact(_c['p4s'], _ground_z, _r_tip_min):
+                            continue
+                        try:
+                            # Same directional-radius treatment the c3 screen uses,
+                            # so the two screens measure comparable residuals.
+                            if cfg.directional_r_tip:
+                                _m4 = float(cfg.directional_r_tip_margin_m)
+                                _r_th_s = self._planner._tip_support_along(
+                                    'thumb', q_ref, -np.asarray(seed['n1_in'], float),
+                                    cfg.r_thumb) + _m4
+                                _r_ix_s = self._planner._tip_support_along(
+                                    'index', q_ref, -np.asarray(seed['n2_in'], float),
+                                    cfg.r_index) + _m4
+                                _r_mf_s = self._planner._tip_support_along(
+                                    'middle', q_ref, -np.asarray(seed['n3_in'], float),
+                                    cfg.r_middle if cfg.r_middle is not None
+                                    else cfg.r_index) + _m4
+                                _r_rf_s = self._planner._tip_support_along(
+                                    'ring', q_ref, -np.asarray(_c['n4_in'], float),
+                                    cfg.r_ring if cfg.r_ring is not None
+                                    else cfg.r_index) + _m4
+                            else:
+                                _r_th_s = float(cfg.r_thumb)
+                                _r_ix_s = float(cfg.r_index)
+                                _r_mf_s = float(cfg.r_middle if cfg.r_middle is not None
+                                                else cfg.r_index)
+                                _r_rf_s = float(cfg.r_ring if cfg.r_ring is not None
+                                                else cfg.r_index)
+                            _t1s = (np.asarray(seed['p1s'], float)
+                                    + _r_th_s * (-np.asarray(seed['n1_in'], float)))
+                            _t2s = (np.asarray(seed['p2s'], float)
+                                    + _r_ix_s * (-np.asarray(seed['n2_in'], float)))
+                            _t3s = (np.asarray(seed['p3s'], float)
+                                    + _r_mf_s * (-np.asarray(seed['n3_in'], float)))
+                            _t4s = (np.asarray(_c['p4s'], float)
+                                    + _r_rf_s * (-np.asarray(_c['n4_in'], float)))
+                            _dls_data4 = self._planner._dls_data
+                            _dls_data4.qpos[:] = self._planner.data.qpos[:]
+                            _dls_data4.qpos[act_idx] = np.asarray(q_ref, float)[:len(act_idx)]
+                            self._planner._dls_ik.solve(
+                                model, _dls_data4,
+                                [self._planner._thumb_sid, self._planner._index_sid,
+                                 self._planner._middle_sid, _sid4],
+                                [_t1s, _t2s, _t3s, _t4s], q_bias=q_ref,
+                                null_gain=float(os.environ.get("PFF_DLS_NULLGAIN", 0.3)))
+                            mj.mj_kinematics(model, _dls_data4)
+                            _e4 = float(np.linalg.norm(
+                                _dls_data4.site_xpos[_sid4] - _t4s))
+                        except Exception:
+                            continue
+                        _c4_scored.append((_e4, _c))
+                    _c4_scored.sort(key=lambda t: t[0])
+                    self.last_c4_rank_table = [
+                        dict(fan_deg=_c['fan_deg'], rf_dls_res_mm=_e * 1e3,
+                             sep3_mm=_c.get('sep3_mm'), sep2_mm=_c.get('sep2_mm'),
+                             accepted=(_k == 0))
+                        for _k, (_e, _c) in enumerate(_c4_scored)]
+                    if _c4_scored:
+                        _best_c4 = _c4_scored[0][1]
+                        seed['p4']    = _best_c4['p4s'].copy()
+                        seed['p4s']   = _best_c4['p4s']
+                        seed['n4_in'] = _best_c4['n4_in']
+                        for _row in (self.last_seed_accept_table or []):
+                            if np.allclose(_row.get('p1s'), seed['p1s'], atol=1e-12):
+                                _row['p4s']   = np.asarray(_best_c4['p4s'], float).copy()
+                                _row['n4_in'] = np.asarray(_best_c4['n4_in'], float).copy()
+                                break
+                        log.info(
+                            f"[seed {i+1}] fourth contact: fan={_best_c4['fan_deg']:+.0f}deg "
+                            f"rf_dls={_c4_scored[0][0]*1e3:.1f}mm "
+                            f"sep_c3={_best_c4.get('sep3_mm', float('nan')):.1f}mm "
+                            f"({len(_c4_scored)}/{len(_c4_cands)} candidates viable)")
+                    else:
+                        # Say WHY: with the shared patch under pressure the usual
+                        # cause is the separation screen emptying the fan, not
+                        # reachability, and those want different fixes.
+                        log.info(
+                            f"[seed {i+1}] fourth contact: no viable candidate of "
+                            f"{len(_c4_cands)} proposed -- staying at "
+                            f"{3 if seed.get('p3s') is not None else 2} contacts "
+                            f"(patch may be too small to separate a 4th contact; "
+                            f"see c4_min_sep_m={float(getattr(cfg, 'c4_min_sep_m', 0.012))*1e3:.0f}mm)")
+                except _C4Infeasible:
+                    pass          # already logged, with the measured reason
+                except Exception as _e_c4:
+                    log.warning(f"[seed {i+1}] fourth-contact seeding failed: {_e_c4}")
+
             # ── Run NLP (warm-started from the pre-check LP's γ and cone y's) ──
             _seed_t0 = time.perf_counter()
             r = self._planner.solve(_q_ref_seed, obj_pos,
@@ -8328,6 +9188,9 @@ class MultiStartGraspPlanner3D:
                                     d2=-seed['n2_in'],
                                     p3_init=seed.get('p3'),
                                     d3=(-seed['n3_in'] if seed.get('n3_in') is not None
+                                        else None),
+                                    p4_init=seed.get('p4'),
+                                    d4=(-seed['n4_in'] if seed.get('n4_in') is not None
                                         else None),
                                     gamma_init=g_pre,
                                     y_by_corner_init=y_by_corner_pre)

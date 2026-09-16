@@ -60,12 +60,16 @@ FINGER_CONFIG_PATH = Path(__file__).resolve().parent.parent / "models" / "grasp_
 
 # Contact SLOTS are positional in the NLP. Slot 1 is the anchor/opposing contact,
 # slot 2 the contact it pinches against, slot 3+ the off-axis load-bearing ones.
-# The GeometryNames fields are still named thumb_*/index_*/middle_* for slots 1/2/3
-# because every consumer in grasp_planner_3d.py reads them by those names -- this
-# table is the ONE place that knows the mapping is positional, not anatomical.
+# The GeometryNames fields are still named thumb_*/index_*/middle_*/ring_* for slots
+# 1/2/3/4 because every consumer in grasp_planner_3d.py reads them by those names --
+# this table is the ONE place that knows the mapping is positional, not anatomical.
+# Slot 4 was added for the four-finger arm; slots 3 and 4 BOTH ride on slot 2's
+# quadratic patch by default, so adding this entry also makes slot 2's patch extent
+# the binding resource for the whole grasp -- see GraspConfig3D.c4_patch_offset_m.
 _SLOT_FIELDS = (("thumb_site", "thumb_geom"),
                 ("index_site", "index_geom"),
-                ("middle_site", "middle_geom"))
+                ("middle_site", "middle_geom"),
+                ("ring_site", "ring_geom"))
 
 
 def parse_fingers(spec):
