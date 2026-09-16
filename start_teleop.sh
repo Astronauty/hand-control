@@ -104,13 +104,30 @@ sim)
 	#
 	# BLAS threads: OpenBLAS defaults to one thread per core (48 here), which OVER-
 	# SUBSCRIBES the grasp NLP's MUMPS/BLAS calls (~18x slower at 48 vs the ~4-thread knee).
-	# That is fixed SURGICALLY in-code (threadpool_limits scoped to JUST the grasp-solver
-	# thread — see _blas_pin in kinova_leap_pick_place.py); we deliberately DO NOT cap
-	# threads process-wide here, because that also throttled the RRT collision checks and
-	# other numpy-heavy main-loop work (a process-wide cap made lock-in RRT crawl). Set
-	# GRASP_BLAS_THREADS=N to change the in-code grasp-solver cap only.
-	exec env DP_PROFILE="${DP_PROFILE:-1}" python3 kinova_leap_pick_place.py \
-		--mode "$MODE" --no-mediapipe "$@"
+	# NOTE: there is NO in-code cap any more. A threadpool_limits pin was tried and REMOVED
+	# (ca1102a) because mutating this pthreads OpenBLAS pool at runtime stalled the RRT —
+	# lock-in produced no [RRT] output at all. _blas_pin no longer exists; GRASP_BLAS_THREADS
+	# is NOT read as a cap, only OPENBLAS_NUM_THREADS is used as a fallback HINT for the
+	# thread count recorded in the grasp-solver log. Capping remains an open question: the
+	# solver is still slow when contended, and the fix must not mutate the shared pool at
+	# runtime (setting OPENBLAS_NUM_THREADS in the ENV before launch is the safe lever, but
+	# it is process-wide and previously throttled RRT/numpy in the main loop).
+	# CONSOLE CAPTURE. This used to `exec` straight into python with no redirect, so
+	# everything the sim prints to the terminal was lost the moment the window scrolled:
+	# the [sdf] per-object bake verdicts, [rec] collision-geom counts, [fingers] slots,
+	# and — the one that actually cost debugging time — traceback.print_exc() from the
+	# BACKGROUND recommender/IK threads, whose failures are otherwise invisible (a thread
+	# that dies mid-solve just stops producing recommendations, silently). Tee to a
+	# timestamped file under logs/console/ AND to the terminal, so a session can be
+	# diagnosed after the fact without changing how it looks while running.
+	# PIPESTATUS preserves python's exit code through the pipe (a bare pipeline reports
+	# tee's). No `exec` into python: the pipeline needs this shell to stay and wait.
+	mkdir -p logs/console
+	_CONSOLE_LOG="logs/console/${MODE}_$(date +%Y%m%d_%H%M%S).log"
+	echo "[start_teleop] console -> $_CONSOLE_LOG"
+	env DP_PROFILE="${DP_PROFILE:-1}" python3 -u kinova_leap_pick_place.py \
+		--mode "$MODE" --no-mediapipe "$@" 2>&1 | tee "$_CONSOLE_LOG"
+	exit "${PIPESTATUS[0]}"
 	;;
 
 viz)

@@ -311,6 +311,164 @@ def lift_episodes(run_dir: Path, trial_id: int, lift_m: float = 0.015,
             'episodes': eps}
 
 
+def classify_unscored(run_dir: Path, trial_id: int, evs: list[dict], lift: dict | None,
+                      bin_x: tuple = (0.320, 0.680),
+                      bin_y: tuple = (-0.080, 0.600),
+                      settle_bin_tol_m: float = 0.05) -> str | None:
+    """For a trial NOT scored success (abandoned / timeout), decide WHY, from the trace.
+
+    An abandoned/timeout trial is one of two very different failures, and the state machine
+    conflates them:
+      * 'missed_place' — the object ACTUALLY reached the place bin (a lift episode ended
+        inside the bin footprint, or the object came to REST inside it at trace end), but
+        the arrival/place detector never fired, so the trial was force-ended as abandoned/
+        timeout. This is a DETECTION miss, not a task failure — it should be re-scored.
+      * 'unreachable'  — the object never got to the bin: it stayed at/near its spawn, rolled
+        off, or was dropped short. A genuine transport/reach failure.
+
+    Returns 'missed_place' | 'unreachable' | None (None = trial WAS scored success, or has
+    no usable trace to judge). Uses the SAME bin footprint lift_episodes uses, so the two
+    stay consistent. The final-rest test catches a place that settled after the last lift
+    episode closed (the golf-ball-into-bin case), which the episode `kind` alone can miss."""
+    # 1) Any lift episode that ended inside the bin == the object was placed there.
+    if lift and any(e.get('ended_in_bin') for e in lift.get('episodes', [])):
+        return 'missed_place'
+    # 2) Object's FINAL resting position inside the bin footprint (place that settled after
+    #    the last episode, or a set-down never captured as a lift episode).
+    hits = sorted(Path(run_dir).glob(f'trial_{trial_id:04d}_*.npz'))
+    if hits:
+        try:
+            z = np.load(hits[0], allow_pickle=True)
+            if 'obj_pos' in z:
+                op = np.asarray(z['obj_pos'], float)
+                if len(op):
+                    fx, fy = float(op[-1, 0]), float(op[-1, 1])
+                    if (bin_x[0] - settle_bin_tol_m <= fx <= bin_x[1] + settle_bin_tol_m
+                            and bin_y[0] - settle_bin_tol_m <= fy <= bin_y[1] + settle_bin_tol_m):
+                        return 'missed_place'
+                    return 'unreachable'
+        except Exception:
+            pass
+    # No trace to judge -> can't tell; leave unclassified rather than guess.
+    return 'unreachable' if lift is not None else None
+
+
+def diagnose_failure(run_dir: Path, trial_id: int,
+                     bin_x: tuple = (0.320, 0.680),
+                     bin_y: tuple = (-0.080, 0.600),
+                     bin_base_top_z: float = 0.87, bin_rim_z: float = 0.925,
+                     lift_lo_m: float = 0.005, dwell_lo_s: float = 0.5,
+                     arrival_speed: float = 0.05, arrival_dwell_s: float = 0.5,
+                     release_gap_m: float = 0.06) -> dict | None:
+    """Re-derive pick/place from the trace at LOWERED thresholds, and — for a trial whose
+    object reached the bin — say WHICH arrival condition failed. The live detectors gate on
+    LIFT_HEIGHT_M(=10mm)×DWELL_S(=1.0s) for a pick and (in-place-on-base AND settled AND
+    released) held ARRIVAL_DWELL_S(=0.5s) for a place; a grasp that lifted only a few mm, or
+    a place that never fully settled/released, is scored as a FAILURE though the operator did
+    the task. This recomputes both leniently and reports the gap.
+
+    Returns a dict of trace-derived diagnostics, or None if the trace is unusable:
+      pick_lo        : bool — object stayed >lift_lo_m above rest for >=dwell_lo_s (a pick at
+                       the lowered threshold, regardless of what the live DWELL_S gate did).
+      max_lift_mm    : peak height above rest.
+      reached_bin    : bool — object was ever inside the bin XY footprint (below the rim).
+      final_in_bin   : bool — object's final rest position is in the footprint.
+      arrival_fail   : None if the object never reached the bin, else the FIRST unmet arrival
+                       condition among 'never_on_base' | 'never_settled' | 'never_released' |
+                       'never_held_dwell' (or 'would_arrive' if all held long enough — a pure
+                       DETECTION miss). Uses fingertip-object gap as the release proxy and
+                       object-z near the bin base as the on-base proxy (no contact channel in
+                       the trace)."""
+    hits = sorted(Path(run_dir).glob(f'trial_{trial_id:04d}_*.npz'))
+    if not hits:
+        return None
+    try:
+        z = np.load(hits[0], allow_pickle=True)
+        t = np.asarray(z['t'], float)
+        op = np.asarray(z['obj_pos'], float)
+    except Exception:
+        return None
+    if len(t) < 2 or 'obj_pos' not in z:
+        return None
+    oz = op[:, 2]
+    # Rest surface = running trailing-2s minimum (adapts across counter->bin), same basis as
+    # lift_episodes; seed with the trial's first-second minimum.
+    rest0 = oz[:np.searchsorted(t, t[0] + 1.0) or 1].min()
+    above = oz - rest0
+    max_lift_mm = float(above.max() * 1e3)
+
+    # --- PICK at the lowered threshold: >lift_lo_m held continuously for >=dwell_lo_s ---
+    pick_lo = False
+    run_t0 = None
+    for i in range(len(t)):
+        if above[i] > lift_lo_m:
+            if run_t0 is None:
+                run_t0 = t[i]
+            elif t[i] - run_t0 >= dwell_lo_s:
+                pick_lo = True
+                break
+        else:
+            run_t0 = None
+
+    # --- Did the object reach the bin? (XY footprint, below the rim) ---
+    in_fp = ((bin_x[0] <= op[:, 0]) & (op[:, 0] <= bin_x[1])
+             & (bin_y[0] <= op[:, 1]) & (op[:, 1] <= bin_y[1])
+             & (oz <= bin_rim_z + 0.02))
+    reached_bin = bool(in_fp.any())
+    final_in_bin = bool(in_fp[-5:].any())   # last few frames (settle)
+
+    # --- Arrival-condition diagnosis (only meaningful once the object reached the bin) ---
+    arrival_fail = None
+    if reached_bin:
+        speed = (np.linalg.norm(np.asarray(z['obj_linvel'], float), axis=1)
+                 if 'obj_linvel' in z else None)
+        gap = None
+        if 'p_thumb' in z and 'p_index' in z:
+            hand = 0.5 * (np.asarray(z['p_thumb'], float) + np.asarray(z['p_index'], float))
+            gap = np.linalg.norm(hand - op, axis=1)          # release proxy
+        # ON BASE: a RESTING object's z-CENTER sits at bin_base_top + its own half-height, NOT
+        # at the bare floor — a fixed "z near floor" test wrongly rejects a placed object (a
+        # wood block rests with its center +42mm above the base, a mug +90mm). The rest height
+        # is object-specific and unknown a priori, so instead detect that the object has COME
+        # TO REST vertically inside the bin: in footprint, below the rim, and its z is no longer
+        # DESCENDING (|dz/dt| small) — i.e. it has settled onto the bin at whatever height its
+        # geometry gives, rather than still being lowered or held aloft. Combined with the
+        # `settled` (low linear speed) test below, this is "set down and at rest on the bin".
+        dz = np.zeros(len(t))
+        if len(t) > 1:
+            dt = np.clip(np.diff(t), 1e-6, None)
+            dz[1:] = np.abs(np.diff(oz)) / dt          # |vertical speed|, m/s
+        z_stable = dz < 0.02                            # not being raised/lowered
+        on_base = in_fp & (oz <= bin_rim_z + 0.02) & z_stable
+        settled = (speed < arrival_speed) if speed is not None else np.ones(len(t), bool)
+        released = (gap > release_gap_m) if gap is not None else np.ones(len(t), bool)
+        # First unmet condition, judged over the window where the object is in the footprint.
+        if not on_base.any():
+            arrival_fail = 'never_on_base'          # hovered in the rim, never set down
+        elif not (in_fp & settled).any():
+            arrival_fail = 'never_settled'          # kept moving in the bin
+        elif not (in_fp & released).any():
+            arrival_fail = 'never_released'         # held it in the bin, never let go
+        else:
+            # All three occur individually — do they hold TOGETHER for arrival_dwell_s?
+            ok = on_base & settled & released
+            held = False
+            w0 = None
+            for i in range(len(t)):
+                if ok[i]:
+                    if w0 is None:
+                        w0 = t[i]
+                    elif t[i] - w0 >= arrival_dwell_s:
+                        held = True
+                        break
+                else:
+                    w0 = None
+            arrival_fail = 'would_arrive' if held else 'never_held_dwell'
+    return {'pick_lo': pick_lo, 'max_lift_mm': round(max_lift_mm, 1),
+            'reached_bin': reached_bin, 'final_in_bin': final_in_bin,
+            'arrival_fail': arrival_fail}
+
+
 def trial_summary(evs: list[dict]) -> dict | None:
     """Reduce one trial's events to the fields the tables need. Returns None if the
     trial neither ended (trial_end) nor reached a successful place (arrival).
@@ -448,6 +606,17 @@ def collect(run_dirs):
             # Arm from the DIRECTORY, not trial_start.method — see method_from_dir.
             _arm = method_from_dir(rd) or s['method']
             _lift = lift_episodes(rd, tid)
+            # For trials NOT scored success, split abandoned/timeout into a genuine
+            # 'unreachable' failure vs a 'missed_place' (the object DID reach the bin but the
+            # place detector never fired). None for successes / untraceable trials.
+            _fail_reason = (None if s['outcome'] == 'success'
+                            else classify_unscored(rd, tid, evs, _lift))
+            # Threshold-sensitivity diagnosis for failed trials: re-derive the pick at a
+            # lowered lift/dwell threshold, and (for objects that reached the bin) say WHICH
+            # arrival condition failed (never set down / never settled / never released /
+            # never held long enough / would-have-arrived). None for successes.
+            _diag = (None if s['outcome'] == 'success'
+                     else diagnose_failure(rd, tid))
             records[(_arm, s['object'])].append({
                 'duration_s': s['duration_s'],
                 'duration_sim_s': s.get('duration_sim_s'),
@@ -456,6 +625,15 @@ def collect(run_dirs):
                 'release_peak_mps': read_release_peak_speed(rd, tid),
                 'timeout':   (s['outcome'] == 'timeout'),
                 'abandoned': (s['outcome'] == 'abandoned'),
+                # Why a non-success trial failed: 'missed_place' (object reached the bin, the
+                # place detector missed it) vs 'unreachable' (never got there). None for
+                # successes. Surfaced in the summary so missed-place detection misses can be
+                # counted separately from real reach/transport failures.
+                'fail_reason': _fail_reason,
+                # Threshold-sensitivity diagnosis (dict or None): pick_lo (would a lowered
+                # lift/dwell have counted the pick), max_lift_mm, reached_bin, and
+                # arrival_fail (which arrival condition blocked the place).
+                'diag': _diag,
                 # Trace-derived attempts/drops — the AUTHORITY (see lift_episodes). Kept
                 # alongside the logged n_attempts/n_drops so the disagreement on runs
                 # recorded before the logger fix is visible rather than silent.
@@ -921,8 +1099,59 @@ def emit_tables(dirs, args, heading=None):
         n = len(recs)
         ndrops = sum(r['n_drops'] for r in recs)
         ns = sum(r['success'] for r in recs)
-        print(f'#   {m:24} {o:16}  n_valid={n:3}  drops={ndrops}  success={ns}',
+        nmiss = sum(1 for r in recs if r.get('fail_reason') == 'missed_place')
+        nunre = sum(1 for r in recs if r.get('fail_reason') == 'unreachable')
+        _extra = f'  missed_place={nmiss}  unreachable={nunre}' if (nmiss or nunre) else ''
+        print(f'#   {m:24} {o:16}  n_valid={n:3}  drops={ndrops}  success={ns}{_extra}',
               file=sys.stderr)
+    # Missed-place tally: non-success trials whose object DID reach the bin (the place
+    # detector missed it). These are re-scorable and should not be counted as task failures.
+    _missed = [(m, o, r) for (m, o), recs in records.items()
+               for r in recs if r.get('fail_reason') == 'missed_place']
+    if _missed:
+        print(f'# MISSED-PLACE (object reached the bin but the trial was scored '
+              f'{{abandoned,timeout}} — detection miss, re-scorable): {len(_missed)}',
+              file=sys.stderr)
+        for m, o, r in sorted(_missed, key=lambda x: (x[0], x[1])):
+            _oc = 'abandoned' if r.get('abandoned') else ('timeout' if r.get('timeout') else '?')
+            print(f'#     {m:24} {o:16}  (logged={_oc})', file=sys.stderr)
+
+    # --- Threshold-sensitivity of the FAILED trials (pick + arrival diagnosis) ----------
+    # Every non-success trial that has a trace, re-derived: did the pick clear a LOWERED lift/
+    # dwell threshold, and — if the object reached the bin — which arrival condition blocked
+    # the place. Answers "were these failures really failures, or threshold/detection artifacts?"
+    _fails = [(m, o, r) for (m, o), recs in records.items()
+              for r in recs if r.get('diag') is not None and not r.get('success')]
+    if _fails:
+        _picked_lo = sum(1 for _m, _o, r in _fails if r['diag'].get('pick_lo'))
+        _nopick_lo = sum(1 for _m, _o, r in _fails if not r['diag'].get('pick_lo'))
+        _reached   = sum(1 for _m, _o, r in _fails if r['diag'].get('reached_bin'))
+        from collections import Counter as _C
+        _afail = _C(r['diag'].get('arrival_fail') for _m, _o, r in _fails
+                    if r['diag'].get('reached_bin'))
+        print(f'# THRESHOLD/DETECTION diagnosis of {len(_fails)} failed trial(s):',
+              file=sys.stderr)
+        print(f'#   PICK @ lowered threshold (5mm/0.5s): picked={_picked_lo}  '
+              f'never-picked={_nopick_lo}   '
+              f'(so {_picked_lo} of {len(_fails)} DID grasp+lift the object)', file=sys.stderr)
+        print(f'#   reached the bin footprint: {_reached}/{len(_fails)}', file=sys.stderr)
+        if _afail:
+            print(f'#   of those, arrival BLOCKED by:', file=sys.stderr)
+            _lbl = {'never_on_base': 'never set down on bin floor (hovered/held over bin)',
+                    'never_settled': 'never settled (kept moving in bin)',
+                    'never_released': 'never released (held in bin, no let-go)',
+                    'never_held_dwell': 'conditions never held together for the dwell',
+                    'would_arrive': 'ALL conditions met — pure DETECTION miss (re-scorable)'}
+            for _k, _n in _afail.most_common():
+                print(f'#       {_n:2}x  {_lbl.get(_k, _k)}', file=sys.stderr)
+        # Per-trial detail so each can be inspected.
+        for m, o, r in sorted(_fails, key=lambda x: (x[0], x[1])):
+            d = r['diag']
+            _oc = 'timeout' if r.get('timeout') else ('abandoned' if r.get('abandoned') else '?')
+            _ml = d.get('max_lift_mm'); _pl = str(d.get('pick_lo'))
+            _rb = str(d.get('reached_bin')); _af = d.get('arrival_fail')
+            print(f'#     {m:22} {o:16} {_oc:9} maxlift={_ml:6.1f}mm '
+                  f'pick_lo={_pl:5} reached_bin={_rb:5} arrival_fail={_af}', file=sys.stderr)
     print('', file=sys.stderr)
 
     if heading:

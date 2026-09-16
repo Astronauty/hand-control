@@ -1,3 +1,4 @@
+import os
 import time
 
 import numpy as np
@@ -44,6 +45,14 @@ class RRTPlanner:
         # are excluded from nearest-neighbour distance so the high-dimensional finger
         # space doesn't swamp the lower-dimensional arm space.
         self._n_plan = n_plan if n_plan is not None else self._n_robot
+
+        # Diagnostic: RRT_NO_COLLISION=1 makes _is_free() unconditionally True (see there).
+        # Timing experiments only -- the path it yields is not collision-free. Announced
+        # loudly at construction so a run that accidentally has it set is obvious.
+        self._no_collision = os.environ.get('RRT_NO_COLLISION', '') == '1'
+        if self._no_collision:
+            print("[RRT] *** RRT_NO_COLLISION=1 -- collision checking DISABLED. "
+                  "Paths are UNSAFE; timing diagnostics only. ***")
 
         self._data = mujoco.MjData(model)
         self._q_lo = model.jnt_range[:self._n_robot, 0].copy()
@@ -223,6 +232,18 @@ class RRTPlanner:
 
     def _is_free(self, q):
         _t0 = time.perf_counter()
+        # DIAGNOSTIC BYPASS (RRT_NO_COLLISION=1). Declares EVERY configuration free, so
+        # plan() measures pure search cost with the collision check removed. The resulting
+        # path is UNSAFE BY CONSTRUCTION -- it may sweep the hand through the table, the
+        # bin, or the objects -- so this is for timing experiments ONLY, never a data run.
+        # Deliberately placed AFTER the timer start and BEFORE mj_kinematics so the call
+        # is still counted in _isfree_n: that keeps the "checks" figure comparable between
+        # the on and off runs (same number of queries, ~0 cost each).
+        if self._no_collision:
+            if hasattr(self, "_isfree_n"):
+                self._isfree_ms += (time.perf_counter() - _t0) * 1e3
+                self._isfree_n += 1
+            return True
         self._data.qpos[:self._n_robot] = q   # only set robot DOFs; objects stay at snapshot
         mujoco.mj_kinematics(self.model, self._data)
         # Broadphase: one vectorized pass over all pairs; the exact query below runs only

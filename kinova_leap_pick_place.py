@@ -442,6 +442,15 @@ if __name__ == "__main__":
              "or 'thumb,index,middle'. Slot 1 anchors the grasp (the antipodal seed "
              "marches from it) and w_align gates on slot-1<->slot-2 opposition, so the "
              "order is not interchangeable. Default: models/grasp_finger_config.json.")
+    _arg_parser.add_argument(
+        '--obj-scale', dest='obj_scale', type=float, default=1.0, metavar='S',
+        help="Coupled object DIFFICULTY knob applied to EVERY pickable object after the "
+             "model compiles: slide friction x S and mass x (1/S) (inertia rescaled with "
+             "mass). S<1 makes grasping HARDER (slippery AND heavy), S>1 easier; S=1 "
+             "(default) is the nominal recorded physics. Suggested runs: 0.8, 0.6, 0.4 "
+             "(harder: mu x0.8/0.6/0.4, mass x1.25/1.67/2.5) plus one easier 1.2 "
+             "(mu x1.2, mass x0.83). Logged per object at startup and tagged into the "
+             "--trial-log run name so each variant's logs stay separate for analysis.")
     args = _arg_parser.parse_args()
     # In-code defaults for behaviours that used to be always-True CLI flags. These
     # never had a way to turn them OFF from the command line, so they only cluttered
@@ -490,8 +499,31 @@ if __name__ == "__main__":
                 Path(_grasp_config_builder.FINGER_CONFIG_PATH).read_text())
         except (OSError, ValueError):
             return list(SLOT_ROLES)
-        _roles = ((_raw.get('per_object') or {}).get(obj_id)
-                  or _raw.get('fingers') or SLOT_ROLES)
+        # KEY FORM — and why this lookup is DELIBERATELY left half-broken for now.
+        #
+        # Callers pass the MODEL BODY name (objects[i]['name'], e.g. 'obj_009_gelatin_box'),
+        # but per_object is keyed by BARE YCB id ('009_gelatin_box') — the ids
+        # models/scene_objects.json uses. So every per_object lookup MISSES and falls back
+        # to the file's default ['thumb','index'].
+        #
+        # That was "fixed" (try obj_id, then the 'obj_'-stripped form) and the fix had to be
+        # REVERTED, because the recommender is only half of the pairing. The executor's
+        # SLOT_ROLES / FINGER_SET / active_joint_slices are resolved ONCE at startup with no
+        # object id, so they stay a 2-slot pinch no matter what this returns ("[fingers]
+        # slots=['thumb','index'] n_contacts=2"). With the key fixed, 036_wood_block and
+        # 009_gelatin_box were planned as TRIPODS and executed as PINCHES: the NLP places p1
+        # and p2 assuming a third contact carries load, then _commit_recommended_pose (see
+        # its `_slot_pts = [rec['p1'], rec['p2']]`) silently drops p3 because zip() against a
+        # 2-element SLOT_ROLES truncates. Measured consequence on the wood block: a committed
+        # index pad 60deg off pad-on at 0.0mm gap, which then diverged MuJoCo on the first
+        # squeeze sample. The two genuine pinch objects (mug, orange) committed 14-18deg pads
+        # in the same run and were fine.
+        #
+        # Restoring the miss makes plan and execution agree at 2 contacts, which is worse
+        # than the config intends but consistent. The REAL fix is to make the executor
+        # per-object as well — see docs/TODO_per_object_fingers.md.
+        _per = _raw.get('per_object') or {}
+        _roles = _per.get(obj_id) or _raw.get('fingers') or SLOT_ROLES
         return [r for r in _roles if isinstance(r, str)]
     print(f"[fingers] slots={SLOT_ROLES}  FINGER_SET={FINGER_SET}  "
           f"n_contacts={_cfg_fingers['n_contacts']}")
@@ -528,6 +560,10 @@ if __name__ == "__main__":
     # ignored for non-anyteleop runs.
     if _RETARGETER == 'anyteleop' and args.anyteleop_type is not None:
         _run_label = f'{_run_label}_{args.anyteleop_type}'
+    # Tag the object-difficulty variant into the run label so each --obj-scale run lands in
+    # its own logs/<mode>_s<scale>_<ts>/ dir (e.g. ..._s0.6_...) for later per-variant analysis.
+    if abs(float(getattr(args, 'obj_scale', 1.0)) - 1.0) > 1e-9:
+        _run_label = f"{_run_label}_s{float(args.obj_scale):.3g}".replace('.', 'p')
     if args.multicam and args.multicam_auto:
         _arg_parser.error("--multicam and --multicam-auto are mutually exclusive")
     # NB: args.trial_log is None when the flag is OMITTED, and '' (falsy!) when passed bare
@@ -947,6 +983,38 @@ if __name__ == "__main__":
                              for sid in id_S]
         objects.append(obj)
 
+    # --- Coupled object-difficulty scaling (--obj-scale S) ---------------------------
+    # Apply AFTER compile + object enumeration, to EVERY pickable object: slide friction
+    # x S and mass x (1/S), inertia rescaled with mass. S<1 = harder (slippery + heavy),
+    # S>1 = easier. One knob walks a single difficulty axis so runs stay comparable to the
+    # S=1 nominal without a full factorial. Friction is set on ALL collision hulls of each
+    # object body (multi-hull YCB meshes carry many), matching how the grasp/RRT read them.
+    _obj_scale = float(getattr(args, 'obj_scale', 1.0))
+    if abs(_obj_scale - 1.0) > 1e-9:
+        _fric_mul = _obj_scale
+        _mass_mul = 1.0 / _obj_scale
+        print(f"[obj-scale] S={_obj_scale:.3g}  ->  friction x{_fric_mul:.3g}, "
+              f"mass x{_mass_mul:.3g} (inertia rescaled) on {len(objects)} object(s):")
+        for _o in objects:
+            _bid = _o['id_body']
+            if _bid < 0:
+                continue
+            # friction: every collision hull of this body (contype!=0), slide component.
+            _hulls = [g for g in range(model.ngeom)
+                      if model.geom_bodyid[g] == _bid and model.geom_contype[g] != 0]
+            for _g in _hulls:
+                model.geom_friction[_g, 0] *= _fric_mul
+            # mass + inertia (mj derives body_mass/body_inertia from geoms at compile, but
+            # they are writable on the compiled model and read live by solve_gamma_live).
+            _m0 = float(model.body_mass[_bid])
+            model.body_mass[_bid] = _m0 * _mass_mul
+            model.body_inertia[_bid] *= _mass_mul
+            _mu_now = float(model.geom_friction[_o['id_geom'], 0]) if _o['id_geom'] >= 0 else float('nan')
+            print(f"    {_o['name']:22s} mu={_mu_now:.3f}  mass={model.body_mass[_bid]:.3f}kg "
+                  f"({len(_hulls)} hull(s))")
+        # Recompute derived quantities so the scaled mass/inertia take effect immediately.
+        mj.mj_forward(model, data)
+
     # Contact-aware capability gate + EAGER SDF BAKE.
     #
     # The _c1/_c2 grasp-site requirement that used to live here was STALE for the
@@ -1106,9 +1174,38 @@ if __name__ == "__main__":
         pad_dir_W = -d0.site_xmat[sid].reshape(3, 3)[:, 0]   # world dir of pad_axis (-x)
         return float(np.max((verts_W - d0.site_xpos[sid]) @ pad_dir_W))
 
-    _PAD_OFFSET = {f: _pad_surface_offset(f) for f in FINGER_SET}
+    _PAD_OFFSET_DERIVED = {f: _pad_surface_offset(f) for f in FINGER_SET}
+    # PAD_OFFSET_MM overrides the derived value for ALL fingers (e.g. PAD_OFFSET_MM=8).
+    # The derived number is the MAX tip-mesh vertex projection, and that choice is what
+    # makes the standoff safe: at the IK solution no pad vertex is inside the surface.
+    # Forcing a SMALLER offset moves every ik_target that much closer along the inward
+    # normal, so the furthest-forward pad vertex ends up (derived - override) INSIDE the
+    # object at solve time -- i.e. the solver is now asked for a penetrating pose, and the
+    # squeeze starts from an impact instead of closing a gap. That is the obj_036_wood_block
+    # failure (committed at gap=0.0mm, measured 2.1N against cmd=0.2N, then NaN in QACC).
+    # Kept as an env override rather than an edit so it can be A/B'd per run and the value
+    # in force is recorded in the console log; the derived value is printed alongside so a
+    # log always says what was overridden and by how much.
+    _pad_override_mm = os.environ.get('PAD_OFFSET_MM')
+    if _pad_override_mm:
+        _po = float(_pad_override_mm) / 1e3
+        _PAD_OFFSET = {f: _po for f in FINGER_SET}
+    else:
+        _PAD_OFFSET = dict(_PAD_OFFSET_DERIVED)
     print(f"[IK] fingerpad surface offsets: "
-          + "  ".join(f"{f}={_PAD_OFFSET[f]*1e3:.1f}mm" for f in FINGER_SET))
+          + "  ".join(f"{f}={_PAD_OFFSET[f]*1e3:.1f}mm" for f in FINGER_SET)
+          + ("" if not _pad_override_mm else
+             "   (PAD_OFFSET_MM override; derived was "
+             + " ".join(f"{f}={_PAD_OFFSET_DERIVED[f]*1e3:.1f}mm" for f in FINGER_SET) + ")"))
+    if _pad_override_mm:
+        _shrunk = [f for f in FINGER_SET if _PAD_OFFSET[f] < _PAD_OFFSET_DERIVED[f] - 1e-9]
+        if _shrunk:
+            print("[IK] WARNING: override is BELOW the derived max-vertex offset for "
+                  + ", ".join(f"{f} (by {(_PAD_OFFSET_DERIVED[f]-_PAD_OFFSET[f])*1e3:.1f}mm)"
+                              for f in _shrunk)
+                  + " — the IK will be asked for a pose with the pad that far INSIDE the "
+                    "object. Expect commits at/below gap=0 and a squeeze that starts as an "
+                    "impact; watch [grasp-quality] and [grasp-gate].")
 
     # All four fingertip tip geoms — used to pick the proximity-based "active object":
     # the object with the smallest AVERAGE signed tip→object distance. This is what the
@@ -1129,6 +1226,23 @@ if __name__ == "__main__":
     _OBJ_GID_TO_IDX = {o['id_geom']: i for i, o in enumerate(objects)}
     _FINGER_BY_GID  = {mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, g): f
                        for f in FINGER_SET for g in _finger_collision_geoms(model, f)}
+    # FULL per-object hull map: EVERY collision geom of each object body -> object index.
+    # _OBJ_GID_TO_IDX above holds only the single named <name>_geom, so any consumer keyed
+    # on it misses contacts on a convex-decomposed mesh's _col_N hulls (025_mug: 43 of
+    # them). Built from the COMPILED contype snapshot for the same reason _OBJ_COL_GIDS is
+    # (stowed objects have their live contype zeroed under --sequential-spawn).
+    _OBJ_HULL_TO_IDX = {}
+    for _oi_h, _o_h in enumerate(objects):
+        for _g_h in range(model.ngeom):
+            if model.geom_bodyid[_g_h] == _o_h['id_body'] and _geom_contype0[_g_h] != 0:
+                _OBJ_HULL_TO_IDX[_g_h] = _oi_h
+        _OBJ_HULL_TO_IDX.setdefault(_o_h['id_geom'], _oi_h)   # always include the named geom
+    # FINGERTIP-ONLY map, for force attribution. _FINGER_BY_GID (above) deliberately spans
+    # every collision geom of a finger -- correct for "is this finger touching?" tests, wrong
+    # for "how much force is the PAD carrying?", which is what the squeeze diagnostic and the
+    # trial log report. Keep both; use this one for forces.
+    _FINGER_BY_TIP_GID = {_gid_t: _f_t for _f_t, _gid_t in _TIP_GEOM_IDS.items()
+                          if _gid_t is not None and _gid_t >= 0}
 
     # --- Trial benchmarking (--trial-log) ------------------------------------------
     # Inert (None) unless --trial-log is passed — every call site below is guarded on
@@ -1159,6 +1273,24 @@ if __name__ == "__main__":
                                    else rest_half_height(int(model.geom_type[_gid]),
                                                          model.geom_size[_gid]))
             _trial_dofadr[_oi] = int(model.jnt_dofadr[model.body_jntadr[_o['id_body']]])
+            # DIAGNOSTIC (2026-09-15, orange phantom-pick investigation). height_above_rest
+            # is obj_z - _trial_rest_hh, compared against LIFT_HEIGHT_M = 0.01. In the
+            # failing robocasa runs it read ~0.837 for a motionless, untouched object --
+            # `lifted` true by ~86x -- which let pick_confirmed fire with touch=False. Three
+            # separate explanations inferred from the logs (counter-vs-table constant, the
+            # rest_half_height fallback, stow-at-init) were each measured and DISPROVED, so
+            # this prints the actual inputs instead of inferring them.
+            #
+            # Read at startup: `branch` must be `measured`, and `h_at_rest` is what the lift
+            # test sees for a settled object -- it should be ~0, NOT ~0.86. If h_at_rest is
+            # ~TABLE_TOP_Z then _trial_rest_hh is an absolute height, not a half-height, and
+            # the subtraction is wrong for every object in the scene.
+            print(f"[rest-hh] {_o['name']:<24} cz={_cz:.4f}  TABLE_TOP_Z={TABLE_TOP_Z:.3f}  "
+                  f"rhh_meas={_rhh_meas:+.4f}  used={_trial_rest_hh[_oi]:.4f}  "
+                  f"branch={'measured' if _rhh_meas > 1e-4 else 'FALLBACK'}  "
+                  f"h_at_rest={_cz - TABLE_TOP_Z - _trial_rest_hh[_oi]:+.4f}  "
+                  f"(lifted@{LIFT_HEIGHT_M:.2f}? "
+                  f"{'STILL-BUG' if (_cz - TABLE_TOP_Z - _trial_rest_hh[_oi]) > LIFT_HEIGHT_M else 'no'})")
 
     # --- Sequential single-location spawner (--sequential-spawn) --------------------------
     # Present ONE object at a time at a single shared spawn point (the first object's xy) and
@@ -1167,12 +1299,21 @@ if __name__ == "__main__":
     # far below the floor and teleported up to the spawn point in turn. See the loop-top
     # advance-on-trial-end block for the trigger.
     _SEQ_SPAWN = args.sequential_spawn
+    # TRANSPORT diagnostic: one row per _TR_DIAG_DT of sim time carrying every input the
+    # drop/arrival decision reads (see the 'transport_diag' emit in the always-run block).
+    # On whenever trial logging is on — it is a handful of rows per second and it is the
+    # only way to attribute a spurious drop or a missed arrival to a specific condition.
+    _TR_DIAG = bool(args.trial_log)
+    _TR_DIAG_DT = 0.1          # sim-seconds between diagnostic rows
+    _tr_diag_last = [0.0]      # list so the loop-top block can rebind without `global`
     # Presentation ORDER is an indirection, NOT a reordering of `objects`: _seq_order[slot]
-    # is the objects[] index shown in that slot. The `objects` list itself must stay in
-    # config order because the shared spawn point is taken from _scene_cfg[0]'s xy (below) —
-    # permuting the list would move the spawn point run-to-run and destroy the identical
-    # initial condition that is this spawner's whole purpose.
-    # _seq_next is therefore a SLOT counter (1..N), not an object index.
+    # is the objects[] index shown in that slot, and _seq_next is a SLOT counter (1..N),
+    # not an object index. Keeping `objects` in config order means an object's index is
+    # stable across runs no matter which --order row is used, so the per-object logs,
+    # _cat_supported / _cat_planners caches and the trial tables all key off the same index
+    # for the same object. (This used to say the list had to stay in config order because
+    # the spawn point was read from _scene_cfg[0]'s xy — that is no longer true: the spawn
+    # point is the hard-coded SEQ_SPAWN_XY below and does not depend on the ordering at all.)
     if args.order is not None and not 1 <= args.order <= len(objects):
         # Bounds can only be checked here: argparse runs before the scene is compiled, so
         # the object count isn't known yet. One row per object = one balanced session each.
@@ -1183,6 +1324,28 @@ if __name__ == "__main__":
         else list(range(len(objects)))
     _seq_next = 1                 # next SLOT to present (slot 0 starts on the table)
     _seq_last_ended_id = None     # trial_id of the last trial we already advanced past
+    # Trial that ENDED but whose end the loop-top advance block has not seen yet.
+    #
+    # The advance block reads _trial_state, but it runs at loop TOP while the key handler
+    # runs LATER in the same iteration -- and press-8 abandons the running trial and
+    # immediately replaces _trial_state with a freshly started one (outcome=None) in the
+    # same block. So by the next iteration the ended trial is gone and the block sees only
+    # the new one: the spawner never advanced, and every operator press-8 recovery silently
+    # consumed the trial end that should have brought up the next object. Backspace and Tab
+    # have the same shape. Recording the id here at abandon time decouples the advance from
+    # whatever _trial_state happens to hold a frame later.
+    _seq_pending_end = [None]     # list so nested handlers can set it without `global`
+
+    def _abandon_and_record(state, t_now):
+        """abandon_trial(), but also record the ended trial id for the advance block.
+
+        Use this from any key handler that abandons a trial -- especially ones that start a
+        replacement trial straight afterwards, since that replacement overwrites
+        _trial_state before the loop-top advance block ever runs."""
+        if state is None or state.outcome is not None:
+            return
+        _trial_runner.abandon_trial(state, t_now)
+        _seq_pending_end[0] = state.trial_id
     # One-shot "skip physics THIS iteration" flag for the sequential reset. Distinct
     # from _dp_reset_frame because the sequential reset fires from the trial-end block
     # ABOVE the drive block, and the drive block re-inits _dp_reset_frame = False every
@@ -1192,11 +1355,23 @@ if __name__ == "__main__":
     _seq_skip_physics = [False]
     _seq_spawn_xy = None
     _seq_spawn_quat = {}          # obj_idx -> the object's authored spawn quat (upright default)
+    # FIXED sequential spawn point, hard-coded on purpose. Every object is presented at
+    # THIS xy regardless of --order and regardless of its own authored xy in
+    # models/scene_objects.json, so the initial condition is identical for every object in
+    # every run -- which is the whole point of --sequential-spawn as a counterbalanced
+    # experiment. It used to be _scene_cfg[0]['xy'], i.e. whichever object the scene list
+    # happened to put first; that is still a single location, but it is a location chosen by
+    # the config's ordering rather than by the experiment, and it silently moves whenever
+    # the scene list is reordered or a different --scene is selected.
+    # Value is the robocasa 025_mug slot: clear of the bin (footprint x in [0.32, 0.68],
+    # y in [-0.08, 0.60]) and inside the arm's comfortable reach at counter height.
+    # NOTE it is a ROBOCASA-frame point. The pick_place scene lays its objects out at
+    # y ~ 0.30-0.42, so under --scene pick_place this puts them further from the base than
+    # that scene was authored for; re-check reachability before running the older scene
+    # with --sequential-spawn.
+    SEQ_SPAWN_XY = [-0.20, 0.45]
     if _SEQ_SPAWN:
-        # Spawn point = the FIRST scene_objects.json entry's xy (index 0 == objects[0]).
-        _seq_spawn_xy = list((_scene_cfg[0].get('xy', [0.5, 0.3]))) if _scene_cfg \
-            else list(data.qpos[model.jnt_qposadr[model.body_jntadr[objects[0]['id_body']]]
-                                :][:2])
+        _seq_spawn_xy = list(SEQ_SPAWN_XY)
 
         def _obj_qadr(i):
             return int(model.jnt_qposadr[model.body_jntadr[objects[i]['id_body']]])
@@ -1246,6 +1421,23 @@ if __name__ == "__main__":
             model.qpos0[_qa:_qa + 2] = xy
             model.qpos0[_qa + 3:_qa + 7] = _seq_spawn_quat[i]
             mj.mj_forward(model, data)
+            # DIAGNOSTIC (see the [rest-hh] print at init). _trial_rest_hh was cached ONCE at
+            # startup from each object's pose at its AUTHORED xy; this teleports it to the
+            # shared SEQ_SPAWN_XY and re-seats it there. If the support height differs between
+            # those two locations, the cached half-height is stale for the whole run and every
+            # height_above_rest in the trial is offset by that difference. Printing the
+            # re-measured value next to the cached one says whether that is happening --
+            # cached and spawn should agree to <1mm, and h_at_spawn should be ~0, not ~0.86.
+            if args.trial_log and i in _trial_rest_hh:
+                _cz_s = float(data.geom_xpos[objects[i]['id_geom']][2])
+                _rhh_s = _cz_s - TABLE_TOP_Z
+                _cached = _trial_rest_hh[i]
+                print(f"[rest-hh@spawn] {objects[i]['name']:<24} cz={_cz_s:.4f}  "
+                      f"rhh_here={_rhh_s:+.4f}  cached={_cached:.4f}  "
+                      f"delta={_rhh_s - _cached:+.4f}  "
+                      f"h_at_spawn={_cz_s - TABLE_TOP_Z - _cached:+.4f}  "
+                      f"(lifted@{LIFT_HEIGHT_M:.2f}? "
+                      f"{'STILL-BUG' if (_cz_s - TABLE_TOP_Z - _cached) > LIFT_HEIGHT_M else 'no'})")
 
         # Present the FIRST-IN-ORDER object at the shared spawn point; stow the rest.
         for _oi in _seq_order[1:]:
@@ -1371,6 +1563,13 @@ if __name__ == "__main__":
                 'gids': _bg, 'base_gid': base}
 
     _BOWL = _bowl_geometry() if args.trial_log else None
+    # Max object-to-base gap (m) still counted as "resting on the bin floor" in the guarded
+    # position fallback of _object_in_bowl. Chosen to separate the two cases the offline
+    # analysis found: a genuinely placed object touches the base (gap ~ 0), while the
+    # wall-wedged false-positive was 9.6mm clear. 3mm sits well below 9.6mm and well above
+    # solver contact penetration (<0.4mm) + settle jitter, so it admits real placements the
+    # flickering contact pair misses without re-admitting the wall-wedged case.
+    _BASE_REST_TOL = 0.003
 
     # Per-object COLLISION geom ids — ALL hulls of a multi-hull YCB mesh, not just <name>_geom.
     # A convex-decomposed object (e.g. 025_mug: 43 hulls) is grasped/placed on ANY of its
@@ -1380,7 +1579,13 @@ if __name__ == "__main__":
     # unconditionally (not gated on _BOWL) so the touching-target check can use it in every mode.
     _OBJ_COL_GIDS = {}
     _OBJ_COL_GID_SET = {}    # same, as a set for fast membership tests
-    if args.trial_log:
+    if True:   # UNGATED (was `if args.trial_log`) — the comment above already claimed this
+        # map was "built unconditionally", but the guard contradicted it. Consumers at
+        # _object_in_bowl (:1566/:1579), the RRT target-hull exemption (:2229) and
+        # _hand_object_contact_metrics all run WITHOUT --trial-log, and each silently fell
+        # back to the single named <name>_geom -- i.e. exactly the multi-hull bug this map
+        # exists to fix (025_mug: 43 hulls). Prerequisites both precede this point:
+        # _geom_contype0 (:814) and objects (:952).
         for _oi, _o in enumerate(objects):
             _bid = _o['id_body']
             # Use the COMPILED contype snapshot (_geom_contype0, taken before any stow),
@@ -1472,15 +1677,43 @@ if __name__ == "__main__":
             g1, g2 = c.geom1, c.geom2
             if (g1 in my_gids and g2 in support) or (g2 in my_gids and g1 in support):
                 return True
-        # NO contact with the bin base => NOT placed. There is deliberately no position-only
-        # fallback here. There used to be one ("if no contacts this step, accept anything in
-        # the footprint z-band"), and it was the false-'place' bug: a gelatin box wedged
-        # against the bin's WEST WALL, its underside 9.6mm clear of the bin floor and held
-        # perfectly static (0.07mm drift over 4.5s), never touched the base at all — but sat
-        # inside the z-band, so the fallback certified it as placed. Resting ON the bin is a
-        # CONTACT fact; inferring it from position is exactly what lets a wall-wedged or
-        # interpenetrating object score. An object leaning on a wall but genuinely resting on
-        # the floor still touches the base, so this stays correct for the leaning case.
+        # GUARDED position fallback (no live object<->base contact pair THIS step).
+        #
+        # A pure contact test misses genuine placements: MuJoCo does not always emit the
+        # object<->base pair every step for a settled object (contacts flicker/drop when the
+        # object rests through a stack, or the pair falls just outside the solver's contact
+        # set on a given step). Offline trace analysis of the ICRA ablation runs found trials
+        # where the object was in the footprint, below the rim, fully settled, released, and
+        # held so for the whole arrival dwell, yet _object_in_bowl returned False every step
+        # because the exact contact pair was never present — 3 real placements scored as
+        # 'abandoned'. So DON'T require the contact to persist; also accept a resting-on-floor
+        # position fact, guarded to exclude the wall-wedged false-positive this method was
+        # written to reject.
+        #
+        # The discriminator between the two cases is the object's LOWEST point vs the bin base
+        # top plane, NOT object-center z (which varies with shape/pose): a genuinely placed
+        # object's underside touches the floor (lowest world-z ~ base top), while the
+        # wall-wedged false-positive had its underside 9.6mm CLEAR of the floor. Compute each
+        # hull's true lowest world-z from its oriented AABB (model.geom_aabb center+half in the
+        # geom frame -> 8 world corners), which is EXACT and — unlike mj_geomDistance — immune
+        # to the box-box GJK phantom-0.0 (bowl_base and box objects are both boxes; a phantom
+        # gap would re-admit the hovering case this guard exists to reject).
+        base_top_z = float(_BOWL['z_lo']) + 2.0 * float(model.geom_size[_BOWL['base_gid']][2]) \
+            if _BOWL.get('base_gid', -1) >= 0 else float(_BOWL['z_lo'])
+        _lowest = np.inf
+        for g in my_gids:
+            ab = model.geom_aabb[g]                     # (6,): center(3) + half(3), geom frame
+            c0 = ab[:3]; hh = ab[3:]
+            R = data.geom_xmat[g].reshape(3, 3); p = data.geom_xpos[g]
+            # 8 AABB corners -> world; track the minimum z.
+            for sx in (-1.0, 1.0):
+                for sy in (-1.0, 1.0):
+                    for sz in (-1.0, 1.0):
+                        corner = c0 + np.array([sx, sy, sz]) * hh
+                        _lowest = min(_lowest, float(p[2] + (R @ corner)[2]))
+        if _lowest <= base_top_z + _BASE_REST_TOL:
+            return True
+        # Underside clearly above the floor (hovering / wall-wedged) => NOT placed.
         return False
 
     def _hand_object_contact_metrics(obj_idx):
@@ -1503,18 +1736,29 @@ if __name__ == "__main__":
         for ci in range(data.ncon):
             con = data.contact[ci]
             g1, g2 = con.geom1, con.geom2
-            if g1 in _HAND_GIDS and g2 in _OBJ_GID_TO_IDX:
+            # OBJECT SIDE: match ANY collision hull, not just the named <name>_geom.
+            # _OBJ_GID_TO_IDX is {id_geom: i} -- ONE geom per object -- so on a
+            # convex-decomposed mesh (025_mug: 43 hulls) every contact on a _col_N hull was
+            # invisible here and the reported force was silently wrong. This is the same
+            # single-hull bug the shared benchmark helper's docstring was written about;
+            # _OBJ_HULL_TO_IDX below is the full map.
+            if g1 in _HAND_GIDS and g2 in _OBJ_HULL_TO_IDX:
                 hand_gid, obj_gid, sgn = g1, g2, 1.0
-            elif g2 in _HAND_GIDS and g1 in _OBJ_GID_TO_IDX:
+            elif g2 in _HAND_GIDS and g1 in _OBJ_HULL_TO_IDX:
                 hand_gid, obj_gid, sgn = g2, g1, -1.0
             else:
                 continue
             mj.mj_contactForce(model, data, ci, ft)
-            fname = _FINGER_BY_GID.get(hand_gid)
+            # FINGER SIDE: attribute force to a finger ONLY via its FINGERTIP geom.
+            # _FINGER_BY_GID maps EVERY collision geom of the finger (proximal links
+            # included), so a knuckle brushing the object counted as fingertip normal
+            # force -- inflating the very numbers the squeeze diagnostic and the trial log
+            # report. The benchmark's _measured_tip_forces keys on tip geoms only.
+            fname = _FINGER_BY_TIP_GID.get(hand_gid)
             if fname is not None:
                 normals[fname]     += ft[0]   # normal component (>= 0, along frame row 0)
                 tangentials[fname] += float(np.hypot(ft[1], ft[2]))
-            if _OBJ_GID_TO_IDX[obj_gid] == obj_idx:
+            if _OBJ_HULL_TO_IDX[obj_gid] == obj_idx:
                 R_con = con.frame.reshape(3, 3)
                 f_W = sgn * (R_con.T @ ft[:3])
                 f_net   += f_W
@@ -1653,8 +1897,22 @@ if __name__ == "__main__":
         _rec_local = obj_grasp.get('rec_local')
         parts = []
         for k, f in enumerate(FINGER_SET):
-            cmd = (float(np.linalg.norm(f_c[3 * k:3 * k + 3]))
-                   if f_c is not None else float('nan'))
+            # COMMANDED force, split into its contact-frame NORMAL and TANGENTIAL parts
+            # rather than reported as one magnitude. The magnitude alone cannot separate the
+            # two ways a grasp loses normal force under a constant command: the allocation
+            # rotating normal->tangential (cmd_n falls, cmd_t rises, |f_c| unchanged) versus
+            # the pad backing off so the commanded force is simply not delivered (cmd_n
+            # steady, meas falls). Observed on 009_gelatin_box: measured thumb normal decayed
+            # 5.55 -> 2.19N while the squeeze command held at 5.7N, and these two components
+            # are what say which of those happened. f_c is contact-frame with col0 = inward
+            # normal (see internal_force_torques), so [0] is normal and [1:] tangential.
+            if f_c is not None:
+                _fk = f_c[3 * k:3 * k + 3]
+                cmd = float(np.linalg.norm(_fk))
+                cmd_n = float(_fk[0])
+                cmd_t = float(np.linalg.norm(_fk[1:]))
+            else:
+                cmd = cmd_n = cmd_t = float('nan')
             n_meas, t_meas = normals[f], tangentials[f]
             util = t_meas / (mu * n_meas) if n_meas > 1e-6 else float('inf')
             # Slip vs the pad-offset anchor (where the tip SITE sits when the pad surface is
@@ -1671,8 +1929,8 @@ if __name__ == "__main__":
                 inward_W  = d.site_xmat[sid_S].reshape(3, 3)[:, 0]
             anchor_W = contact_W - _PAD_OFFSET[f] * inward_W
             slip_mm = 1e3 * float(np.linalg.norm(d.site_xpos[id_C[k]] - anchor_W))
-            parts.append(f"{f}: cmd={cmd:.1f}N meas={n_meas:.1f}N "
-                         f"fric={util:.0%} slip={slip_mm:.1f}mm")
+            parts.append(f"{f}: cmd={cmd:.1f}N(n={cmd_n:.1f},t={cmd_t:.1f}) "
+                         f"meas={n_meas:.1f}N fric={util:.0%} slip={slip_mm:.1f}mm")
         print("\r\n[Squeeze] " + "  |  ".join(parts))
     _squeeze_diag.last = 0.0
 
@@ -1754,12 +2012,17 @@ if __name__ == "__main__":
 
     # Per-joint PD gains for REACH phase: 7 arm joints + 16 LEAP finger joints.
     # Arm gains sized for Gen3's forcerange (±105/±52 Nm); finger gains mirror the small
-    # values used for the planar model's tiny finger actuators. Finger gains bumped 1.5x
-    # (Kp 0.8->1.2, Kd 0.05->0.075) so the LEAP fingers close harder/faster toward the
-    # retargeted/grasp angles. This Kp is used by OUR contact-aware pipeline (the _CAT_MODE
-    # teleop drive + the GRASP/REACH GraspController); leave it as tuned.
-    Kp = np.concatenate([np.full(7, 40.0), np.full(16, 1.2)])
-    Kd = np.concatenate([np.full(7, 4.0),  np.full(16, 0.075)])
+    # values used for the planar model's tiny finger actuators. This Kp is used by OUR
+    # contact-aware pipeline (the _CAT_MODE teleop drive + the GRASP/REACH
+    # GraspController); the plain dexpilot/anyteleop baselines use KP_TELEOP_FINGER below.
+    # MATCHED TO THE BENCHMARK (benchmarks/ycb_grasp/pick_and_place.py builds
+    # Kp = [40]*7 + [finger_kp]*16 with finger_kp=0.8, Kd = [4]*7 + [0.05]*16).
+    # The finger gains were previously bumped 1.5x here (Kp 0.8->1.2, Kd 0.05->0.075)
+    # to close harder/faster toward the retargeted angles; that 1.5x is exactly the
+    # kind of per-harness drift that made a gain tuned in the benchmark mean something
+    # different under teleop. The arm gains (40/4) already matched.
+    Kp = np.concatenate([np.full(7, 40.0), np.full(16, 0.8)])
+    Kd = np.concatenate([np.full(7, 4.0),  np.full(16, 0.05)])
 
     # BASELINE finger position gain (plain dexpilot / anyteleop teleop drive ONLY — the
     # args.mode == 'dexpilot' block). Kept SEPARATE from the contact-aware Kp above so the
@@ -1788,15 +2051,27 @@ if __name__ == "__main__":
     # by construction and gamma covers the true worst case at 1.0x margin. The angular
     # budget is a small cushion for parasitic wrist rotation near singularities (the
     # jog commands zero angular velocity).
-    # 5 m/s^2 (~0.5g): a task-realistic budget for QUASI-STATIC teleop pick-and-place. The
-    # previous 20 m/s^2 (~2g) was aggressive for a TWO-FINGER antipodal grasp — a clean pinch
-    # still certifies there, but it shrank the feasibility margin so much that the recommender's
-    # marginal grasps (and any off-antipodal contact) flipped to wrench-INFEASIBLE and were
-    # hidden by the WF gate. It also doubled as the carry-jog accel slew limit, so lowering it
-    # both makes certification match reality and gently caps carry acceleration. The standalone
-    # ablation defaults are (0.25,0.25,0.25); this sits sensibly between that and the old 20.
-    NCF_ACCEL_BUDGET_XYZ = (5.0, 5.0, 5.0)   # m/s^2   object-frame linear-accel budget
-    NCF_ANG_ACCEL_BUDGET = (1.0, 1.0, 1.0)   # rad/s^2 principal-frame angular-accel budget
+    # 20 m/s^2 (~2g): MATCHED TO THE BENCHMARK (benchmarks/ycb_grasp/pick_and_place.py's
+    # JOG_ACCEL_BUDGET_MPS2 / NCF_ACCEL_BUDGET_XYZ), so the gamma certificate the recommender
+    # solves and the gamma the controller commands describe the SAME task in both harnesses.
+    # gamma scales with this budget, so a teleop run at 5 and a benchmark run at 20 produce
+    # non-comparable gamma on identical contacts -- measured on 017_orange: benchmark
+    # gamma=1.80 vs teleop gamma_raw=0.62 on the same object via the same LP.
+    #
+    # This constant has TWO consumers and they are deliberately the same number: the gamma
+    # LP's disturbance box, and the GRASP-phase jog's per-step acceleration slew limit
+    # (_dv_max below). That identity is what makes the no-slip guarantee true -- the squeeze
+    # is sized for a box the executed motion provably stays inside. Splitting them would
+    # certify for one task and execute another.
+    #
+    # WAS 5 m/s^2 (~0.5g), argued as task-realistic for QUASI-STATIC teleop: at 20 the
+    # recommender's MARGINAL grasps (and any off-antipodal contact) flip to
+    # wrench-INFEASIBLE and are hidden by the WF gate, which is the cost of this change --
+    # fewer candidates offered, but the ones offered are certified for the carry that
+    # actually happens. Note the carry-jog is now also 4x more responsive to the operator.
+    # The standalone ablation defaults are (0.25,0.25,0.25).
+    NCF_ACCEL_BUDGET_XYZ = (20.0, 20.0, 20.0)  # m/s^2   object-frame linear-accel budget
+    NCF_ANG_ACCEL_BUDGET = (1.0, 1.0, 1.0)     # rad/s^2 principal-frame angular-accel budget
 
     # Task definition for the gamma LP (see RAISED_CONTACT_WRENCH_FINDINGS.md sec 5):
     #   True  -> DATUM / Task-B: the linear disturbance is referenced at the GRASP
@@ -1818,7 +2093,25 @@ if __name__ == "__main__":
     # the wrench-cone viz stays at the raw 1.0x gamma so the drawn cage remains the true
     # feasible boundary the LP computed (the trace then sits well inside it).
     # GAMMA_SAFETY_FACTOR = 50.0
-    GAMMA_SAFETY_FACTOR = 5.0
+    # 1.0 -- MATCHED TO THE BENCHMARK, which commands its solved gamma directly. With the
+    # accel budget now also matched (20 m/s^2 above), teleop and the benchmark command the
+    # same squeeze on the same contacts; at 5.0 teleop squeezed 5x harder than the harness
+    # every gain here was tuned in. The margin this multiplier was providing is now carried
+    # by the budget itself: 20 m/s^2 is ~2g of disturbance headroom on a quasi-static carry.
+    GAMMA_SAFETY_FACTOR = 1.0
+    # Stability-ceiling reference, ported from benchmarks/ycb_grasp/pick_from_floor.py:476.
+    # 60 N is the largest internal force validated against the INTEGRATOR (not against the
+    # grasp) in that scene, measured at a contact time constant of 0.02 s. The ceiling is a
+    # property of the contact model and timestep -- NOT of object mass; see the benchmark's
+    # docstring for why the mass term was dropped as spurious. Applied at the gamma solve.
+    GAMMA_STABILITY_REF_N   = 60.0
+    GAMMA_STABILITY_REF_TAU = 0.02
+    # Benchmark-parity safeguards, DEFAULT OFF (see the call sites). Each restores a check
+    # the benchmark performs as a hard abort but teleop has only as a warning. They are
+    # env-gated rather than flipped outright because the benchmark can simply `return`,
+    # whereas teleop has a human mid-grasp with the phase already committed -- so a new hard
+    # stop strands the operator rather than failing cleanly. Enable per-run to A/B them.
+    GAMMA_ABORT_INFEASIBLE = os.environ.get('GAMMA_ABORT_INFEASIBLE', '0') == '1'
     #
     # ---- SCALING THIS AFTER THE GAMMA NORMALISATION FIX (read before retuning) ----
     #
@@ -1867,16 +2160,27 @@ if __name__ == "__main__":
     # harder, the position spring (anchored at the fixed pre-squeeze q_grasp_hold)
     # pulls back proportionally, so measured contact force saturates well below
     # GAMMA/sqrt(2) instead of scaling with it.
-    # SQUEEZE_PD_SCALE = 50.0
-    # 2.0 was too SOFT to hold a sustained lift: the fingers deliver normal force fine
-    # (~22N/contact) but are too compliant to resist the TANGENTIAL shear as the object hangs
-    # under gravity, so the box slips out over ~2s (a momentary lift, no hold). A grasp-lift
-    # integration test (test_grasp_lift.py, live accel=20 budget, 3s hold) found 2.0/3.0
-    # slip (sag +7-15mm, box drops) while 5.0 holds (sag ~0, box lifts +73-79mm and stays)
-    # robustly across gamma x3-x10 — the fix is finger STIFFNESS, not squeeze force (29N/
-    # contact already far exceeds the 0.25kg box's weight). 5.0 is stiff enough to hold the
-    # shear while still soft enough to let the internal force deliver the normal squeeze.
-    SQUEEZE_PD_SCALE = 10.0
+    # 0.25 -- MATCHED TO THE BENCHMARK (pick_and_place.py's squeeze_pd_scale default).
+    #
+    # This is the CLOSING-phase scale only. It is deliberately BELOW 1.0 because closing and
+    # holding want opposite gains (see GraspController.effective_gains): while the pads are
+    # still closing a gap, a stiff finger PD anchored at the pre-squeeze posture suppresses
+    # the very motion internal_force_torques is producing -- measured there, sweeping kp
+    # 0.8 -> 20 monotonically REDUCED grip force 6.03 -> 1.28 N. transport_pd_scale (1.0)
+    # then takes over at ramp completion, so the handoff STIFFENS 0.25 -> 1.0 for the carry,
+    # which is what holds the tangential shear once the object's weight is on the fingertips.
+    #
+    # WAS 10.0, which INVERTED that handoff: 10.0 -> 1.0 is a 10x SOFTENING at exactly the
+    # moment load arrives. Measured on 017_orange under this file's own [gains] logging:
+    # finger kp 7.412 -> 0.7412 at the handoff, measured contact force then decayed
+    # 2.7 -> 2.2 -> 0.0 N against a CONSTANT 3.1 N command, slip grew 8mm -> 63mm, and the
+    # object was lost. The benchmark lifted the same object (+119mm, both contacts held).
+    #
+    # The older note defending 10.0 argued from test_grasp_lift.py that 2.0/3.0 slipped
+    # while 5.0 held, concluding "the fix is finger STIFFNESS" -- that reading is retained
+    # here because it is correct about the HOLD, and wrong only about which knob owns it:
+    # stiffness during the carry is transport_pd_scale's job, and it is already 1.0.
+    SQUEEZE_PD_SCALE = 0.25
 
     # Ramp the squeeze force 0->GAMMA over this many seconds of sim time after each
     # squeeze-on. The internal force pair only cancels once BOTH contacts exist; at
@@ -1884,7 +2188,63 @@ if __name__ == "__main__":
     # REACH), and full force while a finger is still closing that gap arrives as an
     # unbalanced shove that knocks the object across the table (measured: 35N commanded
     # -> box launched 400mm; with the ramp the contacts form at ~N-level forces first).
-    SQUEEZE_RAMP_S = 0.1
+    # 0.1 -> 0.5, matching pick_from_floor.py's SQUEEZE_RAMP_S and the value
+    # grasp_controller.internal_force_torques' own docstring asks callers for ("ramp it
+    # 0->1 over ~0.5s"). 0.1s is 50 steps at dt=2ms, i.e. ~400 N/s on the heaviest object,
+    # and it reproduced the very failure the docstring warns about: on obj_036_wood_block
+    # (0.729kg, the largest gamma in the scene at 39.88N = ~28.2 N/contact) the squeeze
+    # loaded ONE finger to a measured 698.6N against a commanded 0.8N while the thumb read
+    # 0.0N -- an unbalanced shove into a pad that had not closed its gap yet -- and MuJoCo
+    # then hit NaN/Inf in QACC at a finger DOF. The instability guard reset the sim, which
+    # abandoned the trial and advanced the spawner, so from the operator's seat accepting
+    # the grasp instantly ended the trial. The lighter objects (0.047-0.118kg, gamma ~5N)
+    # survived the same 0.1s ramp, which is why this only ever showed up on the block.
+    SQUEEZE_RAMP_S = 0.5
+
+    # ---- Pre-squeeze grasp-quality gate -------------------------------------------------
+    # Thresholds for the committed-pose check printed at [grasp-quality]. The benchmark
+    # ABORTS a solve whose pad gap exceeds CONTACT_GAP_TOL_M (8mm, pick_from_floor.py); this
+    # path had no equivalent, so a visibly broken commit (measured on 017_orange:
+    # pad_align 62deg/54deg with a 12.4mm gap) proceeded straight to a squeeze.
+    #
+    # The gap bound is NOT the benchmark's 8mm. That number is sized for ITS r_tip; here the
+    # IK deliberately parks the tip SITE _PAD_OFFSET behind the contact (10.0mm on this
+    # hand, = the MAX tip-mesh vertex projection, chosen so no pad vertex penetrates at the
+    # solution -- see _pad_surface_offset and the pick_from_floor comment). A gap near 10mm
+    # is therefore the DESIGNED standoff that the squeeze then closes, not a defect, and an
+    # 8mm bound would reject nominal grasps. The bound is set relative to that offset.
+    # The LOWER bound catches the opposite failure: a pad already penetrating at commit has
+    # no gap left to close and the squeeze arrives as an impact (obj_036_wood_block,
+    # gap=0.0mm, measured 2.1N at cmd=0.2N, then NaN in QACC).
+    GRASP_GATE_GAP_MARGIN_M = 0.005   # allowed ABOVE _PAD_OFFSET (so ~15mm at a 10mm offset)
+    GRASP_GATE_GAP_MIN_M    = -0.001  # allowed penetration before it counts as a bad commit
+    GRASP_GATE_ALIGN_DEG    = 40.0    # pad-vs-inward-normal angle (diagnostic "good" is <15)
+    # TIP-PLACEMENT bound: how far a fingertip may end from the contact the grasp was
+    # PLANNED against (the RRT-END tip error already printed on the [IK] line above the
+    # quality line). This is the check that catches the failure the other two cannot.
+    #
+    # Measured on 017_orange: committed at pad_align 33deg/22deg with gaps 5.4mm/-0.0mm --
+    # inside every bound above, and the gate passed it -- yet the wrist video shows the hand
+    # sitting ON TOP of the fruit with the fingers splayed outward, nothing on the far side.
+    # The squeeze had nothing to close on: 39.3N appeared on the FIRST GRASP frame at zero
+    # commanded force and the orange left at 5.6 m/s. Gap and angle cannot see this, because
+    # mj_geomDistance reports the CLOSEST tip-to-surface separation (small for a hand resting
+    # on a sphere) and the pad normals happen to point at the surface from above. The tip
+    # ERROR did see it: 21.3mm, i.e. the finger finished 21mm from where the plan wanted it.
+    # The wood block's commit shows the same signature (19.3/16.0mm).
+    #
+    # NOT reusing REC_REACH_TOL_MM (also 15mm): that is the lock-in IK RESIDUAL tolerance,
+    # a different quantity measured at a different moment. Sharing a constant would mean a
+    # later tuning of one silently retunes the other.
+    GRASP_GATE_TIP_ERR_MM   = 15.0    # RRT-end site->planned-contact distance, per finger
+    # WARN-ONLY by default: print the verdict, change nothing. GRASP_GATE=block additionally
+    # cancels the pending auto-squeeze so the operator must press Enter deliberately rather
+    # than the grasp squeezing itself 0.1s later. It deliberately does NOT unwind the
+    # REACH->GRASP transition -- by the time these metrics are computable the phase switch,
+    # grasp_ctrl and q_grasp_hold are already committed (see the call site), and tearing
+    # that down mid-handler is exactly the kind of state surgery that has broken this file
+    # before. Blocking the SQUEEZE is the safe, sufficient intervention.
+    GRASP_GATE = os.environ.get('GRASP_GATE', 'warn')   # 'warn' | 'block' | 'off'
 
     # contact_aware_teleop: after Enter (REACH->GRASP), hold the wrist STILL for this long
     # (sim time) before arming wrist tracking, so the fingers seat under the ramping squeeze
@@ -1892,7 +2252,14 @@ if __name__ == "__main__":
     # the hand the instant the squeeze begins moves the palm while the pads are still closing
     # the ~mm pad gap, so the object gets dragged before it is firmly held. The squeeze ramp
     # (SQUEEZE_RAMP_S) still runs during this window; this just defers the wrist motion.
-    GRASP_SETTLE_S = 0.2
+    # MUST exceed SQUEEZE_RAMP_S (0.5): this gates when wrist tracking arms, and at 0.2 the
+    # carry began while the squeeze was only 40% ramped -- the arm started moving the object
+    # before the grip that was supposed to hold it existed. The benchmark's equivalent is
+    # stronger still: it ramps for 0.5s then dwells a further 1.5s at full scale, arm
+    # stationary, before any jog (pick_and_place.py:924, `for i in range(n_ramp * 4)`).
+    # 0.6 is the minimum that restores the ordering; raise it toward 2.0 to match the
+    # benchmark's full dwell if the carry still starts under-seated.
+    GRASP_SETTLE_S = float(os.environ.get('GRASP_SETTLE_S', '0.6'))
 
     # contact_aware_teleop: after the single Enter enters GRASP posture (squeeze OFF, pads
     # closing the ~mm gap), wait this long (sim time) before AUTO-applying the squeeze —
@@ -2030,6 +2397,29 @@ if __name__ == "__main__":
                       else None) or [obj_target['id_geom']]
         pair_clearance = {(g, _h): 0.0
                           for g in _ACTIVE_SKIP_GIDS for _h in _tgt_hulls}
+        # SUPPORT-SURFACE EXEMPTION for the NON-ACTIVE fingers. Grasping an object that
+        # RESTS on a surface necessarily brings the whole hand down to ~surface level, so
+        # the idle fingers skim the table along the entire approach, not just at the goal.
+        # Endpoint grace only relaxes a pair AT the two endpoints, so an interior RRT step
+        # (arm a hair different, idle finger dipping a hair lower) violated the un-graced
+        # 5mm table clearance and was rejected -- freezing the goal tree at 1 node and
+        # burning all 30000 iters. Measured in logs/: the 4 of 12 plan() rows with
+        # goal_tree==1 all carry nonactive_surface entries showing leap_rf_md/ds at 0.0mm
+        # from 'table'. _SUPPORT_SURFACE_GIDS was computed for exactly this and never
+        # applied -- this is that application.
+        #
+        # 0.0mm, NOT a free pass: the exact distance is still checked, so an idle finger
+        # may TOUCH the table but can never sweep through it. Active fingers are already
+        # covered vs the target object above; this covers every OTHER hand geom vs the
+        # support surface(s), which is the pair class that actually froze the tree.
+        _active_gid_set = set(_ACTIVE_SKIP_GIDS)
+        _nonactive_gids = [
+            _g for _g in (mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, _n)
+                          for _n in _robot_geom_names)
+            if _g >= 0 and _g not in _active_gid_set]
+        pair_clearance.update({(_g, _s): 0.0
+                               for _g in _nonactive_gids
+                               for _s in _SUPPORT_SURFACE_GIDS})
         # Re-branch the goal's continuous (base/wrist) joints onto the turn nearest the
         # current pose, so the arm never unwinds a near-full revolution just because the IK
         # left a joint on a far 2pi branch. Same configuration, planner-friendly numbering.
@@ -2076,10 +2466,52 @@ if __name__ == "__main__":
         if _adm is not None and not _adm.get('goal_free', True):
             print(f"\r\n[RRT] GOAL in collision before planning — "
                   f"{_adm.get('goal_block')} (RRT will fail; check clearance/hulls)")
+        # The line's collision check is meaningful ONLY because admissibility() above has
+        # just installed pair_clearance, rebuilt the clearance matrix and applied the
+        # endpoint grace -- so _edge_free below sees exactly the relaxed-at-the-endpoints
+        # geometry plan() would use. Without that priming it would report the grasp goal as
+        # blocked every time, since the active fingertips touch the target by construction.
         _t0 = time.time()
-        path = planner.plan(q_start, q_goal, pair_clearance=pair_clearance)
+        n_interp = 100
+
+        def _line():
+            return [q_start + t * (q_goal - q_start)
+                    for t in np.linspace(0, 1, n_interp)]
+
+        # LINE FIRST, then plan(). The straight joint-space line is instant and, for the
+        # short home->grasp reach, usually clear -- so it stays the fast path. What changed
+        # is that its collision verdict now GATES it instead of only being logged: the
+        # 85/85 `line_clear: False` rows in logs/ were straight lines executed through
+        # geometry the checker had already flagged.
+        #
+        # plan() is called only when the line is blocked. Its historical 24s came from two
+        # causes, both addressed: 97.8% of plan time was collision-check cost (measured
+        # on/off via RRT_NO_COLLISION), and the hard failures were the idle-finger-on-table
+        # freeze that the support-surface exemption above now clears.
+        _lin_ok = None
+        try:
+            _lin_ok = planner._edge_free(q_start, q_goal)
+        except Exception:
+            traceback.print_exc()
+        if _lin_ok:
+            path, route = _line(), 'linear'
+        else:
+            try:
+                path = planner.plan(q_start, q_goal, pair_clearance=pair_clearance)
+            except Exception:
+                traceback.print_exc()
+                path = None
+            if path is not None:
+                route = 'rrt'
+            else:
+                # Both failed. Fall back to the unchecked line rather than stranding the
+                # lock-in with no path at all -- same behaviour as before this restore, but
+                # now it is RECORDED as 'linear_unchecked' instead of masquerading as a
+                # clean 'linear', so these show up in the logs as the cases to investigate.
+                path, route = _line(), 'linear_unchecked'
+                print("\r\n[RRT] line blocked AND plan() failed — executing UNCHECKED line")
         plan_time = time.time() - _t0
-        fallback = path is None
+        fallback = (route == 'linear_unchecked')
         # Durable record: RRT outcome + endpoint admissibility, so 'why did RRT fail' is
         # answerable from the log alone (co-located with the grasp solves).
         try:
@@ -2089,37 +2521,56 @@ if __name__ == "__main__":
                 'object':      obj_target['name'],
                 'plan_ms':     round(plan_time * 1e3, 1),
                 'fallback':    bool(fallback),
+                # Which route produced the path: 'linear' (straight line, collision-checked
+                # clear), 'rrt' (line was blocked, planner solved it), or
+                # 'linear_unchecked' (line blocked AND planner failed -- the old unsafe
+                # fallback). Without this the plan_ms history is uninterpretable, since a
+                # fast plan now means "the line was clear", not "RRT was quick".
+                'route':       route,
+                # Verdict of the collision check that no longer gates the path: True =
+                # clear, False = blocked (executed anyway), None = the check itself threw.
+                # This is the signal that will localise the clearance bug — a run where
+                # every lock-in reports False points at the stale-clearance or tripod-
+                # exemption suspects rather than at genuinely obstructed reaches.
+                'line_clear':  _lin_ok,
                 'n_waypoints': len(path) if path is not None else 0,
                 'n_target_hulls': len(_tgt_hulls),
                 'admissibility': _adm,
-                # Speed-vs-connectivity diagnostics from the planner (set by plan()).
-                'iters':        getattr(planner, 'last_iters', None),
-                'start_tree':   getattr(planner, 'last_start_tree', None),
-                'goal_tree':    getattr(planner, 'last_goal_tree', None),
-                'checks':       getattr(planner, '_isfree_n', None),
-                'checks_ms':    round(getattr(planner, '_isfree_ms', 0.0), 1),
-                'first_step_block': getattr(planner, 'first_step_block', None),
+                # Speed-vs-connectivity diagnostics — set by plan(), so they are meaningful
+                # ONLY on the 'rrt' route. On a 'linear' route plan() never ran this
+                # lock-in and these attributes still hold the PREVIOUS plan()'s values;
+                # logging them there produced rows whose iters/goal_tree/checks_ms
+                # described a different reach entirely. Emit them as None off the rrt path.
+                **({'iters':      getattr(planner, 'last_iters', None),
+                    'start_tree': getattr(planner, 'last_start_tree', None),
+                    'goal_tree':  getattr(planner, 'last_goal_tree', None),
+                    'checks':     getattr(planner, '_isfree_n', None),
+                    'checks_ms':  round(getattr(planner, '_isfree_ms', 0.0), 1),
+                    'first_step_block': getattr(planner, 'first_step_block', None),
+                    'raw_wp':      getattr(planner, 'last_raw_wp', None),
+                    'shortcut_wp': getattr(planner, 'last_shortcut_wp', None),
+                    'conv_ratio':  getattr(planner, 'last_conv_ratio', None)}
+                   if route == 'rrt' else
+                   {'iters': None, 'start_tree': None, 'goal_tree': None,
+                    'checks': None, 'checks_ms': None, 'first_step_block': None,
+                    'raw_wp': None, 'shortcut_wp': None, 'conv_ratio': None}),
                 'nonactive_surface': _nonactive_surface,
-                # Path-quality diagnostics: raw -> shortcut -> densified waypoint counts and
-                # the shortcut path's convolution ratio (~1.0 = straight, >1 = detours left).
-                'raw_wp':       getattr(planner, 'last_raw_wp', None),
-                'shortcut_wp':  getattr(planner, 'last_shortcut_wp', None),
-                'conv_ratio':   getattr(planner, 'last_conv_ratio', None),
             })
         except Exception:
             traceback.print_exc()
-        if fallback:
-            # Linear-interpolation fallback: 100 intermediate configs so the PD
-            # controller tracks a smooth sequence rather than jumping to the goal,
-            # which would produce explosive torques and numerical instability.
-            n_interp = 100
-            ts = np.linspace(0, 1, n_interp)
-            path = [q_start + t * (q_goal - q_start) for t in ts]
-            print(f"\r\n[RRT] Planning failed — linear fallback ({n_interp} steps)")
+        # One route now, so one message. The check's verdict rides along as a warning: a
+        # BLOCKED line still executes, and the operator should know the reach is expected
+        # to graze something.
+        if _lin_ok is False:
+            print(f"\r\n[plan] linear ({len(path)} steps) in {plan_time*1e3:.0f}ms "
+                  f"— WARNING: collision check says this line is blocked "
+                  f"(executing anyway; see 'line_clear' in the log)")
             for i, o in enumerate(objects):
                 print(f"         obj{i+1} pos: {data.xpos[o['id_body']]}")
         else:
-            print(f"\r\n[RRT] {len(path)} waypoints")
+            _verdict = 'clear' if _lin_ok else 'check unavailable'
+            print(f"\r\n[plan] linear ({len(path)} steps, {_verdict}) "
+                  f"in {plan_time*1e3:.0f}ms")
         if dash is not None:
             dash.push({'type': 'rrt', 'object': obj_target['name'], 'n_wp': len(path),
                        'plan_time': plan_time, 'fallback': fallback})
@@ -2131,7 +2582,8 @@ if __name__ == "__main__":
             _trial_events.log_solve(_trial_state.trial_id, 'rrt',
                                     plan_time * 1e3, t_wall=time.time(),
                                     object=obj_target['name'],
-                                    n_waypoints=len(path), fallback=fallback)
+                                    n_waypoints=len(path), fallback=fallback,
+                                    route=route, line_clear=_lin_ok)
         _plan_result['waypoints'] = path
         _update_ghost_markers(path)
 
@@ -3279,22 +3731,56 @@ if __name__ == "__main__":
     # by noise. Ranking first and solving once is ~5x less work per recommendation,
     # which is what makes the 2s cadence comfortable rather than tight.
     #
-    # BEST-OF-5 KEPT FOR NOW. Dropping to 1 is ~5x less work per recommendation and
-    # the ranked pool makes the single winner a considered choice rather than an
-    # arbitrary one -- but it removes the cost-ranked fallback, and the per-seed
-    # IK-convergence argument for 5 still stands (~99% vs ~94% chance that at least
-    # one seed converges). It also matters more at counter height than on the
-    # benchmark table: a good tripod seed is RARER up there (measured 2/6 sampled
-    # seeds at 0.86m vs 4/6 at 0.625m), so a single draw returns a collapsed third
-    # contact more often. Revisit once live trials show the ranking holds.
-    _REC_NC         = 5
+    # BEST-OF-4. Settled at 4 after going 5 -> 2 -> 4; both moves were measured, and the
+    # two measurements pull in opposite directions, so record both.
+    #
+    # WHY IT CAME DOWN FROM 5: the LIVE recommender's cost is dominated by the seed count,
+    # because seeds are independent NLPs run SEQUENTIALLY. Measured in one
+    # --sequential-spawn run with GRASP_PROFILE=1, same object and scene:
+    #
+    #   009_gelatin_box  n_seeds=2  ->  4.2s     (seeds 1.8s + 1.4s)
+    #   009_gelatin_box  n_seeds=4  ->  7.5s
+    #   009_gelatin_box  n_seeds=5  -> 16.3s     (one seed burned 5.2s hitting max_iter=800
+    #                                             for a best-effort that LOST to a 1.0s one)
+    #   025_mug          n_seeds=5  -> 19.0s     (~25ms/iter vs the box's ~7 -- 43 collision
+    #                                             hulls make every SDF eval dearer; all 5
+    #                                             seeds converged, so this is pure seed count)
+    #
+    # A 19s recommendation is unusable at a 2s cadence: the operator presses 8, waits, sees
+    # no markers and gives up. Worse, a solve that long starves whatever object comes next,
+    # which is what two rounds of scheduling fixes were chasing before this was measured.
+    # Nothing is degrading over a run -- more seeds are simply being attempted.
+    #
+    # WHAT 2 GIVES UP: the per-seed IK-convergence odds drop (~94% vs ~99% that at least
+    # one seed converges). The note above also warns that a good TRIPOD seed is rarer at
+    # counter height (2/6 sampled seeds at 0.86m vs 4/6 at 0.625m) -- but that argument does
+    # NOT apply to this scene as configured, and it was briefly used here to justify raising
+    # n_seeds back to 4. It should not have been: SLOT_ROLES is resolved ONCE at startup
+    # with no object id, so the run is a 2-CONTACT PINCH throughout ("[fingers]
+    # slots=['thumb','index'] n_contacts=2"), whatever models/grasp_finger_config.json's
+    # per_object map says. There is no third contact to collapse.
+    #
+    # The failure that raise was aimed at -- 036_wood_block committing an INDEX PAD 60deg
+    # off pad-on at 0.0mm gap, then diverging MuJoCo (NaN in QACC at an index DOF) on the
+    # FIRST squeeze sample at cmd=0.2N -- is therefore NOT a seed-count symptom, and more
+    # seeds is not its fix. It broke at 0.2N with 2.1N already measured from pre-existing
+    # penetration, so it is a committed-GEOMETRY problem: neither gamma magnitude nor ramp
+    # duration nor seed count touches it. The lever is to gate the squeeze on the pad_align
+    # number that is already computed and printed at [grasp-quality], so an oblique pad is
+    # rejected and re-solved instead of crashing the sim.
+    #
+    # The live loop re-solves every 2s and display hysteresis keeps the best candidate, so a
+    # bad draw is corrected on the next tick rather than being final -- that is what makes 2
+    # tolerable despite the lower per-solve odds.
+    _REC_NC         = 2
     # OVER-GENERATION MULTIPLIER, not an absolute count: seed_dls_rank_pool
     # generates n_seeds * this many candidates and keeps the best n_seeds by patch
-    # extent (DLS filter + 3-site tiebreak). At _REC_NC=5 a multiplier of 5 would
-    # generate 25 candidates and rank them for 5 solves, which spends more on
-    # ranking than the solves save. 2 -> 10 candidates for 5 slots: the screen
-    # still discards the worst half, at a cost of ~10 DLS solves (milliseconds
-    # each) against five multi-second NLPs.
+    # extent (DLS filter + 3-site tiebreak). A large multiplier costs more in ranking
+    # than the solves save: at _REC_NC=5 a multiplier of 5 would generate 25 candidates
+    # to fill 5 slots. 2 keeps it proportionate at any n_seeds -- at the current
+    # _REC_NC=2 that is 4 candidates for 2 slots, so the screen still discards the
+    # worst half, at a cost of ~4 DLS solves (milliseconds each) against two
+    # multi-second NLPs.
     _REC_RANK_POOL  = 2
     REC_REACH_TOL_MM = 15.0   # lock-in IK residual above which a rec is flagged unreachable
     # GRASP_PROFILE=1: print a per-solve breakdown from the recommender thread — solve /
@@ -3364,10 +3850,19 @@ if __name__ == "__main__":
     _cat_planners     = {}      # obj_idx -> MultiStartGraspPlanner3D (lazy)
     _cat_planner_lock = threading.Lock()
     _rec_thread       = None    # background recommender thread
+    _rec_thread_obj   = [-1]    # obj_idx the in-flight solve belongs to (-1 = none)
     _rec_result       = {}      # {'candidate': {...}, 'obj_idx': int} written by the thread
     _rec_result_lock  = threading.Lock()
     _rec_last_solve   = 0.0     # wall-clock of the last solve start
     _rec_obj_idx      = -1      # object the latest recommendation is for
+    # Why the fire gate is open/shut, as a preformatted string, refreshed by
+    # _recommender_tick each frame and printed (change-gated) by _push_rec_status. The gate
+    # is a 4-way AND of values that live only in locals — supported / idle / previewing /
+    # cadence — so when it stays shut there was NOTHING anywhere saying which conjunct did
+    # it: a silent recommender looked exactly like an absent one (measured: obj_025_mug,
+    # 454 trace rows, prox_idx pinned correctly at 2, zero grasp_rec rows of ANY status).
+    # A list so the tick can rebind it without a `global` declaration.
+    _rec_gate_detail  = ['']
     # Anti-jitter for the continuously-firing recommender: warm-start each solve from the
     # last ACCEPTED contacts (so a static object returns to the same basin), and apply
     # display hysteresis (only replace the shown candidate on a moved object, a new object,
@@ -3563,7 +4058,7 @@ if __name__ == "__main__":
                 # alignment:reachability ratio (~14:1) starved the IK term; w_ik=5.0 lifts
                 # seed convergence 56%->94%, NLP 9/10->10/10 keyframes, holds wrench-feasible,
                 # and ~halves solve time. (The builder's GraspConfig3D default is still 0.70.)
-                w_ik=5.0,
+                w_ik=2.0,
                 # MESH CONTACTS: parameterize each contact by 2 tangential coords on a
                 # local quadratic (paraboloid) patch, exactly as the tabletop benchmark
                 # does. Two reasons, and the second is not optional:
@@ -3600,8 +4095,55 @@ if __name__ == "__main__":
         q_robot_fire: the operator's LIVE robot qpos at fire time (distinct from q_snap,
         the fixed Q_BIAS q_ref the solver uses), recorded so the accept-time validity check
         can compare the pose the grasp was computed at against the pose at lock-in."""
+        def _rec_log_fail(status, solve_ms=0.0, t_fire=None, detail=None):
+            """Log a grasp_rec row for a solve that produced NO candidate.
+
+            Every early exit below used to `return` silently: a raised solve, a lazy
+            planner build that threw, or a solve that came back with p1/p2 None. The only
+            record was traceback.print_exc() to a console start_teleop.sh does not capture,
+            so from the operator's seat a failing recommender and an idle one were
+            indistinguishable — measured: obj_025_mug ran 15.9s with ZERO grasp_rec rows
+            while the tick re-fired every 2s. A row with no rec_p1/rec_p2 and a status
+            saying WHY is what makes that visible in the same timeline as everything else.
+            """
+            if _trial_events is None:
+                return
+            try:
+                _tid = (_trial_state.trial_id
+                        if (_trial_state is not None and _trial_state.outcome is None
+                            and _trial_state.object_name == objects[obj_idx]['name'])
+                        else 0)
+                _trial_events.log_solve(_tid, 'grasp_rec', float(solve_ms),
+                                        t_wall=t_fire, object=objects[obj_idx]['name'],
+                                        status=status, wrench_feasible=False,
+                                        detail=detail)
+            except Exception:
+                traceback.print_exc()
+
         def _run():
-            planner = _get_cat_planner(obj_idx)
+            # STAGE TRACE. A thread that starts, never logs, never raises and never
+            # finishes is either blocked or still working, and nothing distinguished those
+            # from "never ran": measured on obj_025_mug, the tick fired (status: solving)
+            # and then 10.9s of total silence — no grasp_rec row of any status, no
+            # traceback. The try/except below only catches a THROW; a slow or BLOCKED build
+            # raises nothing. These three prints bracket the two stages so the console says
+            # which one is holding. Cheap: ~3 lines per solve, and solves are 2s apart.
+            _stage_t0 = time.time()
+            print(f"[rec] thread: obj={obj_idx} ({objects[obj_idx]['name']}) "
+                  f"building planner ...")
+            # Lazy planner build (first solve for this object) happens HERE, on the
+            # background thread, INSIDE _cat_planner_lock — a throw used to kill the thread
+            # silently, and a long build (43-hull mesh, contending with render+physics)
+            # looks identical to a hang from outside.
+            try:
+                planner = _get_cat_planner(obj_idx)
+            except Exception as _e:
+                traceback.print_exc()
+                _rec_log_fail('planner_build_raised',
+                              detail=f"{type(_e).__name__}: {_e}")
+                return
+            print(f"[rec] thread: obj={obj_idx} planner ready in "
+                  f"{time.time() - _stage_t0:.2f}s; solving ...")
             # The planner's own data must reflect the live object pose for its
             # collision/surface geometry; sync qpos before solving.
             planner._planner.data.qpos[:] = data.qpos[:]
@@ -3636,11 +4178,25 @@ if __name__ == "__main__":
             _t0 = time.time()
             try:
                 res = planner.solve(q_snap, obj_pos, max_seeds=_REC_NC)
-            except Exception:
+            except Exception as _e:
                 traceback.print_exc()
+                _rec_log_fail('solve_raised', (time.time() - _t0) * 1e3, _t_fire_wall,
+                              detail=f"{type(_e).__name__}: {_e}")
                 return
             _solve_ms = (time.time() - _t0) * 1e3
+            # Solve RETURNED. Closes the last blind spot: between "solving ..." above and a
+            # grasp_rec row there were two more ways to produce silence (the NLP still
+            # running, or a return that the store/verify path below swallowed), and the
+            # console could not tell them apart.
+            print(f"[rec] thread: obj={obj_idx} solve returned in {_solve_ms / 1e3:.2f}s "
+                  f"status={res.get('status')} contacts="
+                  f"{res.get('p1') is not None and res.get('p2') is not None}")
             if res.get('p1') is None or res.get('p2') is None:
+                # NO CONTACTS. The NLP ran to completion but produced nothing usable
+                # (status is typically 'failed'). Logged, not swallowed: this is the exit
+                # that made a live recommender look identical to a dead one.
+                _rec_log_fail(res.get('status') or 'no_contacts', _solve_ms, _t_fire_wall,
+                              detail=f"n_seeds={len(res.get('all_results') or [res])}")
                 return
             # Certify wrench feasibility (datum LP inside verify()) BEFORE deciding whether
             # to show this candidate — the visualization must only ever recommend a
@@ -3874,7 +4430,35 @@ if __name__ == "__main__":
         global _rec_thread, _rec_last_solve
         name = objects[prox_idx]['name']
         _supported = prox_idx in _cat_supported
-        _rec_idle  = (_rec_thread is None) or (not _rec_thread.is_alive())
+        # IDLE, PER OBJECT. A running solve blocks a new one only for the SAME object; a
+        # solve still draining for the object we just advanced PAST never gates the object
+        # now in front of the operator. Its result is discarded on arrival anyway (the
+        # obj_idx guard below), so letting it run out costs only CPU.
+        #
+        # This was briefly SERIALIZED instead (one NLP at a time, whatever object), on the
+        # theory that two concurrent solves oversubscribe the 48-thread pthreads OpenBLAS.
+        # That reasoning was wrong, or at least not the binding constraint: profiling showed
+        # the long solves are long because of SEED COUNT (see _REC_NC), not contention -- a
+        # 22s box solve was measured running entirely ALONE. Serializing therefore bought
+        # nothing and cost the presented object its recommendation: obj_025_mug sat at
+        # idle=False for the whole 19.4s of its trial, draining a box solve fired 2.4s
+        # before the advance. Starving the object the operator is looking at is the one
+        # failure mode that is never acceptable, so per-object it is. With _REC_NC=2 the
+        # solves are ~4s and the overlap window is small.
+        _thr_alive = (_rec_thread is not None) and _rec_thread.is_alive()
+        _thr_obj   = _rec_thread_obj[0] if _thr_alive else -1
+        _rec_idle  = (not _thr_alive) or (_thr_obj != prox_idx)
+        # Snapshot every conjunct of the fire gate below, so the status line says WHY it is
+        # or isn't firing. `thr` names the object whose solve occupies the slot, not just
+        # alive/done: "alive" alone could not distinguish a solve for THIS object (a real
+        # block) from a stale one for the object we just advanced past (which must not
+        # block), and that ambiguity is what hid the starvation bug for several runs.
+        _rec_gate_detail[0] = (
+            "gate[sup=%s idle=%s(thr=%s) prev=%s age=%.1fs obj=%d]"
+            % (_supported, _rec_idle,
+               'none' if not _thr_alive
+               else f'alive:obj{_thr_obj}',
+               bool(previewing), time.time() - _rec_last_solve, prox_idx))
 
         # Current WF-gated candidate for this object (thread-written) — read FIRST so the
         # status push below can report its freshness.
@@ -3903,7 +4487,12 @@ if __name__ == "__main__":
         elif previewing:
             _push_rec_status('preview', name, _fresh)
         elif not _rec_idle:
-            _push_rec_status('solving', name, _fresh)
+            # Name the object the RUNNING THREAD is solving, not prox_idx. These diverge
+            # exactly when a stale solve is still in flight, and reporting prox_idx made the
+            # console claim "solving obj_025_mug" while the thread was grinding on the
+            # gelatin box — the single most misleading line in this whole investigation.
+            _push_rec_status('solving', objects[_thr_obj]['name']
+                             if 0 <= _thr_obj < len(objects) else name, _fresh)
         else:
             _push_rec_status('waiting', name, _fresh)
         if (_supported and _rec_idle and not previewing
@@ -3918,6 +4507,7 @@ if __name__ == "__main__":
             # live pose is what the operator's hand was at when this grasp was computed.
             _q_robot_fire = data.qpos[:N_ROBOT].copy()
             _rec_thread = _fire_recommender(prox_idx, _q_snap, _obj_pos, _q_robot_fire)
+            _rec_thread_obj[0] = prox_idx   # whose solve occupies the slot (see _rec_idle)
             _rec_last_solve = time.time()
             _push_rec_status('solving', name, _fresh)
 
@@ -4062,6 +4652,10 @@ if __name__ == "__main__":
     _ctrl_held     = set()         # Ctrl_L / Ctrl_R currently held
     squeeze_on     = False         # GRASP: internal force toggled by Enter
     _squeeze_steps = 0             # sim steps since squeeze-on, drives the force ramp
+    # Sticky per-finger contact-loss flags for the carry (see the detection block in the
+    # GRASP branch). Mirrors the benchmark's _jog_to contact_lost dict. Latched, so a
+    # momentary unload that recovers still leaves a record; cleared on every squeeze toggle.
+    _carry_lost    = {f: False for f in FINGER_SET}
     grasp_ctrl     = None          # GraspController, built at each REACH→GRASP transition
     # Set True once the grasp controller executes (REACH→GRASP): suppresses the approach
     # visualizations (RRT trace + achieved-contact markers) while gripping. Reset on
@@ -4214,6 +4808,14 @@ if __name__ == "__main__":
     if TELE_AUTO_JOG:
         print("[teleop] TELE_AUTO_JOG=1 — GRASP uses the autonomous arrow-key jog "
               "(no wrist tracking). Drive the lift with arrow keys.")
+    # SLIP_CORRECT=0 drops slip_correction_torques from the GRASP torque sum (default on).
+    # This is an A/B switch for a specific suspicion, not a tuning knob — see the long note
+    # at the call site. Env-var rather than a CLI flag so a single run can be re-run both
+    # ways without touching argv or the launcher.
+    SLIP_CORRECT = os.environ.get('SLIP_CORRECT', '1') == '1'
+    if not SLIP_CORRECT:
+        print("[teleop] SLIP_CORRECT=0 — fingertip slip-correction spring DISABLED "
+              "(A/B: does it cause the tangential load it is meant to resist?)")
     _gp_acc = {'track': 0.0, 'refresh': 0.0, 'spin': 0.0, 'step_ik': 0.0,
                'torque': 0.0, 'step': 0.0, 'viz': 0.0, 'n': 0}
     _gp_last = time.time()
@@ -4475,6 +5077,16 @@ if __name__ == "__main__":
         if key == _dash_last_rec_state:
             return
         _dash_last_rec_state = key
+        # ALSO to the console (captured by start_teleop.sh's tee). The dashboard is live-
+        # only, so after the fact there was no record of what the recommender was doing —
+        # and "no grasp recommendation on the 2nd object" was indistinguishable from
+        # "recommender never ran". Change-gated by the same key, so this is a handful of
+        # lines per session, not per frame. _rec_gate_detail (set by the tick just before
+        # each call) carries WHY the gate is in this state.
+        print(f"[rec] status: {state}"
+              + (f"  {obj}" if obj else "")
+              + ("" if fresh is None else f"  fresh={fresh}")
+              + (f"  {_rec_gate_detail[0]}" if _rec_gate_detail[0] else ""))
         if dash is not None:
             dash.push({'type': 'rec_status', 'state': state, 'object': obj,
                        'fresh': fresh})
@@ -4588,6 +5200,12 @@ if __name__ == "__main__":
         _rec_vis = False
         _rec_ik_mode = None
         _rec_last_solve = 0.0
+        # Vacate the slot. Any solve still running belongs to the object we just finished
+        # with, and its result is discarded on arrival anyway (the obj_idx guard). Clearing
+        # the owner here means _rec_idle (per-object, see the tick) reads the incoming
+        # object as unblocked immediately, so it fires without waiting for the stale solve
+        # to drain. _rec_last_solve is zeroed just above, so it also skips the 2s cadence.
+        _rec_thread_obj[0] = -1
         with _rec_result_lock:
             _rec_result.clear()
         with _rec_ik_lock:
@@ -4811,7 +5429,14 @@ if __name__ == "__main__":
                     and 0 <= active_idx < len(objects)):
                 _ao = objects[active_idx]
                 _tnow_tr = data.time
-                _h_tr = float(data.geom_xpos[_ao['id_geom']][2]) - _trial_rest_hh[active_idx]
+                # Clearance ABOVE THE SUPPORT SURFACE = obj_z - surface_top - half_height.
+                # _trial_rest_hh is the object's HALF-HEIGHT (obj_z_at_rest - TABLE_TOP_Z),
+                # so subtracting it alone leaves obj_z - half_height ~= TABLE_TOP_Z -- an
+                # absolute world height, not a clearance. Measured on robocasa: 0.8600 for a
+                # motionless object against LIFT_HEIGHT_M=0.01, i.e. `lifted` true by ~86x in
+                # every trial, which let pick_confirmed fire on untouched objects.
+                _h_tr = (float(data.geom_xpos[_ao['id_geom']][2])
+                         - TABLE_TOP_Z - _trial_rest_hh[active_idx])
                 _sid_tr = _trial_place_sid.get(active_idx, -1)
                 _xy_tr = _spd_tr = None
                 if _sid_tr >= 0:
@@ -4819,23 +5444,86 @@ if __name__ == "__main__":
                         data.geom_xpos[_ao['id_geom']][:2] - data.site_xpos[_sid_tr][:2]))
                     _da_tr = _trial_dofadr[active_idx]
                     _spd_tr = float(np.linalg.norm(data.qvel[_da_tr:_da_tr + 3]))
-                # Robot-contact fact for the RELEASE condition. This site passes
-                # trigger_active=False unconditionally, so the runner's trigger-based
-                # fallback would read "released" on every step — compute the real contact.
+                # Robot-contact fact for the RELEASE condition — the real contact, not the
+                # trigger fallback.
                 _touch_tr = bool(
                     _OBJ_COL_GID_SET.get(active_idx, {_ao['id_geom']}) & {
                         (c.geom2 if c.geom1 in _HAND_GIDS else c.geom1)
                         for c in data.contact[:data.ncon]
                         if c.geom1 in _HAND_GIDS or c.geom2 in _HAND_GIDS})
+                # Live grip state, SAME as the retargeting call sites (dexpilot ~6041 and
+                # the GRASP branch ~7355) rather than a hardwired False. This block is the
+                # one that actually covers TRANSPORT — the GRASP branch stops running the
+                # moment the carry begins — so hardwiring trigger_active=False here left the
+                # runner's drop check with no grip signal at all: lowering a still-GRIPPED
+                # object into the bin read as a descent-with-no-grip and logged a spurious
+                # 'drop' (measured: drop at t=6.36, dwell_s 0.308, while the operator was
+                # still holding the box; phase reverted TRANSPORT->PICK, which permanently
+                # disables the arrival check since it lives under `phase == TRANSPORT`, so
+                # the placement 2s later could never score). _cat_trigger mirrors the GRASP
+                # branch's contact_aware path; the dexpilot path keeps its own block.
+                if _cat_trigger is not None:
+                    _fired_tr  = _cat_trigger.update(squeeze_on)
+                    _active_tr = bool(squeeze_on)
+                else:
+                    _fired_tr  = False
+                    _active_tr = False
+                # TRANSPORT DIAGNOSTIC: log every input the drop/arrival decision reads, once
+                # per _TR_DIAG_DT of sim time, so a spurious drop or a missed arrival can be
+                # attributed to a specific FAILED CONDITION instead of inferred from channels
+                # that mean something narrower than they appear (norm_force is thumb+index
+                # only, so it reads 0.000 N for a grasp held by other parts of the hand —
+                # that is NOT a release, and reading it as one sent two diagnoses wrong).
+                _ib_tr = _object_in_bowl(active_idx)
+                if (_TR_DIAG and _tnow_tr - _tr_diag_last[0] >= _TR_DIAG_DT):
+                    _tr_diag_last[0] = _tnow_tr
+                    _trial_events.log(
+                        _trial_state.trial_id, _tnow_tr, 'transport_diag',
+                        touch=bool(_touch_tr), squeeze=bool(squeeze_on),
+                        in_bowl=(None if _ib_tr is None else bool(_ib_tr)),
+                        h=round(float(_h_tr), 4),
+                        lifted=bool(_h_tr > 0.01),
+                        spd=(None if _spd_tr is None else round(float(_spd_tr), 4)),
+                        ncon=int(data.ncon), obj=active_idx,
+                        obj_z=round(float(data.geom_xpos[_ao['id_geom']][2]), 4))
                 _arrived_tr = _trial_runner.step_pick_or_transport(
-                    _trial_state, _tnow_tr, trigger_fired=False, trigger_active=False,
+                    _trial_state, _tnow_tr, trigger_fired=_fired_tr,
+                    trigger_active=_active_tr,
                     height_above_rest=_h_tr, place_xy_offset=_xy_tr, object_speed=_spd_tr,
-                    inside_container=_object_in_bowl(active_idx),
+                    inside_container=_ib_tr,   # the SAME value just logged above
                     hand_touching=_touch_tr,
                     # Object world height: drives the lift-episode attempt/drop tracking
                     # (see ATTEMPT_LIFT_M). Without it that tracking is inert.
                     object_z=float(data.geom_xpos[_ao['id_geom']][2]),
                     object_xy=tuple(data.geom_xpos[_ao['id_geom']][:2]))
+                # Trace + grasp-force sampling, matching the dexpilot/anyteleop block.
+                #
+                # Both used to be absent here, and the contact-aware GRASP branch that has
+                # them is gated on `control_phase == 'GRASP'` — which the control loop
+                # leaves the moment the carry begins. So a contact-aware trial's .npz
+                # stopped at pick_confirmed (measured: 553 rows, 552 at phase=0 and exactly
+                # ONE at phase=1, ending 1.5s before the trial's own drop event), and
+                # grip_force_peak_n read 0.0 because note_grasp_force was never called
+                # during the only phase it accumulates in. The state machine meanwhile kept
+                # running from HERE, so the events and the trace disagreed about the same
+                # trial. This block is the one that actually covers TRANSPORT, so the
+                # sampling belongs here; the field list is identical to the other two call
+                # sites so every mode's trace carries the same channels.
+                _, _, _ca_normals, _ = _hand_object_contact_metrics(active_idx)
+                _trial_runner.note_grasp_force(
+                    _trial_state, float(sum(_ca_normals.values())))
+                _trial_runner.trace.sample(
+                    t=_tnow_tr,
+                    p_thumb=data.site_xpos[id_C[FINGER_SET.index('thumb')]].copy(),
+                    p_index=data.site_xpos[id_C[FINGER_SET.index('index')]].copy(),
+                    obj_pos=data.geom_xpos[_ao['id_geom']].copy(),
+                    obj_quat=data.xquat[_ao['id_body']].copy(),
+                    obj_linvel=data.qvel[_trial_dofadr[active_idx]:
+                                         _trial_dofadr[active_idx] + 3].copy(),
+                    height_above_rest=_h_tr,
+                    phase=1 if _trial_state.phase == TrialPhase.TRANSPORT else 0,
+                    q_robot=data.qpos[:N_ROBOT].copy(),
+                    obj_qpos=data.qpos[N_ROBOT:].copy())
                 # Arrival sets outcome=SUCCESS but does NOT write trial_end / save the trace —
                 # the caller must call end_trial. Do so on arrival, or on a timeout.
                 if _arrived_tr:
@@ -4854,10 +5542,16 @@ if __name__ == "__main__":
             # fires on any end. Stow the finished object (even on success, where it's in the
             # bin) to keep the table clear and out of nearest-object selection, then teleport
             # the next stowed object to the shared spawn point.
-            if (_SEQ_SPAWN and _trial_state is not None
-                    and _trial_state.outcome is not None
-                    and _trial_state.trial_id != _seq_last_ended_id):
-                _seq_last_ended_id = _trial_state.trial_id
+            # An end recorded by a key handler (press-8 / Backspace / Tab) takes priority:
+            # _trial_state may already have been replaced by the restart those handlers do.
+            _seq_ended_id = _seq_pending_end[0]
+            if _seq_ended_id is None and (_trial_state is not None
+                                          and _trial_state.outcome is not None):
+                _seq_ended_id = _trial_state.trial_id
+            if (_SEQ_SPAWN and _seq_ended_id is not None
+                    and _seq_ended_id != _seq_last_ended_id):
+                _seq_pending_end[0] = None
+                _seq_last_ended_id = _seq_ended_id
                 # The presented object is whatever the ORDER puts in slot _seq_next-1,
                 # independent of how each mode sets active_idx.
                 _seq_done = _seq_next - 1
@@ -4956,7 +5650,47 @@ if __name__ == "__main__":
                         _hand_wrist = _raw[0:3].copy()
                         _hand_head = _raw[3:10].copy()
                         _hand_lm = _raw[57:120].reshape(21, 3).copy()
+                # --- OBJECT POSE IN THE PALM FRAME ----------------------------------------
+                # Everything else in this trace is WORLD frame, which cannot separate "the
+                # hand carried the object" from "the object moved inside the hand" — during a
+                # carry both look like the object translating. Expressing the object in the
+                # PALM frame cancels the rigid hand motion, so any residual IS relative
+                # motion: the grasp shifting, rolling or sliding.
+                #
+                # This is the measurement the transport-slip investigation lacked. Measured
+                # facts it has to explain: during the carry the finger joints track their
+                # (constant) PD target to within ~0.02 rad while measured normal force halves
+                # 4.6 -> 2.4N, so the hand is effectively RIGID and the fingers are not being
+                # back-driven open; yet measured TANGENTIAL force climbs to ~4N against only
+                # ~1N of external demand (f_net ~ [0,0,1.0] = gravity on a 0.097kg box). A
+                # rigid hand cannot shear its own contacts, so either the object is moving
+                # within the grip or the wrist is carrying the pads through a path the
+                # contact cannot sustain (the hazard the jog-damping comment at the
+                # qdot_jog site already names: "drags the fixed-angle fingers across the
+                # object faster than friction can hold it"). obj_in_palm distinguishes them,
+                # and palm_angvel is what to correlate it against.
+                _obj_p_palm = np.full(3, np.nan)
+                _obj_q_palm = np.full(4, np.nan)
+                _palm_angvel = np.full(3, np.nan)
+                if _PALM_BID >= 0 and 0 <= _pt_obj_idx < len(objects):
+                    _p_W = data.xpos[_PALM_BID]
+                    _R_W = data.xmat[_PALM_BID].reshape(3, 3)
+                    _ob = objects[_pt_obj_idx]['id_body']
+                    _obj_p_palm = _R_W.T @ (data.xpos[_ob] - _p_W)
+                    # Relative orientation palm->object as a quaternion (w,x,y,z).
+                    _Rrel = _R_W.T @ data.xmat[_ob].reshape(3, 3)
+                    _qrel = np.zeros(4)
+                    mj.mju_mat2Quat(_qrel, _Rrel.flatten())
+                    _obj_q_palm = _qrel
+                    # Palm angular velocity in WORLD (cvel is [ang(3); lin(3)], body frame
+                    # origin) — the wrist rotation rate the shear should correlate with.
+                    _palm_angvel = np.asarray(data.cvel[_PALM_BID][:3], float).copy()
                 _pose_trace.sample(
+                    # Object pose RELATIVE TO THE PALM — rigid hand motion cancelled, so a
+                    # drift here is the object moving in the grip. NaN outside a trial.
+                    obj_in_palm=_obj_p_palm,
+                    obj_quat_in_palm=_obj_q_palm,
+                    palm_angvel=_palm_angvel,
                     hand_wrist=_hand_wrist,      # headset wrist pos (raw[0:3])
                     hand_head=_hand_head,        # headset pose pos+quat (raw[3:10])
                     hand_lm=_hand_lm,            # 21 wrist-relative landmarks (raw[57:120])
@@ -5056,7 +5790,7 @@ if __name__ == "__main__":
                         # 'abandoned' so the sequential-advance block brings up the next one.
                         if (_trial_runner is not None and _trial_state is not None
                                 and _trial_state.outcome is None):
-                            _trial_runner.abandon_trial(_trial_state, data.time)
+                            _abandon_and_record(_trial_state, data.time)
                             print(f"[skip] object {_seq_next}/{len(objects)} skipped "
                                   f"→ advancing")
                     elif _k == 'record_sample':
@@ -5071,7 +5805,7 @@ if __name__ == "__main__":
                         # before mj_resetData zeroes data.time (keeps the duration valid).
                         if (_trial_runner is not None and _trial_state is not None
                                 and _trial_state.outcome is None):
-                            _trial_runner.abandon_trial(_trial_state, data.time)
+                            _abandon_and_record(_trial_state, data.time)
                         mj.mj_resetData(model, data)
                         data.qpos[:N_ROBOT] = _Q_BIAS_DP
                         # Zero EVERY DOF's velocity/accel/applied-force (not just the
@@ -5125,7 +5859,7 @@ if __name__ == "__main__":
                             # 8 mid-trial abandons the running one and starts fresh; a
                             # clean end otherwise comes only from timeout or place.
                             if _trial_state is not None and _trial_state.outcome is None:
-                                _trial_runner.abandon_trial(_trial_state, data.time)
+                                _abandon_and_record(_trial_state, data.time)
                             _trial_id = (_trial_state.trial_id + 1
                                         if _trial_state is not None else 1)
                             _tobj = objects[_prox_idx]
@@ -5179,6 +5913,19 @@ if __name__ == "__main__":
                 _avg_d = [np.mean([_guarded_geom_dist(_tg, _o['id_geom'])
                                    for _tg in _ALL_TIP_GIDS]) for _o in objects]
                 _prox_idx = int(np.argmin(_avg_d))
+                # --sequential-spawn: the PRESENTED object wins over the argmin. Every other
+                # object is stowed at z=-5 with collision off, but _guarded_geom_dist still
+                # measures to it, and after an advance (';' skip, or a trial end) the argmin
+                # can stay pinned to the object that was just stowed. Everything downstream
+                # keys off _prox_idx — the recommender tick, the rec1/rec2 markers, the
+                # transparency toggle — so the recommender went on solving against a stowed
+                # body under the floor and the newly presented object never got a grasp
+                # recommendation at all (measured: after ';' to obj_025_mug, prox_idx stayed
+                # 3 = the gelatin box, trial 2 logged ZERO grasp_rec solves, n_attempts 0).
+                # The presented object is the one at _seq_order[_seq_next-1] — the same slot
+                # the advance block and the press-8 trial start use.
+                if _SEQ_SPAWN and 0 < _seq_next <= len(objects):
+                    _prox_idx = _seq_order[_seq_next - 1]
 
                 # Hand the Y-toggle transparency to whichever object is now nearest, so it
                 # follows the manipuland as the operator moves between objects (no-op unless
@@ -5600,7 +6347,7 @@ if __name__ == "__main__":
                         # up the next object with a fresh trial — no need to place every one.
                         if (_trial_runner is not None and _trial_state is not None
                                 and _trial_state.outcome is None):
-                            _trial_runner.abandon_trial(_trial_state, data.time)
+                            _abandon_and_record(_trial_state, data.time)
                             print(f"[skip] object {_seq_next}/{len(objects)} skipped "
                                   f"→ advancing")
                     elif _k == 'reset':
@@ -5610,7 +6357,7 @@ if __name__ == "__main__":
                         # to re-capture your current hand pose as the offset.
                         if (_trial_runner is not None and _trial_state is not None
                                 and _trial_state.outcome is None):
-                            _trial_runner.abandon_trial(_trial_state, data.time)
+                            _abandon_and_record(_trial_state, data.time)
                         mj.mj_resetData(model, data)
                         data.qpos[:N_ROBOT] = _Q_BIAS_DP
                         # Zero EVERY DOF's velocity/accel/applied-force (not just the
@@ -5658,7 +6405,7 @@ if __name__ == "__main__":
                             # mid-trial abandons whatever was running, same as the other
                             # modes' mid-trial supersession handling.
                             if _trial_state is not None and _trial_state.outcome is None:
-                                _trial_runner.abandon_trial(_trial_state, data.time)
+                                _abandon_and_record(_trial_state, data.time)
                             _trial_id = (_trial_state.trial_id + 1
                                         if _trial_state is not None else 1)
                             # Normally objects[0] (single-object batch). Under
@@ -5891,9 +6638,12 @@ if __name__ == "__main__":
                     _trial_runner.step_approach(
                         _trial_state, _tnow_dp, data.contact[:data.ncon],
                         _HAND_GIDS, _dp_obj['id_geom'])
+                    # obj_z - surface_top - half_height (see the note at the contact-aware
+                    # transport site): _trial_rest_hh is a HALF-HEIGHT, so TABLE_TOP_Z must
+                    # come off too or this is an absolute height, not a clearance.
                     _hh_dp = _trial_rest_hh[_dp_idx]
                     _height_above_rest_dp = (float(data.geom_xpos[_dp_obj['id_geom']][2])
-                                             - _hh_dp)
+                                             - TABLE_TOP_Z - _hh_dp)
                     # Median-filtered d_s1 so the trial trigger matches the DEBOUNCED
                     # pinch the fingers actually act on (falls back to raw if absent).
                     _rtg = _dexpilot_ctrl.retargeter
@@ -6252,6 +7002,12 @@ if __name__ == "__main__":
                     # tracks the object) so drift shows up. Compare to the committed
                     # recommender-pose tip error printed at lock-in: if this is larger, the
                     # object moved.
+                    # Bound BEFORE the guard: the grasp gate below reads it, and this block
+                    # is skipped entirely in autonomous mode / when no rec_local exists. Left
+                    # unbound, that skip would raise NameError inside the gate's try, whose
+                    # bare except would swallow it and silently kill the [grasp-quality]
+                    # print as well. None means "not measurable here", which the gate skips.
+                    _end_err = None
                     _rec_local_dbg = objects[active_idx].get('rec_local')
                     if _CAT_MODE and _rec_local_dbg is not None:
                         _if_dbg = {f: i for i, f in enumerate(FINGER_SET)}
@@ -6329,10 +7085,27 @@ if __name__ == "__main__":
                                               _accel_box, tuple(_ang_budget), _inertia,
                                               grav_O=(_g_O if NCF_DATUM_MODE else None))
                     if _gamma is None or not np.isfinite(_gamma) or _gamma <= 0.0:
+                        # LP INFEASIBLE = "this contact geometry cannot resist the disturbance
+                        # budget". The benchmark REFUSES to execute here (pick_and_place.py:762,
+                        # phase_log 'gamma_infeasible_no_grasp'), and its comment records that an
+                        # earlier FALLBACK constant was removed precisely because it "converted
+                        # 'no feasible grasp' into 'squeeze anyway at a made-up force'".
+                        # Teleop reinstated exactly that, at GAMMA_FALLBACK=250.0 -- a value
+                        # this file itself flags as far beyond anything measured stable in sim.
+                        #
+                        # GAMMA_ABORT_INFEASIBLE=1 restores the benchmark's refusal: cancel the
+                        # pending auto-squeeze and leave the operator holding position, rather
+                        # than squeezing on certified-infeasible geometry. DEFAULT OFF so an
+                        # operator mid-session is never stranded by a new hard stop.
                         gamma_raw  = GAMMA_FALLBACK
                         gamma_live = GAMMA_FALLBACK
                         print(f"\r\n[gamma] LP infeasible/degenerate for "
                               f"{obj_grasp['name']} — using fallback {GAMMA_FALLBACK:.0f}")
+                        if GAMMA_ABORT_INFEASIBLE:
+                            _auto_squeeze_at = None
+                            print("[gamma] ABORT (GAMMA_ABORT_INFEASIBLE=1): auto-squeeze "
+                                  "cancelled — press N to release and re-solve, or Enter to "
+                                  "squeeze anyway at the fallback.")
                     else:
                         # gamma_raw = the LP's minimum no-slip gamma (the true feasible
                         # boundary, reported in the log). gamma_live = raw * safety factor
@@ -6343,6 +7116,34 @@ if __name__ == "__main__":
                               f"x{GAMMA_SAFETY_FACTOR:.1f} = {gamma_live:.2f} "
                               f"(mass={_mass:.3f}kg mu={_mu[0]:.1f}, "
                               f"~{gamma_live/np.sqrt(2):.2f} N/contact)")
+                    # STABILITY CEILING (ported from the benchmark, pick_from_floor.py:482).
+                    # solve_gamma_live answers a STATICS question and knows nothing about the
+                    # integrator; commanding its answer times GAMMA_SAFETY_FACTOR is what
+                    # launches the object. The limit is set by the CONTACT SOLVER: MuJoCo's
+                    # soft contact is a spring-damper of tau=solref[0], stiffness ~1/tau^2, so
+                    # the tolerable force scales the same way. Teleop had no upper bound at
+                    # all -- the one concrete safeguard the benchmark has and this did not.
+                    #
+                    # Note this ALSO bounds the finger gains: effective_gains() multiplies by
+                    # gamma_cmd/gamma_ref, so an unclamped gamma scaled the PD without bound
+                    # too. Deliberately NOT mass-scaled (see the benchmark's docstring: the
+                    # mass term predicts 0.12N for the orange, which measurement contradicts).
+                    try:
+                        _tip_gids_c = [_TIP_GEOM_IDS[_f] for _f in FINGER_SET
+                                       if _TIP_GEOM_IDS.get(_f, -1) >= 0]
+                        _obj_gids_c = [_g for _g in range(model.ngeom)
+                                       if model.geom_bodyid[_g] == obj_grasp['id_body']]
+                        _tau_c = max(max(float(model.geom_solref[_g][0]) for _g in _obj_gids_c),
+                                     max(float(model.geom_solref[_g][0]) for _g in _tip_gids_c))
+                        _ceiling = (GAMMA_STABILITY_REF_N
+                                    * (_tau_c / GAMMA_STABILITY_REF_TAU) ** 2
+                                    * (float(model.opt.timestep) / 0.002))
+                        if gamma_live > _ceiling:
+                            print(f"[gamma] clamping {gamma_live:.2f} -> {_ceiling:.2f} "
+                                  f"(stability ceiling, tau={_tau_c:.4f}s)")
+                            gamma_live = _ceiling
+                    except Exception:
+                        traceback.print_exc()
 
                     # --- Grasp-quality diagnostic at the COMMITTED pose ---
                     # The lift test calls a grasp "good" at pad-alignment <~15deg and pad-gap
@@ -6354,16 +7155,67 @@ if __name__ == "__main__":
                     try:
                         _gq_ft = np.zeros(6)
                         _gq_parts = []
+                        _gq_vals = []   # (finger, pad_align_deg, gap_mm) for the gate below
                         for _k, _f in enumerate(FINGER_SET):
                             _nin_W = R_WO @ _R_in[_k][:, 0]        # inward normal, world
                             _pad_W = -data.site_xmat[id_C[_k]].reshape(3, 3)[:, 0]
                             _ang = np.degrees(np.arccos(np.clip(_pad_W @ _nin_W, -1, 1)))
                             _tg = _TIP_GEOM_IDS[_f]
-                            _gap = mj.mj_geomDistance(model, data, _tg,
-                                                      obj_grasp['id_geom'], 0.1, _gq_ft) * 1e3
+                            # Distance to the NEAREST hull, not just the named <name>_geom:
+                            # on a decomposed mesh the pad seats on a _col_N hull, so the
+                            # single-geom distance reported a gap to a face the finger was
+                            # nowhere near and the gate judged a good commit as poor (or
+                            # vice versa). Same multi-hull fix as the contact metrics.
+                            _tgt_i = _OBJ_GID_TO_IDX.get(obj_grasp['id_geom'])
+                            _hulls = (_OBJ_COL_GIDS.get(_tgt_i) if _tgt_i is not None
+                                      else None) or [obj_grasp['id_geom']]
+                            _gap = min(mj.mj_geomDistance(model, data, _tg, _h, 0.1, _gq_ft)
+                                       for _h in _hulls) * 1e3
                             _gq_parts.append(f"{_f}: pad_align={_ang:.0f}deg gap={_gap:.1f}mm")
+                            _gq_vals.append((_f, _ang, _gap))
                         print("[grasp-quality] " + "  |  ".join(_gq_parts)
                               + "   (good: align<15deg, gap 0-8mm)")
+                        # GATE. Per-finger bounds on the SAME numbers just printed — no
+                        # recomputation, so the verdict can never disagree with the line
+                        # above it. Gap is judged against this hand's designed standoff
+                        # (_PAD_OFFSET) rather than an absolute figure; see the constants.
+                        if GRASP_GATE != 'off':
+                            _bad = []
+                            for _f, _ang, _gap in _gq_vals:
+                                _hi = (_PAD_OFFSET[_f] + GRASP_GATE_GAP_MARGIN_M) * 1e3
+                                _lo = GRASP_GATE_GAP_MIN_M * 1e3
+                                if _gap > _hi:
+                                    _bad.append(f"{_f} gap {_gap:.1f}mm > {_hi:.1f}mm "
+                                                f"(standoff {_PAD_OFFSET[_f]*1e3:.1f}mm "
+                                                f"+{GRASP_GATE_GAP_MARGIN_M*1e3:.0f}mm)")
+                                elif _gap < _lo:
+                                    _bad.append(f"{_f} gap {_gap:.1f}mm < {_lo:.1f}mm "
+                                                f"(pad already penetrating)")
+                                if _ang > GRASP_GATE_ALIGN_DEG:
+                                    _bad.append(f"{_f} pad_align {_ang:.0f}deg > "
+                                                f"{GRASP_GATE_ALIGN_DEG:.0f}deg (oblique pad)")
+                            # TIP PLACEMENT — the check gap and angle cannot make. _end_err
+                            # is the RRT-END site->planned-contact distance printed on the
+                            # [IK] line just above, in FINGER_SET order (same order as
+                            # _gq_vals), so the two zip. None when not measurable (autonomous
+                            # mode / no rec_local): skip rather than guess.
+                            if _end_err is not None and len(_end_err) == len(_gq_vals):
+                                for (_f, _, _), _te in zip(_gq_vals, _end_err):
+                                    if _te > GRASP_GATE_TIP_ERR_MM:
+                                        _bad.append(
+                                            f"{_f} tip {_te:.1f}mm from planned contact > "
+                                            f"{GRASP_GATE_TIP_ERR_MM:.0f}mm (finger is not "
+                                            f"where the grasp was planned)")
+                            if _bad:
+                                print("[grasp-gate] POOR COMMIT: " + "; ".join(_bad))
+                                if GRASP_GATE == 'block':
+                                    _auto_squeeze_at = None
+                                    print("[grasp-gate] auto-squeeze CANCELLED "
+                                          "(GRASP_GATE=block) — press N to release and "
+                                          "re-solve, or Enter to squeeze anyway.")
+                                else:
+                                    print("[grasp-gate] warn-only (GRASP_GATE=block to "
+                                          "cancel the auto-squeeze on a verdict like this)")
                     except Exception:
                         traceback.print_exc()
 
@@ -6430,14 +7282,12 @@ if __name__ == "__main__":
                         # MATCHED TO THE BENCHMARK, which is a RATIO not a value.
                         # effective_gains scales the finger PD by gamma/gamma_ref, and
                         # the benchmark passes its SOLVED gamma against gamma_ref=1.0.
-                        # Teleop passes gamma_live = gamma_raw * GAMMA_SAFETY_FACTOR,
-                        # so the same object at the same solved gamma would scale the
-                        # PD 5x harder here than in the harness where gamma_ref was
-                        # tuned -- 135x vs 27x on 036_wood_block. Setting gamma_ref to
-                        # the same factor cancels it, so gamma_live/gamma_ref reduces
-                        # to gamma_raw/1.0 and the PD authority per grasp is identical
-                        # in both. The SQUEEZE is still 5x (gamma_live is unchanged);
-                        # only the PD's scaling against it is matched.
+                        # Tracking GAMMA_SAFETY_FACTOR keeps that ratio matched for any
+                        # value of it: gamma_live/gamma_ref == gamma_raw/1.0, which is
+                        # exactly what the benchmark's controller sees. With the factor
+                        # now 1.0 (full squeeze parity) this IS 1.0; the expression is
+                        # kept rather than hardcoded so the two cannot drift apart if
+                        # the factor is ever raised again.
                         gamma_ref=GAMMA_SAFETY_FACTOR,
                         obj_contact_provider=_grasp_provider)
                     # Grasp controller is now executing: clear the approach visualizations —
@@ -6465,7 +7315,13 @@ if __name__ == "__main__":
                     # already seated, then ramps from a true 0N. Matching that here.
                     squeeze_on = False
                     _squeeze_steps = 0
+                    _carry_lost = {f: False for f in FINGER_SET}   # new grasp, new record
                     grasp_ctrl.set_squeeze(squeeze_on)
+                    # Back to CLOSING gains with the squeeze: the next ramp starts from 0N
+                    # and needs the softened finger PD to let the internal force seat the
+                    # pads. Leaving transporting=True here would carry stiff holding gains
+                    # into that ramp and suppress the very motion it is meant to produce.
+                    grasp_ctrl.set_transporting(False)
                     _push_squeeze(squeeze_on, gamma_live)
                     # Draw the wrench cone at the NOMINAL solved squeeze (gamma_raw =
                     # the LP's minimum no-slip gamma, the true feasible boundary) so the
@@ -6514,7 +7370,14 @@ if __name__ == "__main__":
                     _auto_squeeze_at = None
                     squeeze_on = not squeeze_on
                     _squeeze_steps = 0   # restart the force ramp on every toggle-on
+                    _carry_lost = {f: False for f in FINGER_SET}   # new grasp, new record
                     grasp_ctrl.set_squeeze(squeeze_on)
+                    # This toggle goes BOTH ways, so clear the holding gains on every
+                    # transition: on a toggle-OFF there is nothing to hold, and on a
+                    # toggle-ON the ramp restarts from 0N (_squeeze_steps = 0 above) and
+                    # must run on the closing gains until it completes. The ramp-completion
+                    # site re-engages holding gains when _ramp reaches 1.0.
+                    grasp_ctrl.set_transporting(False)
                     _push_squeeze(squeeze_on, gamma_live)
                     print(f"\r\n[Control] squeeze {'ON' if squeeze_on else 'off'}  "
                           f"(gamma={gamma_live:.1f}, ~{gamma_live/np.sqrt(2):.2f} N/contact)"
@@ -6577,6 +7440,8 @@ if __name__ == "__main__":
                     squeeze_on     = False
                     _auto_squeeze_at = None   # cancel a pending auto-squeeze (released first)
                     grasp_ctrl.set_squeeze(False)
+                    # Mirrors pick_and_place.py:1099, which drops both flags at release.
+                    grasp_ctrl.set_transporting(False)
                     _push_squeeze(False, gamma_live)
                     _push_wrench_cone(None, None, None, None)   # clear the cone meshes
                     _grasp_wrist_track = False
@@ -6598,6 +7463,40 @@ if __name__ == "__main__":
                         # limited) instead of inheriting the grasp-carry integrator state.
                         _teleop_arm_hold = None
                         _teleop_wrist_tgt = None
+                        # ...and do the same for the FINGERS, which had no equivalent. The
+                        # arm half of this handoff is re-seeded and its qvel zeroed (see
+                        # below); the finger half jumped straight from the grasp hold to
+                        # wherever the operator's retargeted hand happened to be, with the
+                        # finger PD stiffness simultaneously stepping back up by
+                        # SQUEEZE_PD_SCALE. Measured over three releases in one run, the
+                        # grasping joints travelled 1.4-1.7 rad within 5 trace rows of the
+                        # release and 2.4-3.1 rad within 10 — a fast unconstrained slew, not
+                        # a single-frame snap, which is what reads as a violent release.
+                        #
+                        # Seed the cached drive target with the BLENDED release pose that
+                        # benchmarks/ycb_grasp/pick_and_place.py uses (release_open_frac,
+                        # default 0.5): interpolate only the GRASPING fingers toward the
+                        # open posture. Partial, not full, is deliberate there and measured
+                        # — "0.5 unwedges without the extra release impulse a full open
+                        # imparts (1.0 costs 014_lemon its in_bin)" — and the blend is
+                        # toward a POSE rather than a signed offset because the joint sign
+                        # that opens a finger is not shared across fingers (+0.3 rad extends
+                        # the index but CURLS the thumb), so a uniform delta closes half the
+                        # hand.
+                        #
+                        # SCOPE, so the next reader is not misled: this fixes the FIRST
+                        # frame only. _teleop_q is overwritten by the next
+                        # _dexpilot_ctrl.step() refresh (~30 Hz), so the operator's hand
+                        # reclaims the target almost immediately and the slew that follows
+                        # is unchanged. Bounding the rate over the first few hundred ms is
+                        # the actual remedy and is deliberately NOT done here.
+                        if _teleop_q is not None:
+                            _q_rel = np.asarray(_teleop_q, float).copy()
+                            _f_open = 0.5      # == pick_and_place's release_open_frac default
+                            for _lo, _hi in finger_joint_slices(model, FINGER_SET):
+                                _q_rel[_lo:_hi] = ((1.0 - _f_open) * data.qpos[_lo:_hi]
+                                                   + _f_open * Q_BIAS[_lo:_hi])
+                            _teleop_q = _q_rel
                         _teleop_jog_v[:] = 0.0
                         _teleop_jog_w[:] = 0.0
                         # Zero the arm's PHYSICS velocity too. The GRASP carry injected a
@@ -6612,7 +7511,26 @@ if __name__ == "__main__":
                         _rec_vis       = False
                         _rec_ik_mode   = None
                         active_tgt     = 0
-                        active_idx     = 0
+                        # active_tgt=0 is a REAL null (targets[0] is home), but active_idx=0
+                        # is NOT: it is objects[0], a genuine object. Releasing the fingers
+                        # mid-TRANSPORT — which is exactly how a placement ends, opening the
+                        # hand over the bin — therefore repointed the live trial at objects[0]
+                        # instead of clearing a target. Under --sequential-spawn objects[0] is
+                        # usually STOWED at z=-5 and free-falling, so the always-run TRANSPORT
+                        # block (which keys entirely off active_idx) switched to measuring that
+                        # body mid-carry: h=-171m, speed 57m/s, touch=False -> a spurious 'drop'
+                        # 0.3s later, phase reverted to PICK, and the arrival check was dead for
+                        # the rest of the trial. Measured directly: control_phase GRASP->REACH
+                        # at the release, transport_diag obj flipping 3->0 on the next row while
+                        # object 3 sat happily at z=1.07 in the hand.
+                        # KEEP the trial's object while a trial is running; only fall back when
+                        # there is none, and then to the PRESENTED object, never to a stowed one.
+                        if _trial_state is not None and _trial_state.outcome is None:
+                            pass                      # live trial: its object is still the subject
+                        elif _SEQ_SPAWN and 0 < _seq_next <= len(objects):
+                            active_idx = _seq_order[_seq_next - 1]
+                        else:
+                            active_idx = 0
                         _rec_last_solve = 0.0
                         with _rec_result_lock:
                             _rec_result.clear()
@@ -6689,7 +7607,7 @@ if __name__ == "__main__":
                             # end it rather than silently orphaning it below. Re-planning
                             # the same object starts a fresh trial_id, consistent with
                             # the lock-in path's re-lock-in handling.
-                            _trial_runner.abandon_trial(_trial_state, data.time)
+                            _abandon_and_record(_trial_state, data.time)
                         active_tgt = new_tgt
                         active_idx = max(0, active_tgt - 1)  # map back to objects[]
                         _ik_vis_mode = None   # exit vis mode when switching target
@@ -7150,13 +8068,106 @@ if __name__ == "__main__":
                 if squeeze_on:
                     _squeeze_steps += 1
                     _ramp = min(1.0, _squeeze_steps * model.opt.timestep / SQUEEZE_RAMP_S)
+                    # CLOSING -> HOLDING gains, once the squeeze ramp has fully arrived.
+                    # effective_gains() picks squeeze_pd_scale while transporting is False
+                    # and transport_pd_scale once it is True, and the two phases want
+                    # OPPOSITE gains (see its docstring). Teleop never called
+                    # set_transporting at all, so the whole carry ran on the CLOSING gains
+                    # (SQUEEZE_PD_SCALE, gamma-referenced) — softened finger gains
+                    # whose entire purpose is to let internal_force_torques win against the
+                    # position hold while the pads close a gap. Under load those same soft
+                    # gains get back-driven by the object's weight: measured in the
+                    # controller's own sweep on 036_wood_block, fn decayed 8.20 -> 6.71 N
+                    # over ~200ms at constant squeeze command and the object started falling
+                    # with BOTH contacts still present; at scale 1.0 contact was never lost
+                    # (final carry -0.6% vs 71.9%). That is exactly the reported symptom —
+                    # firm at pickup, slipping as the arm carries, worst on the heavier
+                    # objects (gelatin box 97g over orange 47g).
+                    #
+                    # Fired at ramp completion, NOT at squeeze-on: the benchmark's
+                    # equivalent call sits after "squeeze_done" (pick_and_place.py:1015),
+                    # once force is established. Flipping to stiff holding gains DURING the
+                    # ramp would fight the very internal-force term the ramp is seating, so
+                    # the transition waits for _ramp to reach 1.0. Idempotent — set_
+                    # transporting just assigns a bool — but gated so it is a clean one-shot.
+                    if _ramp >= 1.0 and not grasp_ctrl.transporting:
+                        # GAINS/FORCE LOG across the CLOSING->HOLDING handoff. This ANSWERED
+                        # the question it was added for: teleop ran SQUEEZE_PD_SCALE=10.0
+                        # against the benchmark's 0.25, so the handoff to
+                        # transport_pd_scale=1.0 was a 10x SOFTENING under load where the
+                        # benchmark STIFFENS 4x -- exactly the decay mode
+                        # grasp_controller.py:182-198 measured. Confirmed live on
+                        # 017_orange: kp 7.412 -> 0.7412, measured force 2.7 -> 0.0 N at a
+                        # constant 3.1 N command, slip 8mm -> 63mm, object lost.
+                        # SQUEEZE_PD_SCALE is now 0.25, so this should print STIFFER; the
+                        # log stays as the regression check that it keeps doing so.
+                        # The gamma_ref term cancels identically in both files, so it does
+                        # NOT settle the direction; only the realised kp does. Printed
+                        # either side of the one-shot, with the per-finger normals so the
+                        # force response is visible in the same breath.
+                        try:
+                            _kp_b, _ = grasp_ctrl.effective_gains()
+                            _sl = grasp_ctrl.active_joint_slices
+                            _kp_bf = [round(float(_kp_b[_lo:_hi].max()), 4) for _lo, _hi in _sl]
+                            _, _, _nb, _tb = _hand_object_contact_metrics(active_idx)
+                            grasp_ctrl.set_transporting(True)
+                            _kp_a, _ = grasp_ctrl.effective_gains()
+                            _kp_af = [round(float(_kp_a[_lo:_hi].max()), 4) for _lo, _hi in _sl]
+                            _dirn = ('STIFFER' if _kp_af > _kp_bf else
+                                     'SOFTER' if _kp_af < _kp_bf else 'unchanged')
+                            print(f"\r\n[gains] handoff CLOSING->HOLDING: finger kp "
+                                  f"{_kp_bf} -> {_kp_af}  ({_dirn} under load; benchmark "
+                                  f"goes STIFFER 0.25->1.0)")
+                            print(f"[gains]   gamma_cmd={float(np.max(np.atleast_1d(grasp_ctrl.allocator.gamma))):.2f} "
+                                  f"gamma_ref={grasp_ctrl.gamma_ref} "
+                                  f"squeeze_scale={grasp_ctrl.squeeze_pd_scale} "
+                                  f"transport_scale={grasp_ctrl.transport_pd_scale}")
+                            print(f"[gains]   normals@handoff="
+                                  f"{ {k: round(v, 2) for k, v in _nb.items()} }N  "
+                                  f"tangential={ {k: round(v, 2) for k, v in _tb.items()} }N")
+                        except Exception:
+                            traceback.print_exc()
+                            grasp_ctrl.set_transporting(True)
+                        print(f"\r\n[Control] holding gains engaged (squeeze ramp complete, "
+                              f"{SQUEEZE_RAMP_S:.2f}s)")
                     tau_ctrl[:N_ROBOT] += grasp_ctrl.internal_force_torques(data, scale=_ramp)
                     # Contact-frame position feedback anchoring each fingertip to its
                     # object contact site — holds the TANGENTIAL friction load that the
                     # softened finger PD can't (the softening that helps normal-force
                     # delivery makes the fingers 4x more compliant in exactly the
                     # direction gravity shears the contact).
-                    tau_ctrl[:N_ROBOT] += grasp_ctrl.slip_correction_torques(data)
+                    # SLIP_CORRECT=0 disables this term for an A/B. It is a 200 N/m virtual
+                    # spring per fingertip, capped at f_max=10N, pulling each tip toward an
+                    # anchor that moves with the object — a purely TANGENTIAL command by
+                    # construction, additive on top of the internal squeeze. It exists to
+                    # hold shear the softened finger PD cannot, but the carry traces make it
+                    # a suspect for CAUSING the loss it is meant to prevent: with only ~1N of
+                    # external demand on the object (f_net ~ [0,0,1.0], i.e. gravity support
+                    # on a 0.097kg box) the contacts were nonetheless carrying 3-4N of
+                    # TANGENTIAL force each, and the friction-cone ratio |tf|/|nf| walked
+                    # 0.42 -> 0.60 -> 0.89 over the carry until the thumb hit 4.14N tangential
+                    # against 2.19N normal (local ratio 1.89 vs mu=2.0) and broke loose.
+                    # A spring whose output grows with accumulated tip-anchor drift produces
+                    # exactly that signature. Run once with SLIP_CORRECT=0 to settle it:
+                    # ratio stays ~0.4 -> this term is the cause; ratio climbs anyway -> the
+                    # squeeze allocation itself is producing the tangential internal force.
+                    if SLIP_CORRECT:
+                        tau_ctrl[:N_ROBOT] += grasp_ctrl.slip_correction_torques(data)
+                    # PER-FINGER CONTACT-LOSS DETECTION, at CONTROL RATE. The benchmark's
+                    # _jog_to samples tip forces every physics step and latches a sticky
+                    # per-finger contact_lost flag (pick_and_place.py:281-286), which feeds
+                    # its lift_ok verdict. Teleop measured forces only at trace/dashboard
+                    # rate and summed them across fingers into one scalar, so a single
+                    # fingertip unloading mid-carry -- the first observable sign of the
+                    # release -- was invisible until the object was already falling.
+                    # Detection only: this latches and prints, it does not gate anything.
+                    if _carry_lost is not None and grasp_ctrl.transporting:
+                        _, _, _cl_n, _ = _hand_object_contact_metrics(active_idx)
+                        for _f_cl, _fn_cl in _cl_n.items():
+                            if _fn_cl <= 1e-6 and not _carry_lost[_f_cl]:
+                                _carry_lost[_f_cl] = True
+                                print(f"\r\n[carry] CONTACT LOST on {_f_cl} at t={data.time:.2f}s "
+                                      f"(normals={ {k: round(v, 2) for k, v in _cl_n.items()} }N)")
                     _squeeze_diag(data)
 
             if GRASP_PROFILE and control_phase == 'GRASP':
@@ -7217,8 +8228,12 @@ if __name__ == "__main__":
                         _log_retarget_latency(_trial_state.trial_id)
                         _trial_runner.end_trial(_trial_state, _tnow)
                 elif control_phase == 'GRASP':
+                    # obj_z - surface_top - half_height (see the note at the contact-aware
+                    # transport site): _trial_rest_hh is a HALF-HEIGHT, so TABLE_TOP_Z must
+                    # come off too or this is an absolute height, not a clearance.
                     _hh = _trial_rest_hh[active_idx]
-                    _height_above_rest = float(data.geom_xpos[obj['id_geom']][2]) - _hh
+                    _height_above_rest = (float(data.geom_xpos[obj['id_geom']][2])
+                                          - TABLE_TOP_Z - _hh)
                     if _dp_trigger is not None:
                         # Two-step: see the eager-default note at the dexpilot trial block.
                         if _dexpilot_ctrl is None:

@@ -254,3 +254,6 @@ wrist
 teleop/calibration/wrist_track_config.json
 teleop/calibration/wrist_track_error.jsonl
 third_party/
+
+# Session scratch (pose pools, diagnostic outputs) — local only
+scratchpad/

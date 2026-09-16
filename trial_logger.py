@@ -773,8 +773,24 @@ class TrialRunner:
                     state.surface_z = min(state.surface_z, float(object_z))
 
             if state.attempt_active:
+                # CONFIRM REQUIRES CONTACT. Height alone is not a pick: an object the robot
+                # is not touching has not been picked up, however high it reads. Observed
+                # (017_orange, 2026-09-15 runs): pick_confirmed fired with dwell_s=1.002 and
+                # touch=False on an object sitting motionless on the counter at a frozen
+                # obj_z, because height_above_rest was mis-referenced and read "lifted" from
+                # the first frame. The trial then entered TRANSPORT with no grasp, the
+                # recommender re-solved against the disturbed pose, and its IK drove a finger
+                # into the object -- ejecting it at 4.5 m/s with ncon=0.
+                #
+                # hand_touching is already supplied by every call site; where it is None (no
+                # contact signal available) we fall back to trigger_active, which is engaged
+                # while the grasp condition holds -- the same fallback the arrival RELEASE
+                # check uses. This gates ONLY the confirm: the lift/attempt bookkeeping above
+                # is unchanged, so a lift with no contact still counts as an attempt.
+                held = (bool(hand_touching) if hand_touching is not None
+                        else bool(trigger_active))
                 lifted = height_above_rest > LIFT_HEIGHT_M
-                if lifted:
+                if lifted and held:
                     if state.dwell_t0 is None:
                         state.dwell_t0 = t_now
                     elif t_now - state.dwell_t0 >= DWELL_S:
@@ -850,6 +866,25 @@ class TrialRunner:
                 # descent OUTSIDE the footprint is a genuine drop.
                 if in_place:
                     state.drop_t0 = None   # placement in progress, not a drop — clear any timer
+                    return False
+                # STILL HELD => NOT a drop, wherever it is. A drop means the object left the
+                # hand; an object the robot is demonstrably still touching has not been
+                # dropped, however low it has been lowered. Without this the descent INTO the
+                # target scored a drop: `in_place` (contact with the bin base) is false for
+                # the whole descent — it can only become true AFTER the object is set down,
+                # which is exactly when the guard is no longer needed — so a gripped lowering
+                # fell through to the drop timer below and reverted the phase to PICK, killing
+                # the arrival check before the placement completed.
+                #
+                # Held-ness comes from the same two signals the retargeting call sites supply:
+                # the contact fact (hand_touching) when given, else the grasp trigger. Note
+                # this deliberately does NOT mask a real slip: fingers merely grazing an
+                # object sliding free keep `held` true only while contact persists, and the
+                # drop is counted as soon as it breaks.
+                held = (bool(hand_touching) if hand_touching is not None
+                        else bool(trigger_active))
+                if held:
+                    state.drop_t0 = None
                     return False
                 # Outside the footprint: require the descent to PERSIST for DROP_DWELL_S before
                 # counting a drop, mirroring the pick-confirm dwell above. A single-frame dip
