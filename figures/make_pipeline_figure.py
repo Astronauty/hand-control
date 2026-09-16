@@ -48,7 +48,13 @@ from ycb_grasp import plot_seed_quadratic as SQ
 COL_IN = 7.16          # IEEE DOUBLE column width (two-column span)
 AXLAB_PT = 9.0         # wrench-axis labels; the panels carry no title now
 TITLE_PT, LAB_PT, TICK_PT, LEG_PT = 9.0, 8.0, 7.0, 7.5
-C_TH, C_IX = "#d94801", "#2171b5"
+C_TH, C_IX = "#d94801", "#2171b5"          # thumb / index: contacts AND patches
+# WRENCH HULLS. One colour per panel -- the force and torque plots in a panel
+# are two projections of ONE set, so colouring them differently implied they
+# were different objects. Both are teal/slate rather than orange or blue, so a
+# hull is never read as a contact patch, and the task box stays purple.
+C_HULL_B_LO, C_HULL_B_HI = "#9ecae1", "#3182bd"   # (b) V(1)
+C_HULL_C_LO, C_HULL_C_HI = "#a1d99b", "#31a354"   # (c) V(gamma)
 
 
 # Friction coefficient used for the CONE DRAWING only. The scene's measured mu
@@ -197,9 +203,28 @@ def panel_a(fig, gs, pl, model, data, res, max_tris=2600):
                                  ("p2s", "n2_in", C_IX, "index")):
             p, n = rec["seed"].get(pk), rec["seed"].get(nk)
             if p is None or n is None: continue
-            _paint_contact(ax, sc, np.asarray(p, float), np.asarray(n, float),
-                           col, key)
-            _cb.append((np.asarray(p, float), np.asarray(n, float), col, key))
+            # PATCH at the seed (that is where the paraboloid was fitted), but
+            # the CONE at the contact the NLP converged to. The seed is a
+            # starting point and the solver moves it -- measured 33.3mm on this
+            # grasp -- so a cone drawn at the seed shows a friction cone the
+            # grasp never uses. res['p1']/['p2'] are the solved contacts and
+            # res['n1_final']/['n2_final'] their OUTWARD normals (negated here,
+            # since _cone_faces takes the inward convention).
+            _ps, _ns = np.asarray(p, float), np.asarray(n, float)
+            _pk_s = {"thumb": "p1", "index": "p2"}[key]
+            _nk_s = {"thumb": "n1_final", "index": "n2_final"}[key]
+            _psol = res.get(_pk_s)
+            _nsol = res.get(_nk_s)
+            _pc_ = np.asarray(_psol, float) if _psol is not None else _ps
+            if _nsol is not None and np.all(np.isfinite(np.asarray(_nsol, float))):
+                _nc_ = -np.asarray(_nsol, float)
+            else:
+                _nc_ = _ns
+            _paint_contact(ax, sc, _ps, _ns, col, key, patch=True,
+                           cone=False)
+            _paint_contact(ax, sc, _pc_, _nc_, col, key, patch=False,
+                           cone=True)
+            _cb.append((_pc_, _nc_, col, key))
     ax.plot([c[0]], [c[1]], [c[2]], "x", ms=4.5, color="k", mew=1.1, zorder=6)
     _iso(ax, V)
     ax._callout_contacts = _cb
@@ -300,7 +325,7 @@ def _wrench_hull(ax, P, title, col_lo, col_hi, axlab=None, ball=False,
     ax.set_title(title, fontsize=TITLE_PT, pad=-4)
 
 
-def _paint_contact(ax, sc, p, n, col, key, patch=True):
+def _paint_contact(ax, sc, p, n, col, key, patch=True, cone=True):
     """Draw ONE contact's quadratic patch, friction cone and normal arrow.
 
     Factored out so the exploded callout re-renders the SAME geometry at a
@@ -314,6 +339,8 @@ def _paint_contact(ax, sc, p, n, col, key, patch=True):
                                   depth_sort=True)
         except Exception:
             pass
+    if not cone:
+        return
     facets, rim, gens, axis, head = _cone_faces(p, n, view=_view_dir(ax))
     _cc = matplotlib.colors.to_rgb(col)
     _cone = Poly3DCollection(facets, linewidths=0.0)
@@ -396,10 +423,10 @@ def panel_b(fig, gs, W, alpha, beta, box_f=None, box_t=None, lim_f=None,
     # since the shared limits are set by the LARGER of the two. (c) carries the
     # containment story; (b) just shows the wrench set's shape, framed to
     # itself. The gamma factor is stated in the suptitle either way.
-    _wrench_hull(ax_f, Wa[3:, :].T, "", "#6baed6", "#2171b5",
+    _wrench_hull(ax_f, Wa[3:, :].T, "", C_HULL_B_LO, C_HULL_B_HI,
                  axlab=(r"$f_x$", r"$f_y$", r"$f_z$"))
     ax_t = fig.add_subplot(sub[1, 0], projection="3d")
-    _wrench_hull(ax_t, Wa[:3, :].T, "", "#c7e9c0", "#238b45",
+    _wrench_hull(ax_t, Wa[:3, :].T, "", C_HULL_B_LO, C_HULL_B_HI,
                  axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"))
     return ax_f
 
@@ -423,11 +450,11 @@ def panel_c(fig, gs, W, gamma, box_f=None, box_t=None, lim_f=None,
     Wa = np.asarray(W, float)
     g = float(gamma)
     ax_f = fig.add_subplot(sub[0, 0], projection="3d")
-    _wrench_hull(ax_f, Wa[3:, :].T, "", "#fdd0a2", "#d94801",
+    _wrench_hull(ax_f, Wa[3:, :].T, "", C_HULL_C_LO, C_HULL_C_HI,
                  axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), scale=g, box=box_f,
                  lim=lim_f, box_col="#6a3d9a", box_lab=r"{v:.2f}")
     ax_t = fig.add_subplot(sub[1, 0], projection="3d")
-    _wrench_hull(ax_t, Wa[:3, :].T, "", "#fdd0a2", "#d94801",
+    _wrench_hull(ax_t, Wa[:3, :].T, "", C_HULL_C_LO, C_HULL_C_HI,
                  axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), scale=g,
                  box=box_t, lim=lim_t, box_col="#6a3d9a", box_lab=r"{v:.2f}")
     return ax_f
