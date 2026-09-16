@@ -1164,6 +1164,14 @@ def _seed_third_contact(seed, geom_type, size, center, obj_mat, rng,
     return out
 
 
+class _C4Infeasible(Exception):
+    """The slot-2 patch is geometrically too small to hold a fourth contact at
+    the configured separation. Not an error: the caller drops to a tripod, which
+    is the same degrade-don't-fail rule a rejected seed already follows. Carried
+    as an exception only so the check can sit before the fan without duplicating
+    the fall-through path."""
+
+
 def _seed_fourth_contact(seed, geom_type, size, center, obj_mat,
                          mesh_entry=None, n_fan=8, patch_frame=None,
                          patch_offset_m=0.015, min_sep_m=0.012,
@@ -4526,13 +4534,23 @@ class GraspConfig3D:
     # (a rejected candidate costs nothing, another bearing is tried) where the
     # solve floor cannot (it competes with w_ik on every iteration).
     #
-    # 12 mm is one LEAP pad extent along the contact direction (10.8 mm,
-    # measured -- see _tip_support_along), so two pads at this separation are
-    # just touching rather than overlapping. It is a floor on PAD OVERLAP, not
-    # an attempt to reach the 45.4 mm rest-pose finger pitch: the fingers curl
-    # independently and need not sit one base pitch apart, which is the whole
-    # reason a shared patch works for two fingertips at all.
-    contact_min_sep_m: float = 0.012
+    # 22 mm, and the earlier 12 mm was measured off the WRONG AXIS. 12 mm came
+    # from the pad's extent ALONG THE CONTACT DIRECTION (10.8 mm) -- but two
+    # pads sitting side by side overlap according to their extent in the plane
+    # PERPENDICULAR to that, i.e. the pad's footprint on the object. Measured on
+    # the LEAP tip mesh, taking only vertices within 4 mm of the contact face:
+    # the footprint is 30.1 x 22.2 mm, so centres must be >= ~22 mm apart for
+    # the pads not to overlap. At 12 mm they visibly did.
+    #
+    # Still a floor on PAD OVERLAP, not an attempt to reach the 45.4 mm
+    # rest-pose finger pitch: the fingers curl independently and need not sit
+    # one base pitch apart, which is the whole reason a shared patch works for
+    # two fingertips at all.
+    #
+    # Measured at 22 mm: 036_wood_block and 003_cracker_box both still hold four
+    # separated contacts (3-4 at 22.0 and 44.0 mm), so the stricter floor costs
+    # nothing on the objects that support four fingers at all.
+    contact_min_sep_m: float = 0.022
     r_thumb:  float | None = None
     r_index:  float | None = None
     r_middle: float | None = None
@@ -4563,7 +4581,7 @@ class GraspConfig3D:
         self.c4_own_patch       = kwargs.pop('c4_own_patch', False)
         self.c4_patch_offset_m  = kwargs.pop('c4_patch_offset_m', 0.015)
         self.c4_min_sep_m       = kwargs.pop('c4_min_sep_m', 0.012)
-        self.contact_min_sep_m  = kwargs.pop('contact_min_sep_m', 0.012)
+        self.contact_min_sep_m  = kwargs.pop('contact_min_sep_m', 0.022)
         self.r_thumb  = kwargs.pop('r_thumb', None)
         self.r_index  = kwargs.pop('r_index', None)
         self.r_middle = kwargs.pop('r_middle', None)
@@ -9022,7 +9040,42 @@ class MultiStartGraspPlanner3D:
                             half_extents_mm=[h * 1e3 for h in _hl],
                             min_half_mm=_room4 * 1e3, fan_r_mm=_fanr * 1e3,
                             max_chord_mm=2 * _fanr * 1e3,
-                            min_sep_mm=float(getattr(cfg, 'c4_min_sep_m', 0.012)) * 1e3)
+                            # The SOLVE's floor, which is what the feasibility
+                            # gate below compares max_chord against -- not the
+                            # seed screen's c4_min_sep_m. Reporting the screen's
+                            # made the diagnostic disagree with the decision it
+                            # was supposed to explain.
+                            min_sep_mm=float(getattr(cfg, 'contact_min_sep_m',
+                                                     0.022)) * 1e3)
+                    # AUTO-SELECT: can this patch hold a fourth contact AT ALL?
+                    # The seed fan sweeps a circle of radius fan_r about the
+                    # patch origin, so the furthest two bearings can be apart is
+                    # max_chord = 2*fan_r. If that is below the separation floor
+                    # the fingers need, NO bearing can satisfy it and every
+                    # candidate will be rejected -- running the fan, the
+                    # reachability gate and 8 DLS solves to discover that is
+                    # pure waste, and it reports as "no viable candidate" which
+                    # reads like a search failure rather than a geometric one.
+                    #
+                    # Checked against the SOLVE's floor (contact_min_sep_m), not
+                    # the seed screen's, because the solve is what ultimately has
+                    # to hold the contacts apart: a seed that clears the screen
+                    # but cannot clear the constraint buys nothing.
+                    _need = float(getattr(cfg, 'contact_min_sep_m', 0.022))
+                    if _c3_patch_frame is not None:
+                        _hl4 = [abs(float(_c3_patch_frame['t_lo_0'])),
+                                abs(float(_c3_patch_frame['t_hi_0'])),
+                                abs(float(_c3_patch_frame['t_lo_1'])),
+                                abs(float(_c3_patch_frame['t_hi_1']))]
+                        _chord = 2.0 * min(
+                            float(getattr(cfg, 'c4_patch_offset_m', 0.015)),
+                            0.8 * min(_hl4))
+                        if _chord < _need:
+                            log.info(
+                                f"[seed {i+1}] fourth contact: patch cannot hold one "
+                                f"(max_chord {_chord*1e3:.1f}mm < required "
+                                f"{_need*1e3:.0f}mm) -- staying at 3 contacts")
+                            raise _C4Infeasible()
                     _c4_cands = _seed_fourth_contact(
                         seed, geom_type, geom_size, obj_center_np, obj_R_np,
                         mesh_entry=self._mesh_entry,
@@ -9121,6 +9174,8 @@ class MultiStartGraspPlanner3D:
                             f"{3 if seed.get('p3s') is not None else 2} contacts "
                             f"(patch may be too small to separate a 4th contact; "
                             f"see c4_min_sep_m={float(getattr(cfg, 'c4_min_sep_m', 0.012))*1e3:.0f}mm)")
+                except _C4Infeasible:
+                    pass          # already logged, with the measured reason
                 except Exception as _e_c4:
                     log.warning(f"[seed {i+1}] fourth-contact seeding failed: {_e_c4}")
 

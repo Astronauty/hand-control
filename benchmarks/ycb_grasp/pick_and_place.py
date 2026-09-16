@@ -311,7 +311,7 @@ def run_pick_place(object_id, seed, n_seeds=None, n_relin=None, gws=True, w_gws=
                    release_open_frac=0.5,
                    lift_mode="standard", plan_override=None,
                    nullspace_tracking=False, gap_tol_m=None,
-                   sep_hard=False, min_sep_mm=12.0,
+                   sep_hard=False, min_sep_mm=22.0,
                    squeeze_pd_per_finger=False, contact_gated_alloc=False,
                    force_feedback_ki=0.0, advance_q_target=0.0):
     """Plan + execute one grasp on one object, then carry it to the bin.
@@ -1448,9 +1448,12 @@ def main():
                          "wrench_feasible because a doubled contact is not an "
                          "infeasible one. Can make the solve infeasible on a "
                          "patch too small to hold the contacts that far apart")
-    ap.add_argument("--min-sep-mm", type=float, default=12.0,
-                    help="separation floor (mm) for --sep-hard. Default 12 = one "
-                         "LEAP pad extent, i.e. two pads just touching")
+    ap.add_argument("--min-sep-mm", type=float, default=22.0,
+                    help="separation floor (mm) for --sep-hard. Default 22 = the "
+                         "LEAP pad's FOOTPRINT on the object (30.1x22.2mm at the "
+                         "contact face), so two pads do not overlap. The earlier "
+                         "12 was measured off the contact-DIRECTION extent, which "
+                         "is the wrong axis for side-by-side pads")
     ap.add_argument("--fingers", default=None,
                     help="comma-separated fingers to grasp with, IN SLOT ORDER, e.g. "
                          "'thumb,middle' or 'thumb,index,middle'. Slot 1 anchors the "
