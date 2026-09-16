@@ -53,7 +53,11 @@ C_TH, C_IX = "#d94801", "#2171b5"          # thumb / index: contacts AND patches
 # are two projections of ONE set, so colouring them differently implied they
 # were different objects. Both are teal/slate rather than orange or blue, so a
 # hull is never read as a contact patch, and the task box stays purple.
-C_HULL_B_LO, C_HULL_B_HI = "#9ecae1", "#3182bd"   # (b) V(1)
+# (b) is SLATE GREY, not a hue: its blue conflicted with the index colour, and
+# teal would have read as a shade of (c)'s green. Neutral also says the right
+# thing -- V(1) is the same set as V(gamma), so the panels should differ in
+# SIZE, not in what the colour implies.
+C_HULL_B_LO, C_HULL_B_HI = "#cbd5e1", "#64748b"   # (b) V(1)
 C_HULL_C_LO, C_HULL_C_HI = "#a1d99b", "#31a354"   # (c) V(gamma)
 
 
@@ -418,16 +422,15 @@ def panel_b(fig, gs, W, alpha, beta, box_f=None, box_t=None, lim_f=None,
     sub = gs.subgridspec(2, 1, hspace=0.0)
     Wa = np.asarray(W, float)
     ax_f = fig.add_subplot(sub[0, 0], projection="3d")
-    # NO task box and NO shared limits here. Drawing the box in both panels
-    # made the comparison explicit but left V(1) at a quarter of the frame,
-    # since the shared limits are set by the LARGER of the two. (c) carries the
-    # containment story; (b) just shows the wrench set's shape, framed to
-    # itself. The gamma factor is stated in the suptitle either way.
+    # SHARED AXIS LIMITS with (c). Framing each panel to its own hull would
+    # draw V(1) and V(gamma) at the same size on the page and hide the scaling
+    # entirely -- the one thing the pair exists to show. With a common frame,
+    # V(1) is visibly gamma times smaller. The task box stays in (c) only.
     _wrench_hull(ax_f, Wa[3:, :].T, "", C_HULL_B_LO, C_HULL_B_HI,
-                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"))
+                 axlab=(r"$f_x$", r"$f_y$", r"$f_z$"), lim=lim_f)
     ax_t = fig.add_subplot(sub[1, 0], projection="3d")
     _wrench_hull(ax_t, Wa[:3, :].T, "", C_HULL_B_LO, C_HULL_B_HI,
-                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"))
+                 axlab=(r"$\tau_x$", r"$\tau_y$", r"$\tau_z$"), lim=lim_t)
     return ax_f
 
 
