@@ -310,12 +310,20 @@ def _build_seed_figure(planner, model, data, title_extra="", res=None,
     sc = _scene_from_planner(planner, model, data)
     recs = [_as_rec(e, True) for e in acc] + [_as_rec(e, False) for e in rej]
     # Solved contacts, when the caller handed us the result. Only p1/p2 are
-    # required; p3 rides along at n_contacts>=3.
+    # required; p3/p4 ride along at n_contacts >= 3 / >= 4.
+    #
+    # p4 WAS MISSING HERE, which is why a four-contact solve drew only three
+    # solution triangles even though _overlay_solved handles all four and the
+    # legend listed 'ring'. The seed o was drawn (that comes from the seed
+    # tables, which do carry p4s) but its ^ was not, so the ring finger looked
+    # like a seed the NLP had thrown away -- the exact misreading the overlay
+    # exists to prevent. Written as a loop so a fifth slot cannot reintroduce it.
     _solved = None
     if res is not None and res.get("p1") is not None and res.get("p2") is not None:
         _solved = {"p1": res["p1"], "p2": res["p2"]}
-        if res.get("p3") is not None:
-            _solved["p3"] = res["p3"]
+        for _k in ("p3", "p4"):
+            if res.get(_k) is not None:
+                _solved[_k] = res[_k]
     # WINNER + ITS REAL PATCH FRAMES. solve() runs one NLP per accepted seed and
     # keeps the cost-ranked best; res['seed_index'] says which accepted seed
     # that was, and res['quad_frames'] carries the paraboloid frames that stage
