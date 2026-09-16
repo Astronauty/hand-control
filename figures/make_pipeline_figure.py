@@ -480,7 +480,7 @@ def _iso(ax, P, elev=30, azim=-60):
     # azim ~138, which puts the handle BEHIND the cup -- rejected on the render.
     # (30, -60) shows the hole with both cones still reading as cones.
     ax.view_init(elev=elev, azim=azim)
-    try: ax.set_box_aspect(None, zoom=1.60)
+    try: ax.set_box_aspect(None, zoom=1.78)
     except TypeError: pass
 
 
@@ -535,7 +535,7 @@ def main():
     _g = float(cap["gamma"])
     _lim_f = np.vstack([_Wf * _g, -_Wf * _g, _box_f, -_box_f])
     _lim_t = np.vstack([_Wt * _g, -_Wt * _g, _box_t, -_box_t])
-    fig = plt.figure(figsize=(COL_IN, COL_IN * 0.44))
+    fig = plt.figure(figsize=(COL_IN, COL_IN * 0.42))
     gs = GridSpec(1, 3, figure=fig, wspace=0.0)
     import traceback
     for _nm, _fn in (("a", lambda: panel_a(fig, gs[0, 0], pl, pl._planner.model,
@@ -573,7 +573,11 @@ def main():
     for _x, _s in ((0.17, "(a) seeding"),
                    (0.50, r"(b) wrench set $V(1)$"),
                    (0.84, r"(c) $V(\gamma)=\gamma\,V(1)$")):
-        fig.text(_x, 0.965, _s, fontsize=TITLE_PT, ha="center", va="bottom")
+        fig.text(_x, 0.985, _s, fontsize=TITLE_PT, ha="center", va="bottom")
+    for _x, _s in ((0.17, "(a) seeding"),
+                   (0.50, r"(b) wrench set $V(1)$"),
+                   (0.84, r"(c) $V(\gamma)=\gamma\,V(1)$")):
+        fig.text(_x, 0.985, _s, fontsize=TITLE_PT, ha="center", va="bottom")
     # The task box stated as the physical quantities it is, so the reader can
     # check the arithmetic: m*a per axis, its corner, and the gamma that covers
     # it. Without these the green/purple wireframe is an abstract shape.
@@ -583,27 +587,27 @@ def main():
         np.asarray(a[5], float)[0])
     _bt = np.asarray(_inertia, float) * _angd
     _star = r"$^{*}$" if args.ang_display else ""
-    fig.text(0.5, 1.055,
-             rf"{args.object.replace('_',' ')}:   $m$ = {_mm:.3f} kg,  "
-             rf"$a$ = {_aa:.0f} m/s$^2$ $\Rightarrow$ $ma$ = {_bf:.2f} N/axis"
-             rf"      $\alpha${_star} = {_angd:.0f} rad/s$^2$ $\Rightarrow$ "
-             rf"$\mathbf{{I}}\alpha$ = {_bt.max():.2f} N$\cdot$m",
-             fontsize=TITLE_PT, ha="center", va="bottom")
-    fig.text(0.5, 1.005,
-             rf"$\beta$ = {float(r['gws_beta']):.3f} "
-             rf"($\sum\alpha_i = 1$),    "
-             rf"$\gamma$ = {cap['gamma']:.2f} N"
-             + (r"        $^{*}$illustrative angular budget; the measured one "
-                r"renders sub-pixel" if args.ang_display else ""),
-             fontsize=TICK_PT, ha="center", va="bottom", color="0.35")
+    # NO HEADER BAND. The mass/acceleration/beta/gamma line lived here and was
+    # both cramped and redundant: those are numbers a reader wants to READ, not
+    # locate on a plot. main() prints a caption-ready string instead, and the
+    # freed band goes to the panels -- which is what made V(1) hard to see.
     # top < 1 leaves the suptitle its own band; the panel titles sit at
     # pad=-2 inside their axes, so without this the two collide.
-    fig.subplots_adjust(left=0.0, right=1.0, top=0.97, bottom=0.035)
+    fig.subplots_adjust(left=0.0, right=1.0, top=0.985, bottom=0.03)
     out = Path(args.out or (REPO / "figures" /
                f"pipeline_{args.object}_s{args.seed}.pdf"))
     fig.savefig(out, format="pdf", dpi=600, bbox_inches="tight")
     fig.savefig(out.with_suffix(".png"), dpi=300, bbox_inches="tight")
     print(f"wrote {out}")
+    # Caption inputs -- these used to be a header band above the panels. Put
+    # them in the caption text instead; the figure is for the geometry.
+    print(f"  CAPTION: m = {_mm:.3f} kg, a = {_aa:.0f} m/s^2 "
+          f"=> ma = {_bf:.2f} N/axis ({np.linalg.norm([_bf]*3):.2f} N corner); "
+          f"alpha* = {_angd:.0f} rad/s^2 => I.alpha = {_bt.max():.3f} N.m"
+          + ("  [ILLUSTRATIVE angular budget; the measured 1 rad/s^2 renders "
+             "sub-pixel]" if args.ang_display else "")
+          + f";  beta = {float(r['gws_beta']):.3f} (sum alpha_i = 1), "
+          f"gamma = {cap['gamma']:.2f} N")
     print(f"  beta={float(r['gws_beta']):.5f}  gamma={cap['gamma']:.4f}  "
           f"W={np.asarray(r['gws_W']).shape}")
     return 0
