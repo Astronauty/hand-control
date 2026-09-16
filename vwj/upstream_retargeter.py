@@ -25,7 +25,9 @@ import sys
 import numpy as np
 import mujoco as mj
 
-from vwj.retargeter import (_ARM_JOINTS, _HAND_JOINTS, _TIP_SITES, _DIP_SITES,
+from vwj.retargeter import (_MANO_TIP_THUMB, _MANO_TIP_INDEX, _MANO_TIP_MIDDLE,
+                            _MANO_TIP_RING,
+                            _ARM_JOINTS, _HAND_JOINTS, _TIP_SITES, _DIP_SITES,
                             _WRIST_SITE, _default_config, _CONFIG_PATH)
 from vwj.refvalues import build_ref_values, robot_link_pairs
 from vwj.upstream_kinematics import MujocoRobotModel
@@ -77,7 +79,8 @@ class VWJUpstreamRetargeter:
     whole_robot = True
 
     def __init__(self, model: mj.MjModel, n_arm: int = 7, hand_type: str = "right",
-                 q_home: np.ndarray | None = None, debug: bool = False, **_ignored):
+                 q_home: np.ndarray | None = None, debug: bool = False,
+                 pinch_debounce: bool = True, **_ignored):
         _ensure_upstream_on_path()
         from retargeting.core.optimizers.vector_wrist_joint import VectorWristJointOptimizerV2
         from retargeting.core.kinematics.adaptor import RobotAdaptor
@@ -85,6 +88,13 @@ class VWJUpstreamRetargeter:
         self.model = model
         self.hand_type = hand_type
         self.debug = debug
+        # Pinch distances the trial logger reads — same seam and same eager-default
+        # hazard as the clean-room VWJRetargeter; see its _update_pinch docstring.
+        self.last_d_s1: list[float] = [float("inf")] * 3
+        self.last_d_s1_filt: list[float] = [float("inf")] * 3
+        self._pinch_debounce = bool(pinch_debounce)
+        self._pinch_median_n = 5
+        self._pinch_hist: list[list[float]] = [[], [], []]
         self._opt_joints = _ARM_JOINTS + _HAND_JOINTS
 
         # Frames the optimizer references: origins + tasks + wrist, deduped in the order
@@ -211,10 +221,39 @@ class VWJUpstreamRetargeter:
         # of those takes effect immediately. (A huber/override change needs a restart.)
         return True
 
+    def _update_pinch(self, mano: np.ndarray) -> None:
+        """Index/middle/ring tip -> thumb distances for the trial pinch signal.
+
+        Reporting only — identical to VWJRetargeter._update_pinch (see that docstring);
+        kept as its own copy so the verbatim-upstream A/B partner stays independent of
+        the clean-room class, which is the whole point of this file.
+        """
+        kps = np.asarray(mano, float).reshape(21, 3)
+        thumb = kps[_MANO_TIP_THUMB]
+        d = [float(np.linalg.norm(kps[t] - thumb))
+             for t in (_MANO_TIP_INDEX, _MANO_TIP_MIDDLE, _MANO_TIP_RING)]
+        self.last_d_s1 = d
+        if not self._pinch_debounce:
+            self.last_d_s1_filt = list(d)
+            return
+        for i in range(3):
+            hist = self._pinch_hist[i]
+            hist.append(d[i])
+            if len(hist) > self._pinch_median_n:
+                del hist[0]
+            self.last_d_s1_filt[i] = float(np.median(hist))
+
     def reset(self, q_home: np.ndarray | None = None) -> None:
         if q_home is not None:
             self._q_home = np.asarray(q_home, float)[:self.robot_model.dof].copy()
         self._q_last = self._q_home.copy()
+        # Clear the pinch report too, exactly as VWJRetargeter.reset does. Under
+        # --sequential-spawn reset() fires between trials, so a stale sub-eps distance
+        # surviving here would let the NEXT trial's DexPilotAttemptTrigger fire on the
+        # PREVIOUS trial's pinch before the first retarget() of that trial lands.
+        self._pinch_hist = [[], [], []]
+        self.last_d_s1 = [float("inf")] * 3
+        self.last_d_s1_filt = [float("inf")] * 3
 
     # -- the solve ----------------------------------------------------------------
     def retarget(self, world_lm: np.ndarray, wrist_pos: np.ndarray,
@@ -225,6 +264,7 @@ class VWJUpstreamRetargeter:
 
         c = self._config
         mano = world_landmarks_to_mano(world_lm, self.hand_type) * self.scale
+        self._update_pinch(mano)
         wrist_R = np.asarray(wrist_R, float)
         kps_world = np.asarray(wrist_pos, float)[None, :] + mano @ wrist_R.T
 

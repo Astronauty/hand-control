@@ -91,8 +91,13 @@ class DexPilotController:
             # 'vwj' = clean-room reimplementation; 'vwj_upstream' = the authors' optimizer
             # run verbatim from a local clone (the A/B partner). Both are whole-robot.
             from anyteleop.factory import make_retargeter
+            # pinch_debounce is forwarded even though VWJ solves fingers itself: it does
+            # not touch the solve, only whether the REPORTED last_d_s1_filt is median-
+            # filtered (see VWJRetargeter._update_pinch). Without it, --pinch-debounce
+            # would silently mean nothing on VWJ while working on the other backends.
             self._retarg = make_retargeter(str(retargeter).lower(), model,
-                                           n_arm=n_arm, debug=debug)
+                                           n_arm=n_arm, debug=debug,
+                                           pinch_debounce=pinch_debounce)
         else:
             from anyteleop.factory import make_retargeter
             self._retarg = make_retargeter(retargeter, model, n_arm=n_arm,
